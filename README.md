@@ -20,9 +20,14 @@ make dev       # docker compose postgres + migrate + run the daemon
 make gen       # regenerate sqlc code after editing db/queries or db/migrations
 ```
 
-`frontier-syncd` commands: `serve --roles=...`, `migrate`, `version`.
+`frontier-syncd` commands: `serve --roles=...`, `migrate`,
+`requeue --guid=…|--all-parked`, `version`.
 `fake-github` (cmd/fake-github) serves a canned enrolled repo and emits
 HMAC-signed webhooks; docker-compose runs it beside Postgres.
+
+The `webhook_deliveries.headers` JSONB value is a semantic request envelope:
+the canonical header map plus host, parsed content length, and transfer
+encoding. Wire-exact header casing and ordering are intentionally not retained.
 
 ## Status
 

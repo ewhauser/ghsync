@@ -293,8 +293,15 @@ else, so no pipeline stage does per-event work that could be per-batch work.
   stay minimal.** GitHub sends one HTTP request per delivery, and C-I1
   (durable-before-ack) forces a commit inside that request; there is nothing
   to batch against. The constraint is that this commit is *one single-row
-  insert* into an append-only table with exactly one index (the GUID unique)
-  — no parsing beyond signature check, no classification, no joins.
+  insert* into an append-only table whose write cost stays O(1) — no
+  parsing beyond signature check, no classification, no joins. Indexing:
+  the GUID primary key, plus at most a small partial index over
+  undispatched rows (`WHERE status = 'pending'`) so the dispatcher's claim
+  poll scales with pending work, not retained history; the partial index is
+  empty at steady state and costs the ingress hot path nothing. (Amended
+  from "exactly one index" during M2 review: claim-poll cost and
+  ingress-write cost are both constraints, and the pending-only partial
+  index is the reconciliation.)
   Concurrent deliveries amortize WAL flushes via Postgres group commit.
   Budget: a single-row commit is ~1ms; even a 200 deliveries/sec redelivery
   burst is well inside a small instance's capacity. `synchronous_commit`

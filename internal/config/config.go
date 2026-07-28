@@ -14,6 +14,7 @@ const (
 	defaultDispatchMaxAttempts = 5
 	defaultDispatchDebounce    = 5 * time.Second
 	defaultDispatchPoll        = 250 * time.Millisecond
+	maxDispatchDebounce        = 15 * time.Second
 )
 
 type Config struct {
@@ -102,6 +103,12 @@ func FromEnv() (Config, error) {
 		value, err := parsePositiveDuration("DISPATCH_DEBOUNCE", raw)
 		if err != nil {
 			return Config{}, err
+		}
+		if value > maxDispatchDebounce {
+			return Config{}, fmt.Errorf(
+				"DISPATCH_DEBOUNCE must not exceed %s",
+				maxDispatchDebounce,
+			)
 		}
 		cfg.DispatchDebounce = value
 	}

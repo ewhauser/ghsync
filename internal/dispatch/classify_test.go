@@ -24,10 +24,16 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 				"repository":{"full_name":"acme/monolith"},
 				"pull_request":{"number":4800,"stack":null}
 			}`,
-			want: []Intent{{
-				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4800",
-				Priority: PriorityEvent,
-			}},
+			want: []Intent{
+				{
+					Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4800",
+					Priority: PriorityEvent,
+				},
+				{
+					Kind: queue.KindResolveStackMembership,
+					Key:  "pr:acme/monolith:4800", Priority: PriorityEvent,
+				},
+			},
 		},
 		{
 			name:  "stacked pull request escalates",
@@ -38,10 +44,16 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 				"repository":{"full_name":"acme/monolith"},
 				"pull_request":{"number":4812,"stack":{"number":142}}
 			}`,
-			want: []Intent{{
-				Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
-				Priority: PriorityEvent,
-			}},
+			want: []Intent{
+				{
+					Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
+					Priority: PriorityEvent,
+				},
+				{
+					Kind: queue.KindResolveStackMembership,
+					Key:  "pr:acme/monolith:4812", Priority: PriorityEvent,
+				},
+			},
 		},
 		{
 			name:  "stacked action escalates",
@@ -52,10 +64,16 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 				"repository":{"full_name":"acme/monolith"},
 				"pull_request":{"number":4815,"stack":{"number":142}}
 			}`,
-			want: []Intent{{
-				Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
-				Priority: PriorityEvent,
-			}},
+			want: []Intent{
+				{
+					Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
+					Priority: PriorityEvent,
+				},
+				{
+					Kind: queue.KindResolveStackMembership,
+					Key:  "pr:acme/monolith:4815", Priority: PriorityEvent,
+				},
+			},
 		},
 		{
 			name:  "check run by SHA",
@@ -93,6 +111,19 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 			want: []Intent{{
 				Kind:     queue.KindRefreshBranch,
 				Key:      "branch:acme/monolith:refactor/bm25f-ranker",
+				Priority: PriorityEvent,
+			}},
+		},
+		{
+			name:  "stack branch push escalates",
+			event: "push",
+			body: `{
+				"ref":"refs/heads/refactor/bm25f-ranker",
+				"repository":{"full_name":"acme/monolith"},
+				"stack":{"number":142}
+			}`,
+			want: []Intent{{
+				Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
 				Priority: PriorityEvent,
 			}},
 		},

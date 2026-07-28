@@ -18,9 +18,9 @@ const (
 
 // Intent is a dispatch decision, not an entity payload.
 type Intent struct {
-	Kind     string
-	Key      string
-	Priority string
+	Kind     string `json:"kind"`
+	Key      string `json:"key"`
+	Priority string `json:"priority"`
 }
 
 // Target names a declarative key extractor used by a Rule.
@@ -31,6 +31,9 @@ const (
 	TargetStack       Target = "stack"
 	TargetChecks      Target = "checks"
 	TargetBranch      Target = "branch"
+	// TargetResolveStackMembership carries only the PR key. Its M3 worker
+	// consults cached membership and refreshes both the old and new stacks.
+	TargetResolveStackMembership Target = "resolve_stack_membership"
 )
 
 // Rule is the config-driven event/action → refresh mapping. StackedTarget
@@ -53,9 +56,19 @@ func DefaultRules() []Rule {
 			Target:        TargetPullRequest,
 			StackedTarget: TargetStack,
 		},
+		{
+			Event:  "pull_request",
+			Action: ActionAny,
+			Target: TargetResolveStackMembership,
+		},
 		{Event: "check_run", Action: ActionAny, Target: TargetChecks},
 		{Event: "check_suite", Action: ActionAny, Target: TargetChecks},
-		{Event: "push", Action: ActionAny, Target: TargetBranch},
+		{
+			Event:         "push",
+			Action:        ActionAny,
+			Target:        TargetBranch,
+			StackedTarget: TargetStack,
+		},
 	}
 }
 
@@ -85,6 +98,11 @@ type payloadEnvelope struct {
 			Number int `json:"number"`
 		} `json:"stack"`
 	} `json:"pull_request"`
+	// Stack is populated by synthetic M2 fixtures to model the branch-to-stack
+	// relationship that M3 will resolve from the authoritative cache.
+	Stack *struct {
+		Number int `json:"number"`
+	} `json:"stack"`
 	CheckRun struct {
 		HeadSHA string `json:"head_sha"`
 	} `json:"check_run"`
@@ -118,7 +136,7 @@ func (c Classifier) Classify(event string, body []byte) ([]Intent, error) {
 			continue
 		}
 		target := rule.Target
-		if rule.StackedTarget != "" && payload.PullRequest.Stack != nil {
+		if rule.StackedTarget != "" && payloadStack(payload) != nil {
 			target = rule.StackedTarget
 		}
 		key, emit, err := intentKey(target, event, payload)
@@ -157,6 +175,8 @@ func intentKey(
 	}
 	switch target {
 	case TargetPullRequest:
+		fallthrough
+	case TargetResolveStackMembership:
 		number := payload.Number
 		if number == 0 {
 			number = payload.PullRequest.Number
@@ -166,11 +186,12 @@ func intentKey(
 		}
 		return "pr:" + repo + ":" + strconv.Itoa(number), true, nil
 	case TargetStack:
-		if payload.PullRequest.Stack == nil || payload.PullRequest.Stack.Number <= 0 {
-			return "", false, fmt.Errorf("stacked pull_request payload is missing stack.number")
+		stack := payloadStack(payload)
+		if stack == nil || stack.Number <= 0 {
+			return "", false, fmt.Errorf("%s payload is missing stack.number", event)
 		}
 		return "stack:" + repo + ":" +
-			strconv.Itoa(payload.PullRequest.Stack.Number), true, nil
+			strconv.Itoa(stack.Number), true, nil
 	case TargetChecks:
 		headSHA := payload.CheckRun.HeadSHA
 		if event == "check_suite" {
@@ -205,7 +226,23 @@ func jobKind(target Target) (string, error) {
 		return queue.KindRefreshChecks, nil
 	case TargetBranch:
 		return queue.KindRefreshBranch, nil
+	case TargetResolveStackMembership:
+		return queue.KindResolveStackMembership, nil
 	default:
 		return "", fmt.Errorf("unsupported dispatch target %q", target)
 	}
+}
+
+type stackPointer struct {
+	Number int
+}
+
+func payloadStack(payload payloadEnvelope) *stackPointer {
+	if payload.PullRequest.Stack != nil {
+		return &stackPointer{Number: payload.PullRequest.Stack.Number}
+	}
+	if payload.Stack != nil {
+		return &stackPointer{Number: payload.Stack.Number}
+	}
+	return nil
 }

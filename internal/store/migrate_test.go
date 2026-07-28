@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 // Runs only when TEST_DATABASE_URL points at a disposable Postgres (CI
 // provides one as a service container). Verifies migrations are idempotent,
 // webhook GUID dedupe works through sqlc, and the ingestion table keeps its
-// exactly-one-index invariant.
+// minimal primary-key plus pending-only partial-index invariant.
 func TestMigrateIdempotent(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -28,6 +29,16 @@ func TestMigrateIdempotent(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	defer pool.Close()
+	var synchronousCommit string
+	if err := pool.QueryRow(ctx, "SHOW synchronous_commit").Scan(
+		&synchronousCommit,
+	); err != nil || synchronousCommit != "on" {
+		t.Fatalf(
+			"synchronous_commit = %q (err=%v), want on",
+			synchronousCommit,
+			err,
+		)
+	}
 
 	for range 2 { // twice: second run must be a no-op
 		if err := Migrate(ctx, pool); err != nil {
@@ -99,8 +110,25 @@ func TestMigrateIdempotent(t *testing.T) {
 		WHERE schemaname = current_schema()
 		  AND tablename = 'webhook_deliveries'
 	`).Scan(&indexCount)
-	if err != nil || indexCount != 1 {
-		t.Fatalf("webhook_deliveries index count = %d (err=%v), want 1", indexCount, err)
+	if err != nil || indexCount != 2 {
+		t.Fatalf("webhook_deliveries index count = %d (err=%v), want 2", indexCount, err)
+	}
+	var partialIndexDefinition string
+	err = pool.QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND tablename = 'webhook_deliveries'
+		  AND indexname = 'webhook_deliveries_pending_received_guid_idx'
+	`).Scan(&partialIndexDefinition)
+	if err != nil ||
+		!strings.Contains(partialIndexDefinition, "(received_at, delivery_guid)") ||
+		!strings.Contains(partialIndexDefinition, "WHERE (status = 'pending'::text)") {
+		t.Fatalf(
+			"pending partial index = %q (err=%v)",
+			partialIndexDefinition,
+			err,
+		)
 	}
 
 	var riverTables int

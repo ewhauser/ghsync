@@ -55,6 +55,24 @@ func TestFromEnvRejectsInvalidDispatchValues(t *testing.T) {
 	}
 }
 
+func TestFromEnvDispatchDebounceHardCap(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("DISPATCH_DEBOUNCE", "15s")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("15s boundary rejected: %v", err)
+	}
+	if cfg.DispatchDebounce != 15*time.Second {
+		t.Fatalf("debounce = %s, want 15s", cfg.DispatchDebounce)
+	}
+
+	clearConfigEnv(t)
+	t.Setenv("DISPATCH_DEBOUNCE", "15.000000001s")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("15s + 1ns debounce accepted")
+	}
+}
+
 func TestRequireWebhookSecret(t *testing.T) {
 	if err := (Config{}).RequireWebhookSecret(); err == nil {
 		t.Fatal("empty webhook secret accepted")

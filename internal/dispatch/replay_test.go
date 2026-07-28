@@ -5,9 +5,8 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"sort"
 	"testing"
-
-	"github.com/acme/frontier/internal/queue"
 )
 
 type recordedDelivery struct {
@@ -16,8 +15,8 @@ type recordedDelivery struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-// This is a synthetic recording of the S-142 traffic shape. Real enrolled
-// repository traffic replaces it during M4's webhook validation experiment.
+// This is a synthetic recording of the S-142 traffic shape. Real recorded
+// enrolled-repository traffic lands in M4's webhook validation experiment.
 func loadRecordedDeliveries(t *testing.T) []recordedDelivery {
 	t.Helper()
 	encoded, err := os.ReadFile("testdata/s142_recorded.json")
@@ -34,35 +33,29 @@ func loadRecordedDeliveries(t *testing.T) []recordedDelivery {
 	return deliveries
 }
 
+// loadGoldenJobs reads a hand-authored expected list derived directly from the
+// fixture. It must never call Classify or share classifier mapping helpers.
+func loadGoldenJobs(t *testing.T) []Intent {
+	t.Helper()
+	encoded, err := os.ReadFile("testdata/s142_expected_jobs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobs []Intent
+	if err := json.Unmarshal(encoded, &jobs); err != nil {
+		t.Fatal(err)
+	}
+	sortIntents(jobs)
+	return jobs
+}
+
 func TestRecordedReplayDecisionsAreOrderIndependent(t *testing.T) {
 	deliveries := loadRecordedDeliveries(t)
 	classifier := DefaultClassifier()
-	baseline := classifyDecisionSet(t, classifier, deliveries)
-	if len(baseline) != 12 {
-		t.Fatalf("baseline has %d unique decisions, want 12: %#v", len(baseline), baseline)
-	}
-	for _, required := range []Intent{
-		{
-			Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4800",
-			Priority: PriorityEvent,
-		},
-		{
-			Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
-			Priority: PriorityEvent,
-		},
-		{
-			Kind: queue.KindRefreshChecks, Key: "checks:acme/monolith:8f31c2d",
-			Priority: PriorityEvent,
-		},
-		{
-			Kind:     queue.KindRefreshBranch,
-			Key:      "branch:acme/monolith:refactor/bm25f-ranker",
-			Priority: PriorityEvent,
-		},
-	} {
-		if _, ok := baseline[decisionID(required)]; !ok {
-			t.Fatalf("baseline is missing required decision %+v", required)
-		}
+	golden := loadGoldenJobs(t)
+	baseline := classifyDecisions(t, classifier, deliveries)
+	if !reflect.DeepEqual(baseline, golden) {
+		t.Fatalf("baseline differs from hand-authored golden\n got: %#v\nwant: %#v", baseline, golden)
 	}
 
 	for seed := int64(0); seed < 50; seed++ {
@@ -78,18 +71,18 @@ func TestRecordedReplayDecisionsAreOrderIndependent(t *testing.T) {
 				withDuplicates = append(withDuplicates, delivery)
 			}
 		}
-		got := classifyDecisionSet(t, classifier, withDuplicates)
-		if !reflect.DeepEqual(got, baseline) {
-			t.Fatalf("seed %d decisions differ\n got: %#v\nwant: %#v", seed, got, baseline)
+		got := classifyDecisions(t, classifier, withDuplicates)
+		if !reflect.DeepEqual(got, golden) {
+			t.Fatalf("seed %d decisions differ\n got: %#v\nwant: %#v", seed, got, golden)
 		}
 	}
 }
 
-func classifyDecisionSet(
+func classifyDecisions(
 	t *testing.T,
 	classifier Classifier,
 	deliveries []recordedDelivery,
-) map[string]Intent {
+) []Intent {
 	t.Helper()
 	decisions := make(map[string]Intent)
 	for _, delivery := range deliveries {
@@ -101,9 +94,20 @@ func classifyDecisionSet(
 			decisions[decisionID(intent)] = intent
 		}
 	}
-	return decisions
+	result := make([]Intent, 0, len(decisions))
+	for _, intent := range decisions {
+		result = append(result, intent)
+	}
+	sortIntents(result)
+	return result
 }
 
 func decisionID(intent Intent) string {
 	return intent.Kind + "\x00" + intent.Key + "\x00" + intent.Priority
+}
+
+func sortIntents(intents []Intent) {
+	sort.Slice(intents, func(i, j int) bool {
+		return decisionID(intents[i]) < decisionID(intents[j])
+	})
 }

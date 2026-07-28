@@ -20,6 +20,13 @@ type InstallationBudget struct {
 	BackoffUntil   pgtype.Timestamptz
 }
 
+type RefreshIntentGeneration struct {
+	Kind       string
+	RefreshKey string
+	Generation int64
+	UpdatedAt  pgtype.Timestamptz
+}
+
 type WebhookDelivery struct {
 	DeliveryGuid string
 	Event        string

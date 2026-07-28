@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/store/dbgen"
@@ -30,9 +31,10 @@ type DeliveryInserter interface {
 
 // Handler verifies and durably records GitHub webhook deliveries.
 type Handler struct {
-	deliveries   DeliveryInserter
-	secret       []byte
-	maxBodyBytes int64
+	deliveries     DeliveryInserter
+	secret         []byte
+	maxBodyBytes   int64
+	requestTimeout time.Duration
 }
 
 // NewHandler constructs a webhook handler around sqlc's generated insert.
@@ -40,6 +42,7 @@ func NewHandler(
 	deliveries DeliveryInserter,
 	webhookSecret string,
 	maxBodyBytes int64,
+	requestTimeout time.Duration,
 ) *Handler {
 	if deliveries == nil {
 		panic("ingress delivery inserter is required")
@@ -47,10 +50,14 @@ func NewHandler(
 	if maxBodyBytes <= 0 {
 		panic("ingress max body bytes must be positive")
 	}
+	if requestTimeout <= 0 {
+		panic("ingress request timeout must be positive")
+	}
 	return &Handler{
-		deliveries:   deliveries,
-		secret:       []byte(webhookSecret),
-		maxBodyBytes: maxBodyBytes,
+		deliveries:     deliveries,
+		secret:         []byte(webhookSecret),
+		maxBodyBytes:   maxBodyBytes,
+		requestTimeout: requestTimeout,
 	}
 }
 
@@ -65,6 +72,10 @@ func (h *Handler) Mux() *http.ServeMux {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestCtx, cancel := context.WithTimeout(r.Context(), h.requestTimeout)
+	defer cancel()
+	r = r.WithContext(requestCtx)
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBodyBytes))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
@@ -93,7 +104,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing GitHub delivery headers", http.StatusBadRequest)
 		return
 	}
-	headers, err := json.Marshal(r.Header)
+	headers, err := json.Marshal(requestEnvelope{
+		Headers:          r.Header.Clone(),
+		Host:             r.Host,
+		ContentLength:    r.ContentLength,
+		TransferEncoding: append([]string(nil), r.TransferEncoding...),
+	})
 	if err != nil {
 		http.Error(w, "encode webhook headers", http.StatusInternalServerError)
 		return
@@ -113,4 +129,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// requestEnvelope preserves the semantically relevant request metadata needed
+// for C-R4 gap healing. Go has already canonicalized headers, so wire-exact
+// casing and ordering are intentionally not retained.
+type requestEnvelope struct {
+	Headers          http.Header `json:"headers"`
+	Host             string      `json:"host"`
+	ContentLength    int64       `json:"content_length"`
+	TransferEncoding []string    `json:"transfer_encoding"`
 }

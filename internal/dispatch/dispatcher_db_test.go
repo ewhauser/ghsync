@@ -31,11 +31,17 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(
-		ingress.NewHandler(dbgen.New(pool), testWebhookSecret, 1<<20).Mux(),
+		ingress.NewHandler(
+			dbgen.New(pool),
+			testWebhookSecret,
+			1<<20,
+			5*time.Second,
+		).Mux(),
 	)
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
 	deliveries := loadRecordedDeliveries(t)
+	golden := loadGoldenJobs(t)
 	baseTime := time.Date(2026, 7, 28, 18, 0, 0, 0, time.UTC)
 
 	for run := 0; run < 4; run++ {
@@ -46,17 +52,27 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 		})
 		repo := fmt.Sprintf("acme/monolith-replay-%d", run)
 		guidPrefix := fmt.Sprintf("replay-%d-", run)
-		expected := make(map[string]Intent)
-		for _, delivery := range permuted {
-			payload, encoded := deliveryPayloadForRepo(t, delivery.Payload, repo)
-			intents, err := DefaultClassifier().Classify(delivery.Event, encoded)
+		dispatchTime := baseTime.Add(time.Duration(run) * time.Hour)
+		dispatchOnce := func(batchSize int) int {
+			t.Helper()
+			dispatcher := New(pool, riverClient, Config{
+				BatchSize:    batchSize,
+				MaxAttempts:  3,
+				Debounce:     5 * time.Second,
+				PollInterval: time.Millisecond,
+				Now:          func() time.Time { return dispatchTime },
+				Classifier:   DefaultClassifier(),
+			})
+			count, err := dispatcher.DispatchBatch(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, intent := range intents {
-				expected[decisionID(intent)] = intent
-			}
+			dispatchTime = dispatchTime.Add(time.Millisecond)
+			return count
+		}
 
+		for _, delivery := range permuted {
+			payload, _ := deliveryPayloadForRepo(t, delivery.Payload, repo)
 			guid := guidPrefix + delivery.GUID
 			if _, err := fake.EmitWebhookWithGUID(
 				context.Background(),
@@ -78,17 +94,14 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 					t.Fatalf("redeliver %s: %v", guid, err)
 				}
 			}
+			if random.Intn(3) != 0 {
+				dispatchOnce(1 + random.Intn(7))
+			}
 		}
 
-		dispatcher := New(pool, riverClient, Config{
-			BatchSize:    100,
-			MaxAttempts:  3,
-			Debounce:     5 * time.Second,
-			PollInterval: time.Millisecond,
-			Now:          func() time.Time { return baseTime.Add(time.Duration(run) * time.Hour) },
-			Classifier:   DefaultClassifier(),
-		})
-		drainDispatcher(t, dispatcher)
+		for dispatchOnce(1+random.Intn(7)) > 0 {
+			// Each pass chooses a fresh batch boundary and runs until empty.
+		}
 
 		var deliveryCount, processedCount int
 		if err := pool.QueryRow(context.Background(), `
@@ -108,26 +121,33 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 			)
 		}
 
-		got := riverDecisionSet(t, pool, repo)
+		expected := goldenJobsForRepo(golden, repo)
+		got := riverDecisionsExact(t, pool, repo, len(expected))
 		if !reflect.DeepEqual(got, expected) {
 			t.Fatalf("run %d River decisions differ\n got: %#v\nwant: %#v", run, got, expected)
 		}
 	}
 }
 
-func TestRebaseStormCoalescesPerBranchWithoutSlidingDebounce(t *testing.T) {
+func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 	pool := dispatchTestDatabase(t)
 	riverClient, err := queue.NewClient(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(
-		ingress.NewHandler(dbgen.New(pool), testWebhookSecret, 1<<20).Mux(),
+		ingress.NewHandler(
+			dbgen.New(pool),
+			testWebhookSecret,
+			1<<20,
+			5*time.Second,
+		).Mux(),
 	)
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
 	repo := "acme/rebase-storm"
 	branches := []string{"stack/layer-1", "stack/layer-2", "stack/layer-3"}
+	stackKey := "stack:" + repo + ":142"
 
 	for index := 0; index < 20; index++ {
 		branch := branches[index%len(branches)]
@@ -139,6 +159,7 @@ func TestRebaseStormCoalescesPerBranchWithoutSlidingDebounce(t *testing.T) {
 			map[string]any{
 				"ref":        "refs/heads/" + branch,
 				"repository": map[string]any{"full_name": repo},
+				"stack":      map[string]any{"number": 142},
 			},
 		); err != nil {
 			t.Fatal(err)
@@ -168,50 +189,51 @@ func TestRebaseStormCoalescesPerBranchWithoutSlidingDebounce(t *testing.T) {
 		t.Fatalf("simulated storm duration = %s, want 10s", elapsed)
 	}
 
-	rows, err := pool.Query(context.Background(), `
-		SELECT args->>'key', count(*), min(scheduled_at)
+	var key string
+	var jobCount int
+	var scheduledAt time.Time
+	err = pool.QueryRow(context.Background(), `
+		SELECT args->>'key', count(*) OVER (), scheduled_at
 		FROM river_job
 		WHERE args->>'key' LIKE $1
-		GROUP BY args->>'key'
-	`, "branch:"+repo+":%")
+	`, "%:"+repo+":%").Scan(&key, &jobCount, &scheduledAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	got := make(map[string]time.Time)
-	for rows.Next() {
-		var key string
-		var count int
-		var scheduledAt time.Time
-		if err := rows.Scan(&key, &count, &scheduledAt); err != nil {
-			t.Fatal(err)
-		}
-		if count > 1 {
-			t.Fatalf("%s has %d queued jobs, want at most 1", key, count)
-		}
-		got[key] = scheduledAt
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
+	if key != stackKey || jobCount != 1 {
+		t.Fatalf("storm jobs = key %q count %d, want %q count 1", key, jobCount, stackKey)
 	}
 	first := time.Date(2026, 7, 28, 20, 0, 0, 0, time.UTC)
-	for index, branch := range branches {
-		key := "branch:" + repo + ":" + branch
-		wantScheduled := first.Add(time.Duration(index)*500*time.Millisecond + 5*time.Second)
-		if !got[key].Equal(wantScheduled) {
-			t.Fatalf("%s scheduled at %s, want first-intent time %s", key, got[key], wantScheduled)
-		}
+	wantScheduled := first.Add(5 * time.Second)
+	if !scheduledAt.Equal(wantScheduled) {
+		t.Fatalf("%s scheduled at %s, want %s", key, scheduledAt, wantScheduled)
+	}
+	var generation int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT generation
+		FROM refresh_intent_generations
+		WHERE kind = $1 AND refresh_key = $2
+	`, queue.KindRefreshStack, stackKey).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 20 {
+		t.Fatalf("storm generation = %d, want 20 exact dispatch signals", generation)
 	}
 }
 
-func TestRunningRefreshAllowsQueuedFollowUp(t *testing.T) {
+func TestRunningRefreshRetryableTransitionCannotCollide(t *testing.T) {
 	pool := dispatchTestDatabase(t)
 	riverClient, err := queue.NewClient(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(
-		ingress.NewHandler(dbgen.New(pool), testWebhookSecret, 1<<20).Mux(),
+		ingress.NewHandler(
+			dbgen.New(pool),
+			testWebhookSecret,
+			1<<20,
+			5*time.Second,
+		).Mux(),
 	)
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
@@ -265,8 +287,30 @@ func TestRunningRefreshAllowsQueuedFollowUp(t *testing.T) {
 	`, key).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("jobs for running key = %d, want running + queued follow-up", count)
+	if count != 1 {
+		t.Fatalf("jobs for running key = %d, want one coalesced running job", count)
+	}
+	tag, err = pool.Exec(context.Background(), `
+		UPDATE river_job SET state = 'retryable'
+		WHERE args->>'key' = $1 AND state = 'running'
+	`, key)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("running -> retryable rows=%d err=%v", tag.RowsAffected(), err)
+	}
+	var state string
+	var generation int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT job.state, generation.generation
+		FROM river_job AS job
+		JOIN refresh_intent_generations AS generation
+		  ON generation.kind = job.kind
+		 AND generation.refresh_key = job.args->>'key'
+		WHERE job.args->>'key' = $1
+	`, key).Scan(&state, &generation); err != nil {
+		t.Fatal(err)
+	}
+	if state != "retryable" || generation != 2 {
+		t.Fatalf("state=%s generation=%d, want retryable generation 2", state, generation)
 	}
 }
 
@@ -277,7 +321,12 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(
-		ingress.NewHandler(dbgen.New(pool), testWebhookSecret, 1<<20).Mux(),
+		ingress.NewHandler(
+			dbgen.New(pool),
+			testWebhookSecret,
+			1<<20,
+			5*time.Second,
+		).Mux(),
 	)
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
@@ -337,6 +386,97 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	}
 	if unknown.Status != "processed" || unknown.LastError.Valid {
 		t.Fatalf("unknown delivery = %+v", unknown)
+	}
+
+	requeued, err := dbgen.New(pool).RequeueParkedWebhookDeliveries(
+		context.Background(),
+		dbgen.RequeueParkedWebhookDeliveriesParams{
+			AllParked:    false,
+			DeliveryGuid: poison.DeliveryGuid,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 1 {
+		t.Fatalf("requeued rows = %d, want 1", requeued)
+	}
+	poison, err = dbgen.New(pool).GetWebhookDelivery(
+		context.Background(),
+		poison.DeliveryGuid,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poison.Status != "pending" ||
+		poison.Attempts != 0 ||
+		!poison.LastError.Valid ||
+		!strings.Contains(poison.LastError.String, "operator requeue") ||
+		!strings.Contains(poison.LastError.String, "attempts reset from 2") {
+		t.Fatalf("requeued poison delivery = %+v", poison)
+	}
+	requeued, err = dbgen.New(pool).RequeueParkedWebhookDeliveries(
+		context.Background(),
+		dbgen.RequeueParkedWebhookDeliveriesParams{
+			AllParked:    false,
+			DeliveryGuid: poison.DeliveryGuid,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 0 {
+		t.Fatalf("non-parked requeue rows = %d, want 0", requeued)
+	}
+	if count, err := dispatcher.DispatchBatch(context.Background()); err != nil || count != 1 {
+		t.Fatalf("replayed poison dispatch count=%d err=%v", count, err)
+	}
+	poison, err = dbgen.New(pool).GetWebhookDelivery(
+		context.Background(),
+		poison.DeliveryGuid,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poison.Status != "pending" || poison.Attempts != 1 {
+		t.Fatalf("replayed poison delivery = %+v", poison)
+	}
+
+	for _, guid := range []string{"parked-all-1", "parked-all-2"} {
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO webhook_deliveries (
+				delivery_guid, event, raw_body, headers, status, attempts, last_error
+			)
+			VALUES ($1, 'push', '{}'::bytea, '{}'::jsonb, 'parked', 4, 'poison')
+		`, guid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requeued, err = dbgen.New(pool).RequeueParkedWebhookDeliveries(
+		context.Background(),
+		dbgen.RequeueParkedWebhookDeliveriesParams{
+			AllParked: true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 2 {
+		t.Fatalf("all-parked requeued rows = %d, want 2", requeued)
+	}
+	var resetCount int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM webhook_deliveries
+		WHERE delivery_guid = ANY($1::text[])
+		  AND status = 'pending'
+		  AND attempts = 0
+		  AND last_error LIKE 'operator requeue%'
+	`, []string{"parked-all-1", "parked-all-2"}).Scan(&resetCount); err != nil {
+		t.Fatal(err)
+	}
+	if resetCount != 2 {
+		t.Fatalf("all-parked reset rows = %d, want 2", resetCount)
 	}
 }
 
@@ -424,33 +564,76 @@ func deliveryPayloadForRepo(
 	return decoded, encoded
 }
 
-func riverDecisionSet(
+func goldenJobsForRepo(golden []Intent, repo string) []Intent {
+	result := make([]Intent, 0, len(golden))
+	for _, intent := range golden {
+		intent.Key = strings.Replace(intent.Key, "acme/monolith", repo, 1)
+		result = append(result, intent)
+	}
+	sortIntents(result)
+	return result
+}
+
+func riverDecisionsExact(
 	t *testing.T,
 	pool *pgxpool.Pool,
 	repo string,
-) map[string]Intent {
+	expectedCount int,
+) []Intent {
 	t.Helper()
-	rows, err := pool.Query(context.Background(), `
-		SELECT kind, args, queue, priority, state, unique_states::text
+	var totalCount, duplicateGroups int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
 		FROM river_job
 		WHERE args->>'key' LIKE $1
+	`, "%:"+repo+":%").Scan(&totalCount); err != nil {
+		t.Fatal(err)
+	}
+	if totalCount != expectedCount {
+		t.Fatalf("River rows for %s = %d, want exactly %d", repo, totalCount, expectedCount)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM (
+			SELECT kind, args->>'key'
+			FROM river_job
+			WHERE args->>'key' LIKE $1
+			GROUP BY kind, args->>'key'
+			HAVING count(*) <> 1
+		) AS duplicate_or_missing_groups
+	`, "%:"+repo+":%").Scan(&duplicateGroups); err != nil {
+		t.Fatal(err)
+	}
+	if duplicateGroups != 0 {
+		t.Fatalf("River has %d non-singleton kind/key groups for %s", duplicateGroups, repo)
+	}
+
+	rows, err := pool.Query(context.Background(), `
+		SELECT kind, args, queue, priority, state,
+		       river_job_state_in_bitmask(unique_states, 'running'),
+		       river_job_state_in_bitmask(unique_states, 'completed')
+		FROM river_job
+		WHERE args->>'key' LIKE $1
+		ORDER BY kind, args->>'key'
 	`, "%:"+repo+":%")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	decisions := make(map[string]Intent)
+	decisions := make([]Intent, 0, expectedCount)
 	for rows.Next() {
-		var kind, queueName, state, uniqueStates string
+		var kind, queueName, state string
 		var priority int
 		var encodedArgs []byte
+		var runningUnique, completedUnique bool
 		if err := rows.Scan(
 			&kind,
 			&encodedArgs,
 			&queueName,
 			&priority,
 			&state,
-			&uniqueStates,
+			&runningUnique,
+			&completedUnique,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -475,14 +658,21 @@ func riverDecisionSet(
 				state,
 			)
 		}
-		if uniqueStates != "10110001" {
-			t.Fatalf("job %s/%s unique states = %s", kind, key, uniqueStates)
+		if !runningUnique || completedUnique {
+			t.Fatalf(
+				"job %s/%s uniqueness running=%t completed=%t",
+				kind,
+				key,
+				runningUnique,
+				completedUnique,
+			)
 		}
 		intent := Intent{Kind: kind, Key: key, Priority: queueName}
-		decisions[decisionID(intent)] = intent
+		decisions = append(decisions, intent)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+	sortIntents(decisions)
 	return decisions
 }

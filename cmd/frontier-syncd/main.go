@@ -4,6 +4,7 @@
 //
 //	frontier-syncd serve [--roles=all]   run the engine (default command)
 //	frontier-syncd migrate               apply River + schema migrations
+//	frontier-syncd requeue --guid=...    replay parked deliveries
 //	frontier-syncd version               print the build version
 package main
 
@@ -34,10 +35,13 @@ import (
 var version = "dev"
 
 const (
-	gracefulShutdownTimeout = 10 * time.Second
-	forcedShutdownTimeout   = 5 * time.Second
-	roleIngress             = "ingress"
-	roleDispatch            = "dispatch"
+	httpReadTimeout        = 10 * time.Second
+	webhookRequestTimeout  = 9 * time.Second
+	httpShutdownTimeout    = 10 * time.Second
+	riverShutdownTimeout   = 10 * time.Second
+	riverForcedStopTimeout = 5 * time.Second
+	roleIngress            = "ingress"
+	roleDispatch           = "dispatch"
 )
 
 func main() {
@@ -57,12 +61,79 @@ func run(args []string) error {
 		return serve(args)
 	case "migrate":
 		return migrate()
+	case "requeue":
+		return requeue(args)
 	case "version":
 		fmt.Println(version)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (want serve, migrate, or version)", cmd)
+		return fmt.Errorf(
+			"unknown command %q (want serve, migrate, requeue, or version)",
+			cmd,
+		)
 	}
+}
+
+type requeueOptions struct {
+	guid      string
+	allParked bool
+}
+
+func parseRequeueOptions(args []string) (requeueOptions, error) {
+	fs := flag.NewFlagSet("requeue", flag.ContinueOnError)
+	guid := fs.String("guid", "", "parked delivery GUID to requeue")
+	allParked := fs.Bool("all-parked", false, "requeue every parked delivery")
+	if err := fs.Parse(args); err != nil {
+		return requeueOptions{}, err
+	}
+	if fs.NArg() != 0 {
+		return requeueOptions{}, fmt.Errorf("requeue does not accept positional arguments")
+	}
+	if (*guid == "") == !*allParked {
+		return requeueOptions{}, fmt.Errorf(
+			"requeue requires exactly one of --guid=... or --all-parked",
+		)
+	}
+	return requeueOptions{guid: *guid, allParked: *allParked}, nil
+}
+
+func requeue(args []string) error {
+	options, err := parseRequeueOptions(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.FromEnv()
+	if err != nil {
+		return err
+	}
+	if err := cfg.RequireDatabase(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	count, err := dbgen.New(pool).RequeueParkedWebhookDeliveries(
+		ctx,
+		dbgen.RequeueParkedWebhookDeliveriesParams{
+			AllParked:    options.allParked,
+			DeliveryGuid: options.guid,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("requeue parked deliveries: %w", err)
+	}
+	if !options.allParked && count != 1 {
+		return fmt.Errorf(
+			"parked delivery %q was not requeued (not found or not parked)",
+			options.guid,
+		)
+	}
+	slog.Info("parked deliveries requeued", "count", count)
+	return nil
 }
 
 func migrate() error {
@@ -160,11 +231,13 @@ func serve(args []string) error {
 			dbgen.New(pool),
 			cfg.GitHubWebhookSecret,
 			cfg.WebhookMaxBodyBytes,
+			webhookRequestTimeout,
 		)
 		httpServer = &http.Server{
 			Addr:              cfg.HTTPAddr,
 			Handler:           handler.Mux(),
 			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       httpReadTimeout,
 		}
 		listener, err := net.Listen("tcp", cfg.HTTPAddr)
 		if err != nil {
@@ -187,31 +260,43 @@ func serve(args []string) error {
 	slog.Info("shutting down")
 	cancelServices()
 
-	gracefulCtx, cancelGraceful := context.WithTimeout(
-		context.Background(),
-		gracefulShutdownTimeout,
-	)
 	if httpServer != nil {
-		if err := httpServer.Shutdown(gracefulCtx); err != nil && serviceErr == nil {
-			serviceErr = fmt.Errorf("ingress graceful shutdown: %w", err)
+		httpCtx, cancelHTTP := context.WithTimeout(
+			context.Background(),
+			httpShutdownTimeout,
+		)
+		httpErr := httpServer.Shutdown(httpCtx)
+		cancelHTTP()
+		if httpErr != nil && serviceErr == nil {
+			serviceErr = fmt.Errorf("ingress graceful shutdown: %w", httpErr)
 		}
 	}
 	if riverClient != nil {
-		err = riverClient.Stop(gracefulCtx)
-	}
-	cancelGraceful()
-	if riverClient == nil || err == nil {
-		return serviceErr
-	}
-
-	slog.Warn("graceful shutdown timed out; cancelling active work", "error", err)
-	forcedCtx, cancelForced := context.WithTimeout(
-		context.Background(),
-		forcedShutdownTimeout,
-	)
-	defer cancelForced()
-	if forcedErr := riverClient.StopAndCancel(forcedCtx); forcedErr != nil {
-		return fmt.Errorf("river forced shutdown after graceful stop failed: %w", forcedErr)
+		riverCtx, cancelRiver := context.WithTimeout(
+			context.Background(),
+			riverShutdownTimeout,
+		)
+		riverErr := riverClient.Stop(riverCtx)
+		cancelRiver()
+		if riverErr != nil {
+			slog.Warn(
+				"River graceful shutdown timed out; cancelling active work",
+				"error",
+				riverErr,
+			)
+			forcedCtx, cancelForced := context.WithTimeout(
+				context.Background(),
+				riverForcedStopTimeout,
+			)
+			forcedErr := riverClient.StopAndCancel(forcedCtx)
+			cancelForced()
+			if forcedErr != nil {
+				return fmt.Errorf(
+					"river forced shutdown after graceful stop failed: %w",
+					forcedErr,
+				)
+			}
+		}
 	}
 	return serviceErr
 }

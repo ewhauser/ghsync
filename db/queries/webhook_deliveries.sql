@@ -42,9 +42,28 @@ WHERE delivery.delivery_guid = result.delivery_guid
 
 -- name: ListParkedWebhookDeliveries :many
 -- C-I5: dead-letter deliveries are explicitly queryable for operations and
--- later replay tooling.
+-- replay tooling.
 SELECT *
 FROM webhook_deliveries
 WHERE status = 'parked'
 ORDER BY received_at, delivery_guid
 LIMIT sqlc.arg(result_limit);
+
+-- name: RequeueParkedWebhookDeliveries :execrows
+-- C-I5: only parked deliveries may be replayed. Reset attempts so the delivery
+-- receives a full retry budget, and retain an operator audit note until the
+-- dispatcher claims it.
+UPDATE webhook_deliveries
+SET status = 'pending',
+    attempts = 0,
+    last_error = format(
+        'operator requeue at %s; attempts reset from %s; prior error: %s',
+        clock_timestamp(),
+        attempts,
+        COALESCE(last_error, '<none>')
+    )
+WHERE status = 'parked'
+  AND (
+      sqlc.arg(all_parked)::boolean
+      OR delivery_guid = sqlc.arg(delivery_guid)::text
+  );

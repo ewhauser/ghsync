@@ -126,7 +126,7 @@ LIMIT $1
 `
 
 // C-I5: dead-letter deliveries are explicitly queryable for operations and
-// later replay tooling.
+// replay tooling.
 func (q *Queries) ListParkedWebhookDeliveries(ctx context.Context, resultLimit int32) ([]WebhookDelivery, error) {
 	rows, err := q.db.Query(ctx, listParkedWebhookDeliveries, resultLimit)
 	if err != nil {
@@ -154,6 +154,39 @@ func (q *Queries) ListParkedWebhookDeliveries(ctx context.Context, resultLimit i
 		return nil, err
 	}
 	return items, nil
+}
+
+const requeueParkedWebhookDeliveries = `-- name: RequeueParkedWebhookDeliveries :execrows
+UPDATE webhook_deliveries
+SET status = 'pending',
+    attempts = 0,
+    last_error = format(
+        'operator requeue at %s; attempts reset from %s; prior error: %s',
+        clock_timestamp(),
+        attempts,
+        COALESCE(last_error, '<none>')
+    )
+WHERE status = 'parked'
+  AND (
+      $1::boolean
+      OR delivery_guid = $2::text
+  )
+`
+
+type RequeueParkedWebhookDeliveriesParams struct {
+	AllParked    bool
+	DeliveryGuid string
+}
+
+// C-I5: only parked deliveries may be replayed. Reset attempts so the delivery
+// receives a full retry budget, and retain an operator audit note until the
+// dispatcher claims it.
+func (q *Queries) RequeueParkedWebhookDeliveries(ctx context.Context, arg RequeueParkedWebhookDeliveriesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueParkedWebhookDeliveries, arg.AllParked, arg.DeliveryGuid)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setWebhookDeliveryResults = `-- name: SetWebhookDeliveryResults :execrows

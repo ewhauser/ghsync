@@ -15,11 +15,7 @@ import (
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
-const refreshUniqueStatesSQL = `
-UPDATE river_job
--- River v0.41 bit order: scheduled, retryable, pending, available.
-SET unique_states = B'10110001'
-WHERE id = ANY($1::bigint[])`
+const MaxDebounce = 15 * time.Second
 
 // Config controls dispatcher batching, poison tolerance, and bounded debounce.
 type Config struct {
@@ -45,6 +41,9 @@ func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *
 	if config.BatchSize <= 0 || config.MaxAttempts <= 0 ||
 		config.Debounce <= 0 || config.PollInterval <= 0 {
 		panic("dispatcher sizes and durations must be positive")
+	}
+	if config.Debounce > MaxDebounce {
+		panic("dispatcher debounce must not exceed 15s")
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -129,16 +128,29 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	}
 
 	if len(intents) > 0 {
+		intents = dedupeIntents(intents)
+		encodedIntents, err := json.Marshal(intentGenerationPointers(intents))
+		if err != nil {
+			return 0, fmt.Errorf("encode refresh generation pointers: %w", err)
+		}
+		generations, err := queries.BumpRefreshIntentGenerations(ctx, encodedIntents)
+		if err != nil {
+			return 0, fmt.Errorf("bump refresh intent generations: %w", err)
+		}
+		if len(generations) != len(intents) {
+			return 0, fmt.Errorf(
+				"bump refresh intent generations: got %d of %d rows",
+				len(generations),
+				len(intents),
+			)
+		}
 		params, err := d.insertParams(intents)
 		if err != nil {
 			return 0, err
 		}
-		inserted, err := d.river.InsertManyTx(ctx, tx, params)
+		_, err = d.river.InsertManyTx(ctx, tx, params)
 		if err != nil {
 			return 0, fmt.Errorf("insert refresh intents: %w", err)
-		}
-		if err := normalizeRefreshUniqueStates(ctx, tx, inserted); err != nil {
-			return 0, err
 		}
 	}
 
@@ -163,22 +175,10 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	return len(deliveries), nil
 }
 
-func (d *Dispatcher) insertParams(intents []Intent) ([]river.InsertManyParams, error) {
+func (d *Dispatcher) insertParams(
+	intents []Intent,
+) ([]river.InsertManyParams, error) {
 	scheduledAt := d.config.Now().Add(d.config.Debounce)
-	// C-Q1 intra-batch coalescing: River's unique insert dedupes against
-	// EXISTING rows, but two identical intents inside one InsertManyTx
-	// statement conflict with each other ("ON CONFLICT DO UPDATE command
-	// cannot affect row a second time"). Dedupe by {kind, key} first.
-	seen := make(map[Intent]struct{}, len(intents))
-	deduped := intents[:0]
-	for _, intent := range intents {
-		if _, dup := seen[intent]; dup {
-			continue
-		}
-		seen[intent] = struct{}{}
-		deduped = append(deduped, intent)
-	}
-	intents = deduped
 	params := make([]river.InsertManyParams, 0, len(intents))
 	for _, intent := range intents {
 		args, err := refreshArgs(intent)
@@ -186,22 +186,8 @@ func (d *Dispatcher) insertParams(intents []Intent) ([]river.InsertManyParams, e
 			return nil, err
 		}
 		params = append(params, river.InsertManyParams{
-			Args: args,
-			InsertOpts: &river.InsertOpts{
-				Queue:       queue.QueueEvent,
-				Priority:    1,
-				ScheduledAt: scheduledAt,
-				UniqueOpts: river.UniqueOpts{
-					ByArgs: true,
-					ByState: []rivertype.JobState{
-						rivertype.JobStateAvailable,
-						rivertype.JobStatePending,
-						rivertype.JobStateRetryable,
-						rivertype.JobStateRunning,
-						rivertype.JobStateScheduled,
-					},
-				},
-			},
+			Args:       args,
+			InsertOpts: queue.NewRefreshInsertOpts(scheduledAt),
 		})
 	}
 	return params, nil
@@ -220,40 +206,40 @@ func refreshArgs(intent Intent) (rivertype.JobArgs, error) {
 		return queue.NewRefreshChecksArgs(intent.Key), nil
 	case queue.KindRefreshBranch:
 		return queue.NewRefreshBranchArgs(intent.Key), nil
+	case queue.KindResolveStackMembership:
+		return queue.NewResolveStackMembershipArgs(intent.Key), nil
 	default:
 		return nil, fmt.Errorf("unsupported refresh kind %q", intent.Kind)
 	}
 }
 
-func normalizeRefreshUniqueStates(
-	ctx context.Context,
-	tx pgx.Tx,
-	results []*rivertype.JobInsertResult,
-) error {
-	jobIDs := make([]int64, 0, len(results))
-	for _, result := range results {
-		if !result.UniqueSkippedAsDuplicate {
-			jobIDs = append(jobIDs, result.Job.ID)
+func dedupeIntents(intents []Intent) []Intent {
+	// River dedupes against existing rows, but duplicate unique keys within one
+	// bulk INSERT would conflict with each other. Coalesce each batch first.
+	seen := make(map[Intent]struct{}, len(intents))
+	deduped := make([]Intent, 0, len(intents))
+	for _, intent := range intents {
+		if _, duplicate := seen[intent]; duplicate {
+			continue
 		}
+		seen[intent] = struct{}{}
+		deduped = append(deduped, intent)
 	}
-	if len(jobIDs) == 0 {
-		return nil
-	}
+	return deduped
+}
 
-	// C-Q1 requires pending/scheduled/available/retryable only. River v0.41's
-	// public validator requires running as well, so InsertManyTx receives its
-	// compatible superset and this same transaction stores the exact C-Q1 mask
-	// for the rows it inserted. Completed is excluded at both layers.
-	tag, err := tx.Exec(ctx, refreshUniqueStatesSQL, jobIDs)
-	if err != nil {
-		return fmt.Errorf("set refresh uniqueness states: %w", err)
+type intentGenerationPointer struct {
+	Kind       string `json:"kind"`
+	RefreshKey string `json:"refresh_key"`
+}
+
+func intentGenerationPointers(intents []Intent) []intentGenerationPointer {
+	pointers := make([]intentGenerationPointer, 0, len(intents))
+	for _, intent := range intents {
+		pointers = append(pointers, intentGenerationPointer{
+			Kind:       intent.Kind,
+			RefreshKey: intent.Key,
+		})
 	}
-	if tag.RowsAffected() != int64(len(jobIDs)) {
-		return fmt.Errorf(
-			"set refresh uniqueness states: updated %d of %d jobs",
-			tag.RowsAffected(),
-			len(jobIDs),
-		)
-	}
-	return nil
+	return pointers
 }

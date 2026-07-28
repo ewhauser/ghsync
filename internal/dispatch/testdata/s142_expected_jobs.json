@@ -1,0 +1,15 @@
+[
+  {"kind":"refresh_pr","key":"pr:acme/monolith:4800","priority":"event"},
+  {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4800","priority":"event"},
+  {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4810","priority":"event"},
+  {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4812","priority":"event"},
+  {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4815","priority":"event"},
+  {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4816","priority":"event"},
+  {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4820","priority":"event"},
+  {"kind":"refresh_stack","key":"stack:acme/monolith:142","priority":"event"},
+  {"kind":"refresh_checks","key":"checks:acme/monolith:8f31c2d","priority":"event"},
+  {"kind":"refresh_checks","key":"checks:acme/monolith:bbbb001","priority":"event"},
+  {"kind":"refresh_checks","key":"checks:acme/monolith:bbbb003","priority":"event"},
+  {"kind":"refresh_checks","key":"checks:acme/monolith:bbbb004","priority":"event"},
+  {"kind":"refresh_checks","key":"checks:acme/monolith:bbbb005","priority":"event"}
+]

@@ -16,6 +16,10 @@ func TestRefreshJobArgsArePointersOnly(t *testing.T) {
 		{NewRefreshStackArgs("stack:acme/monolith:142"), KindRefreshStack},
 		{NewRefreshChecksArgs("checks:acme/monolith:abc"), KindRefreshChecks},
 		{NewRefreshBranchArgs("branch:acme/monolith:main"), KindRefreshBranch},
+		{
+			NewResolveStackMembershipArgs("pr:acme/monolith:4812"),
+			KindResolveStackMembership,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.kind, func(t *testing.T) {
