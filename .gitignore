@@ -1,0 +1,4 @@
+/frontier-syncd
+/fake-github
+*.pem
+.env
