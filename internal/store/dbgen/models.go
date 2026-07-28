@@ -8,6 +8,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type InstallationBudget struct {
+	InstallationID int64
+	Class          string
+	Remaining      pgtype.Int8
+	RateLimit      pgtype.Int8
+	ResetAt        pgtype.Timestamptz
+	LeaseOwner     pgtype.Text
+	LeaseUntil     pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+}
+
 type WebhookDelivery struct {
 	DeliveryGuid string
 	Event        string

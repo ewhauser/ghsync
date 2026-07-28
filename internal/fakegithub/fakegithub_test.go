@@ -170,7 +170,7 @@ func TestSeparateFixedWindowRateBudgets(t *testing.T) {
 
 	status, exhaustedRESTHeaders := rest()
 	if status != http.StatusForbidden ||
-		exhaustedRESTHeaders.Get("Retry-After") == "" ||
+		exhaustedRESTHeaders.Get("Retry-After") != "" ||
 		exhaustedRESTHeaders.Get("X-RateLimit-Remaining") != "0" {
 		t.Fatalf("exhausted REST status=%d headers=%v", status, exhaustedRESTHeaders)
 	}

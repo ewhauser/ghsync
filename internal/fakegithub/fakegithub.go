@@ -9,10 +9,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,11 +22,11 @@ import (
 )
 
 type StackRef struct {
-	ID       string `json:"id"`
-	Number   int    `json:"number"`
-	Size     int    `json:"size"`
-	Position int    `json:"position"`
-	Base     Base   `json:"base"`
+	ID       int64 `json:"id"`
+	Number   int   `json:"number"`
+	Size     int   `json:"size"`
+	Position int   `json:"position"`
+	Base     Base  `json:"base"`
 }
 
 type Base struct {
@@ -48,11 +50,22 @@ type PullRequest struct {
 }
 
 type Stack struct {
-	ID           string `json:"id"`
-	Number       int    `json:"number"`
-	Base         Base   `json:"base"`
-	Open         bool   `json:"open"`
-	PullRequests []int  `json:"pull_requests"` // bottom → top, PR numbers
+	ID           int64              `json:"id"`
+	Number       int                `json:"number"`
+	NodeID       string             `json:"node_id"`
+	URL          string             `json:"url"`
+	Base         Base               `json:"base"`
+	Open         bool               `json:"open"`
+	CreatedAt    time.Time          `json:"created_at"`
+	PullRequests []StackPullRequest `json:"pull_requests"` // bottom → top
+}
+
+type StackPullRequest struct {
+	Number   int               `json:"number"`
+	State    string            `json:"state"`
+	Draft    bool              `json:"draft"`
+	MergedAt *time.Time        `json:"merged_at"`
+	Head     PullRequestBranch `json:"head"`
 }
 
 type Fixture struct {
@@ -76,6 +89,17 @@ type rateSnapshot struct {
 	resource  string
 }
 
+// RateLimitStep scripts one response's server-authoritative rate state.
+// StatusCode 403/429 plus RetryAfter models a secondary limit; a zero status
+// is a normal 200 response.
+type RateLimitStep struct {
+	Limit      int64
+	Remaining  int64
+	ResetAt    time.Time
+	StatusCode int
+	RetryAfter time.Duration
+}
+
 // Option customizes the fake server for a scenario.
 type Option func(*Server)
 
@@ -92,6 +116,36 @@ func WithRateLimits(rest, graphql int64) Option {
 	}
 }
 
+func WithRESTRateSteps(steps ...RateLimitStep) Option {
+	return func(s *Server) {
+		s.restSteps = append([]RateLimitStep(nil), steps...)
+	}
+}
+
+func WithGraphQLRateSteps(steps ...RateLimitStep) Option {
+	return func(s *Server) {
+		s.graphQLSteps = append([]RateLimitStep(nil), steps...)
+	}
+}
+
+func WithResponseDelay(delay time.Duration) Option {
+	if delay < 0 {
+		panic("response delay cannot be negative")
+	}
+	return func(s *Server) {
+		s.responseDelay = delay
+	}
+}
+
+func WithInstallationTokenTTL(ttl time.Duration) Option {
+	if ttl <= 0 {
+		panic("installation token TTL must be positive")
+	}
+	return func(s *Server) {
+		s.tokenTTL = ttl
+	}
+}
+
 // Server implements http.Handler for the API surface and can emit webhooks.
 // All mutable state is guarded so tests can mutate the fixture mid-scenario.
 type Server struct {
@@ -100,6 +154,15 @@ type Server struct {
 	webhookSecret []byte
 	restBudget    rateBudget
 	graphQLBudget rateBudget
+	restSteps     []RateLimitStep
+	graphQLSteps  []RateLimitStep
+	restStep      int
+	graphQLStep   int
+	responseDelay time.Duration
+	active        int
+	maxActive     int
+	tokenTTL      time.Duration
+	tokenRequests int
 	mux           *http.ServeMux
 	client        *http.Client
 }
@@ -121,7 +184,8 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 			resetAt:   resetAt,
 			resource:  "graphql",
 		},
-		client: &http.Client{Timeout: 10 * time.Second},
+		tokenTTL: time.Hour,
+		client:   &http.Client{Timeout: 10 * time.Second},
 	}
 	for _, option := range options {
 		option(s)
@@ -132,6 +196,7 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks/{number}", s.getStack)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", s.listPulls)
 	mux.HandleFunc("POST /graphql", s.graphql)
+	mux.HandleFunc("POST /app/installations/{id}/access_tokens", s.installationToken)
 	s.mux = mux
 	return s
 }
@@ -141,18 +206,51 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/app/installations/") {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+
+	delay := s.beginRequest()
+	defer s.endRequest()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+		}
+	}
 
 	resource := "core"
 	if r.URL.Path == "/graphql" {
 		resource = "graphql"
 	}
-	budget, allowed := s.consume(resource, 1)
-	setRateHeaders(w.Header(), budget)
+	rate, scripted, allowed, status, retryAfter := s.nextRate(resource, 1)
+	setRateHeaders(w.Header(), rate)
+	if scripted {
+		r = r.WithContext(context.WithValue(r.Context(), scriptedRateKey{}, true))
+	}
+	if status == http.StatusForbidden || status == http.StatusTooManyRequests {
+		if retryAfter > 0 {
+			w.Header().Set(
+				"Retry-After",
+				strconv.FormatInt(int64((retryAfter+time.Second-1)/time.Second), 10),
+			)
+		}
+		if resource == "graphql" {
+			writeGraphQLRateLimitExceeded(w, rate, status)
+		} else {
+			writeRESTRateLimitExceeded(w, rate, status)
+		}
+		return
+	}
 	if !allowed {
 		if resource == "graphql" {
-			writeGraphQLRateLimitExceeded(w, budget)
+			writeGraphQLRateLimitExceeded(w, rate, http.StatusOK)
 		} else {
-			writeRESTRateLimitExceeded(w, budget)
+			writeRESTRateLimitExceeded(w, rate, http.StatusForbidden)
 		}
 		return
 	}
@@ -176,6 +274,18 @@ func (s *Server) GraphQLRemaining() int64 {
 	return s.snapshot("graphql").remaining
 }
 
+func (s *Server) MaxConcurrent() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxActive
+}
+
+func (s *Server) TokenRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tokenRequests
+}
+
 func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, bool) {
 	s.mu.Lock()
 	fx := s.fixture
@@ -192,7 +302,24 @@ func (s *Server) listStacks(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, fx.Stacks)
+	stacks := fx.Stacks
+	if raw := r.URL.Query().Get("pull_request"); raw != "" {
+		number, err := strconv.Atoi(raw)
+		if err != nil {
+			http.Error(w, "bad pull_request", http.StatusBadRequest)
+			return
+		}
+		stacks = nil
+		for _, stack := range fx.Stacks {
+			for _, pull := range stack.PullRequests {
+				if pull.Number == number {
+					stacks = append(stacks, stack)
+					break
+				}
+			}
+		}
+	}
+	s.writeConditionalJSON(w, r, "core", stacks)
 }
 
 func (s *Server) getStack(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +334,7 @@ func (s *Server) getStack(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, stack := range fx.Stacks {
 		if stack.Number == number {
-			writeJSON(w, stack)
+			s.writeConditionalJSON(w, r, "core", stack)
 			return
 		}
 	}
@@ -226,7 +353,7 @@ func (s *Server) listPulls(w http.ResponseWriter, r *http.Request) {
 			pulls = append(pulls, pull)
 		}
 	}
-	writeJSON(w, pulls)
+	s.writeConditionalJSON(w, r, "core", pulls)
 }
 
 func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +368,32 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 				"used":      budget.limit - budget.remaining,
 			},
 		},
+	})
+}
+
+func (s *Server) installationToken(w http.ResponseWriter, r *http.Request) {
+	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if strings.Count(auth, ".") != 2 {
+		http.Error(w, "valid App JWT required", http.StatusUnauthorized)
+		return
+	}
+	installationID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || installationID <= 0 {
+		http.Error(w, "bad installation ID", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	s.tokenRequests++
+	requestNumber := s.tokenRequests
+	ttl := s.tokenTTL
+	s.mu.Unlock()
+	writeJSON(w, map[string]any{
+		"token": fmt.Sprintf(
+			"fake-installation-%d-token-%d",
+			installationID,
+			requestNumber,
+		),
+		"expires_at": time.Now().Add(ttl).UTC().Format(time.RFC3339Nano),
 	})
 }
 
@@ -309,6 +462,43 @@ func (s *Server) consume(resource string, cost int64) (rateSnapshot, bool) {
 	return budget.snapshot(), true
 }
 
+func (s *Server) nextRate(
+	resource string,
+	cost int64,
+) (rateSnapshot, bool, bool, int, time.Duration) {
+	s.mu.Lock()
+	var steps []RateLimitStep
+	var index *int
+	if resource == "graphql" {
+		steps = s.graphQLSteps
+		index = &s.graphQLStep
+	} else {
+		steps = s.restSteps
+		index = &s.restStep
+	}
+	if *index < len(steps) {
+		step := steps[*index]
+		*index++
+		budget := s.budget(resource)
+		budget.resetIfExpired(time.Now())
+		if step.Limit <= 0 {
+			step.Limit = budget.limit
+		}
+		if step.ResetAt.IsZero() {
+			step.ResetAt = budget.resetAt
+		}
+		budget.limit = step.Limit
+		budget.remaining = step.Remaining
+		budget.resetAt = step.ResetAt
+		snapshot := budget.snapshot()
+		s.mu.Unlock()
+		return snapshot, true, true, step.StatusCode, step.RetryAfter
+	}
+	s.mu.Unlock()
+	snapshot, allowed := s.consume(resource, cost)
+	return snapshot, false, allowed, 0, 0
+}
+
 func (s *Server) snapshot(resource string) rateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -345,6 +535,57 @@ func nextRateReset(now time.Time) time.Time {
 	return now.UTC().Truncate(time.Hour).Add(time.Hour)
 }
 
+func (s *Server) beginRequest() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active++
+	s.maxActive = max(s.maxActive, s.active)
+	return s.responseDelay
+}
+
+func (s *Server) endRequest() {
+	s.mu.Lock()
+	s.active--
+	s.mu.Unlock()
+}
+
+type scriptedRateKey struct{}
+
+func (s *Server) writeConditionalJSON(
+	w http.ResponseWriter,
+	r *http.Request,
+	resource string,
+	value any,
+) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sum := sha256.Sum256(body)
+	etag := fmt.Sprintf(`"%x"`, sum[:16])
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		if scripted, _ := r.Context().Value(scriptedRateKey{}).(bool); !scripted {
+			rate := s.refund(resource, 1)
+			setRateHeaders(w.Header(), rate)
+		}
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	body = append(body, '\n')
+	_, _ = w.Write(body)
+}
+
+func (s *Server) refund(resource string, cost int64) rateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	budget := s.budget(resource)
+	budget.remaining = min(budget.remaining+cost, budget.limit)
+	return budget.snapshot()
+}
+
 func setRateHeaders(header http.Header, budget rateSnapshot) {
 	header.Set("X-RateLimit-Limit", strconv.FormatInt(budget.limit, 10))
 	header.Set("X-RateLimit-Remaining", strconv.FormatInt(budget.remaining, 10))
@@ -353,27 +594,27 @@ func setRateHeaders(header http.Header, budget rateSnapshot) {
 	header.Set("X-RateLimit-Used", strconv.FormatInt(budget.limit-budget.remaining, 10))
 }
 
-func writeRESTRateLimitExceeded(w http.ResponseWriter, budget rateSnapshot) {
-	untilReset := time.Until(budget.resetAt)
-	retryAfter := max(
-		int64((untilReset+time.Second-1)/time.Second),
-		1,
-	)
-	w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+func writeRESTRateLimitExceeded(
+	w http.ResponseWriter,
+	budget rateSnapshot,
+	status int,
+) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusForbidden)
+	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(map[string]any{
 		"message": "API rate limit exceeded for installation.",
 		"documentation_url": "https://docs.github.com/rest/using-the-rest-api/" +
 			"rate-limits-for-the-rest-api",
-		"status": "403",
+		"status": strconv.Itoa(status),
 	}); err != nil {
 		return
 	}
 }
 
-func writeGraphQLRateLimitExceeded(w http.ResponseWriter, budget rateSnapshot) {
-	writeJSON(w, map[string]any{
+func writeGraphQLRateLimitExceeded(w http.ResponseWriter, budget rateSnapshot, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"data": map[string]any{
 			"rateLimit": map[string]any{
 				"cost":      1,

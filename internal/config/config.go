@@ -14,6 +14,9 @@ type Config struct {
 	HTTPAddr string
 	// GitHubAppID identifies the GitHub App installation (GITHUB_APP_ID).
 	GitHubAppID int64
+	// GitHubInstallationID is the single-org App installation
+	// (GITHUB_INSTALLATION_ID).
+	GitHubInstallationID int64
 	// GitHubPrivateKeyPath points at the App's PEM key (GITHUB_PRIVATE_KEY_PATH).
 	GitHubPrivateKeyPath string
 	// GitHubWebhookSecret verifies X-Hub-Signature-256 (GITHUB_WEBHOOK_SECRET).
@@ -37,6 +40,13 @@ func FromEnv() (Config, error) {
 			return Config{}, fmt.Errorf("GITHUB_APP_ID: %w", err)
 		}
 		cfg.GitHubAppID = id
+	}
+	if raw := os.Getenv("GITHUB_INSTALLATION_ID"); raw != "" {
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("GITHUB_INSTALLATION_ID: %w", err)
+		}
+		cfg.GitHubInstallationID = id
 	}
 	return cfg, nil
 }
