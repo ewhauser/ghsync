@@ -12,15 +12,23 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/riverqueue/river"
+
 	"github.com/acme/frontier/internal/config"
+	"github.com/acme/frontier/internal/dispatch"
+	"github.com/acme/frontier/internal/ingress"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
+	"github.com/acme/frontier/internal/store/dbgen"
 )
 
 var version = "dev"
@@ -28,6 +36,8 @@ var version = "dev"
 const (
 	gracefulShutdownTimeout = 10 * time.Second
 	forcedShutdownTimeout   = 5 * time.Second
+	roleIngress             = "ingress"
+	roleDispatch            = "dispatch"
 )
 
 func main() {
@@ -78,11 +88,16 @@ func migrate() error {
 
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	roles := fs.String("roles", "all", "role set to run (M0 supports only all)")
+	rolesFlag := fs.String(
+		"roles",
+		"all",
+		"comma-separated roles: ingress,dispatch, or all",
+	)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := validateRoles(*roles); err != nil {
+	roles, err := parseRoles(*rolesFlag)
+	if err != nil {
 		return err
 	}
 
@@ -92,6 +107,11 @@ func serve(args []string) error {
 	}
 	if err := cfg.RequireDatabase(); err != nil {
 		return err
+	}
+	if roles[roleIngress] {
+		if err := cfg.RequireWebhookSecret(); err != nil {
+			return err
+		}
 	}
 
 	signalCtx, stopSignals := signal.NotifyContext(
@@ -107,28 +127,81 @@ func serve(args []string) error {
 	}
 	defer pool.Close()
 
-	client, err := queue.NewClient(pool)
-	if err != nil {
-		return fmt.Errorf("river client: %w", err)
-	}
-	startCtx, cancelStart := context.WithCancel(context.Background())
-	defer cancelStart()
-	if err := client.Start(startCtx); err != nil {
-		return fmt.Errorf("river start: %w", err)
-	}
-	slog.Info("frontier-syncd running", "version", version, "roles", *roles)
+	serviceCtx, cancelServices := context.WithCancel(context.Background())
+	defer cancelServices()
+	serviceErrors := make(chan error, 2)
 
-	<-signalCtx.Done()
+	var riverClient *river.Client[pgx.Tx]
+	if roles[roleDispatch] {
+		riverClient, err = queue.NewClient(pool)
+		if err != nil {
+			return fmt.Errorf("river client: %w", err)
+		}
+		if err := riverClient.Start(serviceCtx); err != nil {
+			return fmt.Errorf("river start: %w", err)
+		}
+		dispatcher := dispatch.New(pool, riverClient, dispatch.Config{
+			BatchSize:    cfg.DispatchBatchSize,
+			MaxAttempts:  cfg.DispatchMaxAttempts,
+			Debounce:     cfg.DispatchDebounce,
+			PollInterval: cfg.DispatchPollInterval,
+			Classifier:   dispatch.DefaultClassifier(),
+		})
+		go func() {
+			if err := dispatcher.Run(serviceCtx); err != nil {
+				serviceErrors <- fmt.Errorf("dispatcher: %w", err)
+			}
+		}()
+	}
+
+	var httpServer *http.Server
+	if roles[roleIngress] {
+		handler := ingress.NewHandler(
+			dbgen.New(pool),
+			cfg.GitHubWebhookSecret,
+			cfg.WebhookMaxBodyBytes,
+		)
+		httpServer = &http.Server{
+			Addr:              cfg.HTTPAddr,
+			Handler:           handler.Mux(),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		listener, err := net.Listen("tcp", cfg.HTTPAddr)
+		if err != nil {
+			return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
+		}
+		go func() {
+			err := httpServer.Serve(listener)
+			if err != nil && err != http.ErrServerClosed {
+				serviceErrors <- fmt.Errorf("ingress HTTP server: %w", err)
+			}
+		}()
+	}
+
+	slog.Info("frontier-syncd running", "version", version, "roles", *rolesFlag)
+	var serviceErr error
+	select {
+	case <-signalCtx.Done():
+	case serviceErr = <-serviceErrors:
+	}
 	slog.Info("shutting down")
+	cancelServices()
 
 	gracefulCtx, cancelGraceful := context.WithTimeout(
 		context.Background(),
 		gracefulShutdownTimeout,
 	)
-	err = client.Stop(gracefulCtx)
+	if httpServer != nil {
+		if err := httpServer.Shutdown(gracefulCtx); err != nil && serviceErr == nil {
+			serviceErr = fmt.Errorf("ingress graceful shutdown: %w", err)
+		}
+	}
+	if riverClient != nil {
+		err = riverClient.Stop(gracefulCtx)
+	}
 	cancelGraceful()
-	if err == nil {
-		return nil
+	if riverClient == nil || err == nil {
+		return serviceErr
 	}
 
 	slog.Warn("graceful shutdown timed out; cancelling active work", "error", err)
@@ -137,15 +210,36 @@ func serve(args []string) error {
 		forcedShutdownTimeout,
 	)
 	defer cancelForced()
-	if forcedErr := client.StopAndCancel(forcedCtx); forcedErr != nil {
+	if forcedErr := riverClient.StopAndCancel(forcedCtx); forcedErr != nil {
 		return fmt.Errorf("river forced shutdown after graceful stop failed: %w", forcedErr)
 	}
-	return nil
+	return serviceErr
 }
 
 func validateRoles(roles string) error {
-	if roles != "all" {
-		return fmt.Errorf("--roles=%q is unsupported in M0; only --roles=all is available", roles)
+	_, err := parseRoles(roles)
+	return err
+}
+
+func parseRoles(raw string) (map[string]bool, error) {
+	if raw == "all" {
+		return map[string]bool{roleIngress: true, roleDispatch: true}, nil
 	}
-	return nil
+	roles := make(map[string]bool, 2)
+	for _, role := range strings.Split(raw, ",") {
+		switch role {
+		case roleIngress, roleDispatch:
+			roles[role] = true
+		default:
+			return nil, fmt.Errorf(
+				"--roles=%q contains unsupported role %q (want ingress, dispatch, or all)",
+				raw,
+				role,
+			)
+		}
+	}
+	if len(roles) == 0 {
+		return nil, fmt.Errorf("--roles must not be empty")
+	}
+	return roles, nil
 }

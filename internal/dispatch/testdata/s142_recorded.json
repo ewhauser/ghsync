@@ -1,0 +1,280 @@
+[
+  {
+    "guid": "s142-001",
+    "event": "pull_request",
+    "payload": {
+      "action": "opened",
+      "number": 4800,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4800, "stack": null}
+    }
+  },
+  {
+    "guid": "s142-002",
+    "event": "pull_request",
+    "payload": {
+      "action": "stacked",
+      "number": 4812,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4812, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 2}}
+    }
+  },
+  {
+    "guid": "s142-003",
+    "event": "pull_request",
+    "payload": {
+      "action": "stacked",
+      "number": 4815,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4815, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 3}}
+    }
+  },
+  {
+    "guid": "s142-004",
+    "event": "pull_request",
+    "payload": {
+      "action": "stacked",
+      "number": 4816,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4816, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 4}}
+    }
+  },
+  {
+    "guid": "s142-005",
+    "event": "pull_request",
+    "payload": {
+      "action": "stacked",
+      "number": 4820,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4820, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 5}}
+    }
+  },
+  {
+    "guid": "s142-006",
+    "event": "pull_request",
+    "payload": {
+      "action": "synchronize",
+      "number": 4812,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4812, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 2}}
+    }
+  },
+  {
+    "guid": "s142-007",
+    "event": "pull_request",
+    "payload": {
+      "action": "synchronize",
+      "number": 4815,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4815, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 3}}
+    }
+  },
+  {
+    "guid": "s142-008",
+    "event": "pull_request",
+    "payload": {
+      "action": "synchronize",
+      "number": 4816,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4816, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 4}}
+    }
+  },
+  {
+    "guid": "s142-009",
+    "event": "pull_request",
+    "payload": {
+      "action": "synchronize",
+      "number": 4820,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4820, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 5}}
+    }
+  },
+  {
+    "guid": "s142-010",
+    "event": "pull_request",
+    "payload": {
+      "action": "edited",
+      "number": 4812,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4812, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 2}}
+    }
+  },
+  {
+    "guid": "s142-011",
+    "event": "pull_request",
+    "payload": {
+      "action": "closed",
+      "number": 4810,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4810, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 1}}
+    }
+  },
+  {
+    "guid": "s142-012",
+    "event": "pull_request",
+    "payload": {
+      "action": "reopened",
+      "number": 4812,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4812, "stack": {"id": 9876543, "number": 142, "size": 5, "position": 2}}
+    }
+  },
+  {
+    "guid": "s142-013",
+    "event": "check_run",
+    "payload": {
+      "action": "created",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "8f31c2d"}
+    }
+  },
+  {
+    "guid": "s142-014",
+    "event": "check_run",
+    "payload": {
+      "action": "rerequested",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "8f31c2d"}
+    }
+  },
+  {
+    "guid": "s142-015",
+    "event": "check_run",
+    "payload": {
+      "action": "completed",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "8f31c2d"}
+    }
+  },
+  {
+    "guid": "s142-016",
+    "event": "check_run",
+    "payload": {
+      "action": "completed",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "bbbb003"}
+    }
+  },
+  {
+    "guid": "s142-017",
+    "event": "check_suite",
+    "payload": {
+      "action": "completed",
+      "repository": {"full_name": "acme/monolith"},
+      "check_suite": {"head_sha": "bbbb003"}
+    }
+  },
+  {
+    "guid": "s142-018",
+    "event": "check_run",
+    "payload": {
+      "action": "created",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "bbbb004"}
+    }
+  },
+  {
+    "guid": "s142-019",
+    "event": "check_run",
+    "payload": {
+      "action": "completed",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "bbbb004"}
+    }
+  },
+  {
+    "guid": "s142-020",
+    "event": "check_suite",
+    "payload": {
+      "action": "completed",
+      "repository": {"full_name": "acme/monolith"},
+      "check_suite": {"head_sha": "bbbb004"}
+    }
+  },
+  {
+    "guid": "s142-021",
+    "event": "check_run",
+    "payload": {
+      "action": "created",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "bbbb005"}
+    }
+  },
+  {
+    "guid": "s142-022",
+    "event": "check_run",
+    "payload": {
+      "action": "completed",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "bbbb005"}
+    }
+  },
+  {
+    "guid": "s142-023",
+    "event": "check_run",
+    "payload": {
+      "action": "created",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "bbbb001"}
+    }
+  },
+  {
+    "guid": "s142-024",
+    "event": "check_run",
+    "payload": {
+      "action": "completed",
+      "repository": {"full_name": "acme/monolith"},
+      "check_run": {"head_sha": "bbbb001"}
+    }
+  },
+  {
+    "guid": "s142-025",
+    "event": "push",
+    "payload": {
+      "ref": "refs/heads/refactor/tokenizer",
+      "repository": {"full_name": "acme/monolith"}
+    }
+  },
+  {
+    "guid": "s142-026",
+    "event": "push",
+    "payload": {
+      "ref": "refs/heads/refactor/bm25f-ranker",
+      "repository": {"full_name": "acme/monolith"}
+    }
+  },
+  {
+    "guid": "s142-027",
+    "event": "push",
+    "payload": {
+      "ref": "refs/heads/feat/relevance-debug",
+      "repository": {"full_name": "acme/monolith"}
+    }
+  },
+  {
+    "guid": "s142-028",
+    "event": "push",
+    "payload": {
+      "ref": "refs/heads/feat/results-rewire",
+      "repository": {"full_name": "acme/monolith"}
+    }
+  },
+  {
+    "guid": "s142-029",
+    "event": "push",
+    "payload": {
+      "ref": "refs/heads/feat/relevance-telemetry",
+      "repository": {"full_name": "acme/monolith"}
+    }
+  },
+  {
+    "guid": "s142-030",
+    "event": "pull_request",
+    "payload": {
+      "action": "closed",
+      "number": 4800,
+      "repository": {"full_name": "acme/monolith"},
+      "pull_request": {"number": 4800, "stack": null}
+    }
+  }
+]

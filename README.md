@@ -29,7 +29,7 @@ HMAC-signed webhooks; docker-compose runs it beside Postgres.
 - [x] M0 — foundations: module, migrations (River + own), three River
       queues, config, fake GitHub skeleton, CI
 - [x] M1 — GitHub plumbing & budgeter
-- [ ] M2 — ingestion, dispatch, coalescing
+- [x] M2 — ingestion, dispatch, coalescing
 - [ ] M3 — cache & fetchers
 - [ ] M4 — reconciliation & webhook validation
 - [ ] M5 — change stream, derivation seam, contract

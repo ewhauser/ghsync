@@ -9,6 +9,56 @@ import (
 	"context"
 )
 
+const claimWebhookDeliveries = `-- name: ClaimWebhookDeliveries :many
+WITH candidates AS (
+    SELECT delivery_guid
+    FROM webhook_deliveries
+    WHERE status = 'pending'
+    ORDER BY received_at, delivery_guid
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE webhook_deliveries AS delivery
+SET status = 'processing',
+    attempts = delivery.attempts + 1,
+    last_error = NULL
+FROM candidates
+WHERE delivery.delivery_guid = candidates.delivery_guid
+RETURNING delivery.delivery_guid, delivery.event, delivery.raw_body, delivery.headers, delivery.received_at, delivery.status, delivery.attempts, delivery.last_error
+`
+
+// C-P2/C-O2: claim a bounded batch without blocking another dispatcher. The
+// processing transition and attempt increment remain in the caller's batch
+// transaction, so a crashed dispatcher rolls the claim back to pending.
+func (q *Queries) ClaimWebhookDeliveries(ctx context.Context, batchSize int32) ([]WebhookDelivery, error) {
+	rows, err := q.db.Query(ctx, claimWebhookDeliveries, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []WebhookDelivery
+	for rows.Next() {
+		var i WebhookDelivery
+		if err := rows.Scan(
+			&i.DeliveryGuid,
+			&i.Event,
+			&i.RawBody,
+			&i.Headers,
+			&i.ReceivedAt,
+			&i.Status,
+			&i.Attempts,
+			&i.LastError,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countWebhookDeliveriesByStatus = `-- name: CountWebhookDeliveriesByStatus :one
 SELECT count(*) FROM webhook_deliveries WHERE status = $1
 `
@@ -61,6 +111,64 @@ func (q *Queries) InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDe
 		arg.RawBody,
 		arg.Headers,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const listParkedWebhookDeliveries = `-- name: ListParkedWebhookDeliveries :many
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error
+FROM webhook_deliveries
+WHERE status = 'parked'
+ORDER BY received_at, delivery_guid
+LIMIT $1
+`
+
+// C-I5: dead-letter deliveries are explicitly queryable for operations and
+// later replay tooling.
+func (q *Queries) ListParkedWebhookDeliveries(ctx context.Context, resultLimit int32) ([]WebhookDelivery, error) {
+	rows, err := q.db.Query(ctx, listParkedWebhookDeliveries, resultLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []WebhookDelivery
+	for rows.Next() {
+		var i WebhookDelivery
+		if err := rows.Scan(
+			&i.DeliveryGuid,
+			&i.Event,
+			&i.RawBody,
+			&i.Headers,
+			&i.ReceivedAt,
+			&i.Status,
+			&i.Attempts,
+			&i.LastError,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setWebhookDeliveryResults = `-- name: SetWebhookDeliveryResults :execrows
+UPDATE webhook_deliveries AS delivery
+SET status = result.status,
+    last_error = NULLIF(result.last_error, '')
+FROM jsonb_to_recordset($1::jsonb)
+    AS result(delivery_guid text, status text, last_error text)
+WHERE delivery.delivery_guid = result.delivery_guid
+  AND delivery.status = 'processing'
+`
+
+// C-P2: finish the entire claimed batch with one set-based status update.
+func (q *Queries) SetWebhookDeliveryResults(ctx context.Context, results []byte) (int64, error) {
+	result, err := q.db.Exec(ctx, setWebhookDeliveryResults, results)
 	if err != nil {
 		return 0, err
 	}

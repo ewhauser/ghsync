@@ -35,6 +35,7 @@ func (*noopWorker) Work(ctx context.Context, job *river.Job[NoopArgs]) error {
 func NewClient(pool *pgxpool.Pool) (*river.Client[pgx.Tx], error) {
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &noopWorker{})
+	registerRefreshWorkers(workers)
 	return river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Queues: map[string]river.QueueConfig{
 			QueueInteractive: {MaxWorkers: 4},

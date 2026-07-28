@@ -5,6 +5,15 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
+)
+
+const (
+	defaultWebhookMaxBodyBytes = int64(2 << 20)
+	defaultDispatchBatchSize   = 100
+	defaultDispatchMaxAttempts = 5
+	defaultDispatchDebounce    = 5 * time.Second
+	defaultDispatchPoll        = 250 * time.Millisecond
 )
 
 type Config struct {
@@ -24,6 +33,21 @@ type Config struct {
 	// GitHubBaseURL overrides the GitHub API endpoint; used to point at the
 	// fake GitHub server in development and tests (GITHUB_BASE_URL).
 	GitHubBaseURL string
+	// WebhookMaxBodyBytes bounds ingress memory and storage per delivery
+	// (WEBHOOK_MAX_BODY_BYTES).
+	WebhookMaxBodyBytes int64
+	// DispatchBatchSize is the maximum deliveries claimed per transaction
+	// (DISPATCH_BATCH_SIZE).
+	DispatchBatchSize int
+	// DispatchMaxAttempts parks a poison delivery after this many
+	// classification attempts (DISPATCH_MAX_ATTEMPTS).
+	DispatchMaxAttempts int
+	// DispatchDebounce bounds webhook burst coalescing
+	// (DISPATCH_DEBOUNCE).
+	DispatchDebounce time.Duration
+	// DispatchPollInterval controls idle polling latency
+	// (DISPATCH_POLL_INTERVAL).
+	DispatchPollInterval time.Duration
 }
 
 func FromEnv() (Config, error) {
@@ -33,6 +57,11 @@ func FromEnv() (Config, error) {
 		GitHubPrivateKeyPath: os.Getenv("GITHUB_PRIVATE_KEY_PATH"),
 		GitHubWebhookSecret:  os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GitHubBaseURL:        envOr("GITHUB_BASE_URL", "https://api.github.com"),
+		WebhookMaxBodyBytes:  defaultWebhookMaxBodyBytes,
+		DispatchBatchSize:    defaultDispatchBatchSize,
+		DispatchMaxAttempts:  defaultDispatchMaxAttempts,
+		DispatchDebounce:     defaultDispatchDebounce,
+		DispatchPollInterval: defaultDispatchPoll,
 	}
 	if raw := os.Getenv("GITHUB_APP_ID"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
@@ -48,6 +77,41 @@ func FromEnv() (Config, error) {
 		}
 		cfg.GitHubInstallationID = id
 	}
+	if raw := os.Getenv("WEBHOOK_MAX_BODY_BYTES"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			return Config{}, fmt.Errorf("WEBHOOK_MAX_BODY_BYTES must be a positive integer")
+		}
+		cfg.WebhookMaxBodyBytes = value
+	}
+	if raw := os.Getenv("DISPATCH_BATCH_SIZE"); raw != "" {
+		value, err := parsePositiveInt("DISPATCH_BATCH_SIZE", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.DispatchBatchSize = value
+	}
+	if raw := os.Getenv("DISPATCH_MAX_ATTEMPTS"); raw != "" {
+		value, err := parsePositiveInt("DISPATCH_MAX_ATTEMPTS", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.DispatchMaxAttempts = value
+	}
+	if raw := os.Getenv("DISPATCH_DEBOUNCE"); raw != "" {
+		value, err := parsePositiveDuration("DISPATCH_DEBOUNCE", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.DispatchDebounce = value
+	}
+	if raw := os.Getenv("DISPATCH_POLL_INTERVAL"); raw != "" {
+		value, err := parsePositiveDuration("DISPATCH_POLL_INTERVAL", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.DispatchPollInterval = value
+	}
 	return cfg, nil
 }
 
@@ -60,9 +124,33 @@ func (c Config) RequireDatabase() error {
 	return nil
 }
 
+// RequireWebhookSecret fails closed for an ingress role with no HMAC secret.
+func (c Config) RequireWebhookSecret() error {
+	if c.GitHubWebhookSecret == "" {
+		return fmt.Errorf("GITHUB_WEBHOOK_SECRET is required for the ingress role")
+	}
+	return nil
+}
+
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
+}
+
+func parsePositiveInt(key, raw string) (int, error) {
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return value, nil
+}
+
+func parsePositiveDuration(key, raw string) (time.Duration, error) {
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", key)
+	}
+	return value, nil
 }
