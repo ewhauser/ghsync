@@ -1,24 +1,26 @@
 package fakegithub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"testing"
 
 	"github.com/acme/frontier/internal/gh"
 )
 
 func TestServesStacksWithRateHeaders(t *testing.T) {
-	srv := httptest.NewServer(New(DefaultFixture(), "secret"))
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/repos/acme/monolith/stacks")
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := serve(
+		New(DefaultFixture(), "secret"),
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/stacks",
+		nil,
+	)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
@@ -36,15 +38,141 @@ func TestServesStacksWithRateHeaders(t *testing.T) {
 }
 
 func TestUnknownRepoIs404(t *testing.T) {
-	srv := httptest.NewServer(New(DefaultFixture(), "secret"))
-	defer srv.Close()
-	resp, err := http.Get(srv.URL + "/repos/acme/other/stacks")
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := serve(
+		New(DefaultFixture(), "secret"),
+		http.MethodGet,
+		"http://fake.test/repos/acme/other/stacks",
+		nil,
+	)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestPullsGoldenResponseDecodesThroughClientContract(t *testing.T) {
+	fake := New(DefaultFixture(), "secret")
+	resp := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/pulls?state=all",
+		nil,
+	)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile("testdata/list_pulls.golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(body), bytes.TrimSpace(golden)) {
+		t.Fatalf("pull response does not match golden\n got: %s\nwant: %s", body, golden)
+	}
+
+	var extended []PullRequest
+	if err := json.Unmarshal(body, &extended); err != nil {
+		t.Fatalf("decode preview extension: %v", err)
+	}
+	if extended[1].Stack == nil || extended[1].Stack.Number != 142 {
+		t.Fatalf("stack preview extension lost: %+v", extended[1].Stack)
+	}
+
+	pulls, status, err := listPullRequests(
+		context.Background(),
+		"http://fake.test/repos/acme/monolith/pulls?state=all",
+		&http.Client{Transport: handlerRoundTripper{handler: fake}},
+	)
+	if err != nil {
+		t.Fatalf("client list pulls: %v", err)
+	}
+	if status != http.StatusOK || len(pulls) != 5 {
+		t.Fatalf("client response status=%d pulls=%d", status, len(pulls))
+	}
+	if got := pulls[1].Head.Ref; got != "refactor/bm25f-ranker" {
+		t.Fatalf("head ref = %q", got)
+	}
+	if got := pulls[1].Head.SHA; got != "8f31c2d" {
+		t.Fatalf("head sha = %q", got)
+	}
+	if got := pulls[1].Base.Ref; got != "refactor/tokenizer" {
+		t.Fatalf("base ref = %q", got)
+	}
+}
+
+func TestSeparateFixedWindowRateBudgets(t *testing.T) {
+	fake := New(DefaultFixture(), "secret", WithRateLimits(2, 1))
+
+	graphQL := func() (int, map[string]any, http.Header) {
+		t.Helper()
+		resp := serve(
+			fake,
+			http.MethodPost,
+			"http://fake.test/graphql",
+			bytes.NewReader(nil),
+		)
+		defer resp.Body.Close()
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, body, resp.Header
+	}
+	rest := func() (int, http.Header) {
+		t.Helper()
+		resp := serve(
+			fake,
+			http.MethodGet,
+			"http://fake.test/repos/acme/monolith/stacks",
+			nil,
+		)
+		resp.Body.Close()
+		return resp.StatusCode, resp.Header
+	}
+
+	status, body, headers := graphQL()
+	if status != http.StatusOK || headers.Get("X-RateLimit-Resource") != "graphql" {
+		t.Fatalf("GraphQL status=%d resource=%q", status, headers.Get("X-RateLimit-Resource"))
+	}
+	if fake.GraphQLRemaining() != 0 || fake.Remaining() != 2 {
+		t.Fatalf(
+			"budgets after GraphQL: graphql=%d rest=%d",
+			fake.GraphQLRemaining(),
+			fake.Remaining(),
+		)
+	}
+	rateLimit := body["data"].(map[string]any)["rateLimit"].(map[string]any)
+	if rateLimit["remaining"] != float64(0) || rateLimit["limit"] != float64(1) {
+		t.Fatalf("GraphQL rateLimit block = %#v", rateLimit)
+	}
+
+	status, firstRESTHeaders := rest()
+	if status != http.StatusOK ||
+		firstRESTHeaders.Get("X-RateLimit-Resource") != "core" ||
+		firstRESTHeaders.Get("X-RateLimit-Remaining") != "1" {
+		t.Fatalf("first REST status=%d headers=%v", status, firstRESTHeaders)
+	}
+
+	status, body, _ = graphQL()
+	if status != http.StatusOK || body["errors"] == nil {
+		t.Fatalf("exhausted GraphQL status=%d body=%#v", status, body)
+	}
+
+	status, secondRESTHeaders := rest()
+	if status != http.StatusOK || secondRESTHeaders.Get("X-RateLimit-Remaining") != "0" {
+		t.Fatalf("second REST status=%d headers=%v", status, secondRESTHeaders)
+	}
+	if firstRESTHeaders.Get("X-RateLimit-Reset") !=
+		secondRESTHeaders.Get("X-RateLimit-Reset") {
+		t.Fatal("REST reset time slid between requests")
+	}
+
+	status, exhaustedRESTHeaders := rest()
+	if status != http.StatusForbidden ||
+		exhaustedRESTHeaders.Get("Retry-After") == "" ||
+		exhaustedRESTHeaders.Get("X-RateLimit-Remaining") != "0" {
+		t.Fatalf("exhausted REST status=%d headers=%v", status, exhaustedRESTHeaders)
 	}
 }
 
@@ -56,20 +184,27 @@ func TestEmitWebhookSignsAndDelivers(t *testing.T) {
 		body             []byte
 	}
 	got := make(chan received, 1)
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+	fake.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
 		got <- received{
 			event: r.Header.Get("X-GitHub-Event"),
 			guid:  r.Header.Get("X-GitHub-Delivery"),
 			sig:   r.Header.Get("X-Hub-Signature-256"),
 			body:  body,
 		}
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer target.Close()
+		return emptyResponse(http.StatusAccepted), nil
+	})}
 
 	payload := map[string]any{"action": "stacked", "number": 4815}
-	guid, err := fake.EmitWebhook(context.Background(), target.URL, "pull_request", payload)
+	guid, err := fake.EmitWebhook(
+		context.Background(),
+		"http://webhook.test",
+		"pull_request",
+		payload,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +212,12 @@ func TestEmitWebhookSignsAndDelivers(t *testing.T) {
 	rec := <-got
 	if rec.event != "pull_request" || rec.guid != guid {
 		t.Fatalf("delivery headers wrong: %+v", rec)
+	}
+	if matched, err := regexp.MatchString(
+		`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+		guid,
+	); err != nil || !matched {
+		t.Fatalf("delivery GUID %q is not a UUIDv4", guid)
 	}
 	if !gh.VerifySignature([]byte("secret"), rec.body, rec.sig) {
 		t.Fatal("signature does not verify")
@@ -86,13 +227,112 @@ func TestEmitWebhookSignsAndDelivers(t *testing.T) {
 	}
 }
 
+func TestEmitWebhookWithGUIDOverride(t *testing.T) {
+	fake := New(DefaultFixture(), "secret")
+	got := make(chan string, 2)
+	fake.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		got <- r.Header.Get("X-GitHub-Delivery")
+		return emptyResponse(http.StatusAccepted), nil
+	})}
+
+	const guid = "intentional-redelivery-guid"
+	for range 2 {
+		returned, err := fake.EmitWebhookWithGUID(
+			context.Background(),
+			"http://webhook.test",
+			"pull_request",
+			guid,
+			map[string]any{"action": "synchronize"},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if returned != guid {
+			t.Fatalf("returned GUID = %q, want %q", returned, guid)
+		}
+	}
+	if first, second := <-got, <-got; first != guid || second != guid {
+		t.Fatalf("override headers = %q, %q", first, second)
+	}
+}
+
 func TestEmitWebhookFailsOnNon2xx(t *testing.T) {
 	fake := New(DefaultFixture(), "secret")
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "nope", http.StatusServiceUnavailable)
-	}))
-	defer target.Close()
-	if _, err := fake.EmitWebhook(context.Background(), target.URL, "push", map[string]any{}); err == nil {
+	fake.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return emptyResponse(http.StatusServiceUnavailable), nil
+	})}
+	if _, err := fake.EmitWebhook(
+		context.Background(),
+		"http://webhook.test",
+		"push",
+		map[string]any{},
+	); err == nil {
 		t.Fatal("expected error on 503 target")
+	}
+}
+
+// clientPullRequest is deliberately independent of the fake's response type.
+// Its nested shape mirrors google/go-github's PullRequest and catches fixtures
+// that would only decode through flat, fake-only fields.
+type clientPullRequest struct {
+	Number int                 `json:"number"`
+	Head   clientPullReference `json:"head"`
+	Base   clientPullReference `json:"base"`
+}
+
+type clientPullReference struct {
+	Ref string `json:"ref"`
+	SHA string `json:"sha"`
+}
+
+func listPullRequests(
+	ctx context.Context,
+	endpoint string,
+	client *http.Client,
+) ([]clientPullRequest, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	var pulls []clientPullRequest
+	if err := json.NewDecoder(resp.Body).Decode(&pulls); err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return pulls, resp.StatusCode, nil
+}
+
+func serve(handler http.Handler, method, target string, body io.Reader) *http.Response {
+	req := httptest.NewRequest(method, target, body)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	return recorder.Result()
+}
+
+type handlerRoundTripper struct {
+	handler http.Handler
+}
+
+func (rt handlerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	recorder := httptest.NewRecorder()
+	rt.handler.ServeHTTP(recorder, req)
+	return recorder.Result(), nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func emptyResponse(status int) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(nil)),
 	}
 }

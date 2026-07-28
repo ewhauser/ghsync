@@ -7,8 +7,6 @@ package dbgen
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countWebhookDeliveriesByStatus = `-- name: CountWebhookDeliveriesByStatus :one
@@ -23,7 +21,7 @@ func (q *Queries) CountWebhookDeliveriesByStatus(ctx context.Context, status str
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT delivery_guid, event, action, payload, received_at, status, attempts, last_error FROM webhook_deliveries WHERE delivery_guid = $1
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error FROM webhook_deliveries WHERE delivery_guid = $1
 `
 
 func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (WebhookDelivery, error) {
@@ -32,8 +30,8 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (
 	err := row.Scan(
 		&i.DeliveryGuid,
 		&i.Event,
-		&i.Action,
-		&i.Payload,
+		&i.RawBody,
+		&i.Headers,
 		&i.ReceivedAt,
 		&i.Status,
 		&i.Attempts,
@@ -43,7 +41,7 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (
 }
 
 const insertWebhookDelivery = `-- name: InsertWebhookDelivery :execrows
-INSERT INTO webhook_deliveries (delivery_guid, event, action, payload)
+INSERT INTO webhook_deliveries (delivery_guid, event, raw_body, headers)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (delivery_guid) DO NOTHING
 `
@@ -51,8 +49,8 @@ ON CONFLICT (delivery_guid) DO NOTHING
 type InsertWebhookDeliveryParams struct {
 	DeliveryGuid string
 	Event        string
-	Action       pgtype.Text
-	Payload      []byte
+	RawBody      []byte
+	Headers      []byte
 }
 
 // C-I3: duplicate deliveries are free no-ops.
@@ -60,8 +58,8 @@ func (q *Queries) InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDe
 	result, err := q.db.Exec(ctx, insertWebhookDelivery,
 		arg.DeliveryGuid,
 		arg.Event,
-		arg.Action,
-		arg.Payload,
+		arg.RawBody,
+		arg.Headers,
 	)
 	if err != nil {
 		return 0, err

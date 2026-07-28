@@ -8,7 +8,8 @@ test:
 
 lint:
 	go vet ./...
-	@command -v golangci-lint >/dev/null && golangci-lint run ./... || echo "golangci-lint not installed; ran go vet only"
+	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint is required" >&2; exit 1; }
+	golangci-lint run ./...
 
 # Regenerate sqlc query code (internal/store/dbgen).
 gen:
@@ -19,7 +20,7 @@ migrate:
 
 # Local development: Postgres + fake GitHub + the daemon.
 dev:
-	docker compose up -d postgres
+	docker compose up -d --wait postgres fake-github
 	DATABASE_URL=postgres://frontier:frontier@localhost:5433/frontier?sslmode=disable \
 		go run ./cmd/frontier-syncd migrate
 	DATABASE_URL=postgres://frontier:frontier@localhost:5433/frontier?sslmode=disable \

@@ -2,7 +2,9 @@ FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
+COPY db ./db
 RUN CGO_ENABLED=0 go build -o /fake-github ./cmd/fake-github
 
 FROM gcr.io/distroless/static-debian12

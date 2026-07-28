@@ -8,6 +8,7 @@ package fakegithub
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -31,15 +32,19 @@ type Base struct {
 	SHA string `json:"sha"`
 }
 
+type PullRequestBranch struct {
+	Ref string `json:"ref"`
+	SHA string `json:"sha"`
+}
+
 type PullRequest struct {
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	State     string    `json:"state"`
-	HeadRef   string    `json:"head_ref"`
-	HeadSHA   string    `json:"head_sha"`
-	BaseRef   string    `json:"base_ref"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Stack     *StackRef `json:"stack"`
+	Number    int               `json:"number"`
+	Title     string            `json:"title"`
+	State     string            `json:"state"`
+	Head      PullRequestBranch `json:"head"`
+	Base      PullRequestBranch `json:"base"`
+	UpdatedAt time.Time         `json:"updated_at"`
+	Stack     *StackRef         `json:"stack"`
 }
 
 type Stack struct {
@@ -57,28 +62,72 @@ type Fixture struct {
 	PullRequests []PullRequest
 }
 
+type rateBudget struct {
+	limit     int64
+	remaining int64
+	resetAt   time.Time
+	resource  string
+}
+
+type rateSnapshot struct {
+	limit     int64
+	remaining int64
+	resetAt   time.Time
+	resource  string
+}
+
+// Option customizes the fake server for a scenario.
+type Option func(*Server)
+
+// WithRateLimits sets independent REST-request and GraphQL-point limits.
+func WithRateLimits(rest, graphql int64) Option {
+	if rest < 0 || graphql < 0 {
+		panic("rate limits cannot be negative")
+	}
+	return func(s *Server) {
+		s.restBudget.limit = rest
+		s.restBudget.remaining = rest
+		s.graphQLBudget.limit = graphql
+		s.graphQLBudget.remaining = graphql
+	}
+}
+
 // Server implements http.Handler for the API surface and can emit webhooks.
 // All mutable state is guarded so tests can mutate the fixture mid-scenario.
 type Server struct {
 	mu            sync.Mutex
 	fixture       Fixture
 	webhookSecret []byte
-	remaining     int64
-	limit         int64
-	deliverySeq   int
+	restBudget    rateBudget
+	graphQLBudget rateBudget
 	mux           *http.ServeMux
 	client        *http.Client
 }
 
-func New(fixture Fixture, webhookSecret string) *Server {
+func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
+	resetAt := nextRateReset(time.Now())
 	s := &Server{
 		fixture:       fixture,
 		webhookSecret: []byte(webhookSecret),
-		limit:         15000, // GHEC installation budget
-		remaining:     15000,
-		client:        &http.Client{Timeout: 10 * time.Second},
+		restBudget: rateBudget{
+			limit:     15000, // GHEC installation REST budget
+			remaining: 15000,
+			resetAt:   resetAt,
+			resource:  "core",
+		},
+		graphQLBudget: rateBudget{
+			limit:     5000,
+			remaining: 5000,
+			resetAt:   resetAt,
+			resource:  "graphql",
+		},
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
+	for _, option := range options {
+		option(s)
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks", s.listStacks)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks/{number}", s.getStack)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", s.listPulls)
@@ -88,17 +137,25 @@ func New(fixture Fixture, webhookSecret string) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	if s.remaining > 0 {
-		s.remaining--
+	if r.URL.Path == "/healthz" {
+		s.mux.ServeHTTP(w, r)
+		return
 	}
-	remaining := s.remaining
-	limit := s.limit
-	s.mu.Unlock()
 
-	w.Header().Set("x-ratelimit-limit", strconv.FormatInt(limit, 10))
-	w.Header().Set("x-ratelimit-remaining", strconv.FormatInt(remaining, 10))
-	w.Header().Set("x-ratelimit-reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+	resource := "core"
+	if r.URL.Path == "/graphql" {
+		resource = "graphql"
+	}
+	budget, allowed := s.consume(resource, 1)
+	setRateHeaders(w.Header(), budget)
+	if !allowed {
+		if resource == "graphql" {
+			writeGraphQLRateLimitExceeded(w, budget)
+		} else {
+			writeRESTRateLimitExceeded(w, budget)
+		}
+		return
+	}
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -109,11 +166,14 @@ func (s *Server) SetFixture(fixture Fixture) {
 	s.fixture = fixture
 }
 
-// Remaining reports the simulated REST budget left.
+// Remaining reports the simulated REST request budget left.
 func (s *Server) Remaining() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.remaining
+	return s.snapshot("core").remaining
+}
+
+// GraphQLRemaining reports the simulated GraphQL point budget left.
+func (s *Server) GraphQLRemaining() int64 {
+	return s.snapshot("graphql").remaining
 }
 
 func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, bool) {
@@ -170,33 +230,48 @@ func (s *Server) listPulls(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	remaining := s.remaining
-	s.mu.Unlock()
+	budget := s.snapshot("graphql")
 	writeJSON(w, map[string]any{
 		"data": map[string]any{
 			"rateLimit": map[string]any{
 				"cost":      1,
-				"remaining": remaining,
-				"resetAt":   time.Now().Add(time.Hour).Format(time.RFC3339),
+				"limit":     budget.limit,
+				"remaining": budget.remaining,
+				"resetAt":   budget.resetAt.Format(time.RFC3339),
+				"used":      budget.limit - budget.remaining,
 			},
 		},
 	})
 }
 
 // EmitWebhook signs and POSTs a webhook delivery to targetURL, returning the
-// delivery GUID it generated. Non-2xx responses are errors, mirroring
+// globally unique delivery GUID it generated. Non-2xx responses are errors, mirroring
 // GitHub's delivery-failure semantics.
 func (s *Server) EmitWebhook(ctx context.Context, targetURL, event string, payload any) (string, error) {
+	return s.EmitWebhookWithGUID(ctx, targetURL, event, "", payload)
+}
+
+// EmitWebhookWithGUID emits a delivery with an explicit GUID. Tests use it to
+// model GitHub retries and verify GUID deduplication; an empty GUID generates a
+// new UUID just like EmitWebhook.
+func (s *Server) EmitWebhookWithGUID(
+	ctx context.Context,
+	targetURL string,
+	event string,
+	guid string,
+	payload any,
+) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal payload: %w", err)
 	}
 
-	s.mu.Lock()
-	s.deliverySeq++
-	guid := fmt.Sprintf("fake-delivery-%d", s.deliverySeq)
-	s.mu.Unlock()
+	if guid == "" {
+		guid, err = newDeliveryGUID()
+		if err != nil {
+			return "", fmt.Errorf("generate delivery GUID: %w", err)
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
@@ -216,6 +291,122 @@ func (s *Server) EmitWebhook(ctx context.Context, targetURL, event string, paylo
 		return "", fmt.Errorf("webhook target returned %d", resp.StatusCode)
 	}
 	return guid, nil
+}
+
+func health(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) consume(resource string, cost int64) (rateSnapshot, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	budget := s.budget(resource)
+	budget.resetIfExpired(time.Now())
+	if budget.remaining < cost {
+		return budget.snapshot(), false
+	}
+	budget.remaining -= cost
+	return budget.snapshot(), true
+}
+
+func (s *Server) snapshot(resource string) rateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	budget := s.budget(resource)
+	budget.resetIfExpired(time.Now())
+	return budget.snapshot()
+}
+
+func (s *Server) budget(resource string) *rateBudget {
+	if resource == "graphql" {
+		return &s.graphQLBudget
+	}
+	return &s.restBudget
+}
+
+func (b *rateBudget) resetIfExpired(now time.Time) {
+	if now.Before(b.resetAt) {
+		return
+	}
+	b.remaining = b.limit
+	b.resetAt = nextRateReset(now)
+}
+
+func (b *rateBudget) snapshot() rateSnapshot {
+	return rateSnapshot{
+		limit:     b.limit,
+		remaining: b.remaining,
+		resetAt:   b.resetAt,
+		resource:  b.resource,
+	}
+}
+
+func nextRateReset(now time.Time) time.Time {
+	return now.UTC().Truncate(time.Hour).Add(time.Hour)
+}
+
+func setRateHeaders(header http.Header, budget rateSnapshot) {
+	header.Set("X-RateLimit-Limit", strconv.FormatInt(budget.limit, 10))
+	header.Set("X-RateLimit-Remaining", strconv.FormatInt(budget.remaining, 10))
+	header.Set("X-RateLimit-Reset", strconv.FormatInt(budget.resetAt.Unix(), 10))
+	header.Set("X-RateLimit-Resource", budget.resource)
+	header.Set("X-RateLimit-Used", strconv.FormatInt(budget.limit-budget.remaining, 10))
+}
+
+func writeRESTRateLimitExceeded(w http.ResponseWriter, budget rateSnapshot) {
+	untilReset := time.Until(budget.resetAt)
+	retryAfter := max(
+		int64((untilReset+time.Second-1)/time.Second),
+		1,
+	)
+	w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"message": "API rate limit exceeded for installation.",
+		"documentation_url": "https://docs.github.com/rest/using-the-rest-api/" +
+			"rate-limits-for-the-rest-api",
+		"status": "403",
+	}); err != nil {
+		return
+	}
+}
+
+func writeGraphQLRateLimitExceeded(w http.ResponseWriter, budget rateSnapshot) {
+	writeJSON(w, map[string]any{
+		"data": map[string]any{
+			"rateLimit": map[string]any{
+				"cost":      1,
+				"limit":     budget.limit,
+				"remaining": budget.remaining,
+				"resetAt":   budget.resetAt.Format(time.RFC3339),
+				"used":      budget.limit - budget.remaining,
+			},
+		},
+		"errors": []map[string]any{
+			{
+				"type":    "RATE_LIMITED",
+				"message": "API rate limit exceeded for this GraphQL resource.",
+			},
+		},
+	})
+}
+
+func newDeliveryGUID() (string, error) {
+	var uuid [16]byte
+	if _, err := rand.Read(uuid[:]); err != nil {
+		return "", err
+	}
+	uuid[6] = (uuid[6] & 0x0f) | 0x40
+	uuid[8] = (uuid[8] & 0x3f) | 0x80
+	return fmt.Sprintf(
+		"%08x-%04x-%04x-%04x-%012x",
+		uuid[0:4],
+		uuid[4:6],
+		uuid[6:8],
+		uuid[8:10],
+		uuid[10:16],
+	), nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

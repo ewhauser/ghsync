@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/acme/frontier/internal/config"
 	"github.com/acme/frontier/internal/queue"
@@ -23,6 +24,11 @@ import (
 )
 
 var version = "dev"
+
+const (
+	gracefulShutdownTimeout = 10 * time.Second
+	forcedShutdownTimeout   = 5 * time.Second
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -72,9 +78,11 @@ func migrate() error {
 
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	roles := fs.String("roles", "all",
-		"comma-separated roles to run: ingress,dispatch,fetch,sweep,derive,stream (or all)")
+	roles := fs.String("roles", "all", "role set to run (M0 supports only all)")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := validateRoles(*roles); err != nil {
 		return err
 	}
 
@@ -86,10 +94,14 @@ func serve(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	signalCtx, stopSignals := signal.NotifyContext(
+		context.Background(),
+		syscall.SIGINT,
+		syscall.SIGTERM,
+	)
+	defer stopSignals()
 
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	pool, err := store.Connect(signalCtx, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
@@ -99,12 +111,41 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("river client: %w", err)
 	}
-	if err := client.Start(ctx); err != nil {
+	startCtx, cancelStart := context.WithCancel(context.Background())
+	defer cancelStart()
+	if err := client.Start(startCtx); err != nil {
 		return fmt.Errorf("river start: %w", err)
 	}
 	slog.Info("frontier-syncd running", "version", version, "roles", *roles)
 
-	<-ctx.Done()
+	<-signalCtx.Done()
 	slog.Info("shutting down")
-	return client.Stop(context.Background())
+
+	gracefulCtx, cancelGraceful := context.WithTimeout(
+		context.Background(),
+		gracefulShutdownTimeout,
+	)
+	err = client.Stop(gracefulCtx)
+	cancelGraceful()
+	if err == nil {
+		return nil
+	}
+
+	slog.Warn("graceful shutdown timed out; cancelling active work", "error", err)
+	forcedCtx, cancelForced := context.WithTimeout(
+		context.Background(),
+		forcedShutdownTimeout,
+	)
+	defer cancelForced()
+	if forcedErr := client.StopAndCancel(forcedCtx); forcedErr != nil {
+		return fmt.Errorf("river forced shutdown after graceful stop failed: %w", forcedErr)
+	}
+	return nil
+}
+
+func validateRoles(roles string) error {
+	if roles != "all" {
+		return fmt.Errorf("--roles=%q is unsupported in M0; only --roles=all is available", roles)
+	}
+	return nil
 }

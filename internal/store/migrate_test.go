@@ -1,15 +1,20 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/acme/frontier/internal/store/dbgen"
 )
 
 // Runs only when TEST_DATABASE_URL points at a disposable Postgres (CI
-// provides one as a service container). Verifies migrations are idempotent
-// and produce the ingestion table.
+// provides one as a service container). Verifies migrations are idempotent,
+// webhook GUID dedupe works through sqlc, and the ingestion table keeps its
+// exactly-one-index invariant.
 func TestMigrateIdempotent(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -30,15 +35,91 @@ func TestMigrateIdempotent(t *testing.T) {
 		}
 	}
 
-	var count int
-	err = pool.QueryRow(ctx, `SELECT count(*) FROM webhook_deliveries`).Scan(&count)
-	if err != nil {
-		t.Fatalf("webhook_deliveries missing after migrate: %v", err)
+	queries := dbgen.New(pool)
+	guid := "migrate-test-" + time.Now().UTC().Format("20060102T150405.000000000")
+	rawBody := []byte(`{"action":"stacked","number":4815}`)
+	headers := []byte(`{
+		"content-type": "application/json",
+		"x-github-delivery": "` + guid + `",
+		"x-github-event": "pull_request"
+	}`)
+	params := dbgen.InsertWebhookDeliveryParams{
+		DeliveryGuid: guid,
+		Event:        "pull_request",
+		RawBody:      rawBody,
+		Headers:      headers,
 	}
+	first, err := queries.InsertWebhookDelivery(ctx, params)
+	if err != nil {
+		t.Fatalf("first webhook insert: %v", err)
+	}
+	second, err := queries.InsertWebhookDelivery(ctx, params)
+	if err != nil {
+		t.Fatalf("duplicate webhook insert: %v", err)
+	}
+	if first != 1 || second != 0 {
+		t.Fatalf("affected rows = %d, %d; want 1, 0", first, second)
+	}
+
+	stored, err := queries.GetWebhookDelivery(ctx, guid)
+	if err != nil {
+		t.Fatalf("get webhook delivery: %v", err)
+	}
+	if !bytes.Equal(stored.RawBody, rawBody) {
+		t.Fatalf("raw body = %q, want %q", stored.RawBody, rawBody)
+	}
+	var storedHeaders, expectedHeaders map[string]string
+	if err := json.Unmarshal(stored.Headers, &storedHeaders); err != nil {
+		t.Fatalf("decode stored headers: %v", err)
+	}
+	if err := json.Unmarshal(headers, &expectedHeaders); err != nil {
+		t.Fatalf("decode expected headers: %v", err)
+	}
+	if len(storedHeaders) != len(expectedHeaders) {
+		t.Fatalf("stored headers = %#v, want %#v", storedHeaders, expectedHeaders)
+	}
+	for key, want := range expectedHeaders {
+		if got := storedHeaders[key]; got != want {
+			t.Fatalf("stored header %q = %q, want %q", key, got, want)
+		}
+	}
+
+	var deliveryCount int
+	err = pool.QueryRow(ctx,
+		`SELECT count(*) FROM webhook_deliveries WHERE delivery_guid = $1`,
+		guid).Scan(&deliveryCount)
+	if err != nil || deliveryCount != 1 {
+		t.Fatalf("stored delivery count = %d (err=%v), want 1", deliveryCount, err)
+	}
+
+	var indexCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND tablename = 'webhook_deliveries'
+	`).Scan(&indexCount)
+	if err != nil || indexCount != 1 {
+		t.Fatalf("webhook_deliveries index count = %d (err=%v), want 1", indexCount, err)
+	}
+
 	var riverTables int
 	err = pool.QueryRow(ctx,
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'river_job'`).Scan(&riverTables)
 	if err != nil || riverTables != 1 {
 		t.Fatalf("river_job table missing (err=%v, count=%d)", err, riverTables)
+	}
+}
+
+func TestVerifyChecksum(t *testing.T) {
+	checksum := []byte("expected")
+	if err := verifyChecksum("0001.sql", checksum, checksum); err != nil {
+		t.Fatalf("equal checksum rejected: %v", err)
+	}
+	if err := verifyChecksum("0001.sql", []byte("old"), checksum); err == nil {
+		t.Fatal("mismatched checksum accepted")
+	}
+	if err := verifyChecksum("0001.sql", nil, checksum); err == nil {
+		t.Fatal("missing checksum accepted")
 	}
 }

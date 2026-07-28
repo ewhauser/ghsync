@@ -4,8 +4,8 @@
 CREATE TABLE webhook_deliveries (
     delivery_guid TEXT PRIMARY KEY,
     event         TEXT NOT NULL,
-    action        TEXT,
-    payload       JSONB NOT NULL,
+    raw_body      BYTEA NOT NULL,
+    headers       JSONB NOT NULL,
     received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     status        TEXT NOT NULL DEFAULT 'pending',
     attempts      INT NOT NULL DEFAULT 0,

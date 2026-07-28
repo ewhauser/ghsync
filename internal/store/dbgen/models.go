@@ -11,8 +11,8 @@ import (
 type WebhookDelivery struct {
 	DeliveryGuid string
 	Event        string
-	Action       pgtype.Text
-	Payload      []byte
+	RawBody      []byte
+	Headers      []byte
 	ReceivedAt   pgtype.Timestamptz
 	Status       string
 	Attempts     int32
