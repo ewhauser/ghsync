@@ -59,6 +59,7 @@ type Request struct {
 	httpRequest *http.Request
 	resource    Resource
 	observeRate GraphQLRateObserver
+	beforeSend  func(context.Context, *http.Request) error
 }
 
 func NewRESTRequest(req *http.Request) *Request {
@@ -75,6 +76,16 @@ func NewGraphQLRequest(req *http.Request, observer GraphQLRateObserver) *Request
 
 func NewAuthRequest(req *http.Request) *Request {
 	return &Request{httpRequest: req, resource: Auth}
+}
+
+// BeforeSend installs work that must run after admission and immediately
+// before the transport. GitHub clients use it to refresh and inject an
+// installation token without letting a queued request carry a stale token.
+func (r *Request) BeforeSend(
+	fn func(context.Context, *http.Request) error,
+) *Request {
+	r.beforeSend = fn
+	return r
 }
 
 // Response preserves the HTTP response and, for GraphQL, the extracted point

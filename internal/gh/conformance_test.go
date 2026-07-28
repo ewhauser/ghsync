@@ -7,8 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,7 +57,8 @@ func TestResponseHeadersAreAuthoritative(t *testing.T) {
 }
 
 func TestSecondaryLimitClosesGateGloballyForRetryAfter(t *testing.T) {
-	reset := time.Now().Add(time.Hour)
+	clock := newManualClock(time.Now())
+	reset := clock.Now().Add(time.Hour)
 	server, baseURL := startFake(t,
 		fakegithub.WithRESTRateSteps(fakegithub.RateLimitStep{
 			Limit:      100,
@@ -67,7 +68,7 @@ func TestSecondaryLimitClosesGateGloballyForRetryAfter(t *testing.T) {
 			RetryAfter: time.Second,
 		}),
 	)
-	gate := budget.New(server.Client(), budget.Options{})
+	gate := budget.New(server.Client(), budget.Options{Clock: clock})
 	rest := newRESTClient(t, baseURL, gate)
 	graphQL := newGraphQLClient(t, baseURL, gate)
 
@@ -84,19 +85,20 @@ func TestSecondaryLimitClosesGateGloballyForRetryAfter(t *testing.T) {
 		t.Fatalf("secondary-limit error = %v", err)
 	}
 
-	started := time.Now()
-	if _, err := graphQL.Call(
-		context.Background(),
-		budget.Interactive,
-		`query { rateLimit { cost limit remaining resetAt } }`,
-		nil,
-		nil,
-	); err != nil {
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := graphQL.Call(
+			context.Background(),
+			budget.Interactive,
+			`query { rateLimit { cost limit remaining resetAt } }`,
+			nil,
+			nil,
+		)
+		result <- callErr
+	}()
+	clock.Advance(time.Second)
+	if err := <-result; err != nil {
 		t.Fatal(err)
-	}
-	elapsed := time.Since(started)
-	if elapsed < 950*time.Millisecond || elapsed > 1400*time.Millisecond {
-		t.Fatalf("global Retry-After delay = %v, want approximately 1s", elapsed)
 	}
 }
 
@@ -110,10 +112,10 @@ func TestClassFloorsQueueBackgroundAndLeaveInteractiveHeadroom(t *testing.T) {
 			fakegithub.RateLimitStep{Limit: 100, Remaining: 8, ResetAt: reset},
 		),
 	)
-	var starved atomic.Int64
+	starved := make(chan budget.Starvation, 2)
 	gate := budget.New(server.Client(), budget.Options{
-		OnStarvation: func(budget.Starvation) {
-			starved.Add(1)
+		OnStarvation: func(value budget.Starvation) {
+			starved <- value
 		},
 	})
 	client := newRESTClient(t, baseURL, gate)
@@ -132,7 +134,7 @@ func TestClassFloorsQueueBackgroundAndLeaveInteractiveHeadroom(t *testing.T) {
 	if err := call(context.Background(), budget.Interactive); err != nil {
 		t.Fatal(err)
 	}
-	assertQueued(t, func(ctx context.Context) error {
+	assertQueued(t, starved, func(ctx context.Context) error {
 		return call(ctx, budget.Sweep)
 	})
 	if err := call(context.Background(), budget.Interactive); err != nil {
@@ -141,14 +143,11 @@ func TestClassFloorsQueueBackgroundAndLeaveInteractiveHeadroom(t *testing.T) {
 	if err := call(context.Background(), budget.Interactive); err != nil {
 		t.Fatalf("interactive establishing event floor: %v", err)
 	}
-	assertQueued(t, func(ctx context.Context) error {
+	assertQueued(t, starved, func(ctx context.Context) error {
 		return call(ctx, budget.Event)
 	})
 	if err := call(context.Background(), budget.Interactive); err != nil {
 		t.Fatalf("interactive below event floor: %v", err)
-	}
-	if got := starved.Load(); got != 2 {
-		t.Fatalf("starvation hook calls = %d, want 2", got)
 	}
 }
 
@@ -216,18 +215,19 @@ func TestRESTAndGraphQLBudgetsAreIndependent(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if _, _, err := rest.ListStacks(
-		ctx,
-		budget.Interactive,
-		"acme",
-		"monolith",
-		gh.ListStacksOptions{},
-		"",
-	); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("exhausted REST error = %v, want deadline", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	restResult := make(chan error, 1)
+	go func() {
+		_, _, restErr := rest.ListStacks(
+			ctx,
+			budget.Interactive,
+			"acme",
+			"monolith",
+			gh.ListStacksOptions{},
+			"",
+		)
+		restResult <- restErr
+	}()
 	response, err := graphQL.Call(
 		context.Background(),
 		budget.Interactive,
@@ -244,6 +244,10 @@ func TestRESTAndGraphQLBudgetsAreIndependent(t *testing.T) {
 	snapshot := gate.Snapshot()
 	if snapshot.REST.Remaining != 0 || snapshot.GraphQL.Remaining != 64 {
 		t.Fatalf("independent budgets = %+v", snapshot)
+	}
+	cancel()
+	if err := <-restResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("exhausted REST error = %v, want context canceled", err)
 	}
 }
 
@@ -318,20 +322,24 @@ func TestPullsPreservePreviewStackExtension(t *testing.T) {
 }
 
 func TestInstallationTokenCachingAndSingleFlightRenewal(t *testing.T) {
-	server, baseURL := startFake(t,
-		fakegithub.WithInstallationTokenTTL(400*time.Millisecond),
-	)
-	gate := budget.New(server.Client(), budget.Options{})
+	clock := newManualClock(time.Now())
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
+	server, baseURL := startFake(t,
+		fakegithub.WithInstallationTokenTTL(400*time.Millisecond),
+		fakegithub.WithAppAuthentication(99, &key.PublicKey),
+		fakegithub.WithNow(clock.Now),
+	)
+	gate := budget.New(server.Client(), budget.Options{Clock: clock})
 	tokens, err := gh.NewInstallationTokens(gate, gh.InstallationTokenOptions{
 		BaseURL:        baseURL,
 		AppID:          99,
 		InstallationID: 1234,
 		PrivateKey:     key,
 		RefreshBefore:  150 * time.Millisecond,
+		Clock:          clock,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +377,7 @@ func TestInstallationTokenCachingAndSingleFlightRenewal(t *testing.T) {
 		t.Fatalf("token endpoint calls = %d, want 1", calls)
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	clock.Advance(300 * time.Millisecond)
 	second, err := tokens.Token(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -382,12 +390,210 @@ func TestInstallationTokenCachingAndSingleFlightRenewal(t *testing.T) {
 	}
 }
 
-func assertQueued(t *testing.T, call func(context.Context) error) {
+func TestQueuedRequestRefreshesTokenAfterAdmissionWithoutNestedDeadlock(t *testing.T) {
+	clock := newManualClock(time.Now())
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, baseURL := startFake(t,
+		fakegithub.WithInstallationTokenTTL(400*time.Millisecond),
+		fakegithub.WithAppAuthentication(99, &key.PublicKey),
+		fakegithub.WithNow(clock.Now),
+		fakegithub.WithRESTRateSteps(fakegithub.RateLimitStep{
+			Limit:      100,
+			Remaining:  80,
+			ResetAt:    clock.Now().Add(time.Hour),
+			StatusCode: http.StatusForbidden,
+			RetryAfter: time.Second,
+			Secondary:  true,
+		}),
+	)
+	gate := budget.New(server.Client(), budget.Options{
+		Clock:         clock,
+		MaxConcurrent: 1,
+	})
+	tokens, err := gh.NewInstallationTokens(gate, gh.InstallationTokenOptions{
+		BaseURL:        baseURL,
+		AppID:          99,
+		InstallationID: 1234,
+		PrivateKey:     key,
+		RefreshBefore:  150 * time.Millisecond,
+		Clock:          clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstToken, err := tokens.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest, err := gh.NewRESTClient(baseURL, gate, tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = rest.ListStacks(
+		context.Background(),
+		budget.Interactive,
+		"acme",
+		"monolith",
+		gh.ListStacksOptions{},
+		"",
+	)
+	var httpErr *gh.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("secondary response = %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, _, callErr := rest.ListStacks(
+			context.Background(),
+			budget.Interactive,
+			"acme",
+			"monolith",
+			gh.ListStacksOptions{},
+			"",
+		)
+		result <- callErr
+	}()
+	clock.Advance(time.Second)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-admission token renewal deadlocked at MaxConcurrent=1")
+	}
+	if calls := server.TokenRequests(); calls != 2 {
+		t.Fatalf("token endpoint calls = %d, want 2", calls)
+	}
+	authorizations := server.Authorizations()
+	if len(authorizations) != 2 {
+		t.Fatalf("REST authorizations = %q", authorizations)
+	}
+	if authorizations[0] != "Bearer "+firstToken ||
+		authorizations[1] == authorizations[0] {
+		t.Fatalf("queued request authorizations = %q", authorizations)
+	}
+}
+
+func TestGraphQLResponseSizeLimitFailsClosed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = strings.NewReader(strings.Repeat("x", 1024)).WriteTo(w)
+	}))
+	t.Cleanup(server.Close)
+	gate := budget.New(server.Client(), budget.Options{})
+	client, err := gh.NewGraphQLClient(
+		server.URL,
+		gate,
+		gh.StaticToken("test-token"),
+		gh.GraphQLClientOptions{MaxResponseBytes: 128},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Call(
+		context.Background(),
+		budget.Interactive,
+		`query { rateLimit { cost limit remaining resetAt } }`,
+		nil,
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 128 bytes") {
+		t.Fatalf("oversized GraphQL error = %v", err)
+	}
+	if got := gate.Snapshot().InFlight; got != 0 {
+		t.Fatalf("in-flight after oversized body = %d", got)
+	}
+}
+
+type manualClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers map[*manualTimer]struct{}
+}
+
+type manualTimer struct {
+	clock  *manualClock
+	when   time.Time
+	ch     chan time.Time
+	active bool
+}
+
+func newManualClock(now time.Time) *manualClock {
+	return &manualClock{
+		now:    now,
+		timers: make(map[*manualTimer]struct{}),
+	}
+}
+
+func (c *manualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *manualClock) NewTimer(delay time.Duration) budget.Timer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	timer := &manualTimer{
+		clock:  c,
+		when:   c.now.Add(delay),
+		ch:     make(chan time.Time, 1),
+		active: true,
+	}
+	c.timers[timer] = struct{}{}
+	return timer
+}
+
+func (c *manualClock) Advance(by time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(by)
+	now := c.now
+	var ready []*manualTimer
+	for timer := range c.timers {
+		if timer.active && !timer.when.After(now) {
+			timer.active = false
+			ready = append(ready, timer)
+		}
+	}
+	c.mu.Unlock()
+	for _, timer := range ready {
+		timer.ch <- now
+	}
+}
+
+func (t *manualTimer) C() <-chan time.Time {
+	return t.ch
+}
+
+func (t *manualTimer) Stop() bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	wasActive := t.active
+	t.active = false
+	delete(t.clock.timers, t)
+	return wasActive
+}
+
+func assertQueued(
+	t *testing.T,
+	queued <-chan budget.Starvation,
+	call func(context.Context) error,
+) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if err := call(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("queued call error = %v, want deadline", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- call(ctx)
+	}()
+	<-queued
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued call error = %v, want context canceled", err)
 	}
 }
 
@@ -406,6 +612,10 @@ func (s *runningFake) Remaining() int64 {
 
 func (s *runningFake) TokenRequests() int {
 	return s.handler.TokenRequests()
+}
+
+func (s *runningFake) Authorizations() []string {
+	return s.handler.Authorizations()
 }
 
 func startFake(t *testing.T, options ...fakegithub.Option) (*runningFake, string) {

@@ -12,20 +12,35 @@ import (
 	"github.com/acme/frontier/internal/budget"
 )
 
+const defaultGraphQLResponseBytes = 10 << 20
+
 type GraphQLClient struct {
-	client client
+	client           client
+	maxResponseBytes int64
+}
+
+type GraphQLClientOptions struct {
+	MaxResponseBytes int64
 }
 
 func NewGraphQLClient(
 	baseURL string,
 	gate budget.Doer,
 	tokens TokenProvider,
+	options ...GraphQLClientOptions,
 ) (*GraphQLClient, error) {
 	common, err := newClient(baseURL, gate, tokens)
 	if err != nil {
 		return nil, err
 	}
-	return &GraphQLClient{client: common}, nil
+	maxResponseBytes := int64(defaultGraphQLResponseBytes)
+	if len(options) > 0 && options[0].MaxResponseBytes > 0 {
+		maxResponseBytes = options[0].MaxResponseBytes
+	}
+	return &GraphQLClient{
+		client:           common,
+		maxResponseBytes: maxResponseBytes,
+	}, nil
 }
 
 type GraphQLError struct {
@@ -79,7 +94,12 @@ func (c *GraphQLClient) Call(
 	gated, err := c.client.gate.Do(
 		ctx,
 		class,
-		budget.NewGraphQLRequest(req, extractGraphQLRate),
+		budget.NewGraphQLRequest(
+			req,
+			func(resp *http.Response) (budget.GraphQLRate, bool, error) {
+				return extractGraphQLRate(resp, c.maxResponseBytes)
+			},
+		).BeforeSend(c.client.authorize),
 	)
 	if err != nil {
 		if gated != nil && gated.HTTP != nil {
@@ -117,12 +137,23 @@ func (c *GraphQLClient) Call(
 	return result, nil
 }
 
-func extractGraphQLRate(resp *http.Response) (budget.GraphQLRate, bool, error) {
-	body, err := io.ReadAll(resp.Body)
+func extractGraphQLRate(
+	resp *http.Response,
+	maxResponseBytes int64,
+) (budget.GraphQLRate, bool, error) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return budget.GraphQLRate{}, false, fmt.Errorf("read GraphQL rateLimit: %w", err)
 	}
-	resp.Body.Close()
+	if int64(len(body)) > maxResponseBytes {
+		_ = resp.Body.Close()
+		resp.Body = http.NoBody
+		return budget.GraphQLRate{}, false, fmt.Errorf(
+			"GraphQL response exceeds %d bytes",
+			maxResponseBytes,
+		)
+	}
+	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	var envelope struct {
 		Data struct {

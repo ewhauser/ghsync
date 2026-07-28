@@ -3,15 +3,21 @@ package fakegithub
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/acme/frontier/internal/gh"
+	jwt "github.com/golang-jwt/jwt/v4"
 )
 
 func TestServesStacksWithRateHeaders(t *testing.T) {
@@ -173,6 +179,120 @@ func TestSeparateFixedWindowRateBudgets(t *testing.T) {
 		exhaustedRESTHeaders.Get("Retry-After") != "" ||
 		exhaustedRESTHeaders.Get("X-RateLimit-Remaining") != "0" {
 		t.Fatalf("exhausted REST status=%d headers=%v", status, exhaustedRESTHeaders)
+	}
+}
+
+func TestSecondaryLimitModelsHeaderAndHeaderlessForms(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	fake := New(
+		DefaultFixture(),
+		"secret",
+		WithRESTRateSteps(
+			RateLimitStep{
+				Limit:      100,
+				Remaining:  80,
+				ResetAt:    reset,
+				StatusCode: http.StatusForbidden,
+				RetryAfter: time.Second,
+				Secondary:  true,
+			},
+			RateLimitStep{
+				Limit:      100,
+				Remaining:  79,
+				ResetAt:    reset,
+				StatusCode: http.StatusTooManyRequests,
+				Secondary:  true,
+			},
+		),
+	)
+	for index, wantRetryAfter := range []bool{true, false} {
+		resp := serve(
+			fake,
+			http.MethodGet,
+			"http://fake.test/repos/acme/monolith/stacks",
+			nil,
+		)
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := resp.Header.Get("Retry-After") != ""; got != wantRetryAfter {
+			t.Fatalf("step %d Retry-After presence = %v", index, got)
+		}
+		if !strings.Contains(strings.ToLower(string(body)), "secondary rate limit") {
+			t.Fatalf("step %d body is not a secondary-limit shape: %s", index, body)
+		}
+	}
+}
+
+func TestInstallationTokenEndpointValidatesJWTAndReturnsCreated(t *testing.T) {
+	now := time.Now().UTC()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := New(
+		DefaultFixture(),
+		"secret",
+		WithAppAuthentication(99, &key.PublicKey),
+		WithNow(func() time.Time { return now }),
+	)
+	sign := func(issuer string, privateKey *rsa.PrivateKey) string {
+		t.Helper()
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{
+			Issuer:    issuer,
+			IssuedAt:  jwt.NewNumericDate(now.Add(-30 * time.Second)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(5 * time.Minute)),
+		})
+		signed, signErr := token.SignedString(privateKey)
+		if signErr != nil {
+			t.Fatal(signErr)
+		}
+		return signed
+	}
+	call := func(appJWT string) *http.Response {
+		t.Helper()
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"http://fake.test/app/installations/1234/access_tokens",
+			strings.NewReader("{}"),
+		)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Authorization", "Bearer "+appJWT)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		recorder := httptest.NewRecorder()
+		fake.ServeHTTP(recorder, req)
+		return recorder.Result()
+	}
+
+	valid := call(sign(strconv.FormatInt(99, 10), key))
+	valid.Body.Close()
+	if valid.StatusCode != http.StatusCreated {
+		t.Fatalf("valid token status = %d, want 201", valid.StatusCode)
+	}
+	if calls := fake.TokenRequests(); calls != 1 {
+		t.Fatalf("token request count = %d, want 1", calls)
+	}
+
+	wrongKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{
+		"not.a.jwt",
+		sign("100", key),
+		sign("99", wrongKey),
+	} {
+		resp := call(invalid)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("invalid JWT status = %d, want 401", resp.StatusCode)
+		}
+	}
+	if calls := fake.TokenRequests(); calls != 1 {
+		t.Fatalf("invalid JWTs reached token issuance: %d", calls)
 	}
 }
 

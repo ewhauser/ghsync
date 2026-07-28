@@ -29,6 +29,7 @@ type InstallationTokenOptions struct {
 	PrivateKey     *rsa.PrivateKey
 	PrivateKeyPEM  []byte
 	RefreshBefore  time.Duration
+	Clock          interface{ Now() time.Time }
 }
 
 // InstallationTokens exchanges an App JWT for installation access tokens,
@@ -43,6 +44,7 @@ type InstallationTokens struct {
 	signer         ghinstallation.Signer
 	gate           budget.Doer
 	refreshBefore  time.Duration
+	clock          interface{ Now() time.Time }
 
 	mu        sync.Mutex
 	token     string
@@ -77,6 +79,9 @@ func NewInstallationTokens(
 	if options.RefreshBefore <= 0 {
 		options.RefreshBefore = defaultTokenRefreshBefore
 	}
+	if options.Clock == nil {
+		options.Clock = tokenRealClock{}
+	}
 	return &InstallationTokens{
 		baseURL:        baseURL,
 		appID:          options.AppID,
@@ -87,14 +92,28 @@ func NewInstallationTokens(
 		),
 		gate:          gate,
 		refreshBefore: options.RefreshBefore,
+		clock:         options.Clock,
 	}, nil
+}
+
+type tokenRealClock struct{}
+
+func (tokenRealClock) Now() time.Time {
+	return time.Now()
 }
 
 func (m *InstallationTokens) Token(ctx context.Context) (string, error) {
 	if token, ok := m.cached(); ok {
 		return token, nil
 	}
-	result := m.renewals.DoChan("installation-token", func() (any, error) {
+	renewalKey := "installation-token"
+	if budget.InsideAdmission(ctx) {
+		// An ordinary renewal may itself be queued behind this request's slot.
+		// Keep admitted renewals in a separate singleflight group so they can
+		// reuse the outer admission instead of waiting in a cycle.
+		renewalKey += "-admitted"
+	}
+	result := m.renewals.DoChan(renewalKey, func() (any, error) {
 		if token, ok := m.cached(); ok {
 			return token, nil
 		}
@@ -118,21 +137,11 @@ func (m *InstallationTokens) Token(ctx context.Context) (string, error) {
 func (m *InstallationTokens) cached() (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.token, m.token != "" && time.Now().Before(m.expiresAt.Add(-m.refreshBefore))
+	return m.token, m.token != "" &&
+		m.clock.Now().Before(m.expiresAt.Add(-m.refreshBefore))
 }
 
 func (m *InstallationTokens) renew(ctx context.Context) (string, error) {
-	now := time.Now()
-	claims := &jwt.RegisteredClaims{
-		IssuedAt:  jwt.NewNumericDate(now.Add(-30 * time.Second).Truncate(time.Second)),
-		ExpiresAt: jwt.NewNumericDate(now.Add(90 * time.Second).Truncate(time.Second)),
-		Issuer:    strconv.FormatInt(m.appID, 10),
-	}
-	appJWT, err := m.signer.Sign(claims)
-	if err != nil {
-		return "", fmt.Errorf("sign GitHub App JWT: %w", err)
-	}
-
 	path := fmt.Sprintf(
 		"app/installations/%d/access_tokens",
 		m.installationID,
@@ -148,11 +157,14 @@ func (m *InstallationTokens) renew(ctx context.Context) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+appJWT)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)
 
-	gated, err := m.gate.Do(ctx, budget.Interactive, budget.NewAuthRequest(req))
+	gated, err := m.gate.Do(
+		ctx,
+		budget.Interactive,
+		budget.NewAuthRequest(req).BeforeSend(m.authorizeApp),
+	)
 	if err != nil {
 		if gated != nil && gated.HTTP != nil {
 			gated.HTTP.Body.Close()
@@ -171,7 +183,7 @@ func (m *InstallationTokens) renew(ctx context.Context) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
 		return "", fmt.Errorf("decode GitHub installation token: %w", err)
 	}
-	if tokenResponse.Token == "" || !tokenResponse.ExpiresAt.After(time.Now()) {
+	if tokenResponse.Token == "" || !tokenResponse.ExpiresAt.After(m.clock.Now()) {
 		return "", fmt.Errorf("GitHub returned an invalid installation token")
 	}
 	m.mu.Lock()
@@ -179,6 +191,24 @@ func (m *InstallationTokens) renew(ctx context.Context) (string, error) {
 	m.expiresAt = tokenResponse.ExpiresAt
 	m.mu.Unlock()
 	return tokenResponse.Token, nil
+}
+
+func (m *InstallationTokens) authorizeApp(
+	_ context.Context,
+	req *http.Request,
+) error {
+	now := m.clock.Now()
+	claims := &jwt.RegisteredClaims{
+		IssuedAt:  jwt.NewNumericDate(now.Add(-30 * time.Second).Truncate(time.Second)),
+		ExpiresAt: jwt.NewNumericDate(now.Add(90 * time.Second).Truncate(time.Second)),
+		Issuer:    strconv.FormatInt(m.appID, 10),
+	}
+	appJWT, err := m.signer.Sign(claims)
+	if err != nil {
+		return fmt.Errorf("sign GitHub App JWT: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+appJWT)
+	return nil
 }
 
 func (m *InstallationTokens) Expiry() time.Time {

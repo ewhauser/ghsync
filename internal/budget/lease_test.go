@@ -34,7 +34,7 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 		)
 	})
 	leases := NewPostgresLeaseStore(pool)
-	if _, acquired, err := leases.Acquire(
+	if _, _, acquired, err := leases.Acquire(
 		ctx,
 		installationID,
 		"owner-a",
@@ -42,7 +42,7 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 	); err != nil || !acquired {
 		t.Fatalf("first acquire = %v, %v", acquired, err)
 	}
-	if _, acquired, err := leases.Acquire(
+	if _, _, acquired, err := leases.Acquire(
 		ctx,
 		installationID,
 		"owner-b",
@@ -50,7 +50,7 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 	); err != nil || acquired {
 		t.Fatalf("contended acquire = %v, %v", acquired, err)
 	}
-	if renewed, err := leases.Renew(
+	if _, renewed, err := leases.Renew(
 		ctx,
 		installationID,
 		"owner-a",
@@ -67,6 +67,7 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 		GraphQL: ResourceBudget{
 			Known: true, Limit: 5000, Remaining: 4321, ResetAt: reset,
 		},
+		BackoffUntil: reset.Add(-time.Minute),
 	}
 	if saved, err := leases.Save(
 		ctx,
@@ -85,7 +86,7 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	restored, acquired, err := leases.Acquire(
+	restored, _, acquired, err := leases.Acquire(
 		ctx,
 		installationID,
 		"owner-b",
@@ -95,7 +96,8 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 		t.Fatalf("steal expired lease = %v, %v", acquired, err)
 	}
 	if restored.REST.Remaining != 12345 ||
-		restored.GraphQL.Remaining != 4321 {
+		restored.GraphQL.Remaining != 4321 ||
+		!restored.BackoffUntil.Equal(snapshot.BackoffUntil) {
 		t.Fatalf("restored snapshot = %+v", restored)
 	}
 	if saved, err := leases.Save(

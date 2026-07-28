@@ -57,10 +57,6 @@ func (c client) request(
 	query url.Values,
 	body io.Reader,
 ) (*http.Request, error) {
-	token, err := c.tokens.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("GitHub installation token: %w", err)
-	}
 	relative := &url.URL{Path: strings.TrimPrefix(path, "/"), RawQuery: query.Encode()}
 	endpoint := c.baseURL.ResolveReference(relative)
 	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
@@ -68,9 +64,17 @@ func (c client) request(
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)
 	return req, nil
+}
+
+func (c client) authorize(ctx context.Context, req *http.Request) error {
+	token, err := c.tokens.Token(ctx)
+	if err != nil {
+		return fmt.Errorf("GitHub installation token: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	return nil
 }
 
 // HTTPError is a non-success response from GitHub. Response bodies are

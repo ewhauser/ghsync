@@ -11,25 +11,74 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const acquireInstallationBudgetLease = `-- name: AcquireInstallationBudgetLease :execrows
-UPDATE installation_budgets
-SET lease_owner = $1,
-    lease_until = now() + $2::double precision * interval '1 second'
-WHERE installation_id = $3
+const acquireInstallationBudgetLease = `-- name: AcquireInstallationBudgetLease :many
+WITH locked AS MATERIALIZED (
+    SELECT class
+    FROM installation_budgets
+    WHERE installation_id = $2
+    ORDER BY class
+    FOR UPDATE
+),
+proposed AS MATERIALIZED (
+    SELECT clock_timestamp()
+           + $3::double precision * interval '1 second'
+           AS lease_until
+    FROM (SELECT count(*) FROM locked) AS after_lock
+)
+UPDATE installation_budgets AS budgets
+SET lease_owner = $1::text,
+    lease_until = proposed.lease_until
+FROM proposed
+WHERE budgets.installation_id = $2
+  AND (
+      budgets.lease_owner IS NULL
+      OR budgets.lease_until <= clock_timestamp()
+      OR budgets.lease_owner = $1::text
+  )
+RETURNING budgets.class, budgets.remaining, budgets.rate_limit,
+          budgets.reset_at, budgets.backoff_until, budgets.lease_until
 `
 
 type AcquireInstallationBudgetLeaseParams struct {
-	Owner          pgtype.Text
-	TtlSeconds     float64
+	LeaseToken     string
 	InstallationID int64
+	TtlSeconds     float64
 }
 
-func (q *Queries) AcquireInstallationBudgetLease(ctx context.Context, arg AcquireInstallationBudgetLeaseParams) (int64, error) {
-	result, err := q.db.Exec(ctx, acquireInstallationBudgetLease, arg.Owner, arg.TtlSeconds, arg.InstallationID)
+type AcquireInstallationBudgetLeaseRow struct {
+	Class        string
+	Remaining    pgtype.Int8
+	RateLimit    pgtype.Int8
+	ResetAt      pgtype.Timestamptz
+	BackoffUntil pgtype.Timestamptz
+	LeaseUntil   pgtype.Timestamptz
+}
+
+func (q *Queries) AcquireInstallationBudgetLease(ctx context.Context, arg AcquireInstallationBudgetLeaseParams) ([]AcquireInstallationBudgetLeaseRow, error) {
+	rows, err := q.db.Query(ctx, acquireInstallationBudgetLease, arg.LeaseToken, arg.InstallationID, arg.TtlSeconds)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	var items []AcquireInstallationBudgetLeaseRow
+	for rows.Next() {
+		var i AcquireInstallationBudgetLeaseRow
+		if err := rows.Scan(
+			&i.Class,
+			&i.Remaining,
+			&i.RateLimit,
+			&i.ResetAt,
+			&i.BackoffUntil,
+			&i.LeaseUntil,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const ensureInstallationBudget = `-- name: EnsureInstallationBudget :exec
@@ -48,55 +97,68 @@ func (q *Queries) EnsureInstallationBudget(ctx context.Context, arg EnsureInstal
 	return err
 }
 
-const lockInstallationBudgets = `-- name: LockInstallationBudgets :many
-SELECT class, remaining, rate_limit, reset_at, lease_owner, lease_until,
-       (
-           lease_owner IS NOT NULL
-           AND lease_owner <> $1
-           AND lease_until > now()
-       )::boolean AS held_by_other
-FROM installation_budgets
-WHERE installation_id = $2
-ORDER BY class
-FOR UPDATE
+const releaseInstallationBudgetLease = `-- name: ReleaseInstallationBudgetLease :execrows
+UPDATE installation_budgets
+SET lease_owner = NULL, lease_until = NULL
+WHERE installation_id = $1
+  AND lease_owner = $2::text
 `
 
-type LockInstallationBudgetsParams struct {
-	Owner          pgtype.Text
+type ReleaseInstallationBudgetLeaseParams struct {
 	InstallationID int64
+	LeaseToken     string
 }
 
-type LockInstallationBudgetsRow struct {
-	Class       string
-	Remaining   pgtype.Int8
-	RateLimit   pgtype.Int8
-	ResetAt     pgtype.Timestamptz
-	LeaseOwner  pgtype.Text
-	LeaseUntil  pgtype.Timestamptz
-	HeldByOther bool
+func (q *Queries) ReleaseInstallationBudgetLease(ctx context.Context, arg ReleaseInstallationBudgetLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseInstallationBudgetLease, arg.InstallationID, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
-func (q *Queries) LockInstallationBudgets(ctx context.Context, arg LockInstallationBudgetsParams) ([]LockInstallationBudgetsRow, error) {
-	rows, err := q.db.Query(ctx, lockInstallationBudgets, arg.Owner, arg.InstallationID)
+const renewInstallationBudgetLease = `-- name: RenewInstallationBudgetLease :many
+WITH locked AS MATERIALIZED (
+    SELECT class
+    FROM installation_budgets
+    WHERE installation_id = $1
+    ORDER BY class
+    FOR UPDATE
+),
+proposed AS MATERIALIZED (
+    SELECT clock_timestamp()
+           + $3::double precision * interval '1 second'
+           AS lease_until
+    FROM (SELECT count(*) FROM locked) AS after_lock
+)
+UPDATE installation_budgets AS budgets
+SET lease_until = proposed.lease_until
+FROM proposed
+WHERE budgets.installation_id = $1
+  AND budgets.lease_owner = $2::text
+  AND budgets.lease_until > clock_timestamp()
+RETURNING budgets.lease_until
+`
+
+type RenewInstallationBudgetLeaseParams struct {
+	InstallationID int64
+	LeaseToken     string
+	TtlSeconds     float64
+}
+
+func (q *Queries) RenewInstallationBudgetLease(ctx context.Context, arg RenewInstallationBudgetLeaseParams) ([]pgtype.Timestamptz, error) {
+	rows, err := q.db.Query(ctx, renewInstallationBudgetLease, arg.InstallationID, arg.LeaseToken, arg.TtlSeconds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []LockInstallationBudgetsRow
+	var items []pgtype.Timestamptz
 	for rows.Next() {
-		var i LockInstallationBudgetsRow
-		if err := rows.Scan(
-			&i.Class,
-			&i.Remaining,
-			&i.RateLimit,
-			&i.ResetAt,
-			&i.LeaseOwner,
-			&i.LeaseUntil,
-			&i.HeldByOther,
-		); err != nil {
+		var lease_until pgtype.Timestamptz
+		if err := rows.Scan(&lease_until); err != nil {
 			return nil, err
 		}
-		items = append(items, i)
+		items = append(items, lease_until)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -104,38 +166,40 @@ func (q *Queries) LockInstallationBudgets(ctx context.Context, arg LockInstallat
 	return items, nil
 }
 
-const releaseInstallationBudgetLease = `-- name: ReleaseInstallationBudgetLease :exec
-UPDATE installation_budgets
-SET lease_owner = NULL, lease_until = NULL
-WHERE installation_id = $1 AND lease_owner = $2
+const saveInstallationBudgetBackoff = `-- name: SaveInstallationBudgetBackoff :execrows
+WITH locked AS MATERIALIZED (
+    SELECT class
+    FROM installation_budgets
+    WHERE installation_id = $2
+    ORDER BY class
+    FOR UPDATE
+),
+observed AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at
+    FROM (SELECT count(*) FROM locked) AS after_lock
+)
+UPDATE installation_budgets AS budgets
+SET backoff_until = CASE
+        WHEN budgets.backoff_until IS NULL
+          OR budgets.backoff_until < $1::timestamptz
+        THEN $1::timestamptz
+        ELSE budgets.backoff_until
+    END,
+    updated_at = observed.checked_at
+FROM observed
+WHERE budgets.installation_id = $2
+  AND budgets.lease_owner = $3::text
+  AND budgets.lease_until > observed.checked_at
 `
 
-type ReleaseInstallationBudgetLeaseParams struct {
+type SaveInstallationBudgetBackoffParams struct {
+	BackoffUntil   pgtype.Timestamptz
 	InstallationID int64
-	LeaseOwner     pgtype.Text
+	LeaseToken     string
 }
 
-func (q *Queries) ReleaseInstallationBudgetLease(ctx context.Context, arg ReleaseInstallationBudgetLeaseParams) error {
-	_, err := q.db.Exec(ctx, releaseInstallationBudgetLease, arg.InstallationID, arg.LeaseOwner)
-	return err
-}
-
-const renewInstallationBudgetLease = `-- name: RenewInstallationBudgetLease :execrows
-UPDATE installation_budgets
-SET lease_until = now() + $1::double precision * interval '1 second'
-WHERE installation_id = $2
-  AND lease_owner = $3
-  AND lease_until > now()
-`
-
-type RenewInstallationBudgetLeaseParams struct {
-	TtlSeconds     float64
-	InstallationID int64
-	Owner          pgtype.Text
-}
-
-func (q *Queries) RenewInstallationBudgetLease(ctx context.Context, arg RenewInstallationBudgetLeaseParams) (int64, error) {
-	result, err := q.db.Exec(ctx, renewInstallationBudgetLease, arg.TtlSeconds, arg.InstallationID, arg.Owner)
+func (q *Queries) SaveInstallationBudgetBackoff(ctx context.Context, arg SaveInstallationBudgetBackoffParams) (int64, error) {
+	result, err := q.db.Exec(ctx, saveInstallationBudgetBackoff, arg.BackoffUntil, arg.InstallationID, arg.LeaseToken)
 	if err != nil {
 		return 0, err
 	}
@@ -143,23 +207,36 @@ func (q *Queries) RenewInstallationBudgetLease(ctx context.Context, arg RenewIns
 }
 
 const saveInstallationBudgetSnapshot = `-- name: SaveInstallationBudgetSnapshot :execrows
-UPDATE installation_budgets
-SET remaining = CASE class
+WITH locked AS MATERIALIZED (
+    SELECT class
+    FROM installation_budgets
+    WHERE installation_id = $8
+    ORDER BY class
+    FOR UPDATE
+),
+observed AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at
+    FROM (SELECT count(*) FROM locked) AS after_lock
+)
+UPDATE installation_budgets AS budgets
+SET remaining = CASE budgets.class
         WHEN 'rest' THEN $1::bigint
         WHEN 'graphql' THEN $2::bigint
     END,
-    rate_limit = CASE class
+    rate_limit = CASE budgets.class
         WHEN 'rest' THEN $3::bigint
         WHEN 'graphql' THEN $4::bigint
     END,
-    reset_at = CASE class
+    reset_at = CASE budgets.class
         WHEN 'rest' THEN $5::timestamptz
         WHEN 'graphql' THEN $6::timestamptz
     END,
-    updated_at = now()
-WHERE installation_id = $7
-  AND lease_owner = $8
-  AND lease_until > now()
+    backoff_until = $7::timestamptz,
+    updated_at = observed.checked_at
+FROM observed
+WHERE budgets.installation_id = $8
+  AND budgets.lease_owner = $9::text
+  AND budgets.lease_until > observed.checked_at
 `
 
 type SaveInstallationBudgetSnapshotParams struct {
@@ -169,8 +246,9 @@ type SaveInstallationBudgetSnapshotParams struct {
 	GraphqlLimit     pgtype.Int8
 	RestResetAt      pgtype.Timestamptz
 	GraphqlResetAt   pgtype.Timestamptz
+	BackoffUntil     pgtype.Timestamptz
 	InstallationID   int64
-	Owner            pgtype.Text
+	LeaseToken       string
 }
 
 func (q *Queries) SaveInstallationBudgetSnapshot(ctx context.Context, arg SaveInstallationBudgetSnapshotParams) (int64, error) {
@@ -181,8 +259,9 @@ func (q *Queries) SaveInstallationBudgetSnapshot(ctx context.Context, arg SaveIn
 		arg.GraphqlLimit,
 		arg.RestResetAt,
 		arg.GraphqlResetAt,
+		arg.BackoffUntil,
 		arg.InstallationID,
-		arg.Owner,
+		arg.LeaseToken,
 	)
 	if err != nil {
 		return 0, err

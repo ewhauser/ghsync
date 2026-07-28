@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/acme/frontier/internal/gh"
+	jwt "github.com/golang-jwt/jwt/v4"
 )
 
 type StackRef struct {
@@ -90,14 +92,16 @@ type rateSnapshot struct {
 }
 
 // RateLimitStep scripts one response's server-authoritative rate state.
-// StatusCode 403/429 plus RetryAfter models a secondary limit; a zero status
-// is a normal 200 response.
+// Secondary distinguishes GitHub's documented secondary-limit response shape
+// from ordinary primary-budget exhaustion. RetryAfter may be zero to exercise
+// GitHub's headerless secondary-limit fallback.
 type RateLimitStep struct {
 	Limit      int64
 	Remaining  int64
 	ResetAt    time.Time
 	StatusCode int
 	RetryAfter time.Duration
+	Secondary  bool
 }
 
 // Option customizes the fake server for a scenario.
@@ -146,25 +150,51 @@ func WithInstallationTokenTTL(ttl time.Duration) Option {
 	}
 }
 
+// WithAppAuthentication configures the public key and issuer expected by the
+// installation-token endpoint.
+func WithAppAuthentication(appID int64, publicKey *rsa.PublicKey) Option {
+	if appID <= 0 || publicKey == nil {
+		panic("App authentication requires a positive App ID and public key")
+	}
+	return func(s *Server) {
+		s.appID = appID
+		s.appPublicKey = publicKey
+	}
+}
+
+// WithNow supplies deterministic server time for token-expiry tests.
+func WithNow(now func() time.Time) Option {
+	if now == nil {
+		panic("now function is required")
+	}
+	return func(s *Server) {
+		s.now = now
+	}
+}
+
 // Server implements http.Handler for the API surface and can emit webhooks.
 // All mutable state is guarded so tests can mutate the fixture mid-scenario.
 type Server struct {
-	mu            sync.Mutex
-	fixture       Fixture
-	webhookSecret []byte
-	restBudget    rateBudget
-	graphQLBudget rateBudget
-	restSteps     []RateLimitStep
-	graphQLSteps  []RateLimitStep
-	restStep      int
-	graphQLStep   int
-	responseDelay time.Duration
-	active        int
-	maxActive     int
-	tokenTTL      time.Duration
-	tokenRequests int
-	mux           *http.ServeMux
-	client        *http.Client
+	mu             sync.Mutex
+	fixture        Fixture
+	webhookSecret  []byte
+	restBudget     rateBudget
+	graphQLBudget  rateBudget
+	restSteps      []RateLimitStep
+	graphQLSteps   []RateLimitStep
+	restStep       int
+	graphQLStep    int
+	responseDelay  time.Duration
+	active         int
+	maxActive      int
+	tokenTTL       time.Duration
+	tokenRequests  int
+	authorizations []string
+	appID          int64
+	appPublicKey   *rsa.PublicKey
+	now            func() time.Time
+	mux            *http.ServeMux
+	client         *http.Client
 }
 
 func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
@@ -185,6 +215,7 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 			resource:  "graphql",
 		},
 		tokenTTL: time.Hour,
+		now:      time.Now,
 		client:   &http.Client{Timeout: 10 * time.Second},
 	}
 	for _, option := range options {
@@ -227,7 +258,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/graphql" {
 		resource = "graphql"
 	}
-	rate, scripted, allowed, status, retryAfter := s.nextRate(resource, 1)
+	s.mu.Lock()
+	s.authorizations = append(s.authorizations, r.Header.Get("Authorization"))
+	s.mu.Unlock()
+	rate, scripted, allowed, status, retryAfter, secondary := s.nextRate(resource, 1)
 	setRateHeaders(w.Header(), rate)
 	if scripted {
 		r = r.WithContext(context.WithValue(r.Context(), scriptedRateKey{}, true))
@@ -239,7 +273,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				strconv.FormatInt(int64((retryAfter+time.Second-1)/time.Second), 10),
 			)
 		}
-		if resource == "graphql" {
+		if secondary || retryAfter > 0 {
+			writeSecondaryRateLimitExceeded(w, status, resource, rate)
+		} else if resource == "graphql" {
 			writeGraphQLRateLimitExceeded(w, rate, status)
 		} else {
 			writeRESTRateLimitExceeded(w, rate, status)
@@ -284,6 +320,12 @@ func (s *Server) TokenRequests() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.tokenRequests
+}
+
+func (s *Server) Authorizations() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.authorizations...)
 }
 
 func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, bool) {
@@ -372,8 +414,39 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) installationToken(w http.ResponseWriter, r *http.Request) {
-	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if strings.Count(auth, ".") != 2 {
+	if r.Header.Get("Accept") != "application/vnd.github+json" ||
+		r.Header.Get("X-GitHub-Api-Version") != "2022-11-28" ||
+		!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		http.Error(w, "invalid GitHub API headers", http.StatusBadRequest)
+		return
+	}
+	const bearer = "Bearer "
+	rawAuthorization := r.Header.Get("Authorization")
+	if !strings.HasPrefix(rawAuthorization, bearer) ||
+		s.appPublicKey == nil || s.appID <= 0 {
+		http.Error(w, "valid App JWT required", http.StatusUnauthorized)
+		return
+	}
+	auth := strings.TrimPrefix(rawAuthorization, bearer)
+	claims := &fakeAppClaims{}
+	token, err := jwt.NewParser(
+		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
+	).ParseWithClaims(auth, claims, func(token *jwt.Token) (any, error) {
+		if token.Header["typ"] != "JWT" {
+			return nil, fmt.Errorf("JWT typ header is required")
+		}
+		return s.appPublicKey, nil
+	})
+	now := s.now()
+	expectedIssuer := strconv.FormatInt(s.appID, 10)
+	if err != nil || !token.Valid ||
+		claims.Issuer != expectedIssuer ||
+		claims.IssuedAt == nil ||
+		claims.ExpiresAt == nil ||
+		claims.IssuedAt.Time.After(now) ||
+		claims.IssuedAt.Time.Before(now.Add(-time.Minute)) ||
+		!claims.ExpiresAt.Time.After(now) ||
+		claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time) > 10*time.Minute {
 		http.Error(w, "valid App JWT required", http.StatusUnauthorized)
 		return
 	}
@@ -387,14 +460,24 @@ func (s *Server) installationToken(w http.ResponseWriter, r *http.Request) {
 	requestNumber := s.tokenRequests
 	ttl := s.tokenTTL
 	s.mu.Unlock()
-	writeJSON(w, map[string]any{
+	writeJSONStatus(w, http.StatusCreated, map[string]any{
 		"token": fmt.Sprintf(
 			"fake-installation-%d-token-%d",
 			installationID,
 			requestNumber,
 		),
-		"expires_at": time.Now().Add(ttl).UTC().Format(time.RFC3339Nano),
+		"expires_at": now.Add(ttl).UTC().Format(time.RFC3339Nano),
 	})
+}
+
+type fakeAppClaims struct {
+	jwt.RegisteredClaims
+}
+
+// Valid deliberately leaves time validation to installationToken's injected
+// clock while jwt.Parser still verifies the signature and signing algorithm.
+func (*fakeAppClaims) Valid() error {
+	return nil
 }
 
 // EmitWebhook signs and POSTs a webhook delivery to targetURL, returning the
@@ -465,7 +548,7 @@ func (s *Server) consume(resource string, cost int64) (rateSnapshot, bool) {
 func (s *Server) nextRate(
 	resource string,
 	cost int64,
-) (rateSnapshot, bool, bool, int, time.Duration) {
+) (rateSnapshot, bool, bool, int, time.Duration, bool) {
 	s.mu.Lock()
 	var steps []RateLimitStep
 	var index *int
@@ -492,11 +575,11 @@ func (s *Server) nextRate(
 		budget.resetAt = step.ResetAt
 		snapshot := budget.snapshot()
 		s.mu.Unlock()
-		return snapshot, true, true, step.StatusCode, step.RetryAfter
+		return snapshot, true, true, step.StatusCode, step.RetryAfter, step.Secondary
 	}
 	s.mu.Unlock()
 	snapshot, allowed := s.consume(resource, cost)
-	return snapshot, false, allowed, 0, 0
+	return snapshot, false, allowed, 0, 0, false
 }
 
 func (s *Server) snapshot(resource string) rateSnapshot {
@@ -633,6 +716,40 @@ func writeGraphQLRateLimitExceeded(w http.ResponseWriter, budget rateSnapshot, s
 	})
 }
 
+func writeSecondaryRateLimitExceeded(
+	w http.ResponseWriter,
+	status int,
+	resource string,
+	budget rateSnapshot,
+) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if resource == "graphql" {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"rateLimit": map[string]any{
+					"cost":      1,
+					"limit":     budget.limit,
+					"remaining": budget.remaining,
+					"resetAt":   budget.resetAt.Format(time.RFC3339),
+				},
+			},
+			"errors": []map[string]any{{
+				"type":    "RATE_LIMITED",
+				"message": "You have exceeded a secondary rate limit.",
+			}},
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"message": "You have exceeded a secondary rate limit. Please wait " +
+			"a few minutes before you try again.",
+		"documentation_url": "https://docs.github.com/rest/using-the-rest-api/" +
+			"rate-limits-for-the-rest-api#about-secondary-rate-limits",
+		"status": strconv.Itoa(status),
+	})
+}
+
 func newDeliveryGUID() (string, error) {
 	var uuid [16]byte
 	if _, err := rand.Read(uuid[:]); err != nil {
@@ -651,8 +768,13 @@ func newDeliveryGUID() (string, error) {
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
+	writeJSONStatus(w, http.StatusOK, v)
+}
+
+func writeJSONStatus(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 }

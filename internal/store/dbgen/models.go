@@ -17,6 +17,7 @@ type InstallationBudget struct {
 	LeaseOwner     pgtype.Text
 	LeaseUntil     pgtype.Timestamptz
 	UpdatedAt      pgtype.Timestamptz
+	BackoffUntil   pgtype.Timestamptz
 }
 
 type WebhookDelivery struct {

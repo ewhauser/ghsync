@@ -2,6 +2,8 @@ package budget
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/acme/frontier/internal/store/dbgen"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -18,38 +21,66 @@ const (
 	defaultLeaseTTL         = 30 * time.Second
 	defaultRenewInterval    = 10 * time.Second
 	defaultSnapshotInterval = 30 * time.Second
+	defaultStoreTimeout     = 5 * time.Second
 )
 
 // LeaseStore coordinates the one active budgeter for an installation and
-// persists periodic C-P6 state snapshots.
+// persists periodic C-P6 state snapshots. Acquire and Renew return Postgres's
+// authoritative lease expiry; callers must never derive it from local time.
 type LeaseStore interface {
-	Acquire(context.Context, int64, string, time.Duration) (Snapshot, bool, error)
-	Renew(context.Context, int64, string, time.Duration) (bool, error)
+	Acquire(
+		context.Context,
+		int64,
+		string,
+		time.Duration,
+	) (Snapshot, time.Time, bool, error)
+	Renew(
+		context.Context,
+		int64,
+		string,
+		time.Duration,
+	) (time.Time, bool, error)
 	Save(context.Context, int64, string, Snapshot) (bool, error)
+	SaveBackoff(context.Context, int64, string, time.Time) (bool, error)
 	Release(context.Context, int64, string) error
 }
 
-// LeaseOptions identifies and times a per-installation budgeter lease.
+// LeaseOptions identifies and times a per-installation budgeter lease. Owner
+// is a diagnostic process name only; an unguessable per-runtime token is the
+// actual database ownership predicate.
 type LeaseOptions struct {
 	InstallationID   int64
 	Owner            string
 	TTL              time.Duration
 	RenewInterval    time.Duration
 	SnapshotInterval time.Duration
+	StoreTimeout     time.Duration
+	Clock            Clock
 }
 
 type leaseRuntime struct {
 	store          LeaseStore
 	installationID int64
 	owner          string
+	token          string
+	ttl            time.Duration
+	renewInterval  time.Duration
+	snapshotEvery  time.Duration
+	storeTimeout   time.Duration
+	clock          Clock
+	ctx            context.Context
 	cancel         context.CancelFunc
 	done           chan struct{}
+	expiryUpdates  chan time.Time
 	closeOnce      sync.Once
 	closeErr       error
+
+	mu          sync.Mutex
+	leaseExpiry time.Time
 }
 
 // NewLeased acquires the Postgres-coordinated C-B1/C-O2 singleton before
-// returning a usable gate. A live lease held by another owner returns
+// returning a usable gate. A live lease held by another runtime returns
 // ErrLeaseHeld.
 func NewLeased(
 	ctx context.Context,
@@ -58,43 +89,45 @@ func NewLeased(
 	store LeaseStore,
 	leaseOptions LeaseOptions,
 ) (*Gate, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("budget lease: nil context")
+	}
 	if store == nil {
 		return nil, fmt.Errorf("budget lease store is required")
 	}
-	if leaseOptions.TTL <= 0 {
-		leaseOptions.TTL = defaultLeaseTTL
-	}
-	if leaseOptions.RenewInterval <= 0 {
-		leaseOptions.RenewInterval = min(defaultRenewInterval, leaseOptions.TTL/3)
-	}
-	if leaseOptions.SnapshotInterval <= 0 {
-		leaseOptions.SnapshotInterval = defaultSnapshotInterval
-	}
-	if leaseOptions.RenewInterval <= 0 ||
-		leaseOptions.RenewInterval >= leaseOptions.TTL {
-		return nil, fmt.Errorf("budget lease renew interval must be shorter than TTL")
-	}
-	if err := validateLeaseIdentity(
-		leaseOptions.InstallationID,
-		leaseOptions.Owner,
-		leaseOptions.TTL,
-	); err != nil {
+	if err := normalizeLeaseOptions(&leaseOptions, gateOptions.Clock); err != nil {
 		return nil, err
 	}
+	token, err := newLeaseToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate budget lease token: %w", err)
+	}
 
-	persisted, acquired, err := store.Acquire(
-		ctx,
+	acquireCtx, cancelAcquire := context.WithTimeout(ctx, leaseOptions.StoreTimeout)
+	persisted, leaseUntil, acquired, err := store.Acquire(
+		acquireCtx,
 		leaseOptions.InstallationID,
-		leaseOptions.Owner,
+		token,
 		leaseOptions.TTL,
 	)
+	cancelAcquire()
 	if err != nil {
 		return nil, err
 	}
 	if !acquired {
 		return nil, ErrLeaseHeld
 	}
+	if leaseUntil.IsZero() || !leaseOptions.Clock.Now().Before(leaseUntil) {
+		releaseCtx, cancelRelease := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			leaseOptions.StoreTimeout,
+		)
+		_ = store.Release(releaseCtx, leaseOptions.InstallationID, token)
+		cancelRelease()
+		return nil, fmt.Errorf("%w: acquired lease has expired", ErrLeaseLost)
+	}
 
+	gateOptions.Clock = leaseOptions.Clock
 	gate := New(client, gateOptions)
 	gate.restore(persisted)
 	leaseCtx, cancel := context.WithCancel(ctx)
@@ -102,11 +135,21 @@ func NewLeased(
 		store:          store,
 		installationID: leaseOptions.InstallationID,
 		owner:          leaseOptions.Owner,
+		token:          token,
+		ttl:            leaseOptions.TTL,
+		renewInterval:  leaseOptions.RenewInterval,
+		snapshotEvery:  leaseOptions.SnapshotInterval,
+		storeTimeout:   leaseOptions.StoreTimeout,
+		clock:          leaseOptions.Clock,
+		ctx:            leaseCtx,
 		cancel:         cancel,
 		done:           make(chan struct{}),
+		expiryUpdates:  make(chan time.Time, 1),
+		leaseExpiry:    leaseUntil,
 	}
 	gate.lease = runtime
-	go gate.runLease(leaseCtx, leaseOptions)
+	gate.setLeaseUntil(leaseUntil)
+	go gate.runLease(runtime)
 	return gate, nil
 }
 
@@ -114,94 +157,298 @@ func NewLeased(
 // budgeter lease.
 var ErrLeaseHeld = errors.New("GitHub installation budget lease is held")
 
-// PostgresLeaseStore implements lease acquire/renew/steal-on-expiry and
+// PostgresLeaseStore implements atomic lease acquire/renew/steal-on-expiry and
 // periodic snapshots against installation_budgets.
 type PostgresLeaseStore struct {
 	pool *pgxpool.Pool
 }
 
-func (g *Gate) runLease(ctx context.Context, options LeaseOptions) {
-	defer close(g.lease.done)
-	renew := time.NewTicker(options.RenewInterval)
-	snapshot := time.NewTicker(options.SnapshotInterval)
-	defer renew.Stop()
-	defer snapshot.Stop()
+func normalizeLeaseOptions(options *LeaseOptions, gateClock Clock) error {
+	if options.TTL <= 0 {
+		options.TTL = defaultLeaseTTL
+	}
+	if options.RenewInterval <= 0 {
+		options.RenewInterval = min(defaultRenewInterval, options.TTL/3)
+	}
+	if options.SnapshotInterval <= 0 {
+		options.SnapshotInterval = defaultSnapshotInterval
+	}
+	if options.StoreTimeout <= 0 {
+		options.StoreTimeout = min(defaultStoreTimeout, options.TTL/4)
+	}
+	if options.Clock == nil {
+		options.Clock = gateClock
+	}
+	if options.Clock == nil {
+		options.Clock = realClock{}
+	}
+	if options.InstallationID <= 0 {
+		return fmt.Errorf("installation ID must be positive")
+	}
+	if options.Owner == "" {
+		return fmt.Errorf("lease owner name is required")
+	}
+	if options.RenewInterval <= 0 || options.RenewInterval >= options.TTL {
+		return fmt.Errorf("budget lease renew interval must be shorter than TTL")
+	}
+	if options.StoreTimeout <= 0 || options.StoreTimeout >= options.TTL {
+		return fmt.Errorf("budget lease store timeout must be shorter than TTL")
+	}
+	return nil
+}
+
+func newLeaseToken() (string, error) {
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+func (g *Gate) runLease(runtime *leaseRuntime) {
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		g.maintainLease(runtime)
+	}()
+	go func() {
+		defer workers.Done()
+		g.watchLeaseExpiry(runtime)
+	}()
+	workers.Wait()
+	close(runtime.done)
+}
+
+func (g *Gate) maintainLease(runtime *leaseRuntime) {
+	renew := runtime.clock.NewTimer(runtime.renewInterval)
+	snapshot := runtime.clock.NewTimer(runtime.snapshotEvery)
+	defer func() {
+		renew.Stop()
+		snapshot.Stop()
+	}()
 
 	for {
 		select {
-		case <-ctx.Done():
-			g.makeUnavailable(fmt.Errorf("%w: %v", ErrLeaseLost, ctx.Err()))
+		case <-runtime.ctx.Done():
+			if !errors.Is(g.unavailableError(), ErrClosed) {
+				g.loseLease(fmt.Errorf("%w: %v", ErrLeaseLost, runtime.ctx.Err()))
+			}
 			return
-		case <-renew.C:
-			ok, err := g.lease.store.Renew(
-				ctx,
-				g.lease.installationID,
-				g.lease.owner,
-				options.TTL,
-			)
-			if err != nil {
-				g.makeUnavailable(fmt.Errorf("%w: renew: %v", ErrLeaseLost, err))
+		case <-renew.C():
+			until, ok, err := runtime.renew()
+			switch {
+			case err != nil:
+				// A transient failure does not invent lease loss. The independent
+				// watchdog still closes exactly at the last confirmed expiry.
+				renew = resetClockTimer(
+					renew,
+					runtime.clock,
+					runtime.renewRetryDelay(),
+				)
+			case !ok || until.IsZero() || !runtime.clock.Now().Before(until):
+				g.loseLease(ErrLeaseLost)
+				runtime.cancel()
+				return
+			default:
+				runtime.confirmExpiry(until)
+				g.setLeaseUntil(until)
+				runtime.publishExpiry(until)
+				renew = resetClockTimer(renew, runtime.clock, runtime.renewInterval)
+			}
+		case <-snapshot.C():
+			ok, err := runtime.save(g.Snapshot())
+			if err == nil && !ok {
+				g.loseLease(ErrLeaseLost)
+				runtime.cancel()
 				return
 			}
-			if !ok {
-				g.makeUnavailable(ErrLeaseLost)
-				return
-			}
-		case <-snapshot.C:
-			ok, err := g.lease.store.Save(
-				ctx,
-				g.lease.installationID,
-				g.lease.owner,
-				g.Snapshot(),
-			)
-			if err != nil {
-				g.makeUnavailable(fmt.Errorf("%w: save snapshot: %v", ErrLeaseLost, err))
-				return
-			}
-			if !ok {
-				g.makeUnavailable(ErrLeaseLost)
-				return
-			}
+			// Snapshot transport errors do not disprove ownership; renewal and
+			// the expiry watchdog remain the ownership authority.
+			snapshot = resetClockTimer(snapshot, runtime.clock, runtime.snapshotEvery)
 		}
 	}
 }
 
-// Close stops admission, waits for admitted calls, writes one final snapshot,
-// and releases the lease. Request-path calls never persist state (C-P6).
+func (g *Gate) watchLeaseExpiry(runtime *leaseRuntime) {
+	expiry := runtime.currentExpiry()
+	timer := runtime.clock.NewTimer(max(time.Duration(0), expiry.Sub(runtime.clock.Now())))
+	defer func() {
+		timer.Stop()
+	}()
+
+	for {
+		select {
+		case <-runtime.ctx.Done():
+			return
+		case until := <-runtime.expiryUpdates:
+			expiry = until
+			timer = resetClockTimer(
+				timer,
+				runtime.clock,
+				max(time.Duration(0), expiry.Sub(runtime.clock.Now())),
+			)
+		case <-timer.C():
+			g.loseLease(ErrLeaseLost)
+			runtime.cancel()
+			return
+		}
+	}
+}
+
+func resetClockTimer(current Timer, clock Clock, delay time.Duration) Timer {
+	current.Stop()
+	return clock.NewTimer(max(time.Duration(0), delay))
+}
+
+func (r *leaseRuntime) renew() (time.Time, bool, error) {
+	ctx, cancel := context.WithTimeout(r.ctx, r.storeTimeout)
+	defer cancel()
+	return r.store.Renew(ctx, r.installationID, r.token, r.ttl)
+}
+
+func (r *leaseRuntime) save(snapshot Snapshot) (bool, error) {
+	ctx, cancel := context.WithTimeout(r.ctx, r.storeTimeout)
+	defer cancel()
+	return r.store.Save(ctx, r.installationID, r.token, snapshot)
+}
+
+func (r *leaseRuntime) renewRetryDelay() time.Duration {
+	remaining := r.currentExpiry().Sub(r.clock.Now())
+	if remaining <= 0 {
+		return 0
+	}
+	return min(r.renewInterval/2, remaining/2)
+}
+
+func (r *leaseRuntime) confirmExpiry(until time.Time) {
+	r.mu.Lock()
+	r.leaseExpiry = until
+	r.mu.Unlock()
+}
+
+func (r *leaseRuntime) currentExpiry() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.leaseExpiry
+}
+
+func (r *leaseRuntime) publishExpiry(until time.Time) {
+	select {
+	case r.expiryUpdates <- until:
+	default:
+		select {
+		case <-r.expiryUpdates:
+		default:
+		}
+		r.expiryUpdates <- until
+	}
+}
+
+func (g *Gate) unavailableError() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.unavailable
+}
+
+func (g *Gate) persistBackoff(ctx context.Context, until time.Time) error {
+	runtime := g.lease
+	opCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		runtime.storeTimeout,
+	)
+	defer cancel()
+	ok, err := runtime.store.SaveBackoff(
+		opCtx,
+		runtime.installationID,
+		runtime.token,
+		until,
+	)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// Close stops admission, keeps renewal alive while admitted calls drain, then
+// snapshots and releases. If the caller's drain deadline expires, stragglers
+// are canceled before bounded cleanup continues (C-B1/C-B6).
 func (g *Gate) Close(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("budget gate close: nil context")
+	}
 	if g.lease == nil {
-		g.makeUnavailable(ErrClosed)
-		return g.waitIdle(ctx)
+		g.stopAdmission(ErrClosed)
+		if err := g.waitIdle(ctx); err != nil {
+			g.cancelAdmissions()
+			return err
+		}
+		return nil
 	}
 
 	g.lease.closeOnce.Do(func() {
-		g.makeUnavailable(ErrClosed)
-		g.lease.cancel()
+		runtime := g.lease
+		g.stopAdmission(ErrClosed)
+
+		drainErr := g.waitIdle(ctx)
+		if drainErr != nil {
+			g.cancelAdmissions()
+			waitCtx, cancelWait := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				runtime.storeTimeout,
+			)
+			_ = g.waitIdle(waitCtx)
+			cancelWait()
+		}
+
+		// Renewal stays live through the entire drain. Only now may maintenance
+		// stop, immediately before the final snapshot and token-checked release.
+		runtime.cancel()
+		stopCtx, cancelStop := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			runtime.storeTimeout,
+		)
+		var stopErr error
 		select {
-		case <-ctx.Done():
-			g.lease.closeErr = ctx.Err()
-			return
-		case <-g.lease.done:
+		case <-runtime.done:
+		case <-stopCtx.Done():
+			stopErr = stopCtx.Err()
 		}
-		if err := g.waitIdle(ctx); err != nil {
-			g.lease.closeErr = err
+		cancelStop()
+		if stopErr != nil {
+			runtime.closeErr = joinErrors(drainErr, stopErr)
 			return
 		}
-		saved, saveErr := g.lease.store.Save(
-			ctx,
-			g.lease.installationID,
-			g.lease.owner,
+
+		snapshotCtx, cancelSnapshot := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			runtime.storeTimeout,
+		)
+		saved, saveErr := runtime.store.Save(
+			snapshotCtx,
+			runtime.installationID,
+			runtime.token,
 			g.Snapshot(),
 		)
+		cancelSnapshot()
 		if saveErr == nil && !saved {
 			saveErr = ErrLeaseLost
 		}
-		releaseErr := g.lease.store.Release(
-			ctx,
-			g.lease.installationID,
-			g.lease.owner,
+
+		releaseCtx, cancelRelease := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			runtime.storeTimeout,
 		)
-		g.lease.closeErr = joinErrors(saveErr, releaseErr)
+		releaseErr := runtime.store.Release(
+			releaseCtx,
+			runtime.installationID,
+			runtime.token,
+		)
+		cancelRelease()
+		runtime.closeErr = joinErrors(drainErr, saveErr, releaseErr)
 	})
 	return g.lease.closeErr
 }
@@ -213,17 +460,20 @@ func NewPostgresLeaseStore(pool *pgxpool.Pool) *PostgresLeaseStore {
 func (s *PostgresLeaseStore) Acquire(
 	ctx context.Context,
 	installationID int64,
-	owner string,
+	token string,
 	ttl time.Duration,
-) (Snapshot, bool, error) {
-	if err := validateLeaseIdentity(installationID, owner, ttl); err != nil {
-		return Snapshot{}, false, err
+) (Snapshot, time.Time, bool, error) {
+	if err := validateLeaseIdentity(installationID, token, ttl); err != nil {
+		return Snapshot{}, time.Time{}, false, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Snapshot{}, false, fmt.Errorf("begin budget lease: %w", err)
+		return Snapshot{}, time.Time{}, false, fmt.Errorf("begin budget lease: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := setLeaseTransactionTimeouts(ctx, tx, ttl); err != nil {
+		return Snapshot{}, time.Time{}, false, err
+	}
 
 	queries := dbgen.New(tx)
 	for _, class := range []Resource{REST, GraphQL} {
@@ -234,81 +484,90 @@ func (s *PostgresLeaseStore) Acquire(
 				Class:          string(class),
 			},
 		); err != nil {
-			return Snapshot{}, false, fmt.Errorf("ensure budget row: %w", err)
+			return Snapshot{}, time.Time{}, false, fmt.Errorf("ensure budget row: %w", err)
 		}
 	}
 
-	rows, err := queries.LockInstallationBudgets(
-		ctx,
-		dbgen.LockInstallationBudgetsParams{
-			Owner:          text(owner),
-			InstallationID: installationID,
-		},
-	)
-	if err != nil {
-		return Snapshot{}, false, fmt.Errorf("lock budget rows: %w", err)
-	}
-	state, heldByOther, err := scanBudgetRows(rows)
-	if err != nil {
-		return Snapshot{}, false, err
-	}
-	if heldByOther {
-		if err := tx.Commit(ctx); err != nil {
-			return Snapshot{}, false, err
-		}
-		return state, false, nil
-	}
-
-	affected, err := queries.AcquireInstallationBudgetLease(
+	rows, err := queries.AcquireInstallationBudgetLease(
 		ctx,
 		dbgen.AcquireInstallationBudgetLeaseParams{
-			Owner:          text(owner),
-			TtlSeconds:     ttl.Seconds(),
+			LeaseToken:     token,
 			InstallationID: installationID,
+			TtlSeconds:     ttl.Seconds(),
 		},
 	)
 	if err != nil {
-		return Snapshot{}, false, fmt.Errorf("acquire budget lease: %w", err)
+		return Snapshot{}, time.Time{}, false, fmt.Errorf("acquire budget lease: %w", err)
 	}
-	if affected != 2 {
-		return Snapshot{}, false, fmt.Errorf(
-			"acquire budget lease: updated %d rows, want 2",
-			affected,
-		)
+	if len(rows) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return Snapshot{}, time.Time{}, false, err
+		}
+		return Snapshot{}, time.Time{}, false, nil
+	}
+	state, leaseUntil, err := scanAcquiredBudgetRows(rows)
+	if err != nil {
+		return Snapshot{}, time.Time{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Snapshot{}, false, fmt.Errorf("commit budget lease: %w", err)
+		return Snapshot{}, time.Time{}, false, fmt.Errorf("commit budget lease: %w", err)
 	}
-	return state, true, nil
+	return state, leaseUntil, true, nil
+}
+
+func setLeaseTransactionTimeouts(
+	ctx context.Context,
+	tx pgx.Tx,
+	ttl time.Duration,
+) error {
+	timeout := ttl / 3
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = min(timeout, time.Until(deadline))
+	}
+	if timeout <= 0 {
+		return context.DeadlineExceeded
+	}
+	timeout = max(time.Millisecond, timeout)
+	value := fmt.Sprintf("%dms", timeout.Milliseconds())
+	if _, err := tx.Exec(
+		ctx,
+		`SELECT set_config('lock_timeout', $1, true),
+		        set_config('statement_timeout', $1, true)`,
+		value,
+	); err != nil {
+		return fmt.Errorf("set budget lease transaction timeouts: %w", err)
+	}
+	return nil
 }
 
 func (s *PostgresLeaseStore) Renew(
 	ctx context.Context,
 	installationID int64,
-	owner string,
+	token string,
 	ttl time.Duration,
-) (bool, error) {
-	if err := validateLeaseIdentity(installationID, owner, ttl); err != nil {
-		return false, err
+) (time.Time, bool, error) {
+	if err := validateLeaseIdentity(installationID, token, ttl); err != nil {
+		return time.Time{}, false, err
 	}
-	affected, err := dbgen.New(s.pool).RenewInstallationBudgetLease(
+	rows, err := dbgen.New(s.pool).RenewInstallationBudgetLease(
 		ctx,
 		dbgen.RenewInstallationBudgetLeaseParams{
-			TtlSeconds:     ttl.Seconds(),
 			InstallationID: installationID,
-			Owner:          text(owner),
+			LeaseToken:     token,
+			TtlSeconds:     ttl.Seconds(),
 		},
 	)
 	if err != nil {
-		return false, fmt.Errorf("renew budget lease: %w", err)
+		return time.Time{}, false, fmt.Errorf("renew budget lease: %w", err)
 	}
-	return affected == 2, nil
+	until, ok, err := authoritativeExpiry(rows)
+	return until, ok, err
 }
 
 func (s *PostgresLeaseStore) Save(
 	ctx context.Context,
 	installationID int64,
-	owner string,
+	token string,
 	snapshot Snapshot,
 ) (bool, error) {
 	restRemaining, restLimit, restReset := persistedValues(snapshot.REST)
@@ -322,8 +581,9 @@ func (s *PostgresLeaseStore) Save(
 			GraphqlLimit:     graphLimit,
 			RestResetAt:      restReset,
 			GraphqlResetAt:   graphReset,
+			BackoffUntil:     timestamp(snapshot.BackoffUntil),
 			InstallationID:   installationID,
-			Owner:            text(owner),
+			LeaseToken:       token,
 		},
 	)
 	if err != nil {
@@ -332,30 +592,53 @@ func (s *PostgresLeaseStore) Save(
 	return affected == 2, nil
 }
 
+func (s *PostgresLeaseStore) SaveBackoff(
+	ctx context.Context,
+	installationID int64,
+	token string,
+	until time.Time,
+) (bool, error) {
+	affected, err := dbgen.New(s.pool).SaveInstallationBudgetBackoff(
+		ctx,
+		dbgen.SaveInstallationBudgetBackoffParams{
+			BackoffUntil:   timestamp(until),
+			InstallationID: installationID,
+			LeaseToken:     token,
+		},
+	)
+	if err != nil {
+		return false, fmt.Errorf("save budget backoff: %w", err)
+	}
+	return affected == 2, nil
+}
+
 func (s *PostgresLeaseStore) Release(
 	ctx context.Context,
 	installationID int64,
-	owner string,
+	token string,
 ) error {
-	err := dbgen.New(s.pool).ReleaseInstallationBudgetLease(
+	affected, err := dbgen.New(s.pool).ReleaseInstallationBudgetLease(
 		ctx,
 		dbgen.ReleaseInstallationBudgetLeaseParams{
 			InstallationID: installationID,
-			LeaseOwner:     text(owner),
+			LeaseToken:     token,
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("release budget lease: %w", err)
 	}
+	if affected != 2 {
+		return ErrLeaseLost
+	}
 	return nil
 }
 
-func validateLeaseIdentity(installationID int64, owner string, ttl time.Duration) error {
+func validateLeaseIdentity(installationID int64, token string, ttl time.Duration) error {
 	if installationID <= 0 {
 		return fmt.Errorf("installation ID must be positive")
 	}
-	if owner == "" {
-		return fmt.Errorf("lease owner is required")
+	if token == "" {
+		return fmt.Errorf("lease token is required")
 	}
 	if ttl <= 0 {
 		return fmt.Errorf("lease TTL must be positive")
@@ -363,11 +646,17 @@ func validateLeaseIdentity(installationID int64, owner string, ttl time.Duration
 	return nil
 }
 
-func scanBudgetRows(
-	rows []dbgen.LockInstallationBudgetsRow,
-) (Snapshot, bool, error) {
+func scanAcquiredBudgetRows(
+	rows []dbgen.AcquireInstallationBudgetLeaseRow,
+) (Snapshot, time.Time, error) {
+	if len(rows) != 2 {
+		return Snapshot{}, time.Time{}, fmt.Errorf(
+			"acquire budget lease: updated %d rows, want 2",
+			len(rows),
+		)
+	}
 	var snapshot Snapshot
-	heldByOther := false
+	var expiries []pgtype.Timestamptz
 	for _, row := range rows {
 		state := restoredBudget(row.Remaining, row.RateLimit, row.ResetAt)
 		switch Resource(row.Class) {
@@ -376,16 +665,47 @@ func scanBudgetRows(
 		case GraphQL:
 			snapshot.GraphQL = state
 		default:
-			return Snapshot{}, false, fmt.Errorf("unknown persisted budget class %q", row.Class)
+			return Snapshot{}, time.Time{}, fmt.Errorf(
+				"unknown persisted budget class %q",
+				row.Class,
+			)
 		}
-		if row.HeldByOther {
-			heldByOther = true
+		if row.BackoffUntil.Valid &&
+			row.BackoffUntil.Time.After(snapshot.BackoffUntil) {
+			snapshot.BackoffUntil = row.BackoffUntil.Time
 		}
+		expiries = append(expiries, row.LeaseUntil)
 	}
-	if len(rows) != 2 {
-		return Snapshot{}, false, fmt.Errorf("read %d budget rows, want 2", len(rows))
+	until, ok, err := authoritativeExpiry(expiries)
+	if err != nil || !ok {
+		return Snapshot{}, time.Time{}, fmt.Errorf(
+			"acquire budget lease expiry: %w",
+			err,
+		)
 	}
-	return snapshot, heldByOther, nil
+	return snapshot, until, nil
+}
+
+func authoritativeExpiry(
+	values []pgtype.Timestamptz,
+) (time.Time, bool, error) {
+	if len(values) == 0 {
+		return time.Time{}, false, nil
+	}
+	if len(values) != 2 || !values[0].Valid || !values[1].Valid {
+		return time.Time{}, false, fmt.Errorf(
+			"lease expiry rows = %d, want two valid rows",
+			len(values),
+		)
+	}
+	if !values[0].Time.Equal(values[1].Time) {
+		return time.Time{}, false, fmt.Errorf(
+			"inconsistent lease expiries %v and %v",
+			values[0].Time,
+			values[1].Time,
+		)
+	}
+	return values[0].Time, true, nil
 }
 
 func restoredBudget(
@@ -415,6 +735,6 @@ func persistedValues(
 		pgtype.Timestamptz{Time: state.ResetAt, Valid: true}
 }
 
-func text(value string) pgtype.Text {
-	return pgtype.Text{String: value, Valid: true}
+func timestamp(value time.Time) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: value, Valid: !value.IsZero()}
 }

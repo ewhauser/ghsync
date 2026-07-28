@@ -198,7 +198,11 @@ func (c *RESTClient) getJSON(
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
-	gated, err := c.client.gate.Do(ctx, class, budget.NewRESTRequest(req))
+	gated, err := c.client.gate.Do(
+		ctx,
+		class,
+		budget.NewRESTRequest(req).BeforeSend(c.client.authorize),
+	)
 	if err != nil {
 		if gated != nil && gated.HTTP != nil {
 			gated.HTTP.Body.Close()
