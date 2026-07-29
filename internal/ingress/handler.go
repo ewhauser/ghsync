@@ -47,6 +47,9 @@ func NewHandler(
 	if deliveries == nil {
 		panic("ingress delivery inserter is required")
 	}
+	if webhookSecret == "" {
+		panic("ingress webhook secret is required")
+	}
 	if maxBodyBytes <= 0 {
 		panic("ingress max body bytes must be positive")
 	}
@@ -61,13 +64,18 @@ func NewHandler(
 	}
 }
 
-// Mux returns the ingress and health routes.
-func (h *Handler) Mux() *http.ServeMux {
+// NewMux composes liveness with an optional GitHub webhook route.
+func NewMux(webhook http.Handler) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.Handle("POST "+WebhookPath, h)
-	mux.HandleFunc("GET "+HealthPath, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET "+HealthPath, func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	if webhook != nil {
+		mux.Handle("POST "+WebhookPath, webhook)
+	}
 	return mux
 }
 

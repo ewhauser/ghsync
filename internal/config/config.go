@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/acme/frontier/internal/dispatch"
 )
 
 const (
@@ -16,7 +18,6 @@ const (
 	defaultDispatchMaxAttempts = 5
 	defaultDispatchDebounce    = 5 * time.Second
 	defaultDispatchPoll        = 250 * time.Millisecond
-	maxDispatchDebounce        = 15 * time.Second
 
 	defaultFetchBatchWindow = 5 * time.Millisecond
 	defaultBackfillPageSize = 100
@@ -252,10 +253,10 @@ func FromEnv() (Config, error) {
 		if err != nil {
 			return Config{}, err
 		}
-		if value > maxDispatchDebounce {
+		if value > dispatch.MaxDebounce {
 			return Config{}, fmt.Errorf(
 				"DISPATCH_DEBOUNCE must not exceed %s",
-				maxDispatchDebounce,
+				dispatch.MaxDebounce,
 			)
 		}
 		cfg.DispatchDebounce = value

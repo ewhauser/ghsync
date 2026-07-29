@@ -33,11 +33,3 @@ func parseEntityKey(raw, wantKind string) (entityKey, error) {
 	}
 	return key, nil
 }
-
-func splitRepo(fullName string) (string, string, error) {
-	owner, name, ok := strings.Cut(fullName, "/")
-	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-		return "", "", fmt.Errorf("invalid repository %q", fullName)
-	}
-	return owner, name, nil
-}

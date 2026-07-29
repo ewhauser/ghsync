@@ -85,6 +85,82 @@ func TestNoopDeriverEndToEnd(t *testing.T) {
 	}
 }
 
+func TestRunReconnectsAfterListenerBackendTermination(t *testing.T) {
+	pool := deriveDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	service, err := New(Options{
+		Pool:           pool,
+		Deriver:        NoopDeriver{},
+		DirtyCap:       10_000,
+		PollInterval:   20 * time.Millisecond,
+		InstallationID: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listeners := make(chan uint32, 2)
+	service.listenerReady = func(pid uint32) { listeners <- pid }
+
+	runCtx, stop := context.WithCancel(ctx)
+	runErr := make(chan error, 1)
+	go func() { runErr <- service.Run(runCtx) }()
+
+	var listenerPID uint32
+	select {
+	case listenerPID = <-listeners:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	var terminated bool
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT pg_terminate_backend($1)`,
+		int32(listenerPID),
+	).Scan(&terminated); err != nil {
+		t.Fatal(err)
+	}
+	if !terminated {
+		t.Fatalf("deriver listener backend %d was not terminated", listenerPID)
+	}
+
+	scope, _ := insertLoosePullScope(t, ctx, pool, "listener-reconnect")
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var dirty int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM derivation_dirty WHERE scope_key = $1
+		`, scope).Scan(&dirty); err != nil {
+			t.Fatal(err)
+		}
+		if dirty == 0 {
+			break
+		}
+		select {
+		case err := <-runErr:
+			t.Fatalf("deriver stopped after listener termination: %v", err)
+		case <-deadline.C:
+			t.Fatal("poll fallback did not drain after listener termination")
+		case <-ticker.C:
+		}
+	}
+
+	select {
+	case <-listeners:
+		// The listener reconnected while interval polling kept doing work.
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	stop()
+	if err := <-runErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

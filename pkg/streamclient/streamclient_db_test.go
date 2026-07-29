@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/acme/frontier/internal/outbox"
@@ -20,6 +21,77 @@ import (
 )
 
 var streamTestID atomic.Int64
+
+func TestIsRetryableTaxonomy(t *testing.T) {
+	t.Parallel()
+	contention := newCursorContention(
+		"consumer",
+		"entities",
+		&pgconn.PgError{Code: "40001", Message: "serialization"},
+	)
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{
+			name: "cursor contention",
+			err:  fmt.Errorf("tail: %w", contention),
+			want: true,
+		},
+		{
+			name: "listener pool",
+			err: fmt.Errorf(
+				"%w: %w",
+				ErrListenerUnavailable,
+				context.DeadlineExceeded,
+			),
+			want: true,
+		},
+		{
+			name: "raw serialization",
+			err: &pgconn.PgError{
+				Code:    "40001",
+				Message: "serialization",
+			},
+			want: true,
+		},
+		{
+			name: "pool capacity",
+			err: &pgconn.PgError{
+				Code:    "53300",
+				Message: "too many connections",
+			},
+			want: true,
+		},
+		{
+			name: "resync action",
+			err:  &ErrResyncRequired{},
+			want: false,
+		},
+		{name: "canceled", err: context.Canceled, want: false},
+		{
+			name: "deadline",
+			err:  context.DeadlineExceeded,
+			want: false,
+		},
+		{name: "terminal", err: errors.New("bad handler"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsRetryable(test.err); got != test.want {
+				t.Fatalf(
+					"IsRetryable(%v) = %t, want %t",
+					test.err,
+					got,
+					test.want,
+				)
+			}
+		})
+	}
+}
 
 func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 	t *testing.T,
@@ -35,7 +107,7 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 		t.Fatal(err)
 	}
 	initialCursor := snapshot.SafeSeq
-	if err := snapshot.Tx.Commit(ctx); err != nil {
+	if err := snapshot.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,6 +269,107 @@ func TestTailRetriesConcurrentCursorFirstTouchRace(t *testing.T) {
 	}
 }
 
+func TestSnapshotCommitPriorSeqAndIdempotentClose(t *testing.T) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("snapshot-lifecycle")
+	consumer := uniqueStreamName("consumer")
+	client := newTestClient(t, pool, 10)
+
+	initial, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.PriorSeq != 0 {
+		t.Fatalf("initial PriorSeq = %d, want 0", initial.PriorSeq)
+	}
+	if err := initial.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatalf("Close after Commit = %v", err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatalf("second Close after Commit = %v", err)
+	}
+
+	seq := insertCommittedEvent(
+		t,
+		ctx,
+		pool,
+		streamName,
+		"snapshot-lifecycle",
+		time.Now(),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	advanceThrough(t, ctx, watermarker, seq)
+
+	beforeAcquire := pool.Stat().AcquiredConns()
+	snapshot, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.PriorSeq != initial.SafeSeq {
+		t.Fatalf(
+			"PriorSeq = %d, want prior committed cursor %d",
+			snapshot.PriorSeq,
+			initial.SafeSeq,
+		)
+	}
+	if snapshot.SafeSeq < seq {
+		t.Fatalf("SafeSeq = %d, want at least %d", snapshot.SafeSeq, seq)
+	}
+	if got := pool.Stat().AcquiredConns(); got != beforeAcquire+1 {
+		t.Fatalf(
+			"acquired connections during snapshot = %d, want %d",
+			got,
+			beforeAcquire+1,
+		)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatalf("abandon Snapshot = %v", err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatalf("second abandon Snapshot = %v", err)
+	}
+	if cursor := readCursor(t, pool, consumer, streamName); cursor !=
+		snapshot.PriorSeq {
+		t.Fatalf(
+			"cursor after Close = %d, want PriorSeq %d",
+			cursor,
+			snapshot.PriorSeq,
+		)
+	}
+	if got := pool.Stat().AcquiredConns(); got != beforeAcquire {
+		t.Fatalf(
+			"acquired connections after Close = %d, want %d",
+			got,
+			beforeAcquire,
+		)
+	}
+
+	committed, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := committed.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cursor := readCursor(t, pool, consumer, streamName); cursor !=
+		committed.SafeSeq {
+		t.Fatalf(
+			"cursor after Commit = %d, want SafeSeq %d",
+			cursor,
+			committed.SafeSeq,
+		)
+	}
+	if err := committed.Close(); err != nil {
+		t.Fatalf("Close after committed reset = %v", err)
+	}
+}
+
 func TestRetentionCannotDeleteBetweenHorizonCheckAndPageSnapshot(
 	t *testing.T,
 ) {
@@ -302,7 +475,7 @@ func TestWatermarkIgnoresUnrelatedWriterAndLongBootstrapSnapshot(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer bootstrap.Tx.Rollback(context.Background()) //nolint:errcheck
+	defer bootstrap.Close() //nolint:errcheck
 
 	streamName := uniqueStreamName("liveness")
 	seq := insertCommittedEvent(
@@ -334,7 +507,7 @@ func TestTailRecoversAfterListenerDisconnectWhilePollingContinues(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := snapshot.Tx.Commit(ctx); err != nil {
+	if err := snapshot.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -389,6 +562,279 @@ func TestTailRecoversAfterListenerDisconnectWhilePollingContinues(
 	}
 }
 
+func TestTailRepeatedListenerTerminationReachesMaxBackoffAndRecovers(
+	t *testing.T,
+) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("listener-churn")
+	consumer := uniqueStreamName("consumer")
+	client := newTestClient(t, pool, 10)
+	client.minBackoff = 5 * time.Millisecond
+	client.maxBackoff = 20 * time.Millisecond
+	snapshot, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const terminationCount = 4
+	hookErr := make(chan error, terminationCount)
+	retry := make(chan struct {
+		err   error
+		delay time.Duration
+	}, terminationCount+2)
+	recovered := make(chan struct{})
+	var connected atomic.Int32
+	var recoveredOnce sync.Once
+	client.testHooks.listenerConnected = func(pid uint32) {
+		if connected.Add(1) <= terminationCount {
+			var terminated bool
+			err := pool.QueryRow(
+				context.Background(),
+				`SELECT pg_terminate_backend($1)`,
+				pid,
+			).Scan(&terminated)
+			if err == nil && !terminated {
+				err = fmt.Errorf(
+					"listener backend %d was not terminated",
+					pid,
+				)
+			}
+			if err != nil {
+				hookErr <- err
+			}
+			return
+		}
+		recoveredOnce.Do(func() { close(recovered) })
+	}
+	client.testHooks.listenerRetry = func(
+		err error,
+		delay time.Duration,
+	) {
+		retry <- struct {
+			err   error
+			delay time.Duration
+		}{err: err, delay: delay}
+	}
+
+	tailCtx, stopTail := context.WithCancel(ctx)
+	tailErr := make(chan error, 1)
+	delivered := make(chan int64, 1)
+	go func() {
+		tailErr <- client.Tail(
+			tailCtx,
+			consumer,
+			streamName,
+			func(_ context.Context, _ pgx.Tx, event Event) error {
+				delivered <- event.Seq
+				return nil
+			},
+		)
+	}()
+
+	wantBackoffs := []time.Duration{
+		5 * time.Millisecond,
+		10 * time.Millisecond,
+		20 * time.Millisecond,
+		20 * time.Millisecond,
+	}
+	for index, want := range wantBackoffs {
+		select {
+		case observation := <-retry:
+			if !errors.Is(observation.err, ErrListenerUnavailable) {
+				t.Fatalf(
+					"retry %d error = %v, want ErrListenerUnavailable",
+					index,
+					observation.err,
+				)
+			}
+			if !IsRetryable(observation.err) {
+				t.Fatalf("retry %d error is not retryable", index)
+			}
+			if observation.delay != want {
+				t.Fatalf(
+					"retry %d delay = %s, want %s",
+					index,
+					observation.delay,
+					want,
+				)
+			}
+		case err := <-hookErr:
+			t.Fatal(err)
+		case err := <-tailErr:
+			t.Fatalf("Tail stopped during listener churn: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	select {
+	case <-recovered:
+	case err := <-hookErr:
+		t.Fatal(err)
+	case err := <-tailErr:
+		t.Fatalf("Tail stopped before listener recovery: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	seq := insertCommittedEvent(
+		t, ctx, pool, streamName, "after-churn", time.Now(),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	advanceThrough(t, ctx, watermarker, seq)
+	select {
+	case got := <-delivered:
+		if got != seq {
+			t.Fatalf("delivered seq = %d, want %d", got, seq)
+		}
+	case err := <-tailErr:
+		t.Fatalf("Tail stopped after listener recovery: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	stopTail()
+	if err := <-tailErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Tail exit = %v", err)
+	}
+}
+
+func TestTailPersistentListenerPoolExhaustionPollsThenRecovers(
+	t *testing.T,
+) {
+	pool, clientPool := streamTestDatabaseWithClientPool(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("listener-pool")
+	consumer := uniqueStreamName("consumer")
+	client := newTestClient(t, clientPool, 10)
+	client.minBackoff = 5 * time.Millisecond
+	client.maxBackoff = 20 * time.Millisecond
+	snapshot, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const exhaustedAttempts = 3
+	var attempts atomic.Int32
+	var pollOnly atomic.Int32
+	hookErr := make(chan error, exhaustedAttempts)
+	retries := make(chan error, exhaustedAttempts)
+	recovered := make(chan struct{})
+	var recoveredOnce sync.Once
+	client.testHooks.beforeListenerAcquire = func() {
+		if attempts.Add(1) > exhaustedAttempts {
+			return
+		}
+		acquireCtx, stopAcquire := context.WithTimeout(
+			context.Background(),
+			time.Second,
+		)
+		conn, err := clientPool.Acquire(acquireCtx)
+		stopAcquire()
+		if err != nil {
+			hookErr <- fmt.Errorf(
+				"occupy listener pool: %w",
+				err,
+			)
+			return
+		}
+		time.AfterFunc(30*time.Millisecond, conn.Release)
+	}
+	client.testHooks.listenerRetry = func(
+		err error,
+		_ time.Duration,
+	) {
+		retries <- err
+	}
+	client.testHooks.pollOnly = func() {
+		pollOnly.Add(1)
+	}
+	client.testHooks.listenerConnected = func(uint32) {
+		recoveredOnce.Do(func() { close(recovered) })
+	}
+
+	tailCtx, stopTail := context.WithCancel(ctx)
+	tailErr := make(chan error, 1)
+	delivered := make(chan int64, 1)
+	go func() {
+		tailErr <- client.Tail(
+			tailCtx,
+			consumer,
+			streamName,
+			func(_ context.Context, _ pgx.Tx, event Event) error {
+				delivered <- event.Seq
+				return nil
+			},
+		)
+	}()
+	for index := range exhaustedAttempts {
+		select {
+		case retryErr := <-retries:
+			if !errors.Is(retryErr, ErrListenerUnavailable) {
+				t.Fatalf(
+					"pool retry %d = %v, want ErrListenerUnavailable",
+					index,
+					retryErr,
+				)
+			}
+			if !IsRetryable(retryErr) {
+				t.Fatalf("pool retry %d is not retryable", index)
+			}
+		case err := <-hookErr:
+			t.Fatal(err)
+		case err := <-tailErr:
+			t.Fatalf("Tail stopped during pool exhaustion: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	if got := pollOnly.Load(); got < exhaustedAttempts {
+		t.Fatalf(
+			"poll-only iterations = %d, want at least %d",
+			got,
+			exhaustedAttempts,
+		)
+	}
+	select {
+	case <-recovered:
+	case err := <-hookErr:
+		t.Fatal(err)
+	case err := <-tailErr:
+		t.Fatalf("Tail stopped before pool recovery: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	seq := insertCommittedEvent(
+		t, ctx, pool, streamName, "after-pool-recovery", time.Now(),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	advanceThrough(t, ctx, watermarker, seq)
+	select {
+	case got := <-delivered:
+		if got != seq {
+			t.Fatalf("delivered seq = %d, want %d", got, seq)
+		}
+	case err := <-tailErr:
+		t.Fatalf("Tail stopped after pool recovery: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	stopTail()
+	if err := <-tailErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Tail exit = %v", err)
+	}
+}
+
 func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -401,7 +847,7 @@ func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	initialCursor := snapshot.SafeSeq
-	if err := snapshot.Tx.Commit(ctx); err != nil {
+	if err := snapshot.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -501,7 +947,7 @@ func TestRetentionResyncBootstrapConvergesWithoutDuplicateSeqApplication(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := snapshot.Tx.Commit(ctx); err != nil {
+	if err := snapshot.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -596,7 +1042,7 @@ func TestRetentionResyncBootstrapConvergesWithoutDuplicateSeqApplication(
 	`, projection), identity); err != nil {
 		t.Fatal(err)
 	}
-	if err := snapshot.Tx.Commit(ctx); err != nil {
+	if err := snapshot.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 

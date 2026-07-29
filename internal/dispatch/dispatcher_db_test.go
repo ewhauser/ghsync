@@ -47,7 +47,7 @@ func TestConcurrentDispatchersLockGenerationKeysInDeterministicOrder(t *testing.
 		dispatchPool *pgxpool.Pool,
 		riverClient *river.Client[pgx.Tx],
 	) *Dispatcher {
-		return New(dispatchPool, riverClient, Config{
+		return mustNewDispatcher(t, dispatchPool, riverClient, Config{
 			BatchSize:    keyCount,
 			MaxAttempts:  3,
 			Debounce:     5 * time.Second,
@@ -234,14 +234,14 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(
+	server := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(pool),
 			testWebhookSecret,
 			1<<20,
 			5*time.Second,
-		).Mux(),
-	)
+		),
+	))
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
 	deliveries := loadRecordedDeliveries(t)
@@ -259,7 +259,7 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 		dispatchTime := baseTime.Add(time.Duration(run) * time.Hour)
 		dispatchOnce := func(batchSize int) int {
 			t.Helper()
-			dispatcher := New(pool, riverClient, Config{
+			dispatcher := mustNewDispatcher(t, pool, riverClient, Config{
 				BatchSize:    batchSize,
 				MaxAttempts:  3,
 				Debounce:     5 * time.Second,
@@ -339,14 +339,14 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(
+	server := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(pool),
 			testWebhookSecret,
 			1<<20,
 			5*time.Second,
-		).Mux(),
-	)
+		),
+	))
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
 	repo := "acme/rebase-storm"
@@ -371,7 +371,7 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 	}
 
 	now := time.Date(2026, 7, 28, 20, 0, 0, 0, time.UTC)
-	dispatcher := New(pool, riverClient, Config{
+	dispatcher := mustNewDispatcher(t, pool, riverClient, Config{
 		BatchSize:    1,
 		MaxAttempts:  3,
 		Debounce:     5 * time.Second,
@@ -453,20 +453,20 @@ func TestRunningRefreshRetryableTransitionCannotCollide(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(
+	server := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(pool),
 			testWebhookSecret,
 			1<<20,
 			5*time.Second,
-		).Mux(),
-	)
+		),
+	))
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
 	repo := "acme/running-follow-up"
 	key := "branch:" + repo + ":stack/layer"
 	now := time.Date(2026, 7, 28, 21, 0, 0, 0, time.UTC)
-	dispatcher := New(pool, riverClient, Config{
+	dispatcher := mustNewDispatcher(t, pool, riverClient, Config{
 		BatchSize:    10,
 		MaxAttempts:  3,
 		Debounce:     5 * time.Second,
@@ -546,18 +546,18 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(
+	server := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(pool),
 			testWebhookSecret,
 			1<<20,
 			5*time.Second,
-		).Mux(),
-	)
+		),
+	))
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
 	observer := &recordingDispatchObserver{}
-	dispatcher := New(pool, riverClient, Config{
+	dispatcher := mustNewDispatcher(t, pool, riverClient, Config{
 		BatchSize:    10,
 		MaxAttempts:  2,
 		Debounce:     5 * time.Second,
@@ -841,17 +841,18 @@ func cloneDispatchPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
 	return clone
 }
 
-func drainDispatcher(t *testing.T, dispatcher *Dispatcher) {
+func mustNewDispatcher(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	client *river.Client[pgx.Tx],
+	config Config,
+) *Dispatcher {
 	t.Helper()
-	for {
-		count, err := dispatcher.DispatchBatch(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if count == 0 {
-			return
-		}
+	dispatcher, err := New(pool, client, config)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return dispatcher
 }
 
 func deliveryPayloadForRepo(

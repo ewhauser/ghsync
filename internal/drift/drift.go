@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"reflect"
 	"sort"
 	"strconv"
@@ -23,8 +22,10 @@ import (
 
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/gh"
+	"github.com/acme/frontier/internal/observer"
 	"github.com/acme/frontier/internal/opsstate"
 	"github.com/acme/frontier/internal/queue"
+	"github.com/acme/frontier/internal/repoutil"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
@@ -43,14 +44,22 @@ var driftEntityKinds = []string{
 }
 
 type Config struct {
-	InstallationID     int64
-	Period             time.Duration
-	SampleSize         int
-	PageSize           int
-	ResolvedRetention  time.Duration
+	// InstallationID selects the GitHub installation and cached rows sampled.
+	InstallationID int64
+	// Period controls how often River schedules a detector pass.
+	Period time.Duration
+	// SampleSize bounds the number of entities inspected per pass.
+	SampleSize int
+	// PageSize bounds pagination used by full-fetch comparisons.
+	PageSize int
+	// ResolvedRetention controls how long resolved findings remain queryable.
+	ResolvedRetention time.Duration
+	// RetentionBatchSize bounds resolved-finding deletes per transaction.
 	RetentionBatchSize int
-	Now                func() time.Time
-	Observer           Observer
+	// Now supplies detector time; it defaults to time.Now.
+	Now func() time.Time
+	// Observer receives divergence and persistence signals.
+	Observer Observer
 }
 
 type Observer interface {
@@ -87,37 +96,24 @@ func (LogObserver) PersistentDivergence(
 	)
 }
 
-type noopObserver struct{}
-
-func (noopObserver) Divergence(context.Context, dbgen.DriftFinding) {}
-func (noopObserver) PersistentDivergence(
-	context.Context,
-	dbgen.DriftFinding,
-) {
-}
-
 type Observers []Observer
 
 func (observers Observers) Divergence(
 	ctx context.Context,
 	finding dbgen.DriftFinding,
 ) {
-	for _, observer := range observers {
-		if observer != nil {
-			observer.Divergence(ctx, finding)
-		}
-	}
+	observer.FanOut(observers, func(item Observer) {
+		item.Divergence(ctx, finding)
+	})
 }
 
 func (observers Observers) PersistentDivergence(
 	ctx context.Context,
 	finding dbgen.DriftFinding,
 ) {
-	for _, observer := range observers {
-		if observer != nil {
-			observer.PersistentDivergence(ctx, finding)
-		}
-	}
+	observer.FanOut(observers, func(item Observer) {
+		item.PersistentDivergence(ctx, finding)
+	})
 }
 
 type Options struct {
@@ -131,6 +127,7 @@ type Service struct {
 	pool    *pgxpool.Pool
 	rest    *gh.RESTClient
 	graphQL *gh.GraphQLClient
+	writer  *store.EntityWriter
 	config  Config
 
 	riverMu sync.RWMutex
@@ -156,12 +153,13 @@ func New(options Options) (*Service, error) {
 		options.Config.Now = time.Now
 	}
 	if options.Config.Observer == nil {
-		options.Config.Observer = noopObserver{}
+		options.Config.Observer = Observers{}
 	}
 	return &Service{
 		pool:    options.Pool,
 		rest:    options.REST,
 		graphQL: options.GraphQL,
+		writer:  store.NewEntityWriter(options.Pool),
 		config:  options.Config,
 	}, nil
 }
@@ -359,7 +357,7 @@ func (s *Service) Detect(
 	if _, err := queries.PruneResolvedDriftFindingBatch(
 		ctx,
 		dbgen.PruneResolvedDriftFindingBatchParams{
-			Cutoff: timestamptz(
+			Cutoff: repoutil.Timestamptz(
 				s.config.Now().Add(-s.config.ResolvedRetention),
 			),
 			BatchSize: int32(s.config.RetentionBatchSize),
@@ -423,7 +421,7 @@ func (s *Service) inspectSample(
 	if err != nil {
 		return dbgen.DriftFinding{}, false, false, err
 	}
-	observation, err := store.NewEntityWriter(s.pool).BeginObservation(
+	observation, err := s.writer.BeginObservation(
 		ctx,
 		sample.LockKey,
 	)
@@ -485,7 +483,7 @@ func (s *Service) inspectSample(
 		if _, err := dbgen.New(s.pool).ResolveOpenDriftFindings(
 			ctx,
 			dbgen.ResolveOpenDriftFindingsParams{
-				ResolvedAt:     timestamptz(s.config.Now()),
+				ResolvedAt:     repoutil.Timestamptz(s.config.Now()),
 				InstallationID: s.config.InstallationID,
 				EntityKind:     current.EntityKind,
 				EntityKey:      current.EntityKey,
@@ -666,11 +664,11 @@ func (s *Service) recordAndHeal(
 			result, updateErr := queries.EscalateOpenDriftFinding(
 				ctx,
 				dbgen.EscalateOpenDriftFindingParams{
-					LastSeenAt:       timestamptz(now),
+					LastSeenAt:       repoutil.Timestamptz(now),
 					CacheSnapshot:    sample.CacheSnapshot,
 					UpstreamSnapshot: upstream,
 					Diff:             diff,
-					EscalatedAt:      timestamptz(now),
+					EscalatedAt:      repoutil.Timestamptz(now),
 					ID:               finding.ID,
 				},
 			)
@@ -685,7 +683,7 @@ func (s *Service) recordAndHeal(
 			finding, err = queries.TouchOpenDriftFinding(
 				ctx,
 				dbgen.TouchOpenDriftFindingParams{
-					LastSeenAt:       timestamptz(now),
+					LastSeenAt:       repoutil.Timestamptz(now),
 					CacheSnapshot:    sample.CacheSnapshot,
 					UpstreamSnapshot: upstream,
 					Diff:             diff,
@@ -713,12 +711,12 @@ func (s *Service) recordAndHeal(
 			InstallationID:    s.config.InstallationID,
 			EntityKind:        sample.EntityKind,
 			EntityKey:         sample.EntityKey,
-			DetectedAt:        timestamptz(now),
+			DetectedAt:        repoutil.Timestamptz(now),
 			CacheSnapshot:     sample.CacheSnapshot,
 			UpstreamSnapshot:  upstream,
 			Diff:              diff,
 			DiffHash:          hash,
-			RefreshEnqueuedAt: timestamptz(now),
+			RefreshEnqueuedAt: repoutil.Timestamptz(now),
 		},
 	)
 	if err != nil {
@@ -776,7 +774,7 @@ func (s *Service) fullFetch(
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
-		owner, name, err := splitRepo(repo)
+		owner, name, err := repoutil.Split(repo)
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
@@ -791,7 +789,7 @@ func (s *Service) fullFetch(
 			Kind: queue.KindRefreshRepository,
 			Key:  key,
 		}
-		if isNotFound(err) {
+		if repoutil.IsNotFound(err) {
 			return tombstoneSnapshot(), spec, nil
 		}
 		if err != nil {
@@ -815,7 +813,7 @@ func (s *Service) fullFetch(
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
-		owner, name, err := splitRepo(repo)
+		owner, name, err := repoutil.Split(repo)
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
@@ -828,7 +826,7 @@ func (s *Service) fullFetch(
 			"",
 		)
 		spec := queue.RefreshSpec{Kind: queue.KindRefreshPR, Key: key}
-		if isNotFound(err) {
+		if repoutil.IsNotFound(err) {
 			return tombstoneSnapshot(), spec, nil
 		}
 		if err != nil {
@@ -866,7 +864,7 @@ func (s *Service) fullFetch(
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
-		owner, name, err := splitRepo(repo)
+		owner, name, err := repoutil.Split(repo)
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
@@ -879,7 +877,7 @@ func (s *Service) fullFetch(
 			"",
 		)
 		spec := queue.RefreshSpec{Kind: queue.KindRefreshStack, Key: key}
-		if isNotFound(err) {
+		if repoutil.IsNotFound(err) {
 			return tombstoneSnapshot(), spec, nil
 		}
 		if err != nil {
@@ -918,7 +916,7 @@ func (s *Service) fullFetch(
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
-		owner, name, err := splitRepo(repo)
+		owner, name, err := repoutil.Split(repo)
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
@@ -933,7 +931,7 @@ func (s *Service) fullFetch(
 			Kind: queue.KindRefreshRepoRules,
 			Key:  key,
 		}
-		if isNotFound(err) {
+		if repoutil.IsNotFound(err) {
 			return tombstoneSnapshot(), spec, nil
 		}
 		if err != nil {
@@ -962,7 +960,7 @@ func (s *Service) fullFetch(
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
-		owner, name, err := splitRepo(repo)
+		owner, name, err := repoutil.Split(repo)
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
@@ -978,7 +976,7 @@ func (s *Service) fullFetch(
 			Kind: queue.KindRefreshPR,
 			Key:  fmt.Sprintf("pr:%s:%d", repo, number),
 		}
-		if isNotFound(err) {
+		if repoutil.IsNotFound(err) {
 			return tombstoneSnapshot(), spec, nil
 		}
 		if err != nil {
@@ -1011,7 +1009,7 @@ func (s *Service) fullFetch(
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
-		owner, name, err := splitRepo(repo)
+		owner, name, err := repoutil.Split(repo)
 		if err != nil {
 			return nil, queue.RefreshSpec{}, err
 		}
@@ -1034,7 +1032,7 @@ func (s *Service) fullFetch(
 					Kind: queue.KindRefreshChecks,
 					Key:  key,
 				}
-				if isNotFound(fetchErr) {
+				if repoutil.IsNotFound(fetchErr) {
 					return tombstoneSnapshot(), spec, nil
 				}
 				return nil, spec, fmt.Errorf(
@@ -1251,22 +1249,4 @@ func stringKey(key, prefix string) (string, string, error) {
 		return "", "", fmt.Errorf("invalid entity key %q", key)
 	}
 	return rest[:index], rest[index+1:], nil
-}
-
-func splitRepo(fullName string) (string, string, error) {
-	owner, repo, ok := strings.Cut(fullName, "/")
-	if !ok || owner == "" || repo == "" || strings.Contains(repo, "/") {
-		return "", "", fmt.Errorf("invalid repository name %q", fullName)
-	}
-	return owner, repo, nil
-}
-
-func isNotFound(err error) bool {
-	var httpErr *gh.HTTPError
-	return errors.As(err, &httpErr) &&
-		httpErr.StatusCode == http.StatusNotFound
-}
-
-func timestamptz(value time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: value.UTC(), Valid: true}
 }

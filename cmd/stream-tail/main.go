@@ -128,20 +128,38 @@ func tailWithResync(
 			},
 		)
 		var resync *streamclient.ErrResyncRequired
-		if !errors.As(err, &resync) {
+		if errors.As(err, &resync) {
+			slog.Warn(
+				"stream resync required; rebuilding projection",
+				"consumer", resync.Consumer,
+				"stream", resync.Stream,
+				"cursor", resync.Cursor,
+				"pruned_through", resync.PrunedThrough,
+			)
+			if err := bootstrapAndRebuild(
+				ctx, client, consumer, stream,
+			); err != nil {
+				return fmt.Errorf("resync stream: %w", err)
+			}
+			continue
+		}
+		if !streamclient.IsRetryable(err) {
 			return err
 		}
 		slog.Warn(
-			"stream resync required; rebuilding projection",
-			"consumer", resync.Consumer,
-			"stream", resync.Stream,
-			"cursor", resync.Cursor,
-			"pruned_through", resync.PrunedThrough,
+			"retryable stream error; restarting tail",
+			"consumer", consumer,
+			"stream", stream,
+			"error", err,
 		)
-		if err := bootstrapAndRebuild(
-			ctx, client, consumer, stream,
-		); err != nil {
-			return fmt.Errorf("resync stream: %w", err)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
 }
@@ -151,21 +169,29 @@ func bootstrapAndRebuild(
 	client *streamclient.Client,
 	consumer string,
 	stream string,
-) error {
+) (resultErr error) {
 	snapshot, err := client.Bootstrap(ctx, consumer, stream)
 	if err != nil {
 		return fmt.Errorf("bootstrap stream snapshot: %w", err)
 	}
+	defer func() {
+		if closeErr := snapshot.Close(); resultErr == nil &&
+			closeErr != nil {
+			resultErr = fmt.Errorf(
+				"close bootstrap snapshot: %w",
+				closeErr,
+			)
+		}
+	}()
 	// The projection replacement and cursor reset share snapshot.Tx. A real
 	// consumer deletes/replaces its projection from Frontier's public cache
 	// tables here. This logging reference has no materialized projection, so
 	// its rebuild is intentionally a stub. Never move a real rebuild after
 	// Commit: doing so would acknowledge events without applying their state.
 	if err := rebuildProjection(ctx, snapshot.Tx); err != nil {
-		_ = snapshot.Tx.Rollback(context.WithoutCancel(ctx))
 		return fmt.Errorf("rebuild projection: %w", err)
 	}
-	if err := snapshot.Tx.Commit(ctx); err != nil {
+	if err := snapshot.Commit(ctx); err != nil {
 		return fmt.Errorf("commit bootstrap snapshot: %w", err)
 	}
 	slog.Info(
@@ -173,6 +199,7 @@ func bootstrapAndRebuild(
 		"consumer", consumer,
 		"stream", stream,
 		"safe_seq", snapshot.SafeSeq,
+		"prior_seq", snapshot.PriorSeq,
 	)
 	return nil
 }

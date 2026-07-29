@@ -11,19 +11,19 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
 
 	"github.com/acme/frontier/internal/gh"
+	"github.com/acme/frontier/internal/observer"
 	"github.com/acme/frontier/internal/opsstate"
 	"github.com/acme/frontier/internal/queue"
+	"github.com/acme/frontier/internal/repoutil"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
@@ -41,28 +41,45 @@ const (
 )
 
 type Config struct {
+	// InstallationID selects the GitHub installation reconciled by this service.
 	InstallationID int64
 
+	// OpenStackMaxStaleness bounds how long an open stack may go unchecked.
 	OpenStackMaxStaleness time.Duration
-	OpenPRMaxStaleness    time.Duration
+	// OpenPRMaxStaleness bounds how long an open pull request may go unchecked.
+	OpenPRMaxStaleness time.Duration
+	// RepoRulesMaxStaleness bounds repository-rules cache staleness.
 	RepoRulesMaxStaleness time.Duration
-	ClosedMaxStaleness    time.Duration
-	RepositoryListPeriod  time.Duration
+	// ClosedMaxStaleness bounds checks of tracked closed entities.
+	ClosedMaxStaleness time.Duration
+	// RepositoryListPeriod controls authoritative installation listings.
+	RepositoryListPeriod time.Duration
 
+	// PageSize bounds authoritative GitHub list pages.
 	PageSize int
 
+	// GapHealPeriod controls delivery-gap scan scheduling.
 	GapHealPeriod time.Duration
-	GapWindow     time.Duration
-	GapPageSize   int
-	GapMaxPages   int
+	// GapWindow is the delivery-history interval inspected by each scan.
+	GapWindow time.Duration
+	// GapPageSize bounds one deliveries API page.
+	GapPageSize int
+	// GapMaxPages bounds pages inspected before scheduling a continuation.
+	GapMaxPages int
 
-	RetentionPeriod    time.Duration
-	RetentionAge       time.Duration
+	// RetentionPeriod controls payload-pruner scheduling.
+	RetentionPeriod time.Duration
+	// RetentionAge determines when bulky retained data becomes eligible.
+	RetentionAge time.Duration
+	// RetentionBatchSize bounds deletes per transaction.
 	RetentionBatchSize int
 
-	Now      func() time.Time
+	// Now supplies service time; it defaults to time.Now.
+	Now func() time.Time
+	// Observer receives sweep-overrun and gap-healing signals.
 	Observer Observer
-	OnPrune  PruneHook
+	// OnPrune receives per-kind deletion totals after a prune pass.
+	OnPrune PruneHook
 }
 
 // PruneHook is M6's C-R retention-deletion accounting seam.
@@ -180,18 +197,6 @@ func (LogObserver) GapWindowIncomplete(
 	)
 }
 
-type noopObserver struct{}
-
-func (noopObserver) SweepOverrun(
-	context.Context,
-	string,
-	string,
-	time.Duration,
-) {
-}
-func (noopObserver) GapRedelivery(context.Context, int64, string)     {}
-func (noopObserver) GapWindowIncomplete(context.Context, string, int) {}
-
 type Observers []Observer
 
 func (observers Observers) SweepOverrun(
@@ -200,11 +205,9 @@ func (observers Observers) SweepOverrun(
 	scope string,
 	elapsed time.Duration,
 ) {
-	for _, observer := range observers {
-		if observer != nil {
-			observer.SweepOverrun(ctx, kind, scope, elapsed)
-		}
-	}
+	observer.FanOut(observers, func(item Observer) {
+		item.SweepOverrun(ctx, kind, scope, elapsed)
+	})
 }
 
 func (observers Observers) GapRedelivery(
@@ -212,11 +215,9 @@ func (observers Observers) GapRedelivery(
 	deliveryID int64,
 	guid string,
 ) {
-	for _, observer := range observers {
-		if observer != nil {
-			observer.GapRedelivery(ctx, deliveryID, guid)
-		}
-	}
+	observer.FanOut(observers, func(item Observer) {
+		item.GapRedelivery(ctx, deliveryID, guid)
+	})
 }
 
 func (observers Observers) GapWindowIncomplete(
@@ -224,11 +225,9 @@ func (observers Observers) GapWindowIncomplete(
 	cursor string,
 	pages int,
 ) {
-	for _, observer := range observers {
-		if observer != nil {
-			observer.GapWindowIncomplete(ctx, cursor, pages)
-		}
-	}
+	observer.FanOut(observers, func(item Observer) {
+		item.GapWindowIncomplete(ctx, cursor, pages)
+	})
 }
 
 type Options struct {
@@ -256,7 +255,7 @@ func New(options Options) (*Service, error) {
 		options.Config.Now = time.Now
 	}
 	if options.Config.Observer == nil {
-		options.Config.Observer = noopObserver{}
+		options.Config.Observer = Observers{}
 	}
 	if err := options.Config.validate(); err != nil {
 		return nil, err
@@ -582,7 +581,7 @@ func (s *Service) startOrResumeScope(
 			ctx,
 			dbgen.StartSweepCursorParams{
 				FirstCursor:    firstCursor,
-				StartedAt:      timestamptz(now),
+				StartedAt:      repoutil.Timestamptz(now),
 				InstallationID: s.config.InstallationID,
 				SweepKind:      kind,
 				ScopeKey:       scope,
@@ -734,7 +733,7 @@ func (s *Service) fetchPage(
 		if err != nil {
 			return fetchedPage{}, err
 		}
-		owner, repo, err := splitRepo(args.ScopeKey)
+		owner, repo, err := repoutil.Split(args.ScopeKey)
 		if err != nil {
 			return fetchedPage{}, err
 		}
@@ -788,7 +787,7 @@ func (s *Service) fetchPage(
 		if err != nil {
 			return fetchedPage{}, err
 		}
-		owner, repo, err := splitRepo(args.ScopeKey)
+		owner, repo, err := repoutil.Split(args.ScopeKey)
 		if err != nil {
 			return fetchedPage{}, err
 		}
@@ -889,7 +888,7 @@ func (s *Service) persistPage(
 			InstallationID: args.Installation,
 			SweepKind:      args.SweepKind,
 			ScopeKey:       args.ScopeKey,
-			FirstSeenAt:    timestamptz(now),
+			FirstSeenAt:    repoutil.Timestamptz(now),
 		},
 	)
 	if err != nil {
@@ -906,7 +905,7 @@ func (s *Service) persistPage(
 			Etag:           page.etag,
 			NextCursor:     page.nextCursor,
 			EntityKeys:     encodedPageKeys,
-			ListSeenAt:     timestamptz(now),
+			ListSeenAt:     repoutil.Timestamptz(now),
 		},
 	); err != nil {
 		return fmt.Errorf("persist sweep page validator: %w", err)
@@ -921,7 +920,7 @@ func (s *Service) persistPage(
 				ctx,
 				dbgen.RestartSweepCursorPassParams{
 					FirstCursor:    "1",
-					UpdatedAt:      timestamptz(now),
+					UpdatedAt:      repoutil.Timestamptz(now),
 					InstallationID: args.Installation,
 					SweepKind:      args.SweepKind,
 					ScopeKey:       args.ScopeKey,
@@ -959,7 +958,7 @@ func (s *Service) persistPage(
 			if _, err := queries.CompleteSweepCursor(
 				ctx,
 				dbgen.CompleteSweepCursorParams{
-					CompletedAt:    timestamptz(now),
+					CompletedAt:    repoutil.Timestamptz(now),
 					InstallationID: args.Installation,
 					SweepKind:      args.SweepKind,
 					ScopeKey:       args.ScopeKey,
@@ -976,7 +975,7 @@ func (s *Service) persistPage(
 			dbgen.AdvanceSweepCursorParams{
 				NextCursor:     page.nextCursor,
 				PassNewCount:   int32(passNewCount),
-				UpdatedAt:      timestamptz(now),
+				UpdatedAt:      repoutil.Timestamptz(now),
 				InstallationID: args.Installation,
 				SweepKind:      args.SweepKind,
 				ScopeKey:       args.ScopeKey,
@@ -1081,7 +1080,7 @@ func (s *Service) enqueueStaleStacks(ctx context.Context) error {
 		ctx,
 		dbgen.ListStaleOpenStacksParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
+			StaleBefore:    repoutil.Timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1109,7 +1108,7 @@ func (s *Service) enqueueStalePullRequests(ctx context.Context) error {
 		ctx,
 		dbgen.ListStaleOpenPullRequestsParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
+			StaleBefore:    repoutil.Timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1132,7 +1131,7 @@ func (s *Service) enqueueStaleRepoRules(ctx context.Context) error {
 		ctx,
 		dbgen.ListStaleRepoRulesParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
+			StaleBefore:    repoutil.Timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1156,7 +1155,7 @@ func (s *Service) enqueueClosedTracked(ctx context.Context) error {
 		ctx,
 		dbgen.ListStaleClosedStacksParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
+			StaleBefore:    repoutil.Timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1166,7 +1165,7 @@ func (s *Service) enqueueClosedTracked(ctx context.Context) error {
 		ctx,
 		dbgen.ListStaleClosedPullRequestsParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
+			StaleBefore:    repoutil.Timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1255,16 +1254,4 @@ func numericNextCursor(page int) string {
 		return ""
 	}
 	return strconv.Itoa(page)
-}
-
-func splitRepo(fullName string) (string, string, error) {
-	owner, repo, ok := strings.Cut(fullName, "/")
-	if !ok || owner == "" || repo == "" || strings.Contains(repo, "/") {
-		return "", "", fmt.Errorf("invalid repository name %q", fullName)
-	}
-	return owner, repo, nil
-}
-
-func timestamptz(value time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: value.UTC(), Valid: true}
 }

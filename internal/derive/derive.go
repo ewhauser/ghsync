@@ -23,6 +23,8 @@ import (
 const (
 	defaultDirtyCap     = 500
 	defaultPollInterval = 500 * time.Millisecond
+	minListenerBackoff  = 100 * time.Millisecond
+	maxListenerBackoff  = 5 * time.Second
 	dirtyNotifyChannel  = "frontier_derivation_dirty"
 	deriverOperation    = "dirty_sets"
 )
@@ -115,6 +117,7 @@ type Service struct {
 	pollInterval   time.Duration
 	observer       Observer
 	installationID int64
+	listenerReady  func(uint32)
 }
 
 // New constructs a C-D2/C-P5 derivation service. NoopDeriver is wired when no
@@ -392,14 +395,10 @@ func (s *Service) recordHeartbeat(
 // Run drains full batches immediately, then uses dirty-set NOTIFY as a latency
 // hint with interval polling as the correctness path.
 func (s *Service) Run(ctx context.Context) error {
-	listener, err := s.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire deriver listener: %w", err)
-	}
-	defer listener.Release()
-	if _, err := listener.Exec(ctx, "LISTEN "+dirtyNotifyChannel); err != nil {
-		return fmt.Errorf("listen for dirty scopes: %w", err)
-	}
+	var listener *pgxpool.Conn
+	defer func() { releaseListener(listener) }()
+	listenerBackoff := minListenerBackoff
+	var nextListenerAttempt time.Time
 
 	for {
 		count, err := s.RunOnce(ctx)
@@ -412,6 +411,30 @@ func (s *Service) Run(ctx context.Context) error {
 		if count == s.dirtyCap {
 			continue
 		}
+
+		if listener == nil && !time.Now().Before(nextListenerAttempt) {
+			listener, err = s.acquireListener(ctx)
+			if err == nil {
+				listenerBackoff = minListenerBackoff
+				if s.listenerReady != nil {
+					s.listenerReady(listener.Conn().PgConn().PID())
+				}
+			} else {
+				if ctx.Err() != nil {
+					return nil
+				}
+				nextListenerAttempt = time.Now().Add(listenerBackoff)
+				listenerBackoff = growListenerBackoff(listenerBackoff)
+			}
+		}
+
+		if listener == nil {
+			if !waitForPoll(ctx, s.pollInterval) {
+				return nil
+			}
+			continue
+		}
+
 		waitCtx, cancel := context.WithTimeout(ctx, s.pollInterval)
 		_, waitErr := listener.Conn().WaitForNotification(waitCtx)
 		cancel()
@@ -421,8 +444,63 @@ func (s *Service) Run(ctx context.Context) error {
 		case ctx.Err() != nil:
 			return nil
 		default:
-			return fmt.Errorf("wait for dirty notification: %w", waitErr)
+			releaseListener(listener)
+			listener = nil
+			nextListenerAttempt = time.Now().Add(listenerBackoff)
+			listenerBackoff = growListenerBackoff(listenerBackoff)
+			// LISTEN is only a latency hint. The next loop polls the durable
+			// dirty set immediately while the notification connection heals.
 		}
+	}
+}
+
+func (s *Service) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
+	timeout := s.pollInterval
+	if timeout > 250*time.Millisecond {
+		timeout = 250 * time.Millisecond
+	}
+	acquireCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	listener, err := s.pool.Acquire(acquireCtx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := listener.Exec(
+		acquireCtx,
+		"LISTEN "+dirtyNotifyChannel,
+	); err != nil {
+		listener.Release()
+		return nil, err
+	}
+	return listener, nil
+}
+
+func releaseListener(listener *pgxpool.Conn) {
+	if listener == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = listener.Exec(ctx, "UNLISTEN "+dirtyNotifyChannel)
+	listener.Release()
+}
+
+func growListenerBackoff(current time.Duration) time.Duration {
+	current *= 2
+	if current > maxListenerBackoff {
+		return maxListenerBackoff
+	}
+	return current
+}
+
+func waitForPoll(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

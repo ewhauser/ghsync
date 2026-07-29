@@ -1006,14 +1006,14 @@ func TestDisappearanceVerificationTombstonesPRStackAndRepository(
 func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	h := newSweepHarness(t, 100)
 	h.seedCache(t, []int{4812}, false, false)
-	ingressServer := httptest.NewServer(
+	ingressServer := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(h.pool),
 			sweepTestSecret,
 			1<<20,
 			time.Second,
-		).Mux(),
-	)
+		),
+	))
 	defer ingressServer.Close()
 	fixture := h.fixture
 	fixture.PullRequests[1].Title = "truth changed during outage"
@@ -1037,7 +1037,7 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispatcher := dispatch.New(
+	dispatcher, err := dispatch.New(
 		h.pool,
 		h.river,
 		dispatch.Config{
@@ -1048,6 +1048,9 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 			Classifier:   dispatch.DefaultClassifier(),
 		},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.start(t)
 	if err := h.service.HealDeliveryGaps(
 		context.Background(),
@@ -1095,14 +1098,14 @@ func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
 ) {
 	h := newSweepHarness(t, 1)
 	h.service.config.GapMaxPages = 1
-	ingressServer := httptest.NewServer(
+	ingressServer := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(h.pool),
 			sweepTestSecret,
 			1<<20,
 			time.Second,
-		).Mux(),
-	)
+		),
+	))
 	defer ingressServer.Close()
 	for index := range 3 {
 		if _, err := h.fake.DropWebhook(

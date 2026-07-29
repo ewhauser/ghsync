@@ -14,6 +14,7 @@ import (
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/queue"
+	"github.com/acme/frontier/internal/repoutil"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
@@ -209,7 +210,7 @@ func (h *Handler) BackfillRepoPage(
 	if cursor.QueueName == queue.QueueSweep {
 		source = store.SyncSourceReconcile
 	}
-	owner, repoName, err := splitRepo(args.RepoFullName)
+	owner, repoName, err := repoutil.Split(args.RepoFullName)
 	if err != nil {
 		return err
 	}
@@ -845,7 +846,7 @@ func StartBackfill(
 	if pool == nil || client == nil || installationID <= 0 {
 		return dbgen.BackfillCursor{}, fmt.Errorf("invalid backfill kickoff")
 	}
-	if _, _, err := splitRepo(repoFullName); err != nil {
+	if _, _, err := repoutil.Split(repoFullName); err != nil {
 		return dbgen.BackfillCursor{}, err
 	}
 	tx, err := pool.Begin(ctx)

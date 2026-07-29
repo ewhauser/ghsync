@@ -42,13 +42,6 @@ SET generation = refresh_intent_generations.generation + 1,
     updated_at = now()
 RETURNING kind, refresh_key, generation, deadline_at, event_received_at;
 
--- name: GetRefreshIntentGeneration :one
--- A running worker snapshots the generation before fetching authoritative
--- state. Signals coalesced before the fetch are thereby covered by that fetch.
-SELECT generation
-FROM refresh_intent_generations
-WHERE kind = $1 AND refresh_key = $2;
-
 -- name: GetRefreshIntentState :one
 SELECT generation, completed_generation, deadline_at, event_received_at
 FROM refresh_intent_generations

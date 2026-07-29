@@ -333,9 +333,7 @@ func intentKey(
 		return "", false, fmt.Errorf("%s payload is missing repository.full_name", event)
 	}
 	switch target {
-	case TargetPullRequest:
-		fallthrough
-	case TargetResolveStackMembership:
+	case TargetPullRequest, TargetResolveStackMembership:
 		number := payload.Number
 		if number == 0 {
 			number = payload.PullRequest.Number

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/acme/frontier/internal/repoutil"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
@@ -46,9 +47,9 @@ func (s *Service) pruneBatch(
 	payloads, err := queries.PruneWebhookDeliveryPayloadBatch(
 		ctx,
 		dbgen.PruneWebhookDeliveryPayloadBatchParams{
-			Cutoff:    timestamptz(cutoff),
+			Cutoff:    repoutil.Timestamptz(cutoff),
 			BatchSize: int32(s.config.RetentionBatchSize),
-			PrunedAt:  timestamptz(now),
+			PrunedAt:  repoutil.Timestamptz(now),
 		},
 	)
 	if err != nil {
@@ -57,7 +58,7 @@ func (s *Service) pruneBatch(
 	history, err := queries.DeleteCheckHistoryBatch(
 		ctx,
 		dbgen.DeleteCheckHistoryBatchParams{
-			Cutoff:    timestamptz(cutoff),
+			Cutoff:    repoutil.Timestamptz(cutoff),
 			BatchSize: int32(s.config.RetentionBatchSize),
 		},
 	)

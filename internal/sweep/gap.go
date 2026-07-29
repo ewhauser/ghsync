@@ -9,6 +9,7 @@ import (
 
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/queue"
+	"github.com/acme/frontier/internal/repoutil"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
@@ -123,8 +124,8 @@ func (s *Service) loadOrStartGapWindow(
 		state, err = queries.StartGapHealCursor(
 			ctx,
 			dbgen.StartGapHealCursorParams{
-				Cutoff:         timestamptz(now.Add(-s.config.GapWindow)),
-				StartedAt:      timestamptz(now),
+				Cutoff:         repoutil.Timestamptz(now.Add(-s.config.GapWindow)),
+				StartedAt:      repoutil.Timestamptz(now),
 				InstallationID: s.config.InstallationID,
 			},
 		)
@@ -159,7 +160,7 @@ func (s *Service) advanceGapWindow(
 		ctx,
 		dbgen.AdvanceGapHealCursorParams{
 			NextCursor:     next,
-			UpdatedAt:      timestamptz(s.config.Now()),
+			UpdatedAt:      repoutil.Timestamptz(s.config.Now()),
 			InstallationID: s.config.InstallationID,
 			ExpectedCursor: expected,
 		},
@@ -199,7 +200,7 @@ func (s *Service) completeGapWindow(
 	_, err := dbgen.New(s.pool).CompleteGapHealCursor(
 		ctx,
 		dbgen.CompleteGapHealCursorParams{
-			CompletedAt:    timestamptz(s.config.Now()),
+			CompletedAt:    repoutil.Timestamptz(s.config.Now()),
 			InstallationID: s.config.InstallationID,
 			ExpectedCursor: expected,
 		},

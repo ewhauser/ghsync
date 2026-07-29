@@ -48,6 +48,10 @@ transaction so handler effects and cursor advancement remain atomic.
 Concurrent tailers for the same pair therefore surface PostgreSQL
 serialization errors by design.
 
+`pkg/streamclient` classifies that serialization outcome as the typed
+`ErrCursorContention`; consumers may use `IsRetryable` for bounded retry and
+must still restore the one-tailer topology.
+
 Event order is `seq` alone. `occurred_at` is transaction-start time and is
 **not** monotonic with `seq`: a long writer can commit a high sequence with an
 older `occurred_at` than a faster writer. Never order, deduplicate, or resume
@@ -364,6 +368,14 @@ replaces the consumer projection from public cache rows, sets the cursor to
 **W**, and commits. Tailing resumes at `seq > W`. The snapshot can already
 contain state referenced by a later event, so consumers apply by stable key,
 not as patches.
+
+**Bootstrap DISCARDS every undelivered event at or below the watermark for
+that consumer.** The projection replacement and cursor reset must therefore
+commit in the same snapshot transaction.
+
+Product decision: server-side kind and entity-key filtering is deferred from
+v1. Tail pages by `stream`; consumers apply any narrower filtering inside the
+transactional handler.
 
 `LISTEN frontier_change_events` and its statement-level constant-payload
 notification lower latency only. `pkg/streamclient` continues polling during a

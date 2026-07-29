@@ -85,6 +85,189 @@ func TestWatermarkProgressIdleAndUnderLoad(t *testing.T) {
 	}
 }
 
+func TestWatermarkerStandbyFailsOverWithinLeaseTTL(t *testing.T) {
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const leaseTTL = 600 * time.Millisecond
+	leader, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval: 50 * time.Millisecond,
+		LeaseTTL:        leaseTTL,
+		Owner:           fmt.Sprintf("chaos-leader-%d", time.Now().UnixNano()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leader.Step(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	standby, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval: 50 * time.Millisecond,
+		LeaseTTL:        leaseTTL,
+		Owner:           fmt.Sprintf("chaos-standby-%d", time.Now().UnixNano()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := standby.Step(ctx); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("standby Step error = %v, want ErrLeaseHeld", err)
+	}
+
+	target := insertStreamEvent(
+		t,
+		ctx,
+		pool,
+		fmt.Sprintf("leader-failover-%d", time.Now().UnixNano()),
+	)
+	startedAt := time.Now()
+	runCtx, stop := context.WithCancel(ctx)
+	runErr := make(chan error, 1)
+	go func() { runErr <- standby.Run(runCtx) }()
+	waitSafeSequence(t, pool, target)
+	if elapsed := time.Since(startedAt); elapsed > leaseTTL+150*time.Millisecond {
+		t.Fatalf(
+			"standby failover took %s, want within lease TTL %s",
+			elapsed,
+			leaseTTL,
+		)
+	}
+	stop()
+	if err := <-runErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
+	t *testing.T,
+) {
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO operation_heartbeats (
+		    installation_id, component, operation, success_count,
+		    sample_count, last_success_at
+		)
+		VALUES (1, 'watermarker', 'entities', 0, 0, clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+	target := insertStreamEvent(
+		t,
+		ctx,
+		pool,
+		fmt.Sprintf("watermarker-kill-%d", time.Now().UnixNano()),
+	)
+	var priorSafe int64
+	if err := pool.QueryRow(ctx, `
+		SELECT safe_seq FROM stream_watermark WHERE singleton
+	`).Scan(&priorSafe); err != nil {
+		t.Fatal(err)
+	}
+
+	heartbeatLock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer heartbeatLock.Rollback(context.Background()) //nolint:errcheck
+	if _, err := heartbeatLock.Exec(ctx, `
+		UPDATE operation_heartbeats
+		SET success_count = success_count
+		WHERE installation_id = 1
+		  AND component = 'watermarker'
+		  AND operation = 'entities'
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	watermarker, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval:  20 * time.Millisecond,
+		LeaseTTL:         time.Second,
+		FenceLockTimeout: time.Second,
+		Owner: fmt.Sprintf(
+			"exclusive-fence-kill-%d",
+			time.Now().UnixNano(),
+		),
+		InstallationID: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepErr := make(chan error, 1)
+	go func() {
+		_, err := watermarker.Step(ctx)
+		stepErr <- err
+	}()
+
+	watermarkerPID := waitForExclusiveFenceHolder(t, ctx, pool)
+	type writerResult struct {
+		seq int64
+		err error
+	}
+	writerDone := make(chan writerResult, 1)
+	go func() {
+		seq, err := insertStreamEventWithKey(
+			ctx,
+			pool,
+			"watermarker-kill-writer",
+			"unblocked",
+		)
+		writerDone <- writerResult{seq: seq, err: err}
+	}()
+	waitForFenceLocks(t, ctx, pool, "ShareLock", false, 1)
+
+	var terminated bool
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT pg_terminate_backend($1)`,
+		watermarkerPID,
+	).Scan(&terminated); err != nil {
+		t.Fatal(err)
+	}
+	if !terminated {
+		t.Fatalf("watermarker backend %d was not terminated", watermarkerPID)
+	}
+	if err := <-stepErr; err == nil {
+		t.Fatal("terminated watermarker step unexpectedly succeeded")
+	}
+	writer := <-writerDone
+	if writer.err != nil {
+		t.Fatalf("writer remained blocked after backend termination: %v", writer.err)
+	}
+
+	var afterTermination int64
+	if err := pool.QueryRow(ctx, `
+		SELECT safe_seq FROM stream_watermark WHERE singleton
+	`).Scan(&afterTermination); err != nil {
+		t.Fatal(err)
+	}
+	if afterTermination < priorSafe {
+		t.Fatalf(
+			"safe_seq regressed from %d to %d",
+			priorSafe,
+			afterTermination,
+		)
+	}
+	if err := heartbeatLock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := watermarker.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.SafeSeq < target || progress.SafeSeq < writer.seq {
+		t.Fatalf(
+			"recovered safe_seq = %d, want at least original %d and writer %d",
+			progress.SafeSeq,
+			target,
+			writer.seq,
+		)
+	}
+}
+
 func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -833,6 +1016,96 @@ func assertOneStatementWake(
 		}
 		if extra.PID == writerPID {
 			t.Fatalf("extra per-row notification: %+v", extra)
+		}
+	}
+}
+
+func waitForExclusiveFenceHolder(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+) int32 {
+	t.Helper()
+	fenceKey := uint64(outbox.FenceKey)
+	classID := int64(fenceKey >> 32)
+	objectID := int64(uint32(fenceKey))
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var pid int32
+		err := pool.QueryRow(ctx, `
+			SELECT pid
+			FROM pg_locks
+			WHERE locktype = 'advisory'
+			  AND classid = $1
+			  AND objid = $2
+			  AND objsubid = 1
+			  AND mode = 'ExclusiveLock'
+			  AND granted
+			LIMIT 1
+		`, classID, objectID).Scan(&pid)
+		if err == nil {
+			return pid
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-deadline.C:
+			t.Fatal("timed out waiting for watermarker exclusive fence")
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForFenceLocks(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	mode string,
+	granted bool,
+	want int,
+) {
+	t.Helper()
+	fenceKey := uint64(outbox.FenceKey)
+	classID := int64(fenceKey >> 32)
+	objectID := int64(uint32(fenceKey))
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var count int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_locks
+			WHERE locktype = 'advisory'
+			  AND classid = $1
+			  AND objid = $2
+			  AND objsubid = 1
+			  AND mode = $3
+			  AND granted = $4
+		`, classID, objectID, mode, granted).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count >= want {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-deadline.C:
+			t.Fatalf(
+				"timed out waiting for %d outbox fence locks (%s, granted=%t)",
+				want,
+				mode,
+				granted,
+			)
+		case <-ticker.C:
 		}
 	}
 }

@@ -1,6 +1,10 @@
 // Package streamclient is the reference implementation of Frontier's public
 // Postgres change-stream contract. It owns watermark-bounded paging, durable
 // cursors, transactional handler delivery, bootstrap, and RESYNC_REQUIRED.
+//
+// Frontier v1 deliberately binds this library to pgx v5 and database
+// co-location. External services consume the stream through this library and
+// a shared Postgres database connection; v1 does not provide a wire API.
 package streamclient
 
 import (
@@ -9,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -25,6 +30,13 @@ const (
 )
 
 var errCursorFirstTouchRace = errors.New("consumer cursor first-touch race")
+
+// ErrListenerUnavailable classifies a transient failure to acquire or use the
+// dedicated LISTEN connection, including connection-pool exhaustion. Tail
+// handles this condition internally by polling and reconnecting, so callers
+// normally observe it only through an error wrapped by their own
+// instrumentation.
+var ErrListenerUnavailable = errors.New("stream listener unavailable")
 
 // Config controls paging and the correctness-preserving poll fallback.
 type Config struct {
@@ -82,15 +94,146 @@ func (e *ErrResyncRequired) Error() string {
 	)
 }
 
-// Snapshot is an open, repeatable-read cache snapshot paired with SafeSeq.
-// The caller reads public cache tables through Tx, updates its local
-// projection in that same transaction when applicable, then commits Tx. The
-// consumer cursor is reset to SafeSeq only by that commit.
+// ErrCursorContention reports that multiple transactions tried to own one
+// durable (consumer, stream) cursor. It is retryable, but the durable fix is to
+// obey Tail's one-tailer rule rather than run competing retry loops.
+type ErrCursorContention struct {
+	// Consumer is the contended durable consumer name.
+	Consumer string
+	// Stream is the contended stream.
+	Stream string
+	cause  error
+}
+
+// Error implements error.
+func (e *ErrCursorContention) Error() string {
+	return fmt.Sprintf(
+		"stream cursor contention for consumer %q stream %q: %v",
+		e.Consumer,
+		e.Stream,
+		e.cause,
+	)
+}
+
+// Unwrap returns the underlying PostgreSQL serialization error.
+func (e *ErrCursorContention) Unwrap() error {
+	return e.cause
+}
+
+// IsRetryable reports whether an operation may be attempted again without a
+// Bootstrap. Cursor contention, transient listener/pool unavailability,
+// PostgreSQL serialization/deadlock/connection-capacity failures, and pgx
+// failures known to occur before a request was sent are retryable.
+//
+// Context cancellation and deadline expiry are not retryable with the same
+// context. ErrResyncRequired is also false: it requires Bootstrap and a
+// projection replacement before Tail resumes.
+func IsRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var contention *ErrCursorContention
+	if errors.As(err, &contention) ||
+		errors.Is(err, ErrListenerUnavailable) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) {
+		switch postgresError.Code {
+		case
+			"08000", // connection_exception
+			"08001", // sqlclient_unable_to_establish_sqlconnection
+			"08003", // connection_does_not_exist
+			"08004", // sqlserver_rejected_establishment_of_sqlconnection
+			"08006", // connection_failure
+			"08007", // transaction_resolution_unknown
+			"08P01", // protocol_violation
+			"40001", // serialization_failure
+			"40P01", // deadlock_detected
+			"53300", // too_many_connections
+			"55P03", // lock_not_available
+			"57P01", // admin_shutdown
+			"57P02", // crash_shutdown
+			"57P03": // cannot_connect_now
+			return true
+		}
+	}
+	return pgconn.SafeToRetry(err)
+}
+
+// Snapshot is an open, repeatable-read cache snapshot paired with SafeSeq and
+// PriorSeq. The caller reads public cache tables through Tx and replaces its
+// projection in that same transaction, calls Commit to atomically reset the
+// cursor, and defers Close immediately after Bootstrap.
+//
+// Bootstrap DISCARDS every undelivered event at or below SafeSeq for this
+// consumer when Commit succeeds. Ignoring both Commit and Close silently skips
+// that cursor reset and leaks a pooled connection while retaining the cursor
+// row lock, which can block the consumer and eventually exhaust the pool. Tx
+// remains exported for compatibility; prefer Commit and Close for lifecycle
+// management.
 type Snapshot struct {
 	// SafeSeq is the sequence after which Tail resumes.
 	SafeSeq int64
+	// PriorSeq is the durable cursor value Bootstrap replaces on Commit.
+	PriorSeq int64
 	// Tx is the snapshot-consistent Postgres transaction over the cache.
 	Tx pgx.Tx
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// Commit commits the snapshot transaction, its projection replacement, and
+// the cursor reset to SafeSeq. A failed Commit closes the Snapshot; callers
+// must start a new Bootstrap rather than reuse it.
+func (s *Snapshot) Commit(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("commit nil stream snapshot")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return pgx.ErrTxClosed
+	}
+	s.closed = true
+	tx := s.Tx
+	s.mu.Unlock()
+	if tx == nil {
+		return fmt.Errorf("commit stream snapshot without transaction")
+	}
+	return tx.Commit(ctx)
+}
+
+// Close abandons an uncommitted Snapshot by rolling it back and releasing its
+// pooled connection. Close is idempotent and is safe to defer immediately
+// after Bootstrap; after Commit or a direct Tx finalization it returns nil.
+func (s *Snapshot) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	tx := s.Tx
+	s.mu.Unlock()
+	if tx == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := tx.Rollback(ctx)
+	if errors.Is(err, pgx.ErrTxClosed) {
+		return nil
+	}
+	return err
 }
 
 // Client consumes Frontier change streams from the same Postgres database as
@@ -99,6 +242,8 @@ type Client struct {
 	pool         *pgxpool.Pool
 	batchSize    int
 	pollInterval time.Duration
+	minBackoff   time.Duration
+	maxBackoff   time.Duration
 	testHooks    clientTestHooks
 }
 
@@ -106,7 +251,10 @@ type clientTestHooks struct {
 	afterHorizon          func()
 	afterEnsureCursor     func()
 	cursorFirstTouchRetry func()
+	beforeListenerAcquire func()
 	listenerConnected     func(uint32)
+	listenerRetry         func(error, time.Duration)
+	pollOnly              func()
 }
 
 // New validates configuration and constructs a reference stream client.
@@ -130,13 +278,21 @@ func New(pool *pgxpool.Pool, config Config) (*Client, error) {
 		pool:         pool,
 		batchSize:    config.BatchSize,
 		pollInterval: config.PollInterval,
+		minBackoff:   minListenerBackoff,
+		maxBackoff:   maxListenerBackoff,
 	}, nil
 }
 
 // Bootstrap starts a snapshot-then-stream cycle. It returns the current safe
-// watermark and a repeatable-read transaction over the public cache tables.
-// Committing the returned transaction atomically resets the durable cursor to
-// SafeSeq; rolling it back leaves the prior cursor unchanged (C-S3/C-S4).
+// watermark, prior cursor, and a repeatable-read transaction over the public
+// cache tables. Bootstrap DISCARDS every undelivered event at or below the
+// returned SafeSeq when Snapshot.Commit succeeds; the caller must replace its
+// projection in Snapshot.Tx before that commit. Snapshot.Close rolls back and
+// preserves PriorSeq.
+//
+// Callers must defer Snapshot.Close immediately. Ignoring the lifecycle leaks
+// a pooled connection and retains the cursor row lock, potentially blocking
+// Tail and exhausting the pool (C-S3/C-S4).
 func (c *Client) Bootstrap(
 	ctx context.Context,
 	consumer string,
@@ -166,6 +322,9 @@ func (c *Client) Bootstrap(
 		VALUES ($1, $2, 0, clock_timestamp())
 		ON CONFLICT (consumer, stream) DO NOTHING
 	`, consumer, stream); err != nil {
+		if isSerializationFailure(err) {
+			return nil, newCursorContention(consumer, stream, err)
+		}
 		return nil, fmt.Errorf("ensure bootstrap cursor: %w", err)
 	}
 	var prior int64
@@ -175,6 +334,9 @@ func (c *Client) Bootstrap(
 		WHERE consumer = $1 AND stream = $2
 		FOR UPDATE
 	`, consumer, stream).Scan(&prior); err != nil {
+		if isSerializationFailure(err) {
+			return nil, newCursorContention(consumer, stream, err)
+		}
 		return nil, fmt.Errorf("lock bootstrap cursor: %w", err)
 	}
 
@@ -192,7 +354,11 @@ func (c *Client) Bootstrap(
 		return nil, fmt.Errorf("reset bootstrap cursor: %w", err)
 	}
 	ok = true
-	return &Snapshot{SafeSeq: safeSeq, Tx: tx}, nil
+	return &Snapshot{
+		SafeSeq:  safeSeq,
+		PriorSeq: prior,
+		Tx:       tx,
+	}, nil
 }
 
 // Tail continuously pages events with seq > cursor AND seq <= safe_seq,
@@ -200,6 +366,19 @@ func (c *Client) Bootstrap(
 // LISTEN/NOTIFY plus a polling fallback. Migration 0014's after-insert trigger
 // emits frontier_change_events notifications at commit; correctness never
 // depends on receiving one (C-S2/C-S5/C-P6).
+//
+// Run exactly one Tail call for each (consumer, stream). A competing tailer
+// returns *ErrCursorContention rather than an opaque PostgreSQL serialization
+// failure. ErrCursorContention and other errors for which IsRetryable is true
+// may be retried with backoff. ErrResyncRequired is terminal for this Tail
+// call and requires Bootstrap plus projection replacement before resuming.
+// Invalid arguments, handler failures, and context cancellation are terminal
+// unless their wrapped cause is independently classified as retryable.
+//
+// Tail internally retries concurrent cursor first-touch races and all LISTEN
+// failures, including listener connection-pool exhaustion. While LISTEN is
+// unavailable it continues correctness-path polling with bounded reconnect
+// backoff; listener errors are not returned to the caller.
 func (c *Client) Tail(
 	ctx context.Context,
 	consumer string,
@@ -214,7 +393,7 @@ func (c *Client) Tail(
 	}
 	var listener *pgxpool.Conn
 	defer func() { releaseListener(listener) }()
-	listenerBackoff := minListenerBackoff
+	listenerBackoff := c.minBackoff
 	var nextListenerAttempt time.Time
 
 	for {
@@ -236,9 +415,11 @@ func (c *Client) Tail(
 
 		if listener == nil &&
 			!time.Now().Before(nextListenerAttempt) {
+			if hook := c.testHooks.beforeListenerAcquire; hook != nil {
+				hook()
+			}
 			listener, err = c.acquireListener(ctx)
 			if err == nil {
-				listenerBackoff = minListenerBackoff
 				if hook := c.testHooks.listenerConnected; hook != nil {
 					hook(listener.Conn().PgConn().PID())
 				}
@@ -246,12 +427,26 @@ func (c *Client) Tail(
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
+				err = fmt.Errorf(
+					"%w while acquiring LISTEN connection: %w",
+					ErrListenerUnavailable,
+					err,
+				)
 				nextListenerAttempt = time.Now().Add(listenerBackoff)
-				listenerBackoff = growBackoff(listenerBackoff)
+				if hook := c.testHooks.listenerRetry; hook != nil {
+					hook(err, listenerBackoff)
+				}
+				listenerBackoff = growBackoff(
+					listenerBackoff,
+					c.maxBackoff,
+				)
 			}
 		}
 
 		if listener == nil {
+			if hook := c.testHooks.pollOnly; hook != nil {
+				hook()
+			}
 			timer := time.NewTimer(c.pollInterval)
 			select {
 			case <-ctx.Done():
@@ -270,15 +465,30 @@ func (c *Client) Tail(
 		cancel()
 		switch {
 		case waitErr == nil:
+			listenerBackoff = c.minBackoff
 		case errors.Is(waitErr, context.DeadlineExceeded):
 			// Poll fallback is the correctness path (C-S5).
+			// One healthy wait interval proves the listener is stable enough
+			// to reset churn backoff.
+			listenerBackoff = c.minBackoff
 		case ctx.Err() != nil:
 			return ctx.Err()
 		default:
 			releaseListener(listener)
 			listener = nil
+			waitErr = fmt.Errorf(
+				"%w while waiting for notification: %w",
+				ErrListenerUnavailable,
+				waitErr,
+			)
 			nextListenerAttempt = time.Now().Add(listenerBackoff)
-			listenerBackoff = growBackoff(listenerBackoff)
+			if hook := c.testHooks.listenerRetry; hook != nil {
+				hook(waitErr, listenerBackoff)
+			}
+			listenerBackoff = growBackoff(
+				listenerBackoff,
+				c.maxBackoff,
+			)
 			// A failed LISTEN connection only loses the latency hint. The next
 			// loop performs another correctness-path page poll immediately.
 		}
@@ -316,10 +526,13 @@ func releaseListener(listener *pgxpool.Conn) {
 	listener.Release()
 }
 
-func growBackoff(current time.Duration) time.Duration {
+func growBackoff(
+	current time.Duration,
+	maximum time.Duration,
+) time.Duration {
 	current *= 2
-	if current > maxListenerBackoff {
-		return maxListenerBackoff
+	if current > maximum {
+		return maximum
 	}
 	return current
 }
@@ -362,6 +575,8 @@ func (c *Client) deliverPage(
 		// without seeing the newly committed row in this transaction snapshot.
 		// Tail retries in a new snapshot; no handler or cursor effects exist yet.
 		return 0, errCursorFirstTouchRace
+	} else if isSerializationFailure(err) {
+		return 0, newCursorContention(consumer, stream, err)
 	} else if err != nil {
 		return 0, fmt.Errorf("lock consumer cursor: %w", err)
 	}
@@ -453,6 +668,18 @@ func isSerializationFailure(err error) bool {
 	var postgresError *pgconn.PgError
 	return errors.As(err, &postgresError) &&
 		postgresError.Code == "40001"
+}
+
+func newCursorContention(
+	consumer string,
+	stream string,
+	cause error,
+) *ErrCursorContention {
+	return &ErrCursorContention{
+		Consumer: consumer,
+		Stream:   stream,
+		cause:    cause,
+	}
 }
 
 func validateIdentity(consumer string, stream string) error {

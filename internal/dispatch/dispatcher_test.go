@@ -24,19 +24,20 @@ func TestNewEnforcesDebounceHardCap(t *testing.T) {
 		MaxAttempts:  1,
 		Debounce:     MaxDebounce,
 		PollInterval: time.Millisecond,
+		Classifier:   DefaultClassifier(),
 	}
 
-	assertDoesNotPanic(t, func() {
-		New(pool, riverClient, base)
-	})
+	if _, err := New(pool, riverClient, base); err != nil {
+		t.Fatalf("maximum debounce rejected: %v", err)
+	}
 	base.Debounce = MaxDebounce + time.Nanosecond
-	assertPanics(t, func() {
-		New(pool, riverClient, base)
-	})
+	if _, err := New(pool, riverClient, base); err == nil {
+		t.Fatal("debounce above hard cap accepted")
+	}
 }
 
 func TestRunReturnsNilOnContextCancellation(t *testing.T) {
-	dispatcher := newRunTestDispatcher()
+	dispatcher := newRunTestDispatcher(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	dispatcher.dispatchBatch = func(context.Context) (int, error) {
 		cancel()
@@ -49,7 +50,7 @@ func TestRunReturnsNilOnContextCancellation(t *testing.T) {
 }
 
 func TestRunRetriesTransientError(t *testing.T) {
-	dispatcher := newRunTestDispatcher()
+	dispatcher := newRunTestDispatcher(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
 	dispatcher.dispatchBatch = func(context.Context) (int, error) {
@@ -79,7 +80,7 @@ func TestRunRetriesTransientError(t *testing.T) {
 }
 
 func TestRunReturnsFatalError(t *testing.T) {
-	dispatcher := newRunTestDispatcher()
+	dispatcher := newRunTestDispatcher(t)
 	fatal := errors.New("invalid dispatcher state")
 	dispatcher.dispatchBatch = func(context.Context) (int, error) {
 		return 0, fatal
@@ -122,8 +123,9 @@ func TestDedupeIntentsSortsGenerationKeys(t *testing.T) {
 	}
 }
 
-func newRunTestDispatcher() *Dispatcher {
-	return New(
+func newRunTestDispatcher(t *testing.T) *Dispatcher {
+	t.Helper()
+	dispatcher, err := New(
 		new(pgxpool.Pool),
 		new(river.Client[pgx.Tx]),
 		Config{
@@ -131,26 +133,11 @@ func newRunTestDispatcher() *Dispatcher {
 			MaxAttempts:  1,
 			Debounce:     time.Millisecond,
 			PollInterval: time.Millisecond,
+			Classifier:   DefaultClassifier(),
 		},
 	)
-}
-
-func assertDoesNotPanic(t *testing.T, fn func()) {
-	t.Helper()
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			t.Fatalf("unexpected panic: %v", recovered)
-		}
-	}()
-	fn()
-}
-
-func assertPanics(t *testing.T, fn func()) {
-	t.Helper()
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic")
-		}
-	}()
-	fn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dispatcher
 }

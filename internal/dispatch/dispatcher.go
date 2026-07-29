@@ -68,22 +68,30 @@ type Dispatcher struct {
 	afterClaim    func()
 }
 
-func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *Dispatcher {
+// New validates config and constructs a delivery dispatcher.
+func New(
+	pool *pgxpool.Pool,
+	riverClient *river.Client[pgx.Tx],
+	config Config,
+) (*Dispatcher, error) {
 	if pool == nil || riverClient == nil {
-		panic("dispatcher requires Postgres and River clients")
+		return nil, fmt.Errorf("dispatcher requires Postgres and River clients")
 	}
 	if config.BatchSize <= 0 || config.MaxAttempts <= 0 ||
 		config.Debounce <= 0 || config.PollInterval <= 0 {
-		panic("dispatcher sizes and durations must be positive")
+		return nil, fmt.Errorf("dispatcher sizes and durations must be positive")
 	}
 	if config.Debounce > MaxDebounce {
-		panic("dispatcher debounce must not exceed 15s")
+		return nil, fmt.Errorf(
+			"dispatcher debounce must not exceed %s",
+			MaxDebounce,
+		)
 	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
 	if len(config.Classifier.rules) == 0 {
-		config.Classifier = DefaultClassifier()
+		return nil, fmt.Errorf("dispatcher classifier rules are required")
 	}
 	if config.Observer == nil {
 		config.Observer = noopObserver{}
@@ -95,7 +103,7 @@ func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *
 	}
 	dispatcher.dispatchBatch = dispatcher.DispatchBatch
 	dispatcher.retryDelay = jitteredRetryDelay
-	return dispatcher
+	return dispatcher, nil
 }
 
 // Run continuously drains available batches and polls when idle.

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/queue"
+	"github.com/acme/frontier/internal/repoutil"
 	"github.com/acme/frontier/internal/store"
 )
 
@@ -118,7 +118,7 @@ func (h *Handler) RefreshRepository(
 		return err
 	}
 	defer observation.Close() //nolint:errcheck
-	owner, name, err := splitRepo(key.Repo)
+	owner, name, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
 	}
@@ -130,7 +130,7 @@ func (h *Handler) RefreshRepository(
 		name,
 		repository.ETag,
 	)
-	if isNotFound(err) {
+	if repoutil.IsNotFound(err) {
 		// C-R3: only installation-list reconciliation enqueues this
 		// verification fetch; the confirmed 404 is authoritative.
 		_, tombstoneErr := h.writer.TombstoneRepositoryObserved(
@@ -203,7 +203,7 @@ func (h *Handler) RefreshRepoRules(
 		return err
 	}
 	defer observation.Close() //nolint:errcheck
-	owner, name, err := splitRepo(key.Repo)
+	owner, name, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
 	}
@@ -271,7 +271,7 @@ func (h *Handler) RefreshPR(
 		key.Number,
 	)
 	if err == nil && metadata.NodeID != "" {
-		result, err := h.coordinator.submit(
+		_, err := h.coordinator.submit(
 			ctx,
 			key,
 			metadata.NodeID,
@@ -294,7 +294,6 @@ func (h *Handler) RefreshPR(
 			}
 			return err
 		}
-		_ = result
 		return nil
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -342,7 +341,7 @@ func (h *Handler) refreshPRREST(
 	}
 	defer observation.Close() //nolint:errcheck
 	startedAt := time.Now()
-	owner, repoName, err := splitRepo(key.Repo)
+	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
 	}
@@ -370,7 +369,7 @@ func (h *Handler) refreshPRREST(
 		key.Number,
 		queueName,
 	)
-	if isNotFound(err) {
+	if repoutil.IsNotFound(err) {
 		_, tombstoneErr := h.writer.TombstonePullRequestObserved(
 			ctx,
 			observation,
@@ -441,7 +440,7 @@ func (h *Handler) RefreshStack(
 	}
 	defer observation.Close() //nolint:errcheck
 	startedAt := time.Now()
-	owner, repoName, err := splitRepo(key.Repo)
+	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
 	}
@@ -465,7 +464,7 @@ func (h *Handler) RefreshStack(
 		etag,
 	)
 	hook := h.stackHook(repository.FullName, request.Queue)
-	if isNotFound(err) {
+	if repoutil.IsNotFound(err) {
 		_, tombstoneErr := h.writer.TombstoneStackObserved(
 			ctx,
 			observation,
@@ -535,7 +534,7 @@ func (h *Handler) RefreshChecks(
 	}
 	defer observation.Close() //nolint:errcheck
 	startedAt := time.Now()
-	owner, repoName, err := splitRepo(key.Repo)
+	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
 	}
@@ -560,7 +559,7 @@ func (h *Handler) RefreshChecks(
 			gh.ListCheckRunsOptions{PerPage: 100, Page: page},
 			conditionalETag,
 		)
-		if isNotFound(fetchErr) {
+		if repoutil.IsNotFound(fetchErr) {
 			if page == 1 {
 				all = nil
 				etag = ""
@@ -846,7 +845,7 @@ func (h *Handler) ensureRepository(
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return store.RepositoryRecord{}, err
 	}
-	owner, repoName, err := splitRepo(fullName)
+	owner, repoName, err := repoutil.Split(fullName)
 	if err != nil {
 		return store.RepositoryRecord{}, err
 	}
@@ -895,12 +894,6 @@ func classAndSource(
 	default:
 		return "", "", fmt.Errorf("unknown refresh queue %q", queueName)
 	}
-}
-
-func isNotFound(err error) bool {
-	var httpError *gh.HTTPError
-	return errors.As(err, &httpError) &&
-		httpError.StatusCode == http.StatusNotFound
 }
 
 func requestKey(key entityKey) string {

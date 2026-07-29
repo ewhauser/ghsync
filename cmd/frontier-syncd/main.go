@@ -651,7 +651,7 @@ func serve(args []string) error {
 			}
 		}
 		if roles[roleDispatch] {
-			dispatcher := dispatch.New(pool, riverClient, dispatch.Config{
+			dispatcher, err := dispatch.New(pool, riverClient, dispatch.Config{
 				BatchSize:    cfg.DispatchBatchSize,
 				MaxAttempts:  cfg.DispatchMaxAttempts,
 				Debounce:     cfg.DispatchDebounce,
@@ -659,6 +659,9 @@ func serve(args []string) error {
 				Classifier:   classifier,
 				Observer:     runtimeMetrics,
 			})
+			if err != nil {
+				return fmt.Errorf("dispatcher: %w", err)
+			}
 			go func() {
 				if err := dispatcher.Run(serviceCtx); err != nil {
 					serviceErrors <- fmt.Errorf("dispatcher: %w", err)
@@ -762,17 +765,8 @@ func serviceMux(
 	webhook http.Handler,
 	metricsHandler http.Handler,
 ) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc(
-		"GET "+ingress.HealthPath,
-		func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusNoContent)
-		},
-	)
+	mux := ingress.NewMux(webhook)
 	mux.Handle("GET "+frontiermetrics.Path, metricsHandler)
-	if webhook != nil {
-		mux.Handle("POST "+ingress.WebhookPath, webhook)
-	}
 	return mux
 }
 

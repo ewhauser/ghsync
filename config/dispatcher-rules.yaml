@@ -26,4 +26,5 @@ rules:
   - event: push
     action: "*"
     target: branch
+    # Pending Phase-0 validation: real push payloads have no stack object.
     stacked_target: stack

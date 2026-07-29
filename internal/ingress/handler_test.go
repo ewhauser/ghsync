@@ -40,7 +40,7 @@ func TestHandlerVerifiesThenStoresRawDelivery(t *testing.T) {
 	request.Header.Set("X-Extra-Test-Header", "preserved")
 	response := httptest.NewRecorder()
 
-	handler.Mux().ServeHTTP(response, request)
+	NewMux(handler).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%q", response.Code, response.Body.String())
@@ -80,7 +80,7 @@ func TestHandlerRejectsUnverifiedWithoutStoring(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 
-	handler.Mux().ServeHTTP(response, request)
+	NewMux(handler).ServeHTTP(response, request)
 
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", response.Code)
@@ -95,7 +95,7 @@ func TestHandlerAcknowledgesDuplicateGUID(t *testing.T) {
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	response := httptest.NewRecorder()
 
-	handler.Mux().ServeHTTP(
+	NewMux(handler).ServeHTTP(
 		response,
 		signedRequest(t, []byte(`{}`), "secret", "duplicate", "push"),
 	)
@@ -110,7 +110,7 @@ func TestHandlerRejectsOversizeBeforeStoring(t *testing.T) {
 	handler := NewHandler(store, "secret", 4, time.Second)
 	response := httptest.NewRecorder()
 
-	handler.Mux().ServeHTTP(
+	NewMux(handler).ServeHTTP(
 		response,
 		signedRequest(t, []byte(`12345`), "secret", "guid-3", "push"),
 	)
@@ -129,7 +129,7 @@ func TestHandlerRequiresDeliveryHeadersAfterVerification(t *testing.T) {
 	request := signedRequest(t, []byte(`{}`), "secret", "", "push")
 	response := httptest.NewRecorder()
 
-	handler.Mux().ServeHTTP(response, request)
+	NewMux(handler).ServeHTTP(response, request)
 
 	if response.Code != http.StatusBadRequest || store.calls != 0 {
 		t.Fatalf("status=%d insert calls=%d", response.Code, store.calls)
@@ -141,7 +141,7 @@ func TestHandlerDoesNotAcknowledgeFailedCommit(t *testing.T) {
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	response := httptest.NewRecorder()
 
-	handler.Mux().ServeHTTP(
+	NewMux(handler).ServeHTTP(
 		response,
 		signedRequest(t, []byte(`{}`), "secret", "guid-4", "push"),
 	)
@@ -166,7 +166,7 @@ func TestHandlerRequestDeadlineCoversInsert(t *testing.T) {
 	response := httptest.NewRecorder()
 	started := time.Now()
 
-	handler.Mux().ServeHTTP(
+	NewMux(handler).ServeHTTP(
 		response,
 		signedRequest(t, []byte(`{}`), "secret", "guid-deadline", "push"),
 	)
@@ -184,7 +184,7 @@ func TestHealth(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, HealthPath, nil)
 	response := httptest.NewRecorder()
 
-	handler.Mux().ServeHTTP(response, request)
+	NewMux(handler).ServeHTTP(response, request)
 
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", response.Code)

@@ -2084,15 +2084,15 @@ func newPipelineHarness(t *testing.T, repo string) *pipelineHarness {
 		cancel()
 		t.Fatal(err)
 	}
-	ingressServer := httptest.NewServer(
+	ingressServer := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(pool),
 			fetchTestSecret,
 			1<<20,
 			5*time.Second,
-		).Mux(),
-	)
-	dispatcher := dispatch.New(pool, riverClient, dispatch.Config{
+		),
+	))
+	dispatcher, err := dispatch.New(pool, riverClient, dispatch.Config{
 		BatchSize:    100,
 		MaxAttempts:  3,
 		Debounce:     time.Millisecond,
@@ -2100,6 +2100,10 @@ func newPipelineHarness(t *testing.T, repo string) *pipelineHarness {
 		Now:          time.Now,
 		Classifier:   dispatch.DefaultClassifier(),
 	})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
 	return &pipelineHarness{
 		t:          t,
 		repo:       repo,
