@@ -233,7 +233,9 @@ func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
 	`, scope).Scan(&marked); err != nil {
 		t.Fatal(err)
 	}
-	if marked.Before(remarkedAt) {
+	// Postgres timestamptz stores microseconds; the Go-captured expectation
+	// carries nanoseconds, so compare at the database's precision.
+	if marked.Before(remarkedAt.Truncate(time.Microsecond)) {
 		t.Fatalf("surviving mark = %s, want >= %s", marked, remarkedAt)
 	}
 }

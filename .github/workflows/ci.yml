@@ -104,6 +104,13 @@ jobs:
           /tmp/ghsyncd migrate
           /tmp/fake-github -addr=127.0.0.1:19797 -webhook-secret=smoke-secret > /tmp/fake-github.log 2>&1 &
           fake_pid=$!
+          # The daemon's first fetches must not race the fake's listener:
+          # a connection-refused pushes River jobs into polynomial backoff
+          # that can outlast the seed budget.
+          for _ in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:19797/healthz >/dev/null 2>&1 && break
+            sleep 0.2
+          done
           /tmp/ghsyncd serve --roles=all > /tmp/ghsyncd.log 2>&1 &
           sync_pid=$!
           cleanup() {
