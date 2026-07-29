@@ -13,7 +13,7 @@ export GITHUB_APP_ID=123456
 export GITHUB_INSTALLATION_ID=789012
 export GITHUB_PRIVATE_KEY_PATH=/absolute/path/to/test-app.private-key.pem
 export OWNER_REPO=ewhauser/ghsync-phase0
-export CAPTURE_DIR=/absolute/path/to/frontier-phase0-20260728
+export CAPTURE_DIR=/absolute/path/to/ghsync-phase0-20260728
 mkdir -p "$CAPTURE_DIR"
 ```
 
@@ -61,7 +61,7 @@ export INSTALLATION_TOKEN="$(
 )"
 ```
 
-1. Use the enrolled non-production repository designated for Frontier tests.
+1. Use the enrolled non-production repository designated for ghsync tests.
    Do not use a repository with unrelated active contributors or protected
    production branches.
 2. Record:
@@ -72,8 +72,8 @@ export INSTALLATION_TOKEN="$(
    - the current gh-stack preview/API version, if the CLI exposes it;
    - the commit SHA at the bottom and top of the test stack.
 3. Create a five-PR test stack from disposable branches. Put a unique marker in
-   every branch and PR title: `frontier-phase0-YYYYMMDD-HHMM`.
-4. Confirm Frontier ingress is enabled and healthy. Start a capture that records
+   every branch and PR title: `ghsync-phase0-YYYYMMDD-HHMM`.
+4. Confirm ghsync ingress is enabled and healthy. Start a capture that records
    only delivery skeletons and routing fields:
    `delivery GUID`, `delivered_at`, `event`, `action`, repository ID/name, PR
    number, `ref`, `before`, `after`, and the embedded stack tuple
@@ -152,7 +152,7 @@ test "$validation_failed" -eq 0
 
 For every action below, retain observations for 120 seconds after the GitHub
 operation reports success. Record both arrival time at GitHub
-(`delivered_at`) and arrival time at Frontier ingress so event-to-ingress delay
+(`delivered_at`) and arrival time at ghsync ingress so event-to-ingress delay
 is distinguishable from a missing event.
 
 ### Authoritative post-action fetches
@@ -266,7 +266,7 @@ type, replace only those two values and record them in the run metadata. A
 3. Collect deliveries for 120 seconds.
 4. For every former member, record whether a `pull_request` event arrived and
    whether its embedded `stack` value was absent/null. Record any stack-specific
-   event even if Frontier does not yet recognize it.
+   event even if ghsync does not yet recognize it.
 5. Fetch every former PR and the former stack resource. Record whether the
    stack endpoint returns 200, 404, or a closed representation.
 

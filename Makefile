@@ -16,20 +16,20 @@ gen:
 	go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 
 migrate:
-	go run ./cmd/frontier-syncd migrate
+	go run ./cmd/ghsyncd migrate
 
 # Local development: Postgres + fake GitHub + the daemon.
 dev:
 	docker compose up -d --wait postgres fake-github
-	DATABASE_URL=postgres://frontier:frontier@localhost:5433/frontier?sslmode=disable \
-		go run ./cmd/frontier-syncd migrate
-	DATABASE_URL=postgres://frontier:frontier@localhost:5433/frontier?sslmode=disable \
+	DATABASE_URL=postgres://ghsync:ghsync@localhost:5433/ghsync?sslmode=disable \
+		go run ./cmd/ghsyncd migrate
+	DATABASE_URL=postgres://ghsync:ghsync@localhost:5433/ghsync?sslmode=disable \
 	GITHUB_WEBHOOK_SECRET=dev-secret \
 	GITHUB_BASE_URL=http://localhost:9797 \
 	GITHUB_TOKEN=dev-token \
 	GITHUB_INSTALLATION_ID=1 \
 	GITHUB_ORG_ID=1 \
-		go run ./cmd/frontier-syncd serve
+		go run ./cmd/ghsyncd serve
 
 clean:
 	docker compose down -v

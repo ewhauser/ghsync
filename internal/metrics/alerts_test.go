@@ -47,35 +47,35 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 		t.Fatalf("alert count = %d, want broad C-O4 coverage", count)
 	}
 	for alert, threshold := range map[string]string{
-		"FrontierSweepConditionalHitRateLow": "0.80",
-		"FrontierEventCacheP95SLOBreach":     "> 20",
-		"FrontierEventCacheP99SLOBreach":     "> 60",
-		"FrontierDriftOpen":                  "> 0",
-		"FrontierResyncStorm":                "> 3",
+		"GhsyncSweepConditionalHitRateLow": "0.80",
+		"GhsyncEventCacheP95SLOBreach":     "> 20",
+		"GhsyncEventCacheP99SLOBreach":     "> 60",
+		"GhsyncDriftOpen":                  "> 0",
+		"GhsyncResyncStorm":                "> 3",
 	} {
 		if !strings.Contains(expressions[alert], threshold) {
 			t.Fatalf("%s expression = %q, missing %q", alert, expressions[alert], threshold)
 		}
 	}
-	if _, exists := expressions["FrontierBudgetFloorBreached"]; exists {
+	if _, exists := expressions["GhsyncBudgetFloorBreached"]; exists {
 		t.Fatal("lower-priority budget floor is still treated as an invariant")
 	}
 	for _, alert := range []string{
-		"FrontierDriftOpen",
-		"FrontierDriftPassMissing",
-		"FrontierWatermarkStalled",
-		"FrontierWatermarkPassMissing",
-		"FrontierDeriverPassMissing",
-		"FrontierRequiredRoleAbsent",
+		"GhsyncDriftOpen",
+		"GhsyncDriftPassMissing",
+		"GhsyncWatermarkStalled",
+		"GhsyncWatermarkPassMissing",
+		"GhsyncDeriverPassMissing",
+		"GhsyncRequiredRoleAbsent",
 	} {
 		if !strings.Contains(expressions[alert], "absent(") {
 			t.Fatalf("%s does not fail closed on metric absence", alert)
 		}
 	}
-	if durations["FrontierSecondaryGateClosed"] != "5m" ||
+	if durations["GhsyncSecondaryGateClosed"] != "5m" ||
 		!strings.Contains(
-			expressions["FrontierSecondaryGateClosed"],
-			"frontier_c_b2_gate_closed",
+			expressions["GhsyncSecondaryGateClosed"],
+			"ghsync_c_b2_gate_closed",
 		) {
 		t.Fatal("secondary gate alert is not a five-minute boolean condition")
 	}
@@ -84,17 +84,17 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 		"pruner", "watermarker", "deriver",
 	} {
 		if !strings.Contains(
-			expressions["FrontierRequiredRoleAbsent"],
+			expressions["GhsyncRequiredRoleAbsent"],
 			`role="`+role+`"`,
 		) {
 			t.Fatalf("required-role alert omits %s", role)
 		}
 	}
 	if !strings.Contains(
-		expressions["FrontierCacheStalenessBoundBreached"],
+		expressions["GhsyncCacheStalenessBoundBreached"],
 		"max by (entity_class)",
 	) || !strings.Contains(
-		expressions["FrontierSweepOverrun"],
+		expressions["GhsyncSweepOverrun"],
 		"max by (sweep_kind)",
 	) {
 		t.Fatal("constraint comparisons are not reduced to one series per key")
@@ -104,23 +104,23 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 		operation string
 		threshold string
 	}{
-		"FrontierStackSweepPassMissing": {
+		"GhsyncStackSweepPassMissing": {
 			operation: "stacks",
 			threshold: "> 675",
 		},
-		"FrontierPullRequestSweepPassMissing": {
+		"GhsyncPullRequestSweepPassMissing": {
 			operation: "pull_requests",
 			threshold: "> 1350",
 		},
-		"FrontierRepoRulesSweepPassMissing": {
+		"GhsyncRepoRulesSweepPassMissing": {
 			operation: "repo_rules",
 			threshold: "> 8100",
 		},
-		"FrontierRepositorySweepPassMissing": {
+		"GhsyncRepositorySweepPassMissing": {
 			operation: "repositories",
 			threshold: "> 8100",
 		},
-		"FrontierClosedSweepPassMissing": {
+		"GhsyncClosedSweepPassMissing": {
 			operation: "closed_tracked",
 			threshold: "> 194400",
 		},
@@ -142,14 +142,14 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 			t.Fatalf("%s for = %q, want 5m", alert, durations[alert])
 		}
 	}
-	if _, exists := expressions["FrontierSweepPassMissing"]; exists {
+	if _, exists := expressions["GhsyncSweepPassMissing"]; exists {
 		t.Fatal("aggregate 24-hour sweep pass alert still exists")
 	}
 	if !strings.Contains(
-		expressions["FrontierDeriverPassMissing"],
+		expressions["GhsyncDeriverPassMissing"],
 		`component="deriver",operation="dirty_sets"`,
 	) || !strings.Contains(
-		expressions["FrontierDeriverPassMissing"],
+		expressions["GhsyncDeriverPassMissing"],
 		"> 30",
 	) {
 		t.Fatal("deriver pass alert is not tied to its durable heartbeat")
@@ -189,13 +189,13 @@ func TestAlertConditionalRatioExpressionsUseGatedWindowCounts(t *testing.T) {
 		expr string
 	}{
 		{
-			name: "FrontierSweepConditionalHitRateLow",
-			expr: expressions["FrontierSweepConditionalHitRateLow"],
+			name: "GhsyncSweepConditionalHitRateLow",
+			expr: expressions["GhsyncSweepConditionalHitRateLow"],
 		},
 		{name: "dashboard 304 ratio", expr: dashboardExpr},
 	}
-	numerator := `sum(increase(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))`
-	denominator := `sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))`
+	numerator := `sum(increase(ghsync_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))`
+	denominator := `sum(increase(ghsync_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))`
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			expr := strings.Join(strings.Fields(tc.expr), " ")
@@ -220,10 +220,10 @@ func TestAlertConditionalRatioExpressionsUseGatedWindowCounts(t *testing.T) {
 		})
 	}
 
-	alertExpr := expressions["FrontierSweepConditionalHitRateLow"]
+	alertExpr := expressions["GhsyncSweepConditionalHitRateLow"]
 	for _, series := range []string{
-		"frontier_c_b4_conditional_requests_total",
-		"frontier_c_b4_conditional_304s_total",
+		"ghsync_c_b4_conditional_requests_total",
+		"ghsync_c_b4_conditional_304s_total",
 	} {
 		if !strings.Contains(alertExpr, "absent("+series) {
 			t.Fatalf("conditional-ratio alert lost absence check for %s", series)
@@ -233,7 +233,7 @@ func TestAlertConditionalRatioExpressionsUseGatedWindowCounts(t *testing.T) {
 		t.Fatal("a healthy 48-of-60 sweep profile would breach the ratio")
 	}
 
-	resyncExpr := expressions["FrontierResyncStorm"]
+	resyncExpr := expressions["GhsyncResyncStorm"]
 	if strings.Contains(resyncExpr, "absent(") {
 		t.Fatalf("page-severity resync alert still fires on absence: %q", resyncExpr)
 	}

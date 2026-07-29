@@ -2,8 +2,8 @@
 
 ## Symptoms
 
-- `FrontierBudgetClassStarved`, `FrontierSecondaryGateClosed`, or
-  `FrontierSweepConditionalHitRateLow`.
+- `GhsyncBudgetClassStarved`, `GhsyncSecondaryGateClosed`, or
+  `GhsyncSweepConditionalHitRateLow`.
 - Event/sweep queues grow while interactive work continues.
 - Sweep 304 ratio falls below 80 percent.
 
@@ -34,24 +34,24 @@ shell/deployment action:
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=ingress,dispatch,watermarker
+ghsyncd serve --roles=ingress,dispatch,watermarker
 ```
 
 After fixing ETags or request fan-out, restore each background role group:
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=fetch,sweep,drift
+ghsyncd serve --roles=fetch,sweep,drift
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=pruner
+ghsyncd serve --roles=pruner
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=metrics
+ghsyncd serve --roles=metrics
 ```
 
 Never lower class floors to force work through.

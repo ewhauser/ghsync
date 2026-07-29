@@ -1,5 +1,5 @@
 // fake-github runs the scriptable GitHub stand-in as a standalone server for
-// local development (docker-compose points frontier-syncd at it).
+// local development (docker-compose points ghsyncd at it).
 package main
 
 import (

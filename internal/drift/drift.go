@@ -215,7 +215,7 @@ func (s *Service) PeriodicJobs() []*river.PeriodicJob {
 					}
 			},
 			&river.PeriodicJobOpts{
-				ID:         "frontier_drift_detect",
+				ID:         "ghsync_drift_detect",
 				RunOnStart: true,
 			},
 		),

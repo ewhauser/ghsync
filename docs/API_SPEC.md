@@ -1,11 +1,11 @@
-# Frontier Backend — gRPC API Specification (AIP style)
+# ghsync Backend — gRPC API Specification (AIP style)
 
-Draft v0.1. Defines the gRPC surface for the Frontier stacked-PR dashboard
+Draft v0.1. Defines the gRPC surface for the ghsync stacked-PR dashboard
 backend, following Google's API Improvement Proposals (AIPs). The SPA consumes
 these via HTTP/JSON transcoding (AIP-127); the current MSW mock endpoints map
 1:1 onto these methods (mapping table at the end).
 
-Package: `frontier.v1`
+Package: `ghsync.v1`
 
 ---
 
@@ -45,7 +45,7 @@ orgs/{org}/repos/{repo}/pullRequests/{pull_request}   # {pull_request} = PR numb
 ```
 
 **Out of scope — existing services.** User identity/settings and agent runs are
-served by APIs that already exist; this spec does not define them. Frontier
+served by APIs that already exist; this spec does not define them. ghsync
 references them by resource name (see §2.1) rather than owning them.
 
 ### 2.1 Integration with the existing agent-run and user APIs
@@ -54,7 +54,7 @@ references them by resource name (see §2.1) rather than owning them.
   agent-runner API; the derivation engine subscribes to that API's run state to
   light up chips and to gate one-run-per-stack concurrency.
 - The **run plan** the agent dialog renders (intent, context attachments,
-  default prompt, job/comment pickers) is Frontier-derived data, so it stays in
+  default prompt, job/comment pickers) is ghsync-derived data, so it stays in
   this spec as `WorkItemService.GenerateAgentRunPlan`. The client generates a
   plan here, then creates the run through the existing agent API, passing the
   plan's scope lock and attachments through whatever fields that API defines
@@ -108,7 +108,7 @@ message AgentRunPlan { /* … */ }
 
 message WorkItem {
   option (google.api.resource) = {
-    type: "frontier.example.com/WorkItem"
+    type: "ghsync.example.com/WorkItem"
     pattern: "users/{user}/workItems/{work_item}"
   };
 
@@ -117,9 +117,9 @@ message WorkItem {
 
   // Reference to the mirrored stack, or empty for a loose PR (AIP-122 §refs).
   string stack = 3 [(google.api.resource_reference) = {
-    type: "frontier.example.com/Stack" }, (google.api.field_behavior) = OUTPUT_ONLY];
+    type: "ghsync.example.com/Stack" }, (google.api.field_behavior) = OUTPUT_ONLY];
   string repo = 4 [(google.api.resource_reference) = {
-    type: "frontier.example.com/Repo" }, (google.api.field_behavior) = OUTPUT_ONLY];
+    type: "ghsync.example.com/Repo" }, (google.api.field_behavior) = OUTPUT_ONLY];
 
   repeated WorkScope scopes = 5 [(google.api.field_behavior) = OUTPUT_ONLY];
   int32 rank = 6 [(google.api.field_behavior) = OUTPUT_ONLY];
@@ -230,7 +230,7 @@ service PreviewService {
 
 message Preview {
   option (google.api.resource) = {
-    type: "frontier.example.com/Preview"
+    type: "ghsync.example.com/Preview"
     pattern: "users/{user}/workItems/{work_item}/previews/{preview}"
   };
 
@@ -282,7 +282,7 @@ service DryRunService {
 
 message Stack {
   option (google.api.resource) = {
-    type: "frontier.example.com/Stack"
+    type: "ghsync.example.com/Stack"
     pattern: "orgs/{org}/repos/{repo}/stacks/{stack}"
   };
   string name = 1 [(google.api.field_behavior) = IDENTIFIER];
@@ -290,13 +290,13 @@ message Stack {
   bool open = 3 [(google.api.field_behavior) = OUTPUT_ONLY];
   // Bottom → top, mirroring GitHub's Stacks API entry order.
   repeated string pull_requests = 4 [(google.api.resource_reference) = {
-    type: "frontier.example.com/PullRequest" }, (google.api.field_behavior) = OUTPUT_ONLY];
+    type: "ghsync.example.com/PullRequest" }, (google.api.field_behavior) = OUTPUT_ONLY];
   google.protobuf.Timestamp update_time = 5 [(google.api.field_behavior) = OUTPUT_ONLY];
 }
 
 message DryRun {
   option (google.api.resource) = {
-    type: "frontier.example.com/DryRun"
+    type: "ghsync.example.com/DryRun"
     pattern: "orgs/{org}/repos/{repo}/stacks/{stack}/dryRuns/{dry_run}"
   };
   string name = 1 [(google.api.field_behavior) = IDENTIFIER];
@@ -342,7 +342,7 @@ service PullRequestService {
 
 message PullRequest {
   option (google.api.resource) = {
-    type: "frontier.example.com/PullRequest"
+    type: "ghsync.example.com/PullRequest"
     pattern: "orgs/{org}/repos/{repo}/pullRequests/{pull_request}"
   };
   string name = 1 [(google.api.field_behavior) = IDENTIFIER];
@@ -353,7 +353,7 @@ message PullRequest {
   string head_ref = 6 [(google.api.field_behavior) = OUTPUT_ONLY];
   string head_sha = 7 [(google.api.field_behavior) = OUTPUT_ONLY];
   string stack = 8 [(google.api.resource_reference) = {
-    type: "frontier.example.com/Stack" }, (google.api.field_behavior) = OUTPUT_ONLY];
+    type: "ghsync.example.com/Stack" }, (google.api.field_behavior) = OUTPUT_ONLY];
   int32 stack_position = 9 [(google.api.field_behavior) = OUTPUT_ONLY];  // 1 = bottom
   google.protobuf.Timestamp update_time = 10 [(google.api.field_behavior) = OUTPUT_ONLY];
 }
@@ -426,4 +426,4 @@ Open questions for v0.2:
    uniformity; downgrade nudge/assign to synchronous if the extra hop annoys.
 4. How `AgentRunPlan` maps onto the existing agent-runner API's create-run
    request: does that API accept a scope lock and context attachments directly,
-   or does Frontier need to pass the plan by reference for the runner to fetch?
+   or does ghsync need to pass the plan by reference for the runner to fetch?

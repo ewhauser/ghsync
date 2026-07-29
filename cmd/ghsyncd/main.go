@@ -1,12 +1,12 @@
-// frontier-syncd is the Frontier sync engine daemon.
+// ghsyncd is the ghsync sync engine daemon.
 //
 // Usage:
 //
-//	frontier-syncd serve [--roles=all]   run the engine (default command)
-//	frontier-syncd migrate               apply River + schema migrations
-//	frontier-syncd backfill              start/resume installation backfill
-//	frontier-syncd requeue --guid=...    replay parked deliveries
-//	frontier-syncd version               print the build version
+//	ghsyncd serve [--roles=all]   run the engine (default command)
+//	ghsyncd migrate               apply River + schema migrations
+//	ghsyncd backfill              start/resume installation backfill
+//	ghsyncd requeue --guid=...    replay parked deliveries
+//	ghsyncd version               print the build version
 package main
 
 import (
@@ -34,7 +34,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/fetch"
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/ingress"
-	frontiermetrics "github.com/ewhauser/ghsync/internal/metrics"
+	ghsyncmetrics "github.com/ewhauser/ghsync/internal/metrics"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
@@ -63,7 +63,7 @@ const (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "frontier-syncd:", err)
+		fmt.Fprintln(os.Stderr, "ghsyncd:", err)
 		os.Exit(1)
 	}
 }
@@ -323,12 +323,12 @@ func serve(args []string) error {
 	}
 	defer pool.Close()
 
-	metricRegistry, err := frontiermetrics.New()
+	metricRegistry, err := ghsyncmetrics.New()
 	if err != nil {
 		return err
 	}
-	runtimeMetrics, err := frontiermetrics.NewRuntime(
-		frontiermetrics.RuntimeOptions{
+	runtimeMetrics, err := ghsyncmetrics.NewRuntime(
+		ghsyncmetrics.RuntimeOptions{
 			Pool:               pool,
 			InstallationID:     cfg.GitHubInstallationID,
 			Roles:              enabledRoles(roles),
@@ -345,7 +345,7 @@ func serve(args []string) error {
 		return err
 	}
 	if err := metricRegistry.Register(
-		"github.com/ewhauser/ghsync/frontier-syncd",
+		"github.com/ewhauser/ghsync/ghsyncd",
 		runtimeMetrics,
 	); err != nil {
 		return err
@@ -702,7 +702,7 @@ func serve(args []string) error {
 		}
 	}()
 
-	slog.Info("frontier-syncd running", "version", version, "roles", *rolesFlag)
+	slog.Info("ghsyncd running", "version", version, "roles", *rolesFlag)
 	var serviceErr error
 	select {
 	case <-signalCtx.Done():
@@ -766,7 +766,7 @@ func serviceMux(
 	metricsHandler http.Handler,
 ) *http.ServeMux {
 	mux := ingress.NewMux(webhook)
-	mux.Handle("GET "+frontiermetrics.Path, metricsHandler)
+	mux.Handle("GET "+ghsyncmetrics.Path, metricsHandler)
 	return mux
 }
 
@@ -933,7 +933,7 @@ func uniqueStrings(values []string) []string {
 // metrics package's independence from internal/stream (Opus review C6) without
 // widening the stream interface.
 type watermarkMetricsAdapter struct {
-	runtime *frontiermetrics.Runtime
+	runtime *ghsyncmetrics.Runtime
 }
 
 func (a watermarkMetricsAdapter) WatermarkStep(

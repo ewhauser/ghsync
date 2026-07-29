@@ -1,349 +1,349 @@
 groups:
-  - name: frontier-sync-engine
+  - name: ghsync-sync-engine
     rules:
-      - alert: FrontierSweepConditionalHitRateLow
+      - alert: GhsyncSweepConditionalHitRateLow
         expr: >-
           (
             (
-              sum(increase(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
+              sum(increase(ghsync_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
               /
-              sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))
+              sum(increase(ghsync_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))
             ) < 0.80
             and
-            sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])) > 0
+            sum(increase(ghsync_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])) > 0
           )
-          or absent(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"})
-          or absent(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"})
+          or absent(ghsync_c_b4_conditional_requests_total{class="sweep",resource="rest"})
+          or absent(ghsync_c_b4_conditional_304s_total{class="sweep",resource="rest"})
         for: 15m
         labels: {severity: warning}
         annotations:
           constraint: C-B4
           summary: Sweep-scoped rolling conditional 304 ratio is below 80 percent
           description: The rolling sweep request counters are absent or quiet-org validation is not returning at least 80 percent 304s.
-      - alert: FrontierBudgetClassStarved
+      - alert: GhsyncBudgetClassStarved
         expr: >-
-          increase(frontier_c_b3_starvations_total[5m]) > 0
-          or absent(frontier_c_b3_starvations_total)
+          increase(ghsync_c_b3_starvations_total[5m]) > 0
+          or absent(ghsync_c_b3_starvations_total)
         labels: {severity: page}
         annotations:
           constraint: C-B3
           summary: A GitHub request class is starved or unobservable
           description: Inspect the server-authoritative budget, singleton GitHub role, and queued work.
-      - alert: FrontierSecondaryGateClosed
+      - alert: GhsyncSecondaryGateClosed
         expr: >-
-          max(frontier_c_b2_gate_closed) == 1
-          or absent(frontier_c_b2_gate_closed)
+          max(ghsync_c_b2_gate_closed) == 1
+          or absent(ghsync_c_b2_gate_closed)
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-B2
           summary: The installation-wide GitHub gate is closed or unobservable
           description: A secondary-limit response has blocked all GitHub calls continuously, or the metrics collector is absent.
-      - alert: FrontierEventCacheP95SLOBreach
+      - alert: GhsyncEventCacheP95SLOBreach
         expr: >-
-          histogram_quantile(0.95, sum by (le) (rate(frontier_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 20
-          or absent(frontier_c_q2_event_to_cache_latency_seconds_bucket)
+          histogram_quantile(0.95, sum by (le) (rate(ghsync_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 20
+          or absent(ghsync_c_q2_event_to_cache_latency_seconds_bucket)
         for: 10m
         labels: {severity: page}
         annotations:
           constraint: C-Q2
           summary: Webhook-receipt to cache-commit p95 exceeds 20 seconds
           description: The bounded-debounce freshness SLO is breached or its real commit-latency histogram is absent.
-      - alert: FrontierEventCacheP99SLOBreach
+      - alert: GhsyncEventCacheP99SLOBreach
         expr: >-
-          histogram_quantile(0.99, sum by (le) (rate(frontier_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 60
-          or absent(frontier_c_q2_event_to_cache_latency_seconds_bucket)
+          histogram_quantile(0.99, sum by (le) (rate(ghsync_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 60
+          or absent(ghsync_c_q2_event_to_cache_latency_seconds_bucket)
         for: 10m
         labels: {severity: page}
         annotations:
           constraint: C-Q2
           summary: Webhook-receipt to cache-commit p99 exceeds 60 seconds
           description: The bounded-debounce freshness SLO is breached or its real commit-latency histogram is absent.
-      - alert: FrontierInvalidEventCacheClock
+      - alert: GhsyncInvalidEventCacheClock
         expr: >-
-          increase(frontier_c_q2_invalid_event_cache_latency_total[5m]) > 0
-          or absent(frontier_c_q2_invalid_event_cache_latency_total)
+          increase(ghsync_c_q2_invalid_event_cache_latency_total[5m]) > 0
+          or absent(ghsync_c_q2_invalid_event_cache_latency_total)
         labels: {severity: page}
         annotations:
           constraint: C-Q2
           summary: PostgreSQL produced an invalid event-to-commit interval
           description: Receipt and commit timestamps must share the PostgreSQL clock.
-      - alert: FrontierOldestDeliveryTooOld
+      - alert: GhsyncOldestDeliveryTooOld
         expr: >-
-          frontier_c_q2_oldest_unprocessed_delivery_age_seconds > 60
-          or absent(frontier_c_q2_oldest_unprocessed_delivery_age_seconds)
+          ghsync_c_q2_oldest_unprocessed_delivery_age_seconds > 60
+          or absent(ghsync_c_q2_oldest_unprocessed_delivery_age_seconds)
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-Q2
           summary: An unprocessed webhook delivery is older than 60 seconds or unobservable
           description: Dispatch or fetch is no longer keeping freshness within the p99 objective.
-      - alert: FrontierOutstandingGenerationTooOld
+      - alert: GhsyncOutstandingGenerationTooOld
         expr: >-
-          frontier_c_q2_oldest_outstanding_generation_age_seconds > 60
-          or absent(frontier_c_q2_oldest_outstanding_generation_age_seconds)
-          or absent(frontier_c_q2_outstanding_generations)
+          ghsync_c_q2_oldest_outstanding_generation_age_seconds > 60
+          or absent(ghsync_c_q2_oldest_outstanding_generation_age_seconds)
+          or absent(ghsync_c_q2_outstanding_generations)
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-Q2
           summary: An event-backed refresh generation is stuck or unobservable
           description: A delivery can be processed while its authoritative refresh generation remains incomplete.
-      - alert: FrontierEventQueueBacklog
+      - alert: GhsyncEventQueueBacklog
         expr: >-
-          frontier_c_p2_queue_depth{queue="event"} > 1000
-          or absent(frontier_c_p2_queue_depth{queue="event"})
+          ghsync_c_p2_queue_depth{queue="event"} > 1000
+          or absent(ghsync_c_p2_queue_depth{queue="event"})
         for: 5m
         labels: {severity: warning}
         annotations:
           constraint: C-P2
           summary: Event queue depth exceeds 1000 jobs or is unobservable
           description: Batched dispatch is producing work faster than event workers drain it.
-      - alert: FrontierPoisonDeliveryParked
+      - alert: GhsyncPoisonDeliveryParked
         expr: >-
           (
-            max(frontier_c_i5_parked_deliveries) > 0
+            max(ghsync_c_i5_parked_deliveries) > 0
             and
-            max(frontier_c_i5_oldest_parked_delivery_age_seconds) > 300
+            max(ghsync_c_i5_oldest_parked_delivery_age_seconds) > 300
           )
-          or absent(frontier_c_i5_parked_deliveries)
-          or absent(frontier_c_i5_oldest_parked_delivery_age_seconds)
+          or absent(ghsync_c_i5_parked_deliveries)
+          or absent(ghsync_c_i5_oldest_parked_delivery_age_seconds)
         for: 1m
         labels: {severity: page}
         annotations:
           constraint: C-I5
           summary: A parked delivery remains unresolved or poison state is unobservable
-          description: Diagnose one GUID or bounded event/error family, fix it, then use frontier-syncd requeue.
-      - alert: FrontierCacheStalenessBoundBreached
+          description: Diagnose one GUID or bounded event/error family, fix it, then use ghsyncd requeue.
+      - alert: GhsyncCacheStalenessBoundBreached
         expr: >-
           max by (entity_class) (
-            frontier_c_r1_cache_staleness_seconds
+            ghsync_c_r1_cache_staleness_seconds
           )
             > on(entity_class)
           max by (entity_class) (
-            frontier_c_r1_staleness_bound_seconds
+            ghsync_c_r1_staleness_bound_seconds
           )
-          or absent(frontier_c_r1_cache_staleness_seconds)
-          or absent(frontier_c_r1_staleness_bound_seconds)
+          or absent(ghsync_c_r1_cache_staleness_seconds)
+          or absent(ghsync_c_r1_staleness_bound_seconds)
         for: 2m
         labels: {severity: page}
         annotations:
           constraint: C-R1
           summary: A display-eligible cache class is beyond its bound or unobservable
           description: Staleness uses PostgreSQL validation time and the explicit closed-entity display-retention set.
-      - alert: FrontierSweepOverrun
+      - alert: GhsyncSweepOverrun
         expr: >-
-          increase(frontier_c_r2_sweep_overruns_total[15m]) > 0
+          increase(ghsync_c_r2_sweep_overruns_total[15m]) > 0
           or (
             max by (sweep_kind) (
-              frontier_c_r2_sweep_duration_seconds
+              ghsync_c_r2_sweep_duration_seconds
             )
               > on(sweep_kind)
             max by (sweep_kind) (
-              frontier_c_r2_sweep_period_seconds
+              ghsync_c_r2_sweep_period_seconds
             )
           )
-          or absent(frontier_c_r2_sweep_duration_seconds)
-          or absent(frontier_c_r2_sweep_period_seconds)
+          or absent(ghsync_c_r2_sweep_duration_seconds)
+          or absent(ghsync_c_r2_sweep_period_seconds)
         labels: {severity: page}
         annotations:
           constraint: C-R2
           summary: A resumable sweep cannot finish inside its period or is unobservable
           description: Inspect its durable cursor, durable completion heartbeat, queue latency, and GitHub budget.
-      - alert: FrontierStackSweepPassMissing
+      - alert: GhsyncStackSweepPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"} > 675
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"} > 675
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"} > 675
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"} < 0
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"} > 675
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"})
+          or absent(ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"})
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-R2
           summary: The durable stack sweep completion is missing or stale
           description: Stack sweeps run every 3m45s and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
-      - alert: FrontierPullRequestSweepPassMissing
+      - alert: GhsyncPullRequestSweepPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"} > 1350
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"} > 1350
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"} > 1350
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"} < 0
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"} > 1350
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"})
+          or absent(ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"})
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-R2
           summary: The durable pull-request sweep completion is missing or stale
           description: Pull-request sweeps run every 7m30s and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
-      - alert: FrontierRepoRulesSweepPassMissing
+      - alert: GhsyncRepoRulesSweepPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"} > 8100
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"} > 8100
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"} > 8100
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"} < 0
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"} > 8100
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"})
+          or absent(ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"})
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-R2
           summary: The durable repo-rules sweep completion is missing or stale
           description: Repo-rules sweeps run every 45m and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
-      - alert: FrontierRepositorySweepPassMissing
+      - alert: GhsyncRepositorySweepPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"} > 8100
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"} > 8100
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"} > 8100
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"} < 0
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"} > 8100
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"})
+          or absent(ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"})
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-R2
           summary: The durable repository sweep completion is missing or stale
           description: Repository sweeps run every 45m and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
-      - alert: FrontierClosedSweepPassMissing
+      - alert: GhsyncClosedSweepPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"} > 194400
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"} > 194400
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"} > 194400
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"} < 0
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"} > 194400
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"})
+          or absent(ghsync_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"})
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-R2
           summary: The durable closed-entity sweep completion is missing or stale
           description: Closed-entity sweeps run every 18h and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
-      - alert: FrontierDriftOpen
+      - alert: GhsyncDriftOpen
         expr: >-
-          frontier_c_o3_drift_findings{state="open",entity_kind="all"} > 0
-          or absent(frontier_c_o3_drift_findings{state="open",entity_kind="all"})
+          ghsync_c_o3_drift_findings{state="open",entity_kind="all"} > 0
+          or absent(ghsync_c_o3_drift_findings{state="open",entity_kind="all"})
         for: 1m
         labels: {severity: page}
         annotations:
           constraint: C-O3
           summary: Semantic cache drift is open or unobservable
           description: The cache is not trustworthy until the finding heals and resolves.
-      - alert: FrontierDriftPassMissing
+      - alert: GhsyncDriftPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"} > 7200
-          or frontier_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"} > 7200
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"} > 7200
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"} < 0
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"} > 7200
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"})
+          or absent(ghsync_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"})
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-O3
           summary: The durable drift pass heartbeat is missing or stale
           description: Silence from the drift detector is a trust failure, not success.
-      - alert: FrontierWatermarkStalled
+      - alert: GhsyncWatermarkStalled
         expr: >-
           (
-            frontier_c_s2_watermark_lag_sequences > 0
+            ghsync_c_s2_watermark_lag_sequences > 0
             and
-            frontier_c_s2_watermark_age_seconds > 30
+            ghsync_c_s2_watermark_age_seconds > 30
           )
-          or absent(frontier_c_s2_watermark_lag_sequences)
-          or absent(frontier_c_s2_watermark_age_seconds)
+          or absent(ghsync_c_s2_watermark_lag_sequences)
+          or absent(ghsync_c_s2_watermark_age_seconds)
         for: 2m
         labels: {severity: page}
         annotations:
           constraint: C-S2
           summary: The visibility watermark is stalled or unobservable
           description: Check the watermarker lease and real writer/deriver fence before restarting the role.
-      - alert: FrontierWatermarkPassMissing
+      - alert: GhsyncWatermarkPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"} > 30
-          or frontier_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"} > 30
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"} > 30
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"} < 0
+          or ghsync_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"} > 30
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"})
+          or absent(ghsync_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"})
         for: 2m
         labels: {severity: page}
         annotations:
           constraint: C-S2
           summary: The durable watermark heartbeat is missing or stale
           description: Watermark silence fires even when no change-event lag series can be trusted.
-      - alert: FrontierOutboxBacklog
+      - alert: GhsyncOutboxBacklog
         expr: >-
-          frontier_c_s7_prunable_outbox_depth{stream="all"} > 100000
-          or absent(frontier_c_s7_prunable_outbox_depth{stream="all"})
+          ghsync_c_s7_prunable_outbox_depth{stream="all"} > 100000
+          or absent(ghsync_c_s7_prunable_outbox_depth{stream="all"})
         for: 15m
         labels: {severity: warning}
         annotations:
           constraint: C-S7
           summary: Retention-eligible outbox depth exceeds 100000 rows or is absent
           description: This counts only rows actually eligible under the safe watermark and seven-day policy.
-      - alert: FrontierConsumerCursorStalled
+      - alert: GhsyncConsumerCursorStalled
         expr: >-
-          frontier_c_s4_consumer_outstanding_events > 10000
+          ghsync_c_s4_consumer_outstanding_events > 10000
           and on(consumer,stream)
-          frontier_c_s4_oldest_outstanding_event_age_seconds > 300
+          ghsync_c_s4_oldest_outstanding_event_age_seconds > 300
         for: 5m
         labels: {severity: warning}
         annotations:
           constraint: C-S4
           summary: A consumer has too many old visible events
           description: Counts and ages are correlated within the consumer's own stream.
-      - alert: FrontierConsumerMetricsAbsent
+      - alert: GhsyncConsumerMetricsAbsent
         expr: >-
-          absent(frontier_c_s4_consumer_outstanding_events)
-          or absent(frontier_c_s4_oldest_outstanding_event_age_seconds)
+          absent(ghsync_c_s4_consumer_outstanding_events)
+          or absent(ghsync_c_s4_oldest_outstanding_event_age_seconds)
         for: 5m
         labels: {severity: warning}
         annotations:
           constraint: C-S4
           summary: Consumer stream-lag metrics are absent
           description: Confirm whether no consumers are registered before silencing this alert.
-      - alert: FrontierResyncStorm
+      - alert: GhsyncResyncStorm
         expr: >-
-          increase(frontier_c_s4_resyncs_total[15m]) > 3
+          increase(ghsync_c_s4_resyncs_total[15m]) > 3
         labels: {severity: page}
         annotations:
           constraint: C-S4
           summary: A consumer repeatedly entered RESYNC_REQUIRED
           description: Repeated bootstrap failure or retention churn is preventing convergence.
-      - alert: FrontierDeriverBacklog
+      - alert: GhsyncDeriverBacklog
         expr: >-
-          frontier_c_p5_deriver_dirty_backlog > 500
-          or absent(frontier_c_p5_deriver_dirty_backlog)
+          ghsync_c_p5_deriver_dirty_backlog > 500
+          or absent(ghsync_c_p5_deriver_dirty_backlog)
         for: 10m
         labels: {severity: warning}
         annotations:
           constraint: C-P5
           summary: Derivation dirty backlog exceeds one batch or is unobservable
           description: Deriver passes are not draining dirty scopes at the configured cap.
-      - alert: FrontierDeriverPassMissing
+      - alert: GhsyncDeriverPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"} > 30
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"})
+          ghsync_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"} < 0
+          or ghsync_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"} > 30
+          or absent(ghsync_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"})
         for: 2m
         labels: {severity: page}
         annotations:
           constraint: C-P5
           summary: The durable deriver pass heartbeat is missing or stale
           description: Every dirty-set pass records success in its derivation transaction, including an idle pass with no dirty scopes.
-      - alert: FrontierRequiredRoleAbsent
+      - alert: GhsyncRequiredRoleAbsent
         expr: >-
-          absent(frontier_c_o4_role_enabled{role="metrics"})
-          or absent(frontier_c_o4_role_enabled{role="ingress"})
-          or absent(frontier_c_o4_role_enabled{role="fetch"})
-          or absent(frontier_c_o4_role_enabled{role="sweep"})
-          or absent(frontier_c_o4_role_enabled{role="drift"})
-          or absent(frontier_c_o4_role_enabled{role="dispatch"})
-          or absent(frontier_c_o4_role_enabled{role="pruner"})
-          or absent(frontier_c_o4_role_enabled{role="watermarker"})
-          or absent(frontier_c_o4_role_enabled{role="deriver"})
+          absent(ghsync_c_o4_role_enabled{role="metrics"})
+          or absent(ghsync_c_o4_role_enabled{role="ingress"})
+          or absent(ghsync_c_o4_role_enabled{role="fetch"})
+          or absent(ghsync_c_o4_role_enabled{role="sweep"})
+          or absent(ghsync_c_o4_role_enabled{role="drift"})
+          or absent(ghsync_c_o4_role_enabled{role="dispatch"})
+          or absent(ghsync_c_o4_role_enabled{role="pruner"})
+          or absent(ghsync_c_o4_role_enabled{role="watermarker"})
+          or absent(ghsync_c_o4_role_enabled{role="deriver"})
         for: 2m
         labels: {severity: page}
         annotations:

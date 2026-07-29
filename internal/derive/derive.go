@@ -25,7 +25,7 @@ const (
 	defaultPollInterval = 500 * time.Millisecond
 	minListenerBackoff  = 100 * time.Millisecond
 	maxListenerBackoff  = 5 * time.Second
-	dirtyNotifyChannel  = "frontier_derivation_dirty"
+	dirtyNotifyChannel  = "ghsync_derivation_dirty"
 	deriverOperation    = "dirty_sets"
 )
 

@@ -2,7 +2,7 @@
 
 ## Symptoms
 
-- `FrontierResyncStorm`.
+- `GhsyncResyncStorm`.
 - A consumer's `resync_count` rises repeatedly.
 - The consumer receives typed `RESYNC_REQUIRED` after bootstrap.
 
@@ -45,7 +45,7 @@ foreground process in a separate shell/deployment action:
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=watermarker,pruner
+ghsyncd serve --roles=watermarker,pruner
 ```
 
 Do not extend retention to mask a consumer that cannot bootstrap.

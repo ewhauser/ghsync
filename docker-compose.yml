@@ -2,15 +2,15 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: frontier
-      POSTGRES_PASSWORD: frontier
-      POSTGRES_DB: frontier
+      POSTGRES_USER: ghsync
+      POSTGRES_PASSWORD: ghsync
+      POSTGRES_DB: ghsync
     ports:
       - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U frontier"]
+      test: ["CMD-SHELL", "pg_isready -U ghsync"]
       interval: 2s
       timeout: 2s
       retries: 15

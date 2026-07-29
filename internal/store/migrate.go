@@ -29,7 +29,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	defer lockConn.Close(context.Background()) //nolint:errcheck // close releases the session lock
 	if _, err := lockConn.Exec(ctx,
-		`SELECT pg_advisory_lock(hashtextextended('frontier_schema_migrations', 0))`); err != nil {
+		`SELECT pg_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
 

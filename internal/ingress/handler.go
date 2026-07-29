@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	// WebhookPath is the GitHub App webhook target served by frontier-syncd.
+	// WebhookPath is the GitHub App webhook target served by ghsyncd.
 	WebhookPath = "/webhooks/github"
 	// HealthPath is the process liveness endpoint.
 	HealthPath = "/healthz"

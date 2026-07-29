@@ -56,7 +56,7 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		data["nodes"] = nodes
 	} else if strings.Contains(
 		request.Query,
-		"FrontierPullRequestReviewThreadsPage",
+		"GhsyncPullRequestReviewThreadsPage",
 	) {
 		id, after := graphQLCursorVariables(request.Variables)
 		for _, pull := range fx.PullRequests {
@@ -72,7 +72,7 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if strings.Contains(
 		request.Query,
-		"FrontierReviewThreadCommentsPage",
+		"GhsyncReviewThreadCommentsPage",
 	) {
 		id, after := graphQLCursorVariables(request.Variables)
 		for _, pull := range fx.PullRequests {

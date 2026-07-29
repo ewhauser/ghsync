@@ -1,4 +1,4 @@
-// Package metrics owns Frontier's OpenTelemetry meter provider and Prometheus
+// Package metrics owns ghsync's OpenTelemetry meter provider and Prometheus
 // exposition. Runtime packages expose narrow observer interfaces; the daemon
 // registers their implementations here so instrumentation never creates an
 // import cycle.
@@ -51,7 +51,7 @@ func New() (*Registry, error) {
 		sdkmetric.WithReader(exporter),
 		sdkmetric.WithView(sdkmetric.NewView(
 			sdkmetric.Instrument{
-				Name: "frontier_c_q2_event_to_cache_latency_seconds",
+				Name: "ghsync_c_q2_event_to_cache_latency_seconds",
 			},
 			sdkmetric.Stream{
 				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
@@ -64,7 +64,7 @@ func New() (*Registry, error) {
 		)),
 		sdkmetric.WithView(sdkmetric.NewView(
 			sdkmetric.Instrument{
-				Name: "frontier_c_p2_dispatch_batch_size",
+				Name: "ghsync_c_p2_dispatch_batch_size",
 			},
 			sdkmetric.Stream{
 				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
@@ -75,7 +75,7 @@ func New() (*Registry, error) {
 		)),
 		sdkmetric.WithView(sdkmetric.NewView(
 			sdkmetric.Instrument{
-				Name: "frontier_c_p5_deriver_pass_duration_seconds",
+				Name: "ghsync_c_p5_deriver_pass_duration_seconds",
 			},
 			sdkmetric.Stream{
 				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{

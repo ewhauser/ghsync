@@ -1,10 +1,10 @@
-# Frontier Postgres delivery contract
+# ghsync Postgres delivery contract
 
 Contract version: **v1**, introduced by migration `0013`, extended
 additively by migrations `0014`–`0019` and `0021`, and hardened by the
 database-enforced writer fence in migration `0024`.
 
-Postgres is the Frontier sync engine’s public delivery interface. Consumers
+Postgres is the ghsync sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
 `pkg/streamclient`. The Go package is the reference implementation; consumers
 must not reproduce the watermark, cursor, retention, or resync algorithms.
@@ -14,14 +14,14 @@ by the sync engine.
 
 ## Consumer facts
 
-The suggested database role is `frontier_consumer`. Run this block once as a
-role that may create roles and grant access, then grant `frontier_consumer` to
+The suggested database role is `ghsync_consumer`. Run this block once as a
+role that may create roles and grant access, then grant `ghsync_consumer` to
 each application login that runs `pkg/streamclient`:
 
 ```sql
-CREATE ROLE frontier_consumer NOLOGIN;
+CREATE ROLE ghsync_consumer NOLOGIN;
 
-GRANT USAGE ON SCHEMA public TO frontier_consumer;
+GRANT USAGE ON SCHEMA public TO ghsync_consumer;
 
 GRANT SELECT ON TABLE
     repos,
@@ -35,10 +35,10 @@ GRANT SELECT ON TABLE
     change_events,
     stream_watermark,
     stream_horizons
-TO frontier_consumer;
+TO ghsync_consumer;
 
 GRANT SELECT, INSERT, UPDATE ON TABLE consumer_cursors
-TO frontier_consumer;
+TO ghsync_consumer;
 ```
 
 Run exactly **one tailer per `(consumer, stream)`**. Two processes must not
@@ -317,7 +317,7 @@ takes:
 SELECT pg_advisory_xact_lock_shared(5076242250190120306);
 ```
 
-The value is the ASCII bytes for `Frontier` interpreted as a signed `BIGINT`;
+The value is the ASCII bytes for `ghsync` interpreted as a signed `BIGINT`;
 clients pass it as a parameter. All internal entity-writer and deriver paths use
 `internal/outbox.AcquireWriterFence`. Migration `0024` adds a
 `BEFORE INSERT` trigger that rejects any `change_events` write whose backend
@@ -377,7 +377,7 @@ Product decision: server-side kind and entity-key filtering is deferred from
 v1. Tail pages by `stream`; consumers apply any narrower filtering inside the
 transactional handler.
 
-`LISTEN frontier_change_events` and its statement-level constant-payload
+`LISTEN ghsync_change_events` and its statement-level constant-payload
 notification lower latency only. `pkg/streamclient` continues polling during a
 listener failure and reconnects with bounded backoff.
 

@@ -9,17 +9,17 @@ yellow means correct now but losing safety margin.
 Use four large stat panels:
 
 1. **Freshness:** C-Q2 p95/p99 from
-   `frontier_c_q2_event_to_cache_latency_seconds` beside 20s/60s limits, plus
-   `frontier_c_q2_oldest_unprocessed_delivery_age_seconds` and
-   `frontier_c_q2_oldest_outstanding_generation_age_seconds`.
+   `ghsync_c_q2_event_to_cache_latency_seconds` beside 20s/60s limits, plus
+   `ghsync_c_q2_oldest_unprocessed_delivery_age_seconds` and
+   `ghsync_c_q2_oldest_outstanding_generation_age_seconds`.
 2. **Bounded staleness:** table
-   `frontier_c_r1_cache_staleness_seconds` /
-   `frontier_c_r1_staleness_bound_seconds` by `entity_class`.
+   `ghsync_c_r1_cache_staleness_seconds` /
+   `ghsync_c_r1_staleness_bound_seconds` by `entity_class`.
 3. **Correctness:** open
-   `frontier_c_o3_drift_findings{state="open"}` and
-   `frontier_c_i5_parked_deliveries`. Either above zero is red.
-4. **Stream safety:** `frontier_c_s2_watermark_lag_sequences`,
-   `frontier_c_s2_watermark_age_seconds`, and maximum per-stream consumer
+   `ghsync_c_o3_drift_findings{state="open"}` and
+   `ghsync_c_i5_parked_deliveries`. Either above zero is red.
+4. **Stream safety:** `ghsync_c_s2_watermark_lag_sequences`,
+   `ghsync_c_s2_watermark_age_seconds`, and maximum per-stream consumer
    outstanding-event count/age.
 
 This row alone answers the on-call question. Link each stat to its runbook.
@@ -35,12 +35,12 @@ This row alone answers the on-call question. Link each stat to its runbook.
 
   ```promql
   (
-    sum(increase(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
+    sum(increase(ghsync_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
     /
-    sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))
+    sum(increase(ghsync_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))
   )
   and
-  sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])) > 0
+  sum(increase(ghsync_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])) > 0
   ```
 
 ## Row 3: reconciliation and budget
@@ -48,7 +48,7 @@ This row alone answers the on-call question. Link each stat to its runbook.
 - Server-authoritative budget remaining by class/resource; request and
   starvation rates. Starvation, not a post-request floor comparison, is the
   admission-safety signal.
-- `frontier_c_b2_gate_closed` as a boolean with continuous closed duration
+- `ghsync_c_b2_gate_closed` as a boolean with continuous closed duration
   supplied by the alert `for` clause.
 - Sweep duration and period by kind, gap-heal requests, drift state, and
   pruner deletes. Include durable sweep/drift success count, drift sample
@@ -57,12 +57,12 @@ This row alone answers the on-call question. Link each stat to its runbook.
 ## Row 4: stream and derivation
 
 - Watermark sequence lag/age, durable watermarker success age,
-  retention-eligible `frontier_c_s7_prunable_outbox_depth`, and advance rate.
+  retention-eligible `ghsync_c_s7_prunable_outbox_depth`, and advance rate.
 - Consumer own-stream outstanding event count/age and resync rate.
 - Deriver pass duration and dirty backlog.
 
 Keep active alerts down the right edge. Do not split the view by daemon role:
-`frontier_c_o4_role_enabled` identifies each scraped process. Only the
+`ghsync_c_o4_role_enabled` identifies each scraped process. Only the
 dedicated `metrics` role reads authoritative aggregate Postgres state; other
 roles expose local counters. Every trust panel has an absence rule, so a
 missing collector or required role is red rather than a blank success.

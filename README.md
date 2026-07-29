@@ -1,4 +1,4 @@
-# Frontier Sync Engine
+# ghsync Sync Engine
 
 The `sync-engine` branch holds the Go + Postgres sync engine — webhook
 ingestion, authoritative refetch, the mirror cache, coalescing, budget
@@ -20,7 +20,7 @@ make dev       # docker compose postgres + migrate + run the daemon
 make gen       # regenerate sqlc code after editing db/queries or db/migrations
 ```
 
-`frontier-syncd` commands: `serve --roles=...`, `migrate`,
+`ghsyncd` commands: `serve --roles=...`, `migrate`,
 `backfill` (the configured installation), `requeue --guid=…|--guids=…` or
 bounded `requeue --event=… --error-contains=…`,
 `version`.

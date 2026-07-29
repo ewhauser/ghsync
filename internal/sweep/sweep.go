@@ -379,7 +379,7 @@ func (s *Service) ReconciliationPeriodicJobs() []*river.PeriodicJob {
 					periodicInsertOpts(queue.QueueReconcile)
 			},
 			&river.PeriodicJobOpts{
-				ID:         "frontier_gap_heal",
+				ID:         "ghsync_gap_heal",
 				RunOnStart: true,
 			},
 		),
@@ -398,7 +398,7 @@ func (s *Service) PrunerPeriodicJobs() []*river.PeriodicJob {
 				return PruneArgs{}, periodicInsertOpts(queue.QueuePruner)
 			},
 			&river.PeriodicJobOpts{
-				ID:         "frontier_retention_prune",
+				ID:         "ghsync_retention_prune",
 				RunOnStart: true,
 			},
 		),
@@ -424,7 +424,7 @@ func (s *Service) kickoffPeriodic(
 				periodicInsertOpts(queue.QueueReconcile)
 		},
 		&river.PeriodicJobOpts{
-			ID:         "frontier_sweep_" + kind,
+			ID:         "ghsync_sweep_" + kind,
 			RunOnStart: true,
 		},
 	)

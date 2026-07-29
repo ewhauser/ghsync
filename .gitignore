@@ -1,4 +1,4 @@
-/frontier-syncd
+/ghsyncd
 /fake-github
 *.pem
 .env

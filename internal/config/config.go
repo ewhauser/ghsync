@@ -1,4 +1,4 @@
-// Package config loads frontier-syncd configuration from the environment.
+// Package config loads ghsyncd configuration from the environment.
 package config
 
 import (
@@ -57,7 +57,7 @@ const (
 	defaultDeriverDirtyCap       = 500
 )
 
-// Config is frontier-syncd's validated environment-derived runtime surface.
+// Config is ghsyncd's validated environment-derived runtime surface.
 type Config struct {
 	// DatabaseURL is the Postgres connection string (DATABASE_URL).
 	DatabaseURL string
@@ -175,7 +175,7 @@ type Config struct {
 	DeriverDirtyCap int
 }
 
-// FromEnv parses and cross-validates frontier-syncd environment variables.
+// FromEnv parses and cross-validates ghsyncd environment variables.
 func FromEnv() (Config, error) {
 	cfg := Config{
 		DatabaseURL:                os.Getenv("DATABASE_URL"),

@@ -2,7 +2,7 @@
 
 ## Symptoms
 
-- `FrontierDriftOpen`; the dashboard correctness verdict is red.
+- `GhsyncDriftOpen`; the dashboard correctness verdict is red.
 - A finding persists after its self-heal generation completed.
 
 ## Diagnosis
@@ -32,17 +32,17 @@ each foreground invocation is a separate shell/deployment action:
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=fetch,sweep,drift
+ghsyncd serve --roles=fetch,sweep,drift
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=watermarker
+ghsyncd serve --roles=watermarker
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=metrics
+ghsyncd serve --roles=metrics
 ```
 
 Fix the conversion, CAS, or missing event/sweep rule. The detector resolves

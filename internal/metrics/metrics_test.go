@@ -26,7 +26,7 @@ type counterRegistrar struct {
 
 func (r *counterRegistrar) RegisterMetrics(meter metric.Meter) error {
 	var err error
-	r.counter, err = meter.Int64Counter("frontier_c_o4_registry_test")
+	r.counter, err = meter.Int64Counter("ghsync_c_o4_registry_test")
 	return err
 }
 
@@ -53,7 +53,7 @@ func TestRegistryIsolatedPrometheusExposition(t *testing.T) {
 	}
 	if body := response.Body.String(); !strings.Contains(
 		body,
-		"frontier_c_o4_registry_test_total 2",
+		"ghsync_c_o4_registry_test_total 2",
 	) {
 		t.Fatalf("metrics body omitted registry counter:\n%s", body)
 	}
@@ -254,20 +254,20 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{
-		"frontier_c_b3_budget_remaining",
-		"frontier_c_b4_conditional_304s_total",
-		"frontier_c_c2_cache_cas_reject_ratio",
-		"frontier_c_i5_parked_deliveries",
-		"frontier_c_o3_drift_findings",
-		"frontier_c_s2_watermark_lag_sequences",
-		"frontier_c_q2_outstanding_generations",
-		"frontier_c_o4_operation_samples",
-		"frontier_c_o4_last_operation_sample_age_seconds",
-		"frontier_c_p5_deriver_dirty_backlog",
-		`frontier_c_r2_sweep_period_seconds{sweep_kind="stacks"} 225`,
-		`frontier_c_o4_role_enabled{role="fetch"} 1`,
-		`frontier_c_q2_event_to_cache_latency_seconds_count{kind="refresh_pr"} 1`,
-		`frontier_c_q2_invalid_event_cache_latency_total{kind="refresh_pr"} 1`,
+		"ghsync_c_b3_budget_remaining",
+		"ghsync_c_b4_conditional_304s_total",
+		"ghsync_c_c2_cache_cas_reject_ratio",
+		"ghsync_c_i5_parked_deliveries",
+		"ghsync_c_o3_drift_findings",
+		"ghsync_c_s2_watermark_lag_sequences",
+		"ghsync_c_q2_outstanding_generations",
+		"ghsync_c_o4_operation_samples",
+		"ghsync_c_o4_last_operation_sample_age_seconds",
+		"ghsync_c_p5_deriver_dirty_backlog",
+		`ghsync_c_r2_sweep_period_seconds{sweep_kind="stacks"} 225`,
+		`ghsync_c_o4_role_enabled{role="fetch"} 1`,
+		`ghsync_c_q2_event_to_cache_latency_seconds_count{kind="refresh_pr"} 1`,
+		`ghsync_c_q2_invalid_event_cache_latency_total{kind="refresh_pr"} 1`,
 	} {
 		if !strings.Contains(string(body), name) {
 			t.Errorf("metrics exposition omitted %q", name)
@@ -275,13 +275,13 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	}
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_c2_cache_cas_reject_ratio",
+		"ghsync_c_c2_cache_cas_reject_ratio",
 		map[string]string{"entity_kind": "pull_request"},
 		1.0/3.0,
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_s4_consumer_outstanding_events",
+		"ghsync_c_s4_consumer_outstanding_events",
 		map[string]string{
 			"consumer": "metrics-test-consumer",
 			"stream":   "entities",
@@ -290,7 +290,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_s4_resyncs_total",
+		"ghsync_c_s4_resyncs_total",
 		map[string]string{
 			"consumer": "metrics-test-consumer",
 			"stream":   "entities",
@@ -299,43 +299,43 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_s7_prunable_outbox_depth",
+		"ghsync_c_s7_prunable_outbox_depth",
 		map[string]string{"stream": "entities"},
 		3,
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_s7_prunable_outbox_depth",
+		"ghsync_c_s7_prunable_outbox_depth",
 		map[string]string{"stream": "all"},
 		3,
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_o3_drift_findings",
+		"ghsync_c_o3_drift_findings",
 		map[string]string{"state": "open", "entity_kind": "pull_request"},
 		1,
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_o3_drift_findings",
+		"ghsync_c_o3_drift_findings",
 		map[string]string{"state": "resolved", "entity_kind": "stack"},
 		1,
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_o4_operation_successes",
+		"ghsync_c_o4_operation_successes",
 		map[string]string{"component": "drift", "operation": "detector"},
 		7,
 	)
 	assertPrometheusValue(
 		t, body,
-		"frontier_c_o4_operation_samples",
+		"ghsync_c_o4_operation_samples",
 		map[string]string{"component": "sweep", "operation": "repositories"},
 		17,
 	)
 	if age := prometheusValue(
 		t, body,
-		"frontier_c_s4_oldest_outstanding_event_age_seconds",
+		"ghsync_c_s4_oldest_outstanding_event_age_seconds",
 		map[string]string{
 			"consumer": "metrics-test-consumer",
 			"stream":   "entities",
@@ -345,7 +345,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	}
 	if duration := prometheusValue(
 		t, body,
-		"frontier_c_r2_sweep_duration_seconds",
+		"ghsync_c_r2_sweep_duration_seconds",
 		map[string]string{"sweep_kind": "stacks"},
 	); duration < 14 || duration > 16 {
 		t.Fatalf("stacks sweep duration = %v, want about 15s", duration)

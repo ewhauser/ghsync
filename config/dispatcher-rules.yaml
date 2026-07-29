@@ -1,4 +1,4 @@
-# Frontier dispatcher rules. Point DISPATCH_RULES_FILE at this file to make
+# ghsync dispatcher rules. Point DISPATCH_RULES_FILE at this file to make
 # Phase-0 webhook findings deployable as data (SYNC_ENGINE §2.1).
 rules:
   - event: pull_request

@@ -36,7 +36,7 @@ func Open(
 		return nil, fmt.Errorf("test schema suffix: %w", err)
 	}
 	prefix = strings.ToLower(prefix)
-	schema := "frontier_" + prefix + "_" + hex.EncodeToString(suffix)
+	schema := "ghsync_" + prefix + "_" + hex.EncodeToString(suffix)
 	admin, err := store.Connect(ctx, databaseURL)
 	if err != nil {
 		return nil, err

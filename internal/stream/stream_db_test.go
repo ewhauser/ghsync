@@ -919,7 +919,7 @@ func TestStatementLevelWakeTriggersEmitOneConstantNotification(t *testing.T) {
 		t,
 		ctx,
 		pool,
-		"frontier_change_events",
+		"ghsync_change_events",
 		"changed",
 		func(tx pgx.Tx) error {
 			if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
@@ -942,7 +942,7 @@ func TestStatementLevelWakeTriggersEmitOneConstantNotification(t *testing.T) {
 		t,
 		ctx,
 		pool,
-		"frontier_derivation_dirty",
+		"ghsync_derivation_dirty",
 		"dirty",
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `

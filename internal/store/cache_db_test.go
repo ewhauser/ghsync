@@ -459,7 +459,7 @@ func storeTestDatabase(
 	if err != nil {
 		t.Fatalf("connect admin: %v", err)
 	}
-	schema := fmt.Sprintf("frontier_store_%d", time.Now().UnixNano())
+	schema := fmt.Sprintf("ghsync_store_%d", time.Now().UnixNano())
 	identifier := pgx.Identifier{schema}.Sanitize()
 	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
 		admin.Close()

@@ -2,8 +2,8 @@
 
 ## Symptoms
 
-- `FrontierOldestDeliveryTooOld` after ingress recovers.
-- Missing GUIDs followed by `frontier_c_r4_gap_heal_requests_total`.
+- `GhsyncOldestDeliveryTooOld` after ingress recovers.
+- Missing GUIDs followed by `ghsync_c_r4_gap_heal_requests_total`.
 - C-R1 staleness grows while webhook volume is absent.
 
 ## Diagnosis
@@ -32,27 +32,27 @@ separate shell/deployment action:
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=ingress
+ghsyncd serve --roles=ingress
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=dispatch
+ghsyncd serve --roles=dispatch
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=fetch,sweep,drift
+ghsyncd serve --roles=fetch,sweep,drift
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=watermarker
+ghsyncd serve --roles=watermarker
 ```
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=metrics
+ghsyncd serve --roles=metrics
 ```
 
 The sweep role resumes `gap_heal_cursors` and requests missing GUID
@@ -60,7 +60,7 @@ redelivery. Do not delete cursor/delivery rows. If initial enrollment was never
 completed:
 
 ```sh
-frontier-syncd backfill
+ghsyncd backfill
 ```
 
 ## Escalation

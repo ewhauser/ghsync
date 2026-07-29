@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	// FenceKey is a stable, database-wide advisory-lock key ("Frontier" in
+	// FenceKey is a stable, database-wide advisory-lock key ("ghsync" in
 	// ASCII). Writers hold its shared transaction lock before allocating an
 	// outbox sequence; the watermarker briefly takes the exclusive counterpart.
 	FenceKey int64 = 0x46726f6e74696572

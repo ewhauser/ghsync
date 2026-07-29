@@ -12,7 +12,7 @@ import (
 
 	"github.com/ewhauser/ghsync/internal/config"
 	"github.com/ewhauser/ghsync/internal/ingress"
-	frontiermetrics "github.com/ewhauser/ghsync/internal/metrics"
+	ghsyncmetrics "github.com/ewhauser/ghsync/internal/metrics"
 	"github.com/ewhauser/ghsync/internal/queue"
 )
 
@@ -21,13 +21,13 @@ func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
 		w http.ResponseWriter,
 		_ *http.Request,
 	) {
-		_, _ = w.Write([]byte("frontier_c_o4_test 1\n"))
+		_, _ = w.Write([]byte("ghsync_c_o4_test 1\n"))
 	})
 	workerMux := serviceMux(nil, metricsHandler)
 	for path, wantStatus := range map[string]int{
-		ingress.HealthPath:   http.StatusNoContent,
-		frontiermetrics.Path: http.StatusOK,
-		ingress.WebhookPath:  http.StatusNotFound,
+		ingress.HealthPath:  http.StatusNoContent,
+		ghsyncmetrics.Path:  http.StatusOK,
+		ingress.WebhookPath: http.StatusNotFound,
 	} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		if path == ingress.WebhookPath {
@@ -57,9 +57,9 @@ func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
 	metricsResponse := httptest.NewRecorder()
 	ingressMux.ServeHTTP(
 		metricsResponse,
-		httptest.NewRequest(http.MethodGet, frontiermetrics.Path, nil),
+		httptest.NewRequest(http.MethodGet, ghsyncmetrics.Path, nil),
 	)
-	if !strings.Contains(metricsResponse.Body.String(), "frontier_c_o4_test") {
+	if !strings.Contains(metricsResponse.Body.String(), "ghsync_c_o4_test") {
 		t.Fatal("ingress mux omitted metrics handler")
 	}
 }

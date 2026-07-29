@@ -1,4 +1,4 @@
-# Frontier Sync Engine — Implementation Plan
+# ghsync Sync Engine — Implementation Plan
 
 v2.0 · 2026-07-28 · **Scope: the sync engine only.**
 
@@ -43,7 +43,7 @@ schema doc (`db/CONTRACT.md`, written in M5) is part of the deliverable.
 ```
 .                               # Go module root
 ├── cmd/
-│   ├── frontier-syncd/          # single binary, role flags (SYNC_ENGINE §6)
+│   ├── ghsyncd/          # single binary, role flags (SYNC_ENGINE §6)
 │   ├── fake-github/             # deterministic GitHub test double
 │   ├── stream-tail/             # reference Postgres stream consumer
 │   └── soak/                    # storm/soak verifier
@@ -79,7 +79,7 @@ vet, golangci-lint, tests). **Fake GitHub server skeleton** — REST + GraphQL
 + webhook emitter with scriptable scenarios; it is the test substrate for
 every later milestone, so it starts first.
 
-*Exit:* `make dev` boots an idle `frontier-syncd`; CI green; fake GitHub can
+*Exit:* `make dev` boots an idle `ghsyncd`; CI green; fake GitHub can
 serve a canned repo and emit a canned webhook.
 
 ### M1 — GitHub plumbing & budgeter (≈1.5 wk)
@@ -196,7 +196,7 @@ writes exist).
 
 ## 6. Definition of done (v1)
 
-A deployed `frontier-syncd` that: mirrors the enrolled org with staleness
+A deployed `ghsyncd` that: mirrors the enrolled org with staleness
 inside C-R1 bounds and drift = 0; survives webhook outages via gap healing +
 sweeps; spends < 10% of the GHEC budget in steady state with class floors
 enforced; exposes the documented Postgres read model and an `entities`

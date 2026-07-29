@@ -2,8 +2,8 @@
 
 ## Symptoms
 
-- `FrontierPoisonDeliveryParked`.
-- `frontier_c_i5_parked_deliveries` is nonzero.
+- `GhsyncPoisonDeliveryParked`.
+- `ghsync_c_i5_parked_deliveries` is nonzero.
 - Dispatch logs repeat a classification error through
   `DISPATCH_MAX_ATTEMPTS`.
 
@@ -33,25 +33,25 @@ separate shell/deployment action:
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=dispatch
+ghsyncd serve --roles=dispatch
 ```
 
 Once the fixed dispatch role is ready, test one GUID:
 
 ```sh
-frontier-syncd requeue --guid=DELIVERY_GUID
+ghsyncd requeue --guid=DELIVERY_GUID
 ```
 
 After it processes cleanly, replay at most 100 exact GUIDs:
 
 ```sh
-frontier-syncd requeue --guids=guid-1,guid-2
+ghsyncd requeue --guids=guid-1,guid-2
 ```
 
 Alternatively, replay the next bounded batch sharing one diagnosed signature:
 
 ```sh
-frontier-syncd requeue \
+ghsyncd requeue \
   --event=pull_request \
   --error-contains='unsupported action reopened'
 ```

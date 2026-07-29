@@ -142,109 +142,109 @@ func NewRuntime(options RuntimeOptions) (*Runtime, error) {
 func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	var err error
 	if r.githubRequests, err = meter.Int64Counter(
-		"frontier_c_b1_github_requests",
+		"ghsync_c_b1_github_requests",
 		metric.WithDescription("Admitted GitHub requests by class and resource (C-B1)."),
 	); err != nil {
 		return err
 	}
 	if r.conditionalRequests, err = meter.Int64Counter(
-		"frontier_c_b4_conditional_requests",
+		"ghsync_c_b4_conditional_requests",
 		metric.WithDescription("Conditional GitHub requests for rolling C-B4 ratios."),
 	); err != nil {
 		return err
 	}
 	if r.conditional304s, err = meter.Int64Counter(
-		"frontier_c_b4_conditional_304s",
+		"ghsync_c_b4_conditional_304s",
 		metric.WithDescription("Conditional GitHub requests answered 304 for rolling C-B4 ratios."),
 	); err != nil {
 		return err
 	}
 	if r.starvations, err = meter.Int64Counter(
-		"frontier_c_b3_starvations",
+		"ghsync_c_b3_starvations",
 		metric.WithDescription("Requests queued behind a reserved budget floor (C-B3)."),
 	); err != nil {
 		return err
 	}
 	if r.dispatchBatches, err = meter.Int64Histogram(
-		"frontier_c_p2_dispatch_batch_size",
+		"ghsync_c_p2_dispatch_batch_size",
 		metric.WithDescription("Webhook deliveries committed per dispatch transaction (C-P2)."),
 	); err != nil {
 		return err
 	}
 	if r.fetches, err = meter.Int64Counter(
-		"frontier_c_c1_fetches",
+		"ghsync_c_c1_fetches",
 		metric.WithDescription("Authoritative fetch jobs by pointer kind and outcome (C-C1)."),
 	); err != nil {
 		return err
 	}
 	if r.eventToCache, err = meter.Float64Histogram(
-		"frontier_c_q2_event_to_cache_latency_seconds",
+		"ghsync_c_q2_event_to_cache_latency_seconds",
 		metric.WithDescription("Webhook received to authoritative cache completion latency (C-Q2)."),
 	); err != nil {
 		return err
 	}
 	if r.invalidEventLatency, err = meter.Int64Counter(
-		"frontier_c_q2_invalid_event_cache_latency",
+		"ghsync_c_q2_invalid_event_cache_latency",
 		metric.WithDescription("Invalid negative PostgreSQL event-to-cache intervals (C-Q2)."),
 	); err != nil {
 		return err
 	}
 	if r.cacheWrites, err = meter.Int64Counter(
-		"frontier_c_c2_cache_cas_writes",
+		"ghsync_c_c2_cache_cas_writes",
 		metric.WithDescription("Cache compare-and-swap outcomes by entity kind (C-C2)."),
 	); err != nil {
 		return err
 	}
 	if r.sweepOverruns, err = meter.Int64Counter(
-		"frontier_c_r2_sweep_overruns",
+		"ghsync_c_r2_sweep_overruns",
 		metric.WithDescription("Sweep passes observed beyond their configured period (C-R2)."),
 	); err != nil {
 		return err
 	}
 	if r.gapHealRequests, err = meter.Int64Counter(
-		"frontier_c_r4_gap_heal_requests",
+		"ghsync_c_r4_gap_heal_requests",
 		metric.WithDescription("GitHub delivery redelivery requests (C-R4)."),
 	); err != nil {
 		return err
 	}
 	if r.gapWindowIncomplete, err = meter.Int64Counter(
-		"frontier_c_r4_gap_windows_incomplete",
+		"ghsync_c_r4_gap_windows_incomplete",
 		metric.WithDescription("Gap scans that reached their page cap (C-R4)."),
 	); err != nil {
 		return err
 	}
 	if r.driftTransitions, err = meter.Int64Counter(
-		"frontier_c_o3_drift_transitions",
+		"ghsync_c_o3_drift_transitions",
 		metric.WithDescription("New and persistent semantic drift observations (C-O3)."),
 	); err != nil {
 		return err
 	}
 	if r.prunerDeletes, err = meter.Int64Counter(
-		"frontier_c_r2_pruner_deletes",
+		"ghsync_c_r2_pruner_deletes",
 		metric.WithDescription("Rows or payloads removed by bounded retention passes (C-R2/C-S7)."),
 	); err != nil {
 		return err
 	}
 	if r.watermarkAdvances, err = meter.Int64Counter(
-		"frontier_c_s2_watermark_advances",
+		"ghsync_c_s2_watermark_advances",
 		metric.WithDescription("Visibility watermark advances (C-S2)."),
 	); err != nil {
 		return err
 	}
 	if r.deriverPassDuration, err = meter.Float64Histogram(
-		"frontier_c_p5_deriver_pass_duration_seconds",
+		"ghsync_c_p5_deriver_pass_duration_seconds",
 		metric.WithDescription("Dirty-set derivation pass duration (C-P5)."),
 	); err != nil {
 		return err
 	}
 	if r.deriverPasses, err = meter.Int64Counter(
-		"frontier_c_p5_deriver_passes",
+		"ghsync_c_p5_deriver_passes",
 		metric.WithDescription("Dirty-set derivation passes and outcomes (C-P5)."),
 	); err != nil {
 		return err
 	}
 	if r.stalenessMisses, err = meter.Int64Counter(
-		"frontier_c_r1_refresh_deadline_misses",
+		"ghsync_c_r1_refresh_deadline_misses",
 		metric.WithDescription("Reconciliation fetches completed beyond C-R1 deadlines."),
 	); err != nil {
 		return err

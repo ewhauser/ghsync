@@ -12,13 +12,13 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: frontier
-          POSTGRES_PASSWORD: frontier
-          POSTGRES_DB: frontier_test
+          POSTGRES_USER: ghsync
+          POSTGRES_PASSWORD: ghsync
+          POSTGRES_DB: ghsync_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U frontier"
+          --health-cmd "pg_isready -U ghsync"
           --health-interval 2s
           --health-timeout 2s
           --health-retries 15
@@ -35,7 +35,7 @@ jobs:
       - run: go vet ./...
       - name: Unit and required database integration tests
         env:
-          TEST_DATABASE_URL: postgres://frontier:frontier@localhost:5432/frontier_test?sslmode=disable
+          TEST_DATABASE_URL: postgres://ghsync:ghsync@localhost:5432/ghsync_test?sslmode=disable
         run: |
           if [ -z "${TEST_DATABASE_URL:-}" ]; then
             echo "TEST_DATABASE_URL must be set in CI; DB-gated tests may not skip"
@@ -44,7 +44,7 @@ jobs:
           go test ./...
       - name: Race-sensitive sync engine tests
         env:
-          TEST_DATABASE_URL: postgres://frontier:frontier@localhost:5432/frontier_test?sslmode=disable
+          TEST_DATABASE_URL: postgres://ghsync:ghsync@localhost:5432/ghsync_test?sslmode=disable
         run: |
           if [ -z "${TEST_DATABASE_URL:-}" ]; then
             echo "TEST_DATABASE_URL must be set in CI; DB-gated tests may not skip"
@@ -68,13 +68,13 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: frontier
-          POSTGRES_PASSWORD: frontier
-          POSTGRES_DB: frontier_test
+          POSTGRES_USER: ghsync
+          POSTGRES_PASSWORD: ghsync
+          POSTGRES_DB: ghsync_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U frontier"
+          --health-cmd "pg_isready -U ghsync"
           --health-interval 2s
           --health-timeout 2s
           --health-retries 15
@@ -85,13 +85,13 @@ jobs:
           go-version-file: go.mod
       - name: Build smoke binaries
         run: |
-          go build -o /tmp/frontier-syncd ./cmd/frontier-syncd
+          go build -o /tmp/ghsyncd ./cmd/ghsyncd
           go build -o /tmp/fake-github ./cmd/fake-github
-          go build -o /tmp/frontier-soak ./cmd/soak
+          go build -o /tmp/ghsync-soak ./cmd/soak
       - name: Run two-minute DB-gated soak smoke
         env:
-          DATABASE_URL: postgres://frontier:frontier@127.0.0.1:5432/frontier_test?sslmode=disable
-          TEST_DATABASE_URL: postgres://frontier:frontier@127.0.0.1:5432/frontier_test?sslmode=disable
+          DATABASE_URL: postgres://ghsync:ghsync@127.0.0.1:5432/ghsync_test?sslmode=disable
+          TEST_DATABASE_URL: postgres://ghsync:ghsync@127.0.0.1:5432/ghsync_test?sslmode=disable
           GITHUB_WEBHOOK_SECRET: smoke-secret
           GITHUB_BASE_URL: http://127.0.0.1:19797
           GITHUB_TOKEN: fake-installation-smoke
@@ -101,18 +101,18 @@ jobs:
           DRIFT_PERIOD: 5s
         run: |
           set -euo pipefail
-          /tmp/frontier-syncd migrate
+          /tmp/ghsyncd migrate
           /tmp/fake-github -addr=127.0.0.1:19797 -webhook-secret=smoke-secret > /tmp/fake-github.log 2>&1 &
           fake_pid=$!
-          /tmp/frontier-syncd serve --roles=all > /tmp/frontier-syncd.log 2>&1 &
+          /tmp/ghsyncd serve --roles=all > /tmp/ghsyncd.log 2>&1 &
           sync_pid=$!
           cleanup() {
             kill "$sync_pid" "$fake_pid" 2>/dev/null || true
             wait "$sync_pid" "$fake_pid" 2>/dev/null || true
           }
           trap cleanup EXIT
-          /tmp/frontier-syncd backfill
-          if ! /tmp/frontier-soak \
+          /tmp/ghsyncd backfill
+          if ! /tmp/ghsync-soak \
             --profile=smoke \
             --duration=2m \
             --recorded-rate=1 \
@@ -121,7 +121,7 @@ jobs:
             --installation-id="$GITHUB_INSTALLATION_ID" \
             --engine-url=http://127.0.0.1:18080 \
             --fake-github-url=http://127.0.0.1:19797; then
-            tail -200 /tmp/frontier-syncd.log
+            tail -200 /tmp/ghsyncd.log
             tail -200 /tmp/fake-github.log
             exit 1
           fi

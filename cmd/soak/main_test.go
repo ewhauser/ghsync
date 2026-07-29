@@ -54,24 +54,24 @@ func TestSmokeLoadArithmeticIsExactlyTenTimesRecordedRate(t *testing.T) {
 func TestMetricValueWithoutLabelsSumsZeroInitAndLabeledSeries(t *testing.T) {
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	families, err := parser.TextToMetricFamilies(strings.NewReader(`
-# TYPE frontier_c_b3_starvations_total counter
-frontier_c_b3_starvations_total 0
-frontier_c_b3_starvations_total{class="event",resource="rest"} 3
-frontier_c_b3_starvations_total{class="sweep",resource="graphql"} 2
+# TYPE ghsync_c_b3_starvations_total counter
+ghsync_c_b3_starvations_total 0
+ghsync_c_b3_starvations_total{class="event",resource="rest"} 3
+ghsync_c_b3_starvations_total{class="sweep",resource="graphql"} 2
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := metricValue(
 		families,
-		"frontier_c_b3_starvations_total",
+		"ghsync_c_b3_starvations_total",
 		nil,
 	); got != 5 {
 		t.Fatalf("unfiltered starvation total = %v, want 5", got)
 	}
 	if got := metricValue(
 		families,
-		"frontier_c_b3_starvations_total",
+		"ghsync_c_b3_starvations_total",
 		map[string]string{"class": "event", "resource": "rest"},
 	); got != 3 {
 		t.Fatalf("labeled starvation total = %v, want 3", got)
@@ -221,25 +221,25 @@ func TestValidateConfigRequiresPositiveInstallation(t *testing.T) {
 func TestHistogramQuantileUsesConstraintBuckets(t *testing.T) {
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	families, err := parser.TextToMetricFamilies(strings.NewReader(`
-# TYPE frontier_c_q2_event_to_cache_latency_seconds histogram
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="20"} 95
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="60"} 99
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="+Inf"} 100
-frontier_c_q2_event_to_cache_latency_seconds_sum 1000
-frontier_c_q2_event_to_cache_latency_seconds_count 100
+# TYPE ghsync_c_q2_event_to_cache_latency_seconds histogram
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="20"} 95
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="60"} 99
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="+Inf"} 100
+ghsync_c_q2_event_to_cache_latency_seconds_sum 1000
+ghsync_c_q2_event_to_cache_latency_seconds_count 100
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
 	p95, count, err := histogramQuantile(
-		families["frontier_c_q2_event_to_cache_latency_seconds"],
+		families["ghsync_c_q2_event_to_cache_latency_seconds"],
 		0.95,
 	)
 	if err != nil || p95 != 20 || count != 100 {
 		t.Fatalf("p95=%v count=%d err=%v", p95, count, err)
 	}
 	p99, _, err := histogramQuantile(
-		families["frontier_c_q2_event_to_cache_latency_seconds"],
+		families["ghsync_c_q2_event_to_cache_latency_seconds"],
 		0.99,
 	)
 	if err != nil || p99 != 60 {
@@ -250,35 +250,35 @@ frontier_c_q2_event_to_cache_latency_seconds_count 100
 func TestHistogramDeltasExcludePreexistingSamples(t *testing.T) {
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	priorFamilies, err := parser.TextToMetricFamilies(strings.NewReader(`
-# TYPE frontier_c_q2_event_to_cache_latency_seconds histogram
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="20"} 90
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="60"} 99
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="+Inf"} 100
-frontier_c_q2_event_to_cache_latency_seconds_sum 1000
-frontier_c_q2_event_to_cache_latency_seconds_count 100
+# TYPE ghsync_c_q2_event_to_cache_latency_seconds histogram
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="20"} 90
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="60"} 99
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="+Inf"} 100
+ghsync_c_q2_event_to_cache_latency_seconds_sum 1000
+ghsync_c_q2_event_to_cache_latency_seconds_count 100
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
 	currentFamilies, err := parser.TextToMetricFamilies(strings.NewReader(`
-# TYPE frontier_c_q2_event_to_cache_latency_seconds histogram
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="20"} 100
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="60"} 109
-frontier_c_q2_event_to_cache_latency_seconds_bucket{le="+Inf"} 110
-frontier_c_q2_event_to_cache_latency_seconds_sum 1100
-frontier_c_q2_event_to_cache_latency_seconds_count 110
+# TYPE ghsync_c_q2_event_to_cache_latency_seconds histogram
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="20"} 100
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="60"} 109
+ghsync_c_q2_event_to_cache_latency_seconds_bucket{le="+Inf"} 110
+ghsync_c_q2_event_to_cache_latency_seconds_sum 1100
+ghsync_c_q2_event_to_cache_latency_seconds_count 110
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
 	prior, err := histogramState(
-		priorFamilies["frontier_c_q2_event_to_cache_latency_seconds"],
+		priorFamilies["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	current, err := histogramState(
-		currentFamilies["frontier_c_q2_event_to_cache_latency_seconds"],
+		currentFamilies["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
 	if err != nil {
 		t.Fatal(err)

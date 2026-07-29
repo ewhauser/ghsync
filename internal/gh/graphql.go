@@ -150,7 +150,7 @@ type ReviewCommentNode struct {
 	} `json:"author"`
 }
 
-const pullRequestNodesQuery = `query FrontierPullRequestNodes($ids: [ID!]!) {
+const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on PullRequest {
       id
@@ -196,7 +196,7 @@ const pullRequestNodesQuery = `query FrontierPullRequestNodes($ids: [ID!]!) {
   rateLimit { cost limit remaining resetAt }
 }`
 
-const pullRequestReviewThreadsPageQuery = `query FrontierPullRequestReviewThreadsPage(
+const pullRequestReviewThreadsPageQuery = `query GhsyncPullRequestReviewThreadsPage(
   $id: ID!,
   $after: String
 ) {
@@ -221,7 +221,7 @@ const pullRequestReviewThreadsPageQuery = `query FrontierPullRequestReviewThread
   rateLimit { cost limit remaining resetAt }
 }`
 
-const reviewThreadCommentsPageQuery = `query FrontierReviewThreadCommentsPage(
+const reviewThreadCommentsPageQuery = `query GhsyncReviewThreadCommentsPage(
   $id: ID!,
   $after: String
 ) {

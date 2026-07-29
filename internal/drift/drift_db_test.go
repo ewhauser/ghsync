@@ -877,7 +877,7 @@ func driftTestDatabase(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("connect admin: %v", err)
 	}
-	schema := fmt.Sprintf("frontier_drift_%d", time.Now().UnixNano())
+	schema := fmt.Sprintf("ghsync_drift_%d", time.Now().UnixNano())
 	identifier := pgx.Identifier{schema}.Sanitize()
 	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
 		admin.Close()

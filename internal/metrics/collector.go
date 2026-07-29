@@ -16,170 +16,170 @@ import (
 func (r *Runtime) registerObservables(meter metric.Meter) error {
 	var err error
 	if r.budgetRemaining, err = meter.Int64ObservableGauge(
-		"frontier_c_b3_budget_remaining",
+		"ghsync_c_b3_budget_remaining",
 		metric.WithDescription("Server-authoritative remaining budget by priority and resource (C-B3)."),
 	); err != nil {
 		return err
 	}
 	if r.budgetLimit, err = meter.Int64ObservableGauge(
-		"frontier_c_b3_budget_limit",
+		"ghsync_c_b3_budget_limit",
 		metric.WithDescription("Server-authoritative budget denominator by resource (C-B3)."),
 	); err != nil {
 		return err
 	}
 	if r.gateClosed, err = meter.Int64ObservableGauge(
-		"frontier_c_b2_gate_closed",
+		"ghsync_c_b2_gate_closed",
 		metric.WithDescription("Whether the installation-wide secondary-limit gate is closed (C-B2)."),
 	); err != nil {
 		return err
 	}
 	if r.queueDepth, err = meter.Int64ObservableGauge(
-		"frontier_c_p2_queue_depth",
+		"ghsync_c_p2_queue_depth",
 		metric.WithDescription("Runnable or scheduled River jobs by queue (C-P2)."),
 	); err != nil {
 		return err
 	}
 	if r.oldestDeliveryAge, err = meter.Float64ObservableGauge(
-		"frontier_c_q2_oldest_unprocessed_delivery_age_seconds",
+		"ghsync_c_q2_oldest_unprocessed_delivery_age_seconds",
 		metric.WithDescription("Age of the oldest pending or processing webhook delivery (C-Q2)."),
 	); err != nil {
 		return err
 	}
 	if r.outstandingGenCount, err = meter.Int64ObservableGauge(
-		"frontier_c_q2_outstanding_generations",
+		"ghsync_c_q2_outstanding_generations",
 		metric.WithDescription("Refresh generations not yet completed (C-Q2)."),
 	); err != nil {
 		return err
 	}
 	if r.outstandingGenAge, err = meter.Float64ObservableGauge(
-		"frontier_c_q2_oldest_outstanding_generation_age_seconds",
+		"ghsync_c_q2_oldest_outstanding_generation_age_seconds",
 		metric.WithDescription("Age of the oldest event-backed incomplete generation (C-Q2)."),
 	); err != nil {
 		return err
 	}
 	if r.parkedCount, err = meter.Int64ObservableGauge(
-		"frontier_c_i5_parked_deliveries",
+		"ghsync_c_i5_parked_deliveries",
 		metric.WithDescription("Durably parked poison webhook deliveries (C-I5)."),
 	); err != nil {
 		return err
 	}
 	if r.parkedAge, err = meter.Float64ObservableGauge(
-		"frontier_c_i5_oldest_parked_delivery_age_seconds",
+		"ghsync_c_i5_oldest_parked_delivery_age_seconds",
 		metric.WithDescription("Age of the oldest parked poison delivery (C-I5)."),
 	); err != nil {
 		return err
 	}
 	if r.cacheStaleness, err = meter.Float64ObservableGauge(
-		"frontier_c_r1_cache_staleness_seconds",
+		"ghsync_c_r1_cache_staleness_seconds",
 		metric.WithDescription("Worst live cache validation age by C-R1 entity class."),
 	); err != nil {
 		return err
 	}
 	if r.stalenessBound, err = meter.Float64ObservableGauge(
-		"frontier_c_r1_staleness_bound_seconds",
+		"ghsync_c_r1_staleness_bound_seconds",
 		metric.WithDescription("Configured maximum cache age by C-R1 entity class."),
 	); err != nil {
 		return err
 	}
 	if r.casRejectRatio, err = meter.Float64ObservableGauge(
-		"frontier_c_c2_cache_cas_reject_ratio",
+		"ghsync_c_c2_cache_cas_reject_ratio",
 		metric.WithDescription("Process-lifetime compare-and-swap reject ratio by entity class (C-C2)."),
 	); err != nil {
 		return err
 	}
 	if r.tombstoneCount, err = meter.Int64ObservableGauge(
-		"frontier_c_c4_tombstones",
+		"ghsync_c_c4_tombstones",
 		metric.WithDescription("Retained tombstones by mirror entity class (C-C4)."),
 	); err != nil {
 		return err
 	}
 	if r.sweepDuration, err = meter.Float64ObservableGauge(
-		"frontier_c_r2_sweep_duration_seconds",
+		"ghsync_c_r2_sweep_duration_seconds",
 		metric.WithDescription("Latest or in-progress sweep duration by kind (C-R2)."),
 	); err != nil {
 		return err
 	}
 	if r.sweepPeriod, err = meter.Float64ObservableGauge(
-		"frontier_c_r2_sweep_period_seconds",
+		"ghsync_c_r2_sweep_period_seconds",
 		metric.WithDescription("Configured sweep period by kind (C-R2)."),
 	); err != nil {
 		return err
 	}
 	if r.driftFindings, err = meter.Int64ObservableGauge(
-		"frontier_c_o3_drift_findings",
+		"ghsync_c_o3_drift_findings",
 		metric.WithDescription("Durable semantic drift findings by entity kind and state (C-O3)."),
 	); err != nil {
 		return err
 	}
 	if r.watermarkLag, err = meter.Int64ObservableGauge(
-		"frontier_c_s2_watermark_lag_sequences",
+		"ghsync_c_s2_watermark_lag_sequences",
 		metric.WithDescription("Committed outbox max sequence minus safe sequence (C-S2)."),
 	); err != nil {
 		return err
 	}
 	if r.watermarkAge, err = meter.Float64ObservableGauge(
-		"frontier_c_s2_watermark_age_seconds",
+		"ghsync_c_s2_watermark_age_seconds",
 		metric.WithDescription("Age of the last visibility watermark publication (C-S2)."),
 	); err != nil {
 		return err
 	}
 	if r.prunableOutboxDepth, err = meter.Int64ObservableGauge(
-		"frontier_c_s7_prunable_outbox_depth",
+		"ghsync_c_s7_prunable_outbox_depth",
 		metric.WithDescription("Retention-eligible change events at or below the safe consumer horizon (C-S7)."),
 	); err != nil {
 		return err
 	}
 	if r.consumerOutstanding, err = meter.Int64ObservableGauge(
-		"frontier_c_s4_consumer_outstanding_events",
+		"ghsync_c_s4_consumer_outstanding_events",
 		metric.WithDescription("Visible unconsumed events in the consumer's own stream (C-S4)."),
 	); err != nil {
 		return err
 	}
 	if r.consumerOutstandingAge, err = meter.Float64ObservableGauge(
-		"frontier_c_s4_oldest_outstanding_event_age_seconds",
+		"ghsync_c_s4_oldest_outstanding_event_age_seconds",
 		metric.WithDescription("Age of the oldest visible unconsumed event in the consumer's stream (C-S4)."),
 	); err != nil {
 		return err
 	}
 	if r.resyncCount, err = meter.Int64ObservableCounter(
-		"frontier_c_s4_resyncs",
+		"ghsync_c_s4_resyncs",
 		metric.WithDescription("Durable RESYNC_REQUIRED count by consumer (C-S4)."),
 	); err != nil {
 		return err
 	}
 	if r.deriverDirtyBacklog, err = meter.Int64ObservableGauge(
-		"frontier_c_p5_deriver_dirty_backlog",
+		"ghsync_c_p5_deriver_dirty_backlog",
 		metric.WithDescription("Dirty derivation scopes awaiting a set-drain pass (C-P5)."),
 	); err != nil {
 		return err
 	}
 	if r.operationSuccesses, err = meter.Int64ObservableGauge(
-		"frontier_c_o4_operation_successes",
+		"ghsync_c_o4_operation_successes",
 		metric.WithDescription("Durable completed trust-operation passes (C-O4)."),
 	); err != nil {
 		return err
 	}
 	if r.operationSamples, err = meter.Int64ObservableGauge(
-		"frontier_c_o4_operation_samples",
+		"ghsync_c_o4_operation_samples",
 		metric.WithDescription("Durable trust-operation samples inspected (C-O4)."),
 	); err != nil {
 		return err
 	}
 	if r.operationSuccessAge, err = meter.Float64ObservableGauge(
-		"frontier_c_o4_last_operation_success_age_seconds",
+		"ghsync_c_o4_last_operation_success_age_seconds",
 		metric.WithDescription("Age of the last durable trust-operation completion; -1 means never (C-O4)."),
 	); err != nil {
 		return err
 	}
 	if r.operationSampleAge, err = meter.Float64ObservableGauge(
-		"frontier_c_o4_last_operation_sample_age_seconds",
+		"ghsync_c_o4_last_operation_sample_age_seconds",
 		metric.WithDescription("Age of the last durable trust-operation sample; -1 means never (C-O4)."),
 	); err != nil {
 		return err
 	}
 	if r.roleEnabled, err = meter.Int64ObservableGauge(
-		"frontier_c_o4_role_enabled",
-		metric.WithDescription("Roles enabled in this frontier-syncd process (C-O4)."),
+		"ghsync_c_o4_role_enabled",
+		metric.WithDescription("Roles enabled in this ghsyncd process (C-O4)."),
 	); err != nil {
 		return err
 	}

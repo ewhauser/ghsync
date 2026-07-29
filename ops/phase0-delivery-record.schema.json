@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2019-09/schema",
-  "$id": "https://frontier.invalid/schemas/phase0-delivery-record.schema.json",
-  "title": "Frontier Phase-0 delivery observation",
+  "$id": "https://ghsync.invalid/schemas/phase0-delivery-record.schema.json",
+  "title": "ghsync Phase-0 delivery observation",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -131,7 +131,7 @@
     "source": {
       "enum": [
         "github_app_delivery_api",
-        "frontier_ingress"
+        "ghsync_ingress"
       ]
     },
     "duplicate": {

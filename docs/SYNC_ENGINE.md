@@ -1,4 +1,4 @@
-# Frontier Sync Engine — Go + Postgres Design
+# ghsync Sync Engine — Go + Postgres Design
 
 Draft v0.2. Decisions locked in this revision: **single org** (single-tenant
 deployment; one installation), **GHEC only** (no GHES support), **90-day
@@ -75,7 +75,7 @@ Consequences baked into the design:
    generate no PR events at all (pure reorder, unstack of an idle stack).
 2. **Stacked-PR events escalate scope.** For a PR in a stack, `closed`,
    `synchronize`, and base-edit events refresh the stack, not the PR — the
-   interesting state transitions (frontier movement, retarget) are stack-level.
+   interesting state transitions (ghsync movement, retarget) are stack-level.
 3. **Preview instability is a named risk.** These webhook semantics are a
    private-preview surface and may change without notice. Mitigations: the
    sweep floor (correctness never depends on stack webhooks), the drift

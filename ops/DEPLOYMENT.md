@@ -2,7 +2,7 @@
 
 ## Artifact and supported topology
 
-Production deploys one `frontier-syncd` artifact in the following process
+Production deploys one `ghsyncd` artifact in the following process
 groups. Every process receives the same positive
 `GITHUB_INSTALLATION_ID`, exposes `GET /healthz` and `GET /metrics`, and only
 the ingress group exposes the webhook POST.
@@ -38,7 +38,7 @@ leaves two renewal opportunities inside each TTL and makes a rolling restart a
 bounded stop/start operation, not a replica-first overlap.
 
 The `metrics` role is the sole database aggregate collector. Other roles still
-publish their process-local counters and `frontier_c_o4_role_enabled`, but do
+publish their process-local counters and `ghsync_c_o4_role_enabled`, but do
 not repeat expensive cache/outbox aggregation on every scrape.
 
 `serve --roles=all` remains a local/CI convenience, not the production rolling
@@ -130,13 +130,13 @@ resumable REST pagination.
 Before any new-version process starts:
 
 ```sh
-frontier-syncd migrate
+ghsyncd migrate
 ```
 
 The command takes an advisory lock, applies River migrations first, then
-embedded Frontier files lexically. Each Frontier migration is one transaction
+embedded ghsync files lexically. Each ghsync migration is one transaction
 recorded with a SHA-256 checksum. Changed applied bytes fail closed. Never edit
-an applied file; add a forward migration. The current artifact embeds Frontier
+an applied file; add a forward migration. The current artifact embeds ghsync
 migrations `0001` through `0029`; every migration already present in a target
 ledger is immutable.
 
@@ -154,7 +154,7 @@ On an empty cache, start the process groups and then seed the configured
 installation exactly once:
 
 ```sh
-frontier-syncd backfill
+ghsyncd backfill
 ```
 
 The combined GitHub singleton is safe to start before this command: the drift
@@ -181,7 +181,7 @@ absence alert or manufacture a bootstrap heartbeat.
 
 ## Replacement procedure
 
-1. Verify backup/PITR health and run `frontier-syncd migrate` once.
+1. Verify backup/PITR health and run `ghsyncd migrate` once.
 2. Replace ingress, dispatch, watermarker, and deriver groups normally: start a
    new replica, require `/healthz` and its role metric, then `SIGTERM` one old
    replica.
@@ -262,7 +262,7 @@ SELECT count(*) AS rows,
 FROM change_events;
 ```
 
-The `FrontierOutboxBacklog` warning fires when more than 100,000 rows are
+The `GhsyncOutboxBacklog` warning fires when more than 100,000 rows are
 already retention-eligible for 15 minutes. That threshold is a pruning-health
 signal, not spare capacity: disk planning must accommodate the full seven-day
 window plus that backlog and operational headroom. Alert separately on database

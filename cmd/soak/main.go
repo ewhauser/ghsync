@@ -1,4 +1,4 @@
-// soak drives the standalone fake GitHub against a running frontier-syncd and
+// soak drives the standalone fake GitHub against a running ghsyncd and
 // exits successfully only after the configured load, run-scoped assertions,
 // durable trust passes, and exact fake-to-cache convergence all succeed.
 package main
@@ -29,7 +29,7 @@ import (
 
 	"github.com/ewhauser/ghsync/internal/fakegithub"
 	"github.com/ewhauser/ghsync/internal/ingress"
-	frontiermetrics "github.com/ewhauser/ghsync/internal/metrics"
+	ghsyncmetrics "github.com/ewhauser/ghsync/internal/metrics"
 	"github.com/ewhauser/ghsync/pkg/streamclient"
 )
 
@@ -121,7 +121,7 @@ func main() {
 func runMain(args []string) error {
 	fs := flag.NewFlagSet("soak", flag.ContinueOnError)
 	engineURL := fs.String(
-		"engine-url", defaultEngineURL, "running frontier-syncd base URL",
+		"engine-url", defaultEngineURL, "running ghsyncd base URL",
 	)
 	fakeGitHubURL := fs.String(
 		"fake-github-url",
@@ -291,7 +291,7 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 	initialHistogram, err := histogramState(
-		initial["frontier_c_q2_event_to_cache_latency_seconds"],
+		initial["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
 	if err != nil {
 		return err
@@ -299,12 +299,12 @@ func run(ctx context.Context, cfg config) error {
 	state := runState{
 		startWatermark: metricValue(
 			initial,
-			"frontier_c_s2_watermark_advances_total",
+			"ghsync_c_s2_watermark_advances_total",
 			nil,
 		),
 		startStarvations: metricValue(
 			initial,
-			"frontier_c_b3_starvations_total",
+			"ghsync_c_b3_starvations_total",
 			nil,
 		),
 		lastHistogram: initialHistogram,
@@ -418,13 +418,13 @@ loadLoop:
 		if !state.postLoadCaptured {
 			state.postLoadCaptured = true
 			state.postLoadDriftPasses = operationValue(
-				final, "frontier_c_o4_operation_successes", "drift", "detector",
+				final, "ghsync_c_o4_operation_successes", "drift", "detector",
 			)
 			state.postLoadDriftSamples = operationValue(
-				final, "frontier_c_o4_operation_samples", "drift", "detector",
+				final, "ghsync_c_o4_operation_samples", "drift", "detector",
 			)
 			state.postLoadWatermarks = operationValue(
-				final, "frontier_c_o4_operation_successes", "watermarker", "entities",
+				final, "ghsync_c_o4_operation_successes", "watermarker", "entities",
 			)
 		}
 		streamReady := false
@@ -451,22 +451,22 @@ loadLoop:
 				cfg.drainTimeout,
 				metricValue(
 					final,
-					"frontier_c_q2_oldest_unprocessed_delivery_age_seconds",
+					"ghsync_c_q2_oldest_unprocessed_delivery_age_seconds",
 					nil,
 				),
 				metricValue(
 					final,
-					"frontier_c_p2_queue_depth",
+					"ghsync_c_p2_queue_depth",
 					map[string]string{"queue": "event"},
 				),
 				metricValue(
 					final,
-					"frontier_c_q2_outstanding_generations",
+					"ghsync_c_q2_outstanding_generations",
 					nil,
 				),
 				metricValue(
 					final,
-					"frontier_c_s2_watermark_lag_sequences",
+					"ghsync_c_s2_watermark_lag_sequences",
 					nil,
 				),
 				convergenceErr,
@@ -512,7 +512,7 @@ func newSoakStreamConsumer(
 	pool *pgxpool.Pool,
 	runID string,
 ) (*soakStreamConsumer, error) {
-	table := "frontier_soak_applied_" + runID
+	table := "ghsync_soak_applied_" + runID
 	tableSQL := pgx.Identifier{table}.Sanitize()
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE `+tableSQL+` (
@@ -525,7 +525,7 @@ func newSoakStreamConsumer(
 	consumer := &soakStreamConsumer{
 		parent:   ctx,
 		pool:     pool,
-		consumer: "frontier-soak-" + runID,
+		consumer: "ghsync-soak-" + runID,
 		tableSQL: tableSQL,
 	}
 	client, err := streamclient.New(pool, streamclient.Config{
@@ -787,19 +787,19 @@ func postPopulationTrustCompleted(
 	return state.postLoadCaptured &&
 		operationValue(
 			families,
-			"frontier_c_o4_operation_successes",
+			"ghsync_c_o4_operation_successes",
 			"drift",
 			"detector",
 		) > state.postLoadDriftPasses &&
 		operationValue(
 			families,
-			"frontier_c_o4_operation_samples",
+			"ghsync_c_o4_operation_samples",
 			"drift",
 			"detector",
 		) > state.postLoadDriftSamples &&
 		operationValue(
 			families,
-			"frontier_c_o4_operation_successes",
+			"ghsync_c_o4_operation_successes",
 			"watermarker",
 			"entities",
 		) > state.postLoadWatermarks
@@ -874,7 +874,7 @@ func waitForCacheSeed(
 		if time.Now().After(deadline) {
 			return fmt.Errorf(
 				"cache seed did not complete within %s (%s); "+
-					"run frontier-syncd backfill before soak",
+					"run ghsyncd backfill before soak",
 				cfg.drainTimeout,
 				lastState,
 			)
@@ -1152,7 +1152,7 @@ func scrape(
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodGet,
-		cfg.engineURL+frontiermetrics.Path,
+		cfg.engineURL+ghsyncmetrics.Path,
 		nil,
 	)
 	if err != nil {
@@ -1185,16 +1185,16 @@ func assertLive(
 ) error {
 	state.samples++
 	required := []string{
-		"frontier_c_b3_starvations_total",
-		"frontier_c_i5_parked_deliveries",
-		"frontier_c_o3_drift_findings",
-		"frontier_c_o4_operation_successes",
-		"frontier_c_o4_operation_samples",
-		"frontier_c_o4_last_operation_sample_age_seconds",
-		"frontier_c_p2_queue_depth",
-		"frontier_c_q2_oldest_unprocessed_delivery_age_seconds",
-		"frontier_c_q2_outstanding_generations",
-		"frontier_c_s2_watermark_lag_sequences",
+		"ghsync_c_b3_starvations_total",
+		"ghsync_c_i5_parked_deliveries",
+		"ghsync_c_o3_drift_findings",
+		"ghsync_c_o4_operation_successes",
+		"ghsync_c_o4_operation_samples",
+		"ghsync_c_o4_last_operation_sample_age_seconds",
+		"ghsync_c_p2_queue_depth",
+		"ghsync_c_q2_oldest_unprocessed_delivery_age_seconds",
+		"ghsync_c_q2_outstanding_generations",
+		"ghsync_c_s2_watermark_lag_sequences",
 	}
 	for _, name := range required {
 		if families[name] == nil {
@@ -1202,20 +1202,20 @@ func assertLive(
 		}
 	}
 	if parked := metricValue(
-		families, "frontier_c_i5_parked_deliveries", nil,
+		families, "ghsync_c_i5_parked_deliveries", nil,
 	); parked > 0 {
 		return fmt.Errorf("C-I5 parked deliveries = %.0f", parked)
 	}
 	if open := metricValue(
 		families,
-		"frontier_c_o3_drift_findings",
+		"ghsync_c_o3_drift_findings",
 		map[string]string{"state": "open", "entity_kind": "all"},
 	); open > 0 {
 		return fmt.Errorf("C-O3 open drift findings = %.0f", open)
 	}
 	starvations := metricValue(
 		families,
-		"frontier_c_b3_starvations_total",
+		"ghsync_c_b3_starvations_total",
 		nil,
 	)
 	if starvations > state.startStarvations {
@@ -1224,11 +1224,11 @@ func assertLive(
 			starvations-state.startStarvations,
 		)
 	}
-	if budget := families["frontier_c_b3_budget_remaining"]; budget != nil && len(budget.Metric) > 0 {
+	if budget := families["ghsync_c_b3_budget_remaining"]; budget != nil && len(budget.Metric) > 0 {
 		state.budgetSamples++
 	}
 	current, err := histogramState(
-		families["frontier_c_q2_event_to_cache_latency_seconds"],
+		families["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
 	if err != nil {
 		return err
@@ -1270,22 +1270,22 @@ func assertLive(
 func pipelineDrained(families map[string]*dto.MetricFamily) bool {
 	return metricValue(
 		families,
-		"frontier_c_q2_oldest_unprocessed_delivery_age_seconds",
+		"ghsync_c_q2_oldest_unprocessed_delivery_age_seconds",
 		nil,
 	) == 0 &&
 		metricValue(
 			families,
-			"frontier_c_p2_queue_depth",
+			"ghsync_c_p2_queue_depth",
 			map[string]string{"queue": "event"},
 		) == 0 &&
 		metricValue(
 			families,
-			"frontier_c_q2_outstanding_generations",
+			"ghsync_c_q2_outstanding_generations",
 			nil,
 		) == 0 &&
 		metricValue(
 			families,
-			"frontier_c_s2_watermark_lag_sequences",
+			"ghsync_c_s2_watermark_lag_sequences",
 			nil,
 		) == 0
 }
@@ -1299,7 +1299,7 @@ func assertFinal(
 	}
 	endWatermark := metricValue(
 		families,
-		"frontier_c_s2_watermark_advances_total",
+		"ghsync_c_s2_watermark_advances_total",
 		nil,
 	)
 	if endWatermark <= state.startWatermark {
@@ -1311,7 +1311,7 @@ func assertFinal(
 	}
 	endWatermarkPasses := metricValue(
 		families,
-		"frontier_c_o4_operation_successes",
+		"ghsync_c_o4_operation_successes",
 		map[string]string{
 			"component": "watermarker",
 			"operation": "entities",
@@ -1327,7 +1327,7 @@ func assertFinal(
 	}
 	endDriftPasses := metricValue(
 		families,
-		"frontier_c_o4_operation_successes",
+		"ghsync_c_o4_operation_successes",
 		map[string]string{
 			"component": "drift",
 			"operation": "detector",
@@ -1343,7 +1343,7 @@ func assertFinal(
 	}
 	endDriftSamples := metricValue(
 		families,
-		"frontier_c_o4_operation_samples",
+		"ghsync_c_o4_operation_samples",
 		map[string]string{
 			"component": "drift",
 			"operation": "detector",

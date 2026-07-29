@@ -1,8 +1,8 @@
-// Package streamclient is the reference implementation of Frontier's public
+// Package streamclient is the reference implementation of ghsync's public
 // Postgres change-stream contract. It owns watermark-bounded paging, durable
 // cursors, transactional handler delivery, bootstrap, and RESYNC_REQUIRED.
 //
-// Frontier v1 deliberately binds this library to pgx v5 and database
+// ghsync v1 deliberately binds this library to pgx v5 and database
 // co-location. External services consume the stream through this library and
 // a shared Postgres database connection; v1 does not provide a wire API.
 package streamclient
@@ -26,7 +26,7 @@ const (
 	defaultPollInterval = 500 * time.Millisecond
 	minListenerBackoff  = 100 * time.Millisecond
 	maxListenerBackoff  = 5 * time.Second
-	notificationChannel = "frontier_change_events"
+	notificationChannel = "ghsync_change_events"
 )
 
 var errCursorFirstTouchRace = errors.New("consumer cursor first-touch race")
@@ -236,7 +236,7 @@ func (s *Snapshot) Close() error {
 	return err
 }
 
-// Client consumes Frontier change streams from the same Postgres database as
+// Client consumes ghsync change streams from the same Postgres database as
 // the cache read model.
 type Client struct {
 	pool         *pgxpool.Pool
@@ -364,7 +364,7 @@ func (c *Client) Bootstrap(
 // Tail continuously pages events with seq > cursor AND seq <= safe_seq,
 // invokes handler inside the cursor transaction, and waits using
 // LISTEN/NOTIFY plus a polling fallback. Migration 0014's after-insert trigger
-// emits frontier_change_events notifications at commit; correctness never
+// emits ghsync_change_events notifications at commit; correctness never
 // depends on receiving one (C-S2/C-S5/C-P6).
 //
 // Run exactly one Tail call for each (consumer, stream). A competing tailer

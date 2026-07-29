@@ -2,7 +2,7 @@
 
 ## Symptoms
 
-- `FrontierWatermarkStalled`.
+- `GhsyncWatermarkStalled`.
 - Outbox depth rises while watermark progress stops.
 - Consumers stay connected but receive no committed events.
 
@@ -49,7 +49,7 @@ shell/deployment action:
 
 ```sh
 # In a separate shell/deployment action:
-frontier-syncd serve --roles=watermarker
+ghsyncd serve --roles=watermarker
 ```
 
 A fence timeout is a retryable, metered step outcome; do not treat one timeout

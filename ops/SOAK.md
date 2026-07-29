@@ -20,7 +20,7 @@ The default smoke arithmetic is explicit: `120 seconds * 1 event/second * 10`
 ## CI smoke
 
 CI provisions fresh Postgres, migrates it, starts fake GitHub and
-`frontier-syncd --roles=all`, runs `frontier-syncd backfill`, and sets
+`ghsyncd --roles=all`, runs `ghsyncd backfill`, and sets
 `DRIFT_PERIOD=5s` so a durable pass must finish after population. The verifier
 refuses to start traffic until that installation backfill and all of its real
 cache-writer jobs have completed. The equivalent verifier command is:
@@ -49,20 +49,20 @@ artifact digest being evaluated.
 1. Create an empty database and record its PostgreSQL version:
 
    ```sh
-   createdb frontier_soak_release
-   export DATABASE_URL='postgres://frontier@127.0.0.1:5432/frontier_soak_release?sslmode=disable'
+   createdb ghsync_soak_release
+   export DATABASE_URL='postgres://ghsync@127.0.0.1:5432/ghsync_soak_release?sslmode=disable'
    psql "$DATABASE_URL" -Atc 'select version()' > postgres-version.txt
    ```
 
 2. Build once, record checksums, and migrate with those bytes:
 
    ```sh
-   go build -o ./frontier-syncd ./cmd/frontier-syncd
+   go build -o ./ghsyncd ./cmd/ghsyncd
    go build -o ./fake-github ./cmd/fake-github
-   go build -o ./frontier-soak ./cmd/soak
-   shasum -a 256 ./frontier-syncd ./fake-github ./frontier-soak \
+   go build -o ./ghsync-soak ./cmd/soak
+   shasum -a 256 ./ghsyncd ./fake-github ./ghsync-soak \
      > artifact-sha256.txt
-   ./frontier-syncd migrate 2>&1 | tee migrate.log
+   ./ghsyncd migrate 2>&1 | tee migrate.log
    ```
 
 3. Start the isolated fixture and engine. `serve --roles=all` is intentional
@@ -81,10 +81,10 @@ artifact digest being evaluated.
      > fake-github.log 2>&1 &
    echo $! > fake-github.pid
 
-   ./frontier-syncd serve --roles=all > frontier-syncd.log 2>&1 &
-   echo $! > frontier-syncd.pid
+   ./ghsyncd serve --roles=all > ghsyncd.log 2>&1 &
+   echo $! > ghsyncd.pid
 
-   ./frontier-syncd backfill 2>&1 | tee backfill-start.log
+   ./ghsyncd backfill 2>&1 | tee backfill-start.log
    ```
 
    The verifier below waits for the installation and repository backfill
@@ -95,7 +95,7 @@ artifact digest being evaluated.
 4. Run the full profile and retain its stdout/stderr:
 
    ```sh
-   ./frontier-soak \
+   ./ghsync-soak \
      --profile=48h \
      --duration=48h \
      --recorded-rate=1 \

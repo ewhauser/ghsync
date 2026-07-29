@@ -18,9 +18,9 @@ import (
 // ControlEmitPath is a development-only control surface used by cmd/soak to
 // ask the standalone fake to record and emit a signed delivery.
 const (
-	ControlEmitPath = "/_frontier/emit"
+	ControlEmitPath = "/_ghsync/emit"
 	// ControlTruthPath exposes current soak truth to the local oracle.
-	ControlTruthPath          = "/_frontier/truth"
+	ControlTruthPath          = "/_ghsync/truth"
 	maxRecordedAuthorizations = 1024
 )
 
@@ -421,7 +421,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/_frontier/") {
+	if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/_ghsync/") {
 		s.mux.ServeHTTP(w, r)
 		return
 	}

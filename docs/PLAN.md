@@ -1,4 +1,4 @@
-# Frontier — Stacked PR Work Dashboard: Build Plan
+# ghsync — Stacked PR Work Dashboard: Build Plan
 
 A full-stack React app implementing the Claude Design prototype in
 `Stacked PR Dashboard.dc.html`, built on top of GitHub's Stacked PRs feature
@@ -8,7 +8,7 @@ A full-stack React app implementing the Claude Design prototype in
 
 ## 1. What the prototype is
 
-A triage dashboard ("Frontier") that answers one question: **what is my single
+A triage dashboard ("ghsync") that answers one question: **what is my single
 highest-leverage move across all my stacks and loose PRs right now?**
 
 ### Surfaces
@@ -64,13 +64,13 @@ Prototype props worth keeping as user settings: `defaultLens`,
 
 ### Scenario coverage in the mock data (our functional spec)
 
-1. **S-142** — stack with failing required check on the frontier PR; upstack
+1. **S-142** — stack with failing required check on the ghsync PR; upstack
    layers dependency-blocked; flake-vs-code-failure judgment; delegate-fix agent
    with failing-job picker (required vs optional/flaky jobs).
 2. **S-138** — all-ready stack that just needs a clean rebase (dry-run found no
    conflicts) — "1-click" maintenance; approval-dismissal warning derived from
    repo rules.
-3. **S-131** — ready frontier PR (merge largest ready prefix = 1) + CODEOWNER
+3. **S-131** — ready ghsync PR (merge largest ready prefix = 1) + CODEOWNER
    gate above it; nudge (dedupe-aware), direct-assign with suggestions, and an
    "AI: pick best reviewer" agent action.
 4. **#4788** — loose ready PR (same vocabulary, no stack semantics).
@@ -126,7 +126,7 @@ Prototype props worth keeping as user settings: `defaultLens`,
 ### 2.2 Gaps — APIs/services we must supply ourselves
 
 1. **Work-item derivation engine** (the product): classify each stack/loose PR
-   into board columns; find the **frontier** (lowest unmerged PR) and the **root
+   into board columns; find the **ghsync** (lowest unmerged PR) and the **root
    blocker**; compute the **largest contiguous ready prefix**; mute
    dependency-blocked layers; generate highlight lines, "meanwhile in parallel",
    and cascade text. Pure derivation over GitHub data — but nothing on GitHub
@@ -194,7 +194,7 @@ Prototype props worth keeping as user settings: `defaultLens`,
 │ API server (Node + TS, Fastify)                            │
 │  auth (GitHub App user OAuth) · REST · SSE fan-out         │
 ├────────────────────────────────────────────────────────────┤
-│ Derivation engine (pure TS pkg): classification, frontier, │
+│ Derivation engine (pure TS pkg): classification, ghsync, │
 │ ready-prefix, leverage rank, blast radius — fully unit-    │
 │ testable against fixture snapshots                         │
 ├──────────────┬──────────────────┬──────────────────────────┤
@@ -282,11 +282,11 @@ POST /webhooks/github                                 (HMAC-verified)
 
 ### 3.3 Derivation engine rules (from the prototype)
 
-- **Frontier** = lowest unmerged PR in the stack.
-- **Root blocker** = first gate on the frontier, priority: required check
+- **ghsync** = lowest unmerged PR in the stack.
+- **Root blocker** = first gate on the ghsync, priority: required check
   failing → changes requested → your review requested → conflict/non-linear →
   CODEOWNER/review missing → CI running/queued → AI gate. Everything above the
-  frontier with an unmet dependency is **dependency-blocked** (muted, never a
+  ghsync with an unmet dependency is **dependency-blocked** (muted, never a
   card of its own; "blocked by ↓").
 - **Columns**: root blocker actionable *by the viewer* → **Your move**; shape
   problems (non-linear, conflict) with otherwise-ready layers → **Maintenance**;

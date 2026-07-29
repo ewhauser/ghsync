@@ -94,7 +94,7 @@ func runContext(
 	return err
 }
 
-// tailWithResync is THE reference implementation of Frontier's consumer
+// tailWithResync is THE reference implementation of ghsync's consumer
 // resync protocol: detect ErrResyncRequired, Bootstrap and rebuild the
 // projection transactionally, then resume Tail from the newly committed
 // cursor. Production consumers should preserve this loop and replace only the
@@ -184,7 +184,7 @@ func bootstrapAndRebuild(
 		}
 	}()
 	// The projection replacement and cursor reset share snapshot.Tx. A real
-	// consumer deletes/replaces its projection from Frontier's public cache
+	// consumer deletes/replaces its projection from ghsync's public cache
 	// tables here. This logging reference has no materialized projection, so
 	// its rebuild is intentionally a stub. Never move a real rebuild after
 	// Commit: doing so would acknowledge events without applying their state.

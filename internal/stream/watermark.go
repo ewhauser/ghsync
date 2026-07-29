@@ -109,7 +109,7 @@ func NewWatermarker(
 	}
 	owner := options.Owner
 	if owner == "" {
-		owner = "frontier-watermarker"
+		owner = "ghsync-watermarker"
 	}
 	if options.Observer == nil {
 		options.Observer = noopWatermarkObserver{}
