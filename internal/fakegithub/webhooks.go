@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/acme/frontier/internal/gh"
+	"github.com/ewhauser/ghsync/internal/gh"
 	jwt "github.com/golang-jwt/jwt/v4"
 )
 

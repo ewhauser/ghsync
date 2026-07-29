@@ -13,10 +13,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/outbox"
-	"github.com/acme/frontier/internal/store"
-	"github.com/acme/frontier/internal/stream"
-	"github.com/acme/frontier/internal/testdb"
+	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/stream"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 var deriveTestID atomic.Int64

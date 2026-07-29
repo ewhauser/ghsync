@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/acme/frontier/internal/budget"
-	"github.com/acme/frontier/internal/clocktest"
-	"github.com/acme/frontier/internal/fakegithub"
-	"github.com/acme/frontier/internal/gh"
+	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/clocktest"
+	"github.com/ewhauser/ghsync/internal/fakegithub"
+	"github.com/ewhauser/ghsync/internal/gh"
 )
 
 func TestResponseHeadersAreAuthoritative(t *testing.T) {

@@ -11,12 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 
-	"github.com/acme/frontier/internal/budget"
-	"github.com/acme/frontier/internal/gh"
-	"github.com/acme/frontier/internal/queue"
-	"github.com/acme/frontier/internal/repoutil"
-	"github.com/acme/frontier/internal/store"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/gh"
+	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/repoutil"
+	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const backfillPollInterval = 100 * time.Millisecond

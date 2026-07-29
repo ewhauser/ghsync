@@ -1,4 +1,4 @@
-module github.com/acme/frontier
+module github.com/ewhauser/ghsync
 
 go 1.26.5
 

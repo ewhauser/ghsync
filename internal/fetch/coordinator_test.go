@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/acme/frontier/internal/queue"
-	"github.com/acme/frontier/internal/store"
+	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/store"
 )
 
 func TestSortedPullRequestKeysUseImmutableRepositoryIdentity(t *testing.T) {

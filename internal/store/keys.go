@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/acme/frontier/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/outbox"
 )
 
 // RepositoryEntityKey returns the normative lock and change-stream key for a

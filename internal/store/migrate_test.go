@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 // Runs only when TEST_DATABASE_URL points at a disposable Postgres (CI

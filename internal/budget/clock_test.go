@@ -3,7 +3,7 @@ package budget
 import (
 	"time"
 
-	"github.com/acme/frontier/internal/clocktest"
+	"github.com/ewhauser/ghsync/internal/clocktest"
 )
 
 type manualClock = clocktest.Manual

@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/acme/frontier/internal/budget"
-	"github.com/acme/frontier/internal/gh"
-	"github.com/acme/frontier/internal/store"
+	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/gh"
+	"github.com/ewhauser/ghsync/internal/store"
 )
 
 var errGraphQLNodeNotFound = errors.New("GraphQL PR node was not found")

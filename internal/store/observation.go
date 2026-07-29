@@ -9,9 +9,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/outbox"
-	"github.com/acme/frontier/internal/pipeline"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/pipeline"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 // Observation owns a session-level advisory lock on one dedicated connection.

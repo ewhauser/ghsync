@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/acme/frontier/internal/repoutil"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/repoutil"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 // Prune enforces the decided 90-day bulky-data policy. Delivery skeleton rows

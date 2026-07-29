@@ -11,11 +11,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/acme/frontier/internal/gh"
-	"github.com/acme/frontier/internal/opsstate"
-	"github.com/acme/frontier/internal/queue"
-	"github.com/acme/frontier/internal/repoutil"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/gh"
+	"github.com/ewhauser/ghsync/internal/opsstate"
+	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/repoutil"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 func (s *Service) Kickoff(

@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/acme/frontier/internal/queue"
+	"github.com/ewhauser/ghsync/internal/queue"
 	"gopkg.in/yaml.v3"
 )
 

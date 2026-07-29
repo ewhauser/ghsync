@@ -27,10 +27,10 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 
-	"github.com/acme/frontier/internal/fakegithub"
-	"github.com/acme/frontier/internal/ingress"
-	frontiermetrics "github.com/acme/frontier/internal/metrics"
-	"github.com/acme/frontier/pkg/streamclient"
+	"github.com/ewhauser/ghsync/internal/fakegithub"
+	"github.com/ewhauser/ghsync/internal/ingress"
+	frontiermetrics "github.com/ewhauser/ghsync/internal/metrics"
+	"github.com/ewhauser/ghsync/pkg/streamclient"
 )
 
 const (

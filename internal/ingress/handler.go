@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/acme/frontier/internal/gh"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/gh"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const (

@@ -14,8 +14,8 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivertype"
 
-	"github.com/acme/frontier/internal/pipeline"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/pipeline"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const (

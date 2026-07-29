@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/acme/frontier/internal/queue"
+	"github.com/ewhauser/ghsync/internal/queue"
 )
 
 func TestDefaultClassifierHintCoverage(t *testing.T) {

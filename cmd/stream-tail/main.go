@@ -14,8 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/acme/frontier/internal/store"
-	"github.com/acme/frontier/pkg/streamclient"
+	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/pkg/streamclient"
 )
 
 func main() {

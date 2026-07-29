@@ -10,9 +10,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/outbox"
-	streammaint "github.com/acme/frontier/internal/stream"
-	"github.com/acme/frontier/internal/testdb"
+	"github.com/ewhauser/ghsync/internal/outbox"
+	streammaint "github.com/ewhauser/ghsync/internal/stream"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 func TestStreamTailSmoke(t *testing.T) {

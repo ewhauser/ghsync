@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/acme/frontier/internal/budget"
+	"github.com/ewhauser/ghsync/internal/budget"
 )
 
 const defaultGraphQLResponseBytes = 10 << 20

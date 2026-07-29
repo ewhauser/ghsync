@@ -15,8 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/opsstate"
-	"github.com/acme/frontier/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/opsstate"
+	"github.com/ewhauser/ghsync/internal/outbox"
 )
 
 const (

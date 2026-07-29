@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/acme/frontier/internal/budget"
+	"github.com/ewhauser/ghsync/internal/budget"
 )
 
 func TestGetJSONRetainsRequestETagWhen304OmitsResponseETag(t *testing.T) {

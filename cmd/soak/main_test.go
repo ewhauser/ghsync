@@ -12,8 +12,8 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 
-	"github.com/acme/frontier/internal/outbox"
-	"github.com/acme/frontier/internal/testdb"
+	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 func TestProfileDuration(t *testing.T) {

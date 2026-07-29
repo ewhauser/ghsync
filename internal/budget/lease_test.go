@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/acme/frontier/internal/store"
+	"github.com/ewhauser/ghsync/internal/store"
 )
 
 func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {

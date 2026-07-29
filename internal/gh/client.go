@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/acme/frontier/internal/budget"
+	"github.com/ewhauser/ghsync/internal/budget"
 )
 
 const (

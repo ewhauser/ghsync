@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/acme/frontier/internal/outbox"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 // ChecksMetadata returns conditional-fetch metadata for one head SHA.

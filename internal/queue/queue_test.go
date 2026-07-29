@@ -11,8 +11,8 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
-	"github.com/acme/frontier/internal/store"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 type noopArgs struct{}

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 // BranchTargets returns the derivation scopes affected by a branch change.

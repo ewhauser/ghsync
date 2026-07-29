@@ -26,20 +26,20 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/riverqueue/river"
 
-	"github.com/acme/frontier/internal/budget"
-	"github.com/acme/frontier/internal/config"
-	"github.com/acme/frontier/internal/derive"
-	"github.com/acme/frontier/internal/dispatch"
-	"github.com/acme/frontier/internal/drift"
-	"github.com/acme/frontier/internal/fetch"
-	"github.com/acme/frontier/internal/gh"
-	"github.com/acme/frontier/internal/ingress"
-	frontiermetrics "github.com/acme/frontier/internal/metrics"
-	"github.com/acme/frontier/internal/queue"
-	"github.com/acme/frontier/internal/store"
-	"github.com/acme/frontier/internal/store/dbgen"
-	streammaint "github.com/acme/frontier/internal/stream"
-	"github.com/acme/frontier/internal/sweep"
+	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/config"
+	"github.com/ewhauser/ghsync/internal/derive"
+	"github.com/ewhauser/ghsync/internal/dispatch"
+	"github.com/ewhauser/ghsync/internal/drift"
+	"github.com/ewhauser/ghsync/internal/fetch"
+	"github.com/ewhauser/ghsync/internal/gh"
+	"github.com/ewhauser/ghsync/internal/ingress"
+	frontiermetrics "github.com/ewhauser/ghsync/internal/metrics"
+	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
+	streammaint "github.com/ewhauser/ghsync/internal/stream"
+	"github.com/ewhauser/ghsync/internal/sweep"
 )
 
 var version = "dev"
@@ -345,7 +345,7 @@ func serve(args []string) error {
 		return err
 	}
 	if err := metricRegistry.Register(
-		"github.com/acme/frontier/frontier-syncd",
+		"github.com/ewhauser/ghsync/frontier-syncd",
 		runtimeMetrics,
 	); err != nil {
 		return err

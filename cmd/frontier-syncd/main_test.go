@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/acme/frontier/internal/config"
-	"github.com/acme/frontier/internal/ingress"
-	frontiermetrics "github.com/acme/frontier/internal/metrics"
-	"github.com/acme/frontier/internal/queue"
+	"github.com/ewhauser/ghsync/internal/config"
+	"github.com/ewhauser/ghsync/internal/ingress"
+	frontiermetrics "github.com/ewhauser/ghsync/internal/metrics"
+	"github.com/ewhauser/ghsync/internal/queue"
 )
 
 func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {

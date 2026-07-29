@@ -16,11 +16,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 
-	"github.com/acme/frontier/internal/fakegithub"
-	"github.com/acme/frontier/internal/ingress"
-	"github.com/acme/frontier/internal/queue"
-	"github.com/acme/frontier/internal/store"
-	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/fakegithub"
+	"github.com/ewhauser/ghsync/internal/ingress"
+	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const testWebhookSecret = "dispatch-test-secret"

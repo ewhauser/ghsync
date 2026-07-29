@@ -14,10 +14,10 @@ import (
 	"github.com/prometheus/common/model"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/acme/frontier/internal/budget"
-	"github.com/acme/frontier/internal/outbox"
-	"github.com/acme/frontier/internal/queue"
-	"github.com/acme/frontier/internal/testdb"
+	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 type counterRegistrar struct {

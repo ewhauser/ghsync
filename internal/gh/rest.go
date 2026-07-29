@@ -12,7 +12,7 @@ import (
 
 	"github.com/google/go-github/v88/github"
 
-	"github.com/acme/frontier/internal/budget"
+	"github.com/ewhauser/ghsync/internal/budget"
 )
 
 // StackBase identifies a stack's base ref and commit.

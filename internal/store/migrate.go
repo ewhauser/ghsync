@@ -13,7 +13,7 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
 
-	"github.com/acme/frontier/db"
+	"github.com/ewhauser/ghsync/db"
 )
 
 // Migrate applies River's migrations followed by our own plain-SQL files, in

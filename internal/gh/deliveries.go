@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/acme/frontier/internal/budget"
+	"github.com/ewhauser/ghsync/internal/budget"
 )
 
 // AppHookDelivery is the compact delivery-list representation used by C-R4.

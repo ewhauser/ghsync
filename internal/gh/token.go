@@ -17,7 +17,7 @@ import (
 	jwt "github.com/golang-jwt/jwt/v4"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/acme/frontier/internal/budget"
+	"github.com/ewhauser/ghsync/internal/budget"
 )
 
 const defaultTokenRefreshBefore = time.Minute

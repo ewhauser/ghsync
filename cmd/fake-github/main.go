@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/acme/frontier/internal/fakegithub"
+	"github.com/ewhauser/ghsync/internal/fakegithub"
 )
 
 func main() {

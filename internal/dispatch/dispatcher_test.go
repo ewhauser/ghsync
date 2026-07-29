@@ -14,7 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 
-	"github.com/acme/frontier/internal/queue"
+	"github.com/ewhauser/ghsync/internal/queue"
 )
 
 func TestNewEnforcesDebounceHardCap(t *testing.T) {

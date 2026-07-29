@@ -12,7 +12,7 @@ Export the non-secret coordinates for the test installation:
 export GITHUB_APP_ID=123456
 export GITHUB_INSTALLATION_ID=789012
 export GITHUB_PRIVATE_KEY_PATH=/absolute/path/to/test-app.private-key.pem
-export OWNER_REPO=acme/frontier-phase0
+export OWNER_REPO=ewhauser/ghsync-phase0
 export CAPTURE_DIR=/absolute/path/to/frontier-phase0-20260728
 mkdir -p "$CAPTURE_DIR"
 ```

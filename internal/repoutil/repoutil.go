@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/acme/frontier/internal/gh"
+	"github.com/ewhauser/ghsync/internal/gh"
 )
 
 // Split separates an owner/name repository identifier.

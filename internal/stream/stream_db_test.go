@@ -16,11 +16,11 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/derive"
-	"github.com/acme/frontier/internal/outbox"
-	"github.com/acme/frontier/internal/pipeline"
-	"github.com/acme/frontier/internal/store"
-	"github.com/acme/frontier/internal/testdb"
+	"github.com/ewhauser/ghsync/internal/derive"
+	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/pipeline"
+	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 func TestWatermarkProgressIdleAndUnderLoad(t *testing.T) {

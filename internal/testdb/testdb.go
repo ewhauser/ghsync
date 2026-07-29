@@ -14,7 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/store"
+	"github.com/ewhauser/ghsync/internal/store"
 )
 
 // Database owns one migrated schema and its search-path-scoped pool.

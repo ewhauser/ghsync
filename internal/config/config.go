@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/acme/frontier/internal/dispatch"
+	"github.com/ewhauser/ghsync/internal/dispatch"
 )
 
 const (

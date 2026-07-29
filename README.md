@@ -9,7 +9,7 @@ lives on `main` and is untouched here. The gRPC API
 ([docs/API_SPEC.md](docs/API_SPEC.md)) is a future project — this system's
 delivery interface is the documented Postgres contract.
 
-Module path `github.com/acme/frontier` is a placeholder until a remote exists.
+Module path: `github.com/ewhauser/ghsync`.
 
 ## Development
 
