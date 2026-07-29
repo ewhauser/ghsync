@@ -228,6 +228,7 @@ type RESTResponse struct {
 	ETag        string
 	NotModified bool
 	NextPage    int
+	NextCursor  string
 }
 
 type RESTClient struct {
@@ -444,6 +445,7 @@ func (c *RESTClient) getJSON(
 		StatusCode: resp.StatusCode,
 		ETag:       resp.Header.Get("ETag"),
 		NextPage:   nextPage(resp.Header.Get("Link")),
+		NextCursor: nextCursor(resp.Header.Get("Link")),
 	}
 	if resp.StatusCode == http.StatusNotModified {
 		resp.Body.Close()
@@ -487,4 +489,22 @@ func nextPage(link string) int {
 		return page
 	}
 	return 0
+}
+
+func nextCursor(link string) string {
+	for _, part := range strings.Split(link, ",") {
+		if !strings.Contains(part, `rel="next"`) {
+			continue
+		}
+		start := strings.Index(part, "<")
+		end := strings.Index(part, ">")
+		if start < 0 || end <= start {
+			continue
+		}
+		endpoint, err := url.Parse(part[start+1 : end])
+		if err == nil {
+			return endpoint.Query().Get("cursor")
+		}
+	}
+	return ""
 }

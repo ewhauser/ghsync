@@ -76,6 +76,20 @@ SET last_checked_at = GREATEST(last_checked_at, sqlc.arg(checked_at)),
                 ELSE sqlc.arg(etag)::text END
 WHERE gh_id = sqlc.arg(gh_id);
 
+-- name: TombstoneRepository :one
+-- C-R3 repository disappearance is authoritative only after the installation
+-- listing omits it and this entity fetch confirms 404.
+UPDATE repos
+SET tombstoned_at = sqlc.arg(tombstoned_at),
+    synced_at = sqlc.arg(synced_at),
+    last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    etag = '',
+    sync_source = sqlc.arg(sync_source)
+WHERE gh_id = sqlc.arg(gh_id)
+  AND tombstoned_at IS NULL
+  AND last_checked_at <= sqlc.arg(tombstoned_at)
+RETURNING *;
+
 -- name: UpsertRepositoryAlias :exec
 INSERT INTO repo_aliases (full_name, repo_id, first_seen_at, last_seen_at)
 VALUES (

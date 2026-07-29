@@ -129,9 +129,16 @@ func (h *Handler) RefreshRepository(
 		repository.ETag,
 	)
 	if isNotFound(err) {
-		// TODO(M4, C-R3): installation reconciliation owns authoritative
-		// repository-disappearance tombstones.
-		return fmt.Errorf("repository %s disappeared during refresh", key.Repo)
+		// C-R3: only installation-list reconciliation enqueues this
+		// verification fetch; the confirmed 404 is authoritative.
+		_, tombstoneErr := h.writer.TombstoneRepositoryObserved(
+			ctx,
+			observation,
+			repository,
+			source,
+			startedAt,
+		)
+		return tombstoneErr
 	}
 	if err != nil {
 		return fmt.Errorf("fetch repository %s: %w", key.Repo, err)
@@ -255,6 +262,12 @@ func (h *Handler) RefreshPR(
 	class, source, err := classAndSource(request.Queue)
 	if err != nil {
 		return err
+	}
+	if request.Queue == queue.QueueSweep {
+		// C-B4: reconciliation validates possibly unchanged entities with the
+		// cached REST ETag. Event/interactive work may still use the richer
+		// ganged GraphQL path.
+		return h.refreshPRREST(ctx, key, class, source, request.Queue)
 	}
 	metadata, err := h.writer.PullRequestMetadata(
 		ctx,

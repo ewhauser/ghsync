@@ -1204,6 +1204,58 @@ func (q *Queries) TombstonePullRequest(ctx context.Context, arg TombstonePullReq
 	return i, err
 }
 
+const tombstoneRepository = `-- name: TombstoneRepository :one
+UPDATE repos
+SET tombstoned_at = $1,
+    synced_at = $2,
+    last_checked_at = GREATEST(last_checked_at, $1),
+    etag = '',
+    sync_source = $3
+WHERE gh_id = $4
+  AND tombstoned_at IS NULL
+  AND last_checked_at <= $1
+RETURNING id, installation_id, org_id, gh_id, node_id, owner, name, full_name, default_branch, archived, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at
+`
+
+type TombstoneRepositoryParams struct {
+	TombstonedAt pgtype.Timestamptz
+	SyncedAt     pgtype.Timestamptz
+	SyncSource   string
+	GhID         int64
+}
+
+// C-R3 repository disappearance is authoritative only after the installation
+// listing omits it and this entity fetch confirms 404.
+func (q *Queries) TombstoneRepository(ctx context.Context, arg TombstoneRepositoryParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, tombstoneRepository,
+		arg.TombstonedAt,
+		arg.SyncedAt,
+		arg.SyncSource,
+		arg.GhID,
+	)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.InstallationID,
+		&i.OrgID,
+		&i.GhID,
+		&i.NodeID,
+		&i.Owner,
+		&i.Name,
+		&i.FullName,
+		&i.DefaultBranch,
+		&i.Archived,
+		&i.GhUpdatedAt,
+		&i.HeadSha,
+		&i.SyncedAt,
+		&i.Etag,
+		&i.SyncSource,
+		&i.TombstonedAt,
+		&i.LastCheckedAt,
+	)
+	return i, err
+}
+
 const tombstoneStack = `-- name: TombstoneStack :one
 UPDATE stacks
 SET tombstoned_at = $1,

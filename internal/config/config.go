@@ -15,6 +15,21 @@ const (
 	defaultDispatchDebounce    = 5 * time.Second
 	defaultDispatchPoll        = 250 * time.Millisecond
 	maxDispatchDebounce        = 15 * time.Second
+
+	defaultSweepOpenStackStaleness = 5 * time.Minute
+	defaultSweepOpenPRStaleness    = 10 * time.Minute
+	defaultSweepRepoRulesStaleness = time.Hour
+	defaultSweepClosedStaleness    = 24 * time.Hour
+	defaultSweepRepositoryPeriod   = time.Hour
+	defaultSweepPageSize           = 100
+	defaultGapHealPeriod           = 5 * time.Minute
+	defaultGapWindow               = 6 * time.Hour
+	defaultGapPageSize             = 100
+	defaultGapMaxPages             = 10
+	defaultDriftPeriod             = time.Hour
+	defaultDriftSampleSize         = 10
+	defaultRetentionPeriod         = 24 * time.Hour
+	defaultRetentionAge            = 90 * 24 * time.Hour
 )
 
 type Config struct {
@@ -55,21 +70,59 @@ type Config struct {
 	// DispatchPollInterval controls idle polling latency
 	// (DISPATCH_POLL_INTERVAL).
 	DispatchPollInterval time.Duration
+	// DispatchRulesFile optionally replaces the built-in dispatcher rule table
+	// with YAML/JSON data (DISPATCH_RULES_FILE).
+	DispatchRulesFile string
+
+	// M4 C-R1 bounds and periodic schedules are runtime configuration rather
+	// than constants in the sweeper.
+	SweepOpenStackMaxStaleness time.Duration
+	SweepOpenPRMaxStaleness    time.Duration
+	SweepRepoRulesMaxStaleness time.Duration
+	SweepClosedMaxStaleness    time.Duration
+	SweepRepositoryListPeriod  time.Duration
+	SweepPageSize              int
+
+	GapHealPeriod time.Duration
+	GapWindow     time.Duration
+	GapPageSize   int
+	GapMaxPages   int
+
+	DriftPeriod     time.Duration
+	DriftSampleSize int
+
+	RetentionPeriod time.Duration
+	RetentionAge    time.Duration
 }
 
 func FromEnv() (Config, error) {
 	cfg := Config{
-		DatabaseURL:          os.Getenv("DATABASE_URL"),
-		HTTPAddr:             envOr("HTTP_ADDR", ":8080"),
-		GitHubPrivateKeyPath: os.Getenv("GITHUB_PRIVATE_KEY_PATH"),
-		GitHubWebhookSecret:  os.Getenv("GITHUB_WEBHOOK_SECRET"),
-		GitHubToken:          os.Getenv("GITHUB_TOKEN"),
-		GitHubBaseURL:        envOr("GITHUB_BASE_URL", "https://api.github.com"),
-		WebhookMaxBodyBytes:  defaultWebhookMaxBodyBytes,
-		DispatchBatchSize:    defaultDispatchBatchSize,
-		DispatchMaxAttempts:  defaultDispatchMaxAttempts,
-		DispatchDebounce:     defaultDispatchDebounce,
-		DispatchPollInterval: defaultDispatchPoll,
+		DatabaseURL:                os.Getenv("DATABASE_URL"),
+		HTTPAddr:                   envOr("HTTP_ADDR", ":8080"),
+		GitHubPrivateKeyPath:       os.Getenv("GITHUB_PRIVATE_KEY_PATH"),
+		GitHubWebhookSecret:        os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		GitHubToken:                os.Getenv("GITHUB_TOKEN"),
+		GitHubBaseURL:              envOr("GITHUB_BASE_URL", "https://api.github.com"),
+		WebhookMaxBodyBytes:        defaultWebhookMaxBodyBytes,
+		DispatchBatchSize:          defaultDispatchBatchSize,
+		DispatchMaxAttempts:        defaultDispatchMaxAttempts,
+		DispatchDebounce:           defaultDispatchDebounce,
+		DispatchPollInterval:       defaultDispatchPoll,
+		DispatchRulesFile:          os.Getenv("DISPATCH_RULES_FILE"),
+		SweepOpenStackMaxStaleness: defaultSweepOpenStackStaleness,
+		SweepOpenPRMaxStaleness:    defaultSweepOpenPRStaleness,
+		SweepRepoRulesMaxStaleness: defaultSweepRepoRulesStaleness,
+		SweepClosedMaxStaleness:    defaultSweepClosedStaleness,
+		SweepRepositoryListPeriod:  defaultSweepRepositoryPeriod,
+		SweepPageSize:              defaultSweepPageSize,
+		GapHealPeriod:              defaultGapHealPeriod,
+		GapWindow:                  defaultGapWindow,
+		GapPageSize:                defaultGapPageSize,
+		GapMaxPages:                defaultGapMaxPages,
+		DriftPeriod:                defaultDriftPeriod,
+		DriftSampleSize:            defaultDriftSampleSize,
+		RetentionPeriod:            defaultRetentionPeriod,
+		RetentionAge:               defaultRetentionAge,
 	}
 	if raw := os.Getenv("GITHUB_APP_ID"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
@@ -132,6 +185,53 @@ func FromEnv() (Config, error) {
 			return Config{}, err
 		}
 		cfg.DispatchPollInterval = value
+	}
+	durationValues := []struct {
+		key    string
+		target *time.Duration
+	}{
+		{"SWEEP_OPEN_STACK_MAX_STALENESS", &cfg.SweepOpenStackMaxStaleness},
+		{"SWEEP_OPEN_PR_MAX_STALENESS", &cfg.SweepOpenPRMaxStaleness},
+		{"SWEEP_REPO_RULES_MAX_STALENESS", &cfg.SweepRepoRulesMaxStaleness},
+		{"SWEEP_CLOSED_MAX_STALENESS", &cfg.SweepClosedMaxStaleness},
+		{"SWEEP_REPOSITORY_LIST_PERIOD", &cfg.SweepRepositoryListPeriod},
+		{"GAP_HEAL_PERIOD", &cfg.GapHealPeriod},
+		{"GAP_COMPARISON_WINDOW", &cfg.GapWindow},
+		{"DRIFT_PERIOD", &cfg.DriftPeriod},
+		{"RETENTION_PERIOD", &cfg.RetentionPeriod},
+		{"RETENTION_AGE", &cfg.RetentionAge},
+	}
+	for _, item := range durationValues {
+		if raw := os.Getenv(item.key); raw != "" {
+			value, err := parsePositiveDuration(item.key, raw)
+			if err != nil {
+				return Config{}, err
+			}
+			*item.target = value
+		}
+	}
+	intValues := []struct {
+		key    string
+		target *int
+	}{
+		{"SWEEP_PAGE_SIZE", &cfg.SweepPageSize},
+		{"GAP_PAGE_SIZE", &cfg.GapPageSize},
+		{"GAP_MAX_PAGES", &cfg.GapMaxPages},
+		{"DRIFT_SAMPLE_SIZE", &cfg.DriftSampleSize},
+	}
+	for _, item := range intValues {
+		if raw := os.Getenv(item.key); raw != "" {
+			value, err := parsePositiveInt(item.key, raw)
+			if err != nil {
+				return Config{}, err
+			}
+			*item.target = value
+		}
+	}
+	if cfg.SweepPageSize > 100 || cfg.GapPageSize > 100 {
+		return Config{}, fmt.Errorf(
+			"SWEEP_PAGE_SIZE and GAP_PAGE_SIZE must not exceed 100",
+		)
 	}
 	return cfg, nil
 }

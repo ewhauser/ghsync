@@ -426,6 +426,75 @@ func (w *EntityWriter) ApplyRepositoryObserved(
 	return applied, nil
 }
 
+// TombstoneRepositoryObserved applies C-R3's verified repository
+// disappearance through the same lock/dirty/outbox transaction as every other
+// authoritative cache mutation. Child mirrors remain retained history; live
+// readers and future sweeps exclude them through the repository tombstone.
+func (w *EntityWriter) TombstoneRepositoryObserved(
+	ctx context.Context,
+	observation *Observation,
+	repository RepositoryRecord,
+	source SyncSource,
+	at time.Time,
+) (bool, error) {
+	if !source.Valid() {
+		return false, fmt.Errorf("invalid repository tombstone source")
+	}
+	if at.IsZero() {
+		at = w.now()
+	}
+	key := RepositoryEntityKey(
+		repository.InstallationID,
+		repository.GitHubID,
+	)
+	tx, err := w.beginEntityTx(ctx, observation, key)
+	if err != nil {
+		return false, fmt.Errorf("begin repository tombstone: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	queries := dbgen.New(tx)
+	current, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, fmt.Errorf("read tombstoned repository: %w", err)
+	}
+	scopes, err := queries.ListRepositoryDerivationScopes(ctx, current.ID)
+	if err != nil {
+		return false, fmt.Errorf("resolve repository tombstone scopes: %w", err)
+	}
+	_, tombstoneErr := queries.TombstoneRepository(
+		ctx,
+		dbgen.TombstoneRepositoryParams{
+			TombstonedAt: timestamp(at),
+			SyncedAt:     timestamp(at),
+			SyncSource:   string(source),
+			GhID:         repository.GitHubID,
+		},
+	)
+	if tombstoneErr != nil && !errors.Is(tombstoneErr, pgx.ErrNoRows) {
+		return false, fmt.Errorf("tombstone repository: %w", tombstoneErr)
+	}
+	applied := tombstoneErr == nil
+	if applied {
+		if err := markAndEmit(
+			ctx,
+			queries,
+			scopes,
+			"repository.tombstoned",
+			key,
+			at,
+		); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit repository tombstone: %w", err)
+	}
+	return applied, nil
+}
+
 func (w *EntityWriter) applyRepositoryTx(
 	ctx context.Context,
 	queries *dbgen.Queries,

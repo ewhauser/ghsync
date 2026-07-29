@@ -80,6 +80,18 @@ type DerivationDirty struct {
 	MarkedAt pgtype.Timestamptz
 }
 
+type DriftFinding struct {
+	ID                int64
+	InstallationID    int64
+	EntityKind        string
+	EntityKey         string
+	DetectedAt        pgtype.Timestamptz
+	CacheSnapshot     []byte
+	UpstreamSnapshot  []byte
+	Diff              []byte
+	RefreshEnqueuedAt pgtype.Timestamptz
+}
+
 type InstallationBackfillCursor struct {
 	InstallationID int64
 	Phase          string
@@ -218,13 +230,36 @@ type Stack struct {
 	LastCheckedAt pgtype.Timestamptz
 }
 
+type SweepCursor struct {
+	InstallationID int64
+	SweepKind      string
+	ScopeKey       string
+	Cursor         string
+	SeenKeys       []byte
+	StartedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	CompletedAt    pgtype.Timestamptz
+}
+
+type SweepPage struct {
+	InstallationID int64
+	SweepKind      string
+	ScopeKey       string
+	Cursor         string
+	Etag           string
+	NextCursor     string
+	EntityKeys     []byte
+	LastCheckedAt  pgtype.Timestamptz
+}
+
 type WebhookDelivery struct {
-	DeliveryGuid string
-	Event        string
-	RawBody      []byte
-	Headers      []byte
-	ReceivedAt   pgtype.Timestamptz
-	Status       string
-	Attempts     int32
-	LastError    pgtype.Text
+	DeliveryGuid    string
+	Event           string
+	RawBody         []byte
+	Headers         []byte
+	ReceivedAt      pgtype.Timestamptz
+	Status          string
+	Attempts        int32
+	LastError       pgtype.Text
+	PayloadPrunedAt pgtype.Timestamptz
 }

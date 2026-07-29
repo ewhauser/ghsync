@@ -73,6 +73,58 @@ func TestFromEnvDispatchDebounceHardCap(t *testing.T) {
 	}
 }
 
+func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SweepOpenStackMaxStaleness != 5*time.Minute ||
+		cfg.SweepOpenPRMaxStaleness != 10*time.Minute ||
+		cfg.SweepRepoRulesMaxStaleness != time.Hour ||
+		cfg.SweepClosedMaxStaleness != 24*time.Hour ||
+		cfg.RetentionAge != 90*24*time.Hour {
+		t.Fatalf("unexpected M4 defaults: %+v", cfg)
+	}
+	t.Setenv("SWEEP_OPEN_STACK_MAX_STALENESS", "30s")
+	t.Setenv("SWEEP_PAGE_SIZE", "50")
+	t.Setenv("GAP_COMPARISON_WINDOW", "2h")
+	t.Setenv("DRIFT_SAMPLE_SIZE", "7")
+	t.Setenv("RETENTION_AGE", "2160h")
+	t.Setenv("DISPATCH_RULES_FILE", "/tmp/rules.yaml")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SweepOpenStackMaxStaleness != 30*time.Second ||
+		cfg.SweepPageSize != 50 ||
+		cfg.GapWindow != 2*time.Hour ||
+		cfg.DriftSampleSize != 7 ||
+		cfg.RetentionAge != 90*24*time.Hour ||
+		cfg.DispatchRulesFile != "/tmp/rules.yaml" {
+		t.Fatalf("unexpected M4 overrides: %+v", cfg)
+	}
+}
+
+func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
+	for key, value := range map[string]string{
+		"SWEEP_OPEN_PR_MAX_STALENESS": "0s",
+		"SWEEP_PAGE_SIZE":             "101",
+		"GAP_PAGE_SIZE":               "101",
+		"GAP_MAX_PAGES":               "0",
+		"DRIFT_SAMPLE_SIZE":           "none",
+		"RETENTION_AGE":               "-1h",
+	} {
+		t.Run(key, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv(key, value)
+			if _, err := FromEnv(); err == nil {
+				t.Fatalf("%s=%q accepted", key, value)
+			}
+		})
+	}
+}
+
 func TestRequireWebhookSecret(t *testing.T) {
 	if err := (Config{}).RequireWebhookSecret(); err == nil {
 		t.Fatal("empty webhook secret accepted")
@@ -122,6 +174,21 @@ func clearConfigEnv(t *testing.T) {
 		"DISPATCH_MAX_ATTEMPTS",
 		"DISPATCH_DEBOUNCE",
 		"DISPATCH_POLL_INTERVAL",
+		"DISPATCH_RULES_FILE",
+		"SWEEP_OPEN_STACK_MAX_STALENESS",
+		"SWEEP_OPEN_PR_MAX_STALENESS",
+		"SWEEP_REPO_RULES_MAX_STALENESS",
+		"SWEEP_CLOSED_MAX_STALENESS",
+		"SWEEP_REPOSITORY_LIST_PERIOD",
+		"SWEEP_PAGE_SIZE",
+		"GAP_HEAL_PERIOD",
+		"GAP_COMPARISON_WINDOW",
+		"GAP_PAGE_SIZE",
+		"GAP_MAX_PAGES",
+		"DRIFT_PERIOD",
+		"DRIFT_SAMPLE_SIZE",
+		"RETENTION_PERIOD",
+		"RETENTION_AGE",
 	} {
 		t.Setenv(key, "")
 	}

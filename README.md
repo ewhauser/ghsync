@@ -23,6 +23,8 @@ make gen       # regenerate sqlc code after editing db/queries or db/migrations
 `frontier-syncd` commands: `serve --roles=...`, `migrate`,
 `backfill` (the configured installation), `requeue --guid=…|--all-parked`,
 `version`.
+Serve roles are `ingress`, `dispatch`, `fetch`, `sweep`, `drift`, and
+`pruner`; `all` enables the complete pipeline.
 `fake-github` (cmd/fake-github) serves a canned enrolled repo and emits
 HMAC-signed webhooks; docker-compose runs it beside Postgres.
 
@@ -48,6 +50,28 @@ Installation backfill enumerates repositories, refreshes repository rules,
 stacks, and PR detail as ordinary jobs, moves long tails to the `sweep` queue,
 and marks cursors complete only after durable child generations complete.
 
+### M4 reconciliation and validation
+
+River periodic jobs enqueue configured C-R1 schedules on the `sweep` queue.
+Authoritative repository, stack, and open-PR listings persist cursors, per-page
+ETags, and page membership; a restarted worker resumes the recorded page.
+Unchanged pages validate cached entity freshness, while changed pages enqueue
+ordinary conditional entity refreshes. Listing disappearance always takes the
+verify-then-404 path before a retained tombstone is written.
+
+Startup and scheduled gap healing compare a bounded App-deliveries cursor
+window against retained `webhook_deliveries` GUID skeletons and request
+redelivery for missing GUIDs. The drift job full-fetches a random semantic
+sample, records attached diffs in `drift_findings`, and enqueues self-healing
+refreshes. The pruner removes webhook bodies/headers and `check_history` older
+than the configured 90-day boundary; it does not prune `change_events`.
+
+The C-R1 durations, gap window, drift sample, and retention settings are
+environment configuration. Dispatcher rules can be loaded from
+[`config/dispatcher-rules.yaml`](config/dispatcher-rules.yaml) with
+`DISPATCH_RULES_FILE`; the real-repository validation protocol is
+[`ops/PHASE0-WEBHOOK-VALIDATION.md`](ops/PHASE0-WEBHOOK-VALIDATION.md).
+
 ## Status
 
 - [x] M0 — foundations: module, migrations (River + own), three River
@@ -55,6 +79,6 @@ and marks cursors complete only after durable child generations complete.
 - [x] M1 — GitHub plumbing & budgeter
 - [x] M2 — ingestion, dispatch, coalescing
 - [x] M3 — cache & fetchers
-- [ ] M4 — reconciliation & webhook validation
+- [x] M4 — reconciliation & webhook validation
 - [ ] M5 — change stream, derivation seam, contract
 - [ ] M6 — hardening & operations

@@ -145,6 +145,26 @@ type RepositoryRule struct {
 	Rules       []map[string]any `json:"rules"`
 }
 
+// HookDelivery is the fake's public /app/hook/deliveries representation.
+type HookDelivery struct {
+	ID             int64     `json:"id"`
+	GUID           string    `json:"guid"`
+	DeliveredAt    time.Time `json:"delivered_at"`
+	Redelivery     bool      `json:"redelivery"`
+	Status         string    `json:"status"`
+	StatusCode     int       `json:"status_code"`
+	Event          string    `json:"event"`
+	Action         string    `json:"action"`
+	InstallationID int64     `json:"installation_id"`
+	RepositoryID   int64     `json:"repository_id"`
+}
+
+type storedHookDelivery struct {
+	HookDelivery
+	targetURL string
+	body      []byte
+}
+
 func (c CheckRun) MarshalJSON() ([]byte, error) {
 	type wireCheckRun CheckRun
 	return json.Marshal(struct {
@@ -307,6 +327,9 @@ type Server struct {
 	requestCounts  map[string]int
 	notFound       map[string]int
 	requestHook    func(string, string, int, *Fixture)
+	deliveries     []storedHookDelivery
+	nextDeliveryID int64
+	redeliveries   []int64
 }
 
 func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
@@ -326,11 +349,12 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 			resetAt:   resetAt,
 			resource:  "graphql",
 		},
-		tokenTTL:      time.Hour,
-		now:           time.Now,
-		client:        &http.Client{Timeout: 10 * time.Second},
-		requestCounts: make(map[string]int),
-		notFound:      make(map[string]int),
+		tokenTTL:       time.Hour,
+		now:            time.Now,
+		client:         &http.Client{Timeout: 10 * time.Second},
+		requestCounts:  make(map[string]int),
+		notFound:       make(map[string]int),
+		nextDeliveryID: 1,
 	}
 	for _, option := range options {
 		option(s)
@@ -350,6 +374,11 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 	)
 	mux.HandleFunc("POST /graphql", s.graphql)
 	mux.HandleFunc("POST /app/installations/{id}/access_tokens", s.installationToken)
+	mux.HandleFunc("GET /app/hook/deliveries", s.listAppHookDeliveries)
+	mux.HandleFunc(
+		"POST /app/hook/deliveries/{id}/attempts",
+		s.redeliverAppHookDelivery,
+	)
 	s.mux = mux
 	return s
 }
@@ -454,6 +483,25 @@ func (s *Server) SetFixture(fixture Fixture) {
 	s.fixture = fixture
 }
 
+// RedeliveryRequests reports the delivery IDs requested through the fake
+// redelivery endpoint.
+func (s *Server) RedeliveryRequests() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.redeliveries...)
+}
+
+// Deliveries returns the recorded delivery-list skeletons newest first.
+func (s *Server) Deliveries() []HookDelivery {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]HookDelivery, 0, len(s.deliveries))
+	for index := len(s.deliveries) - 1; index >= 0; index-- {
+		result = append(result, s.deliveries[index].HookDelivery)
+	}
+	return result
+}
+
 // Remaining reports the simulated REST request budget left.
 func (s *Server) Remaining() int64 {
 	return s.snapshot("core").remaining
@@ -506,8 +554,9 @@ func (s *Server) listInstallationRepositories(
 	r *http.Request,
 ) {
 	s.mu.Lock()
-	repositories := append([]Repository(nil), s.fixture.Repositories...)
-	if len(repositories) == 0 {
+	configured := s.fixture.Repositories
+	repositories := append([]Repository(nil), configured...)
+	if configured == nil {
 		repositories = []Repository{s.fixture.Repository}
 	}
 	s.mu.Unlock()
@@ -935,6 +984,95 @@ func (s *Server) installationToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) listAppHookDeliveries(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	perPage := 30
+	if raw := r.URL.Query().Get("per_page"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 || value > 100 {
+			http.Error(w, "bad per_page", http.StatusUnprocessableEntity)
+			return
+		}
+		perPage = value
+	}
+	offset := 0
+	if raw := r.URL.Query().Get("cursor"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 0 {
+			http.Error(w, "bad cursor", http.StatusUnprocessableEntity)
+			return
+		}
+		offset = value
+	}
+	deliveries := s.Deliveries()
+	if offset > len(deliveries) {
+		offset = len(deliveries)
+	}
+	end := min(offset+perPage, len(deliveries))
+	page := deliveries[offset:end]
+	if end < len(deliveries) {
+		nextURL := *r.URL
+		query := nextURL.Query()
+		query.Set("cursor", strconv.Itoa(end))
+		nextURL.RawQuery = query.Encode()
+		w.Header().Set(
+			"Link",
+			fmt.Sprintf("<%s>; rel=\"next\"", nextURL.String()),
+		)
+	}
+	s.writeConditionalJSON(w, r, "core", page)
+}
+
+func (s *Server) redeliverAppHookDelivery(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "bad delivery ID", http.StatusUnprocessableEntity)
+		return
+	}
+	s.mu.Lock()
+	var original *storedHookDelivery
+	for index := range s.deliveries {
+		if s.deliveries[index].ID == id {
+			copy := s.deliveries[index]
+			original = &copy
+			break
+		}
+	}
+	if original != nil {
+		s.redeliveries = append(s.redeliveries, id)
+	}
+	s.mu.Unlock()
+	if original == nil {
+		http.Error(w, "delivery not found", http.StatusUnprocessableEntity)
+		return
+	}
+	statusCode, deliveryErr := s.sendWebhook(
+		r.Context(),
+		original.targetURL,
+		original.Event,
+		original.GUID,
+		original.body,
+	)
+	s.recordHookDelivery(
+		original.targetURL,
+		original.Event,
+		original.GUID,
+		original.body,
+		true,
+		statusCode,
+	)
+	if deliveryErr != nil {
+		http.Error(w, deliveryErr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
 type fakeAppClaims struct {
 	jwt.RegisteredClaims
 }
@@ -973,25 +1111,118 @@ func (s *Server) EmitWebhookWithGUID(
 			return "", fmt.Errorf("generate delivery GUID: %w", err)
 		}
 	}
+	statusCode, deliveryErr := s.sendWebhook(
+		ctx,
+		targetURL,
+		event,
+		guid,
+		body,
+	)
+	s.recordHookDelivery(
+		targetURL,
+		event,
+		guid,
+		body,
+		false,
+		statusCode,
+	)
+	return guid, deliveryErr
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+// DropWebhook records a GitHub-side delivery without sending it to ingress.
+// C-R4 tests use this to model an outage/drop and then verify redelivery.
+func (s *Server) DropWebhook(
+	targetURL string,
+	event string,
+	payload any,
+) (string, error) {
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("marshal payload: %w", err)
+	}
+	guid, err := newDeliveryGUID()
+	if err != nil {
+		return "", fmt.Errorf("generate delivery GUID: %w", err)
+	}
+	s.recordHookDelivery(targetURL, event, guid, body, false, 0)
+	return guid, nil
+}
+
+func (s *Server) sendWebhook(
+	ctx context.Context,
+	targetURL string,
+	event string,
+	guid string,
+	body []byte,
+) (int, error) {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		targetURL,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GitHub-Event", event)
 	req.Header.Set("X-GitHub-Delivery", guid)
 	req.Header.Set("X-Hub-Signature-256", gh.SignBody(s.webhookSecret, body))
-
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", fmt.Errorf("webhook target returned %d", resp.StatusCode)
+		return resp.StatusCode, fmt.Errorf(
+			"webhook target returned %d",
+			resp.StatusCode,
+		)
 	}
-	return guid, nil
+	return resp.StatusCode, nil
+}
+
+func (s *Server) recordHookDelivery(
+	targetURL string,
+	event string,
+	guid string,
+	body []byte,
+	redelivery bool,
+	statusCode int,
+) int64 {
+	status := "DROPPED"
+	if statusCode >= 200 && statusCode <= 399 {
+		status = "OK"
+	} else if statusCode > 0 {
+		status = "FAILED"
+	}
+	var action string
+	var envelope struct {
+		Action string `json:"action"`
+	}
+	if json.Unmarshal(body, &envelope) == nil {
+		action = envelope.Action
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.nextDeliveryID
+	s.nextDeliveryID++
+	s.deliveries = append(s.deliveries, storedHookDelivery{
+		HookDelivery: HookDelivery{
+			ID:           id,
+			GUID:         guid,
+			DeliveredAt:  s.now().UTC(),
+			Redelivery:   redelivery,
+			Status:       status,
+			StatusCode:   statusCode,
+			Event:        event,
+			Action:       action,
+			RepositoryID: s.fixture.Repository.ID,
+		},
+		targetURL: targetURL,
+		body:      append([]byte(nil), body...),
+	})
+	return id
 }
 
 func health(w http.ResponseWriter, r *http.Request) {

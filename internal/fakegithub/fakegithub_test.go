@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -501,6 +502,89 @@ func TestEmitWebhookFailsOnNon2xx(t *testing.T) {
 		map[string]any{},
 	); err == nil {
 		t.Fatal("expected error on 503 target")
+	}
+}
+
+func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
+	var received int
+	target := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			received++
+			w.WriteHeader(http.StatusNoContent)
+		},
+	))
+	defer target.Close()
+	fake := New(DefaultFixture(), "secret")
+	for index := range 3 {
+		if _, err := fake.DropWebhook(
+			target.URL,
+			"push",
+			map[string]any{
+				"action": "test",
+				"index":  index,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/app/hook/deliveries?per_page=2",
+		nil,
+	)
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK ||
+		!strings.Contains(first.Header.Get("Link"), "cursor=2") {
+		t.Fatalf(
+			"first page status/link = %d/%q",
+			first.StatusCode,
+			first.Header.Get("Link"),
+		)
+	}
+	var deliveries []HookDelivery
+	if err := json.NewDecoder(first.Body).Decode(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 2 || deliveries[0].ID <= deliveries[1].ID {
+		t.Fatalf("first page deliveries = %+v", deliveries)
+	}
+	second := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/app/hook/deliveries?per_page=2&cursor=2",
+		nil,
+	)
+	defer second.Body.Close()
+	var remaining []HookDelivery
+	if err := json.NewDecoder(second.Body).Decode(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("second page deliveries = %+v", remaining)
+	}
+	redelivery := serve(
+		fake,
+		http.MethodPost,
+		fmt.Sprintf(
+			"http://fake.test/app/hook/deliveries/%d/attempts",
+			deliveries[0].ID,
+		),
+		nil,
+	)
+	defer redelivery.Body.Close()
+	if redelivery.StatusCode != http.StatusAccepted {
+		t.Fatalf("redelivery status = %d", redelivery.StatusCode)
+	}
+	if received != 1 ||
+		len(fake.RedeliveryRequests()) != 1 ||
+		!fake.Deliveries()[0].Redelivery {
+		t.Fatalf(
+			"received=%d requests=%v deliveries=%+v",
+			received,
+			fake.RedeliveryRequests(),
+			fake.Deliveries(),
+		)
 	}
 }
 

@@ -5,10 +5,12 @@ package dispatch
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/acme/frontier/internal/queue"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -40,10 +42,10 @@ const (
 // escalates a pull request event when its payload carries the stack preview
 // object (SYNC_ENGINE §2.1).
 type Rule struct {
-	Event         string
-	Action        string
-	Target        Target
-	StackedTarget Target
+	Event         string `json:"event" yaml:"event"`
+	Action        string `json:"action" yaml:"action"`
+	Target        Target `json:"target" yaml:"target"`
+	StackedTarget Target `json:"stacked_target,omitempty" yaml:"stacked_target,omitempty"`
 }
 
 // DefaultRules is data rather than event-specific control flow so preview
@@ -83,6 +85,63 @@ func NewClassifier(rules []Rule) Classifier {
 
 func DefaultClassifier() Classifier {
 	return NewClassifier(DefaultRules())
+}
+
+// LoadRulesFile makes Phase-0 webhook findings a reviewed data change rather
+// than an event-specific code branch. YAML is a superset of the shipped JSON
+// shape, so either format is accepted.
+func LoadRulesFile(path string) ([]Rule, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read dispatcher rules file: %w", err)
+	}
+	var document struct {
+		Rules []Rule `json:"rules" yaml:"rules"`
+	}
+	if err := yaml.Unmarshal(body, &document); err != nil {
+		return nil, fmt.Errorf("decode dispatcher rules file: %w", err)
+	}
+	if len(document.Rules) == 0 {
+		return nil, fmt.Errorf("dispatcher rules file has no rules")
+	}
+	for index, rule := range document.Rules {
+		if err := validateRule(rule); err != nil {
+			return nil, fmt.Errorf("dispatcher rule %d: %w", index, err)
+		}
+	}
+	return document.Rules, nil
+}
+
+func validateRule(rule Rule) error {
+	if rule.Event == "" || strings.TrimSpace(rule.Event) != rule.Event {
+		return fmt.Errorf("event must be non-empty and trimmed")
+	}
+	if rule.Action == "" {
+		return fmt.Errorf("action must be non-empty")
+	}
+	if !validTarget(rule.Target) {
+		return fmt.Errorf("unsupported target %q", rule.Target)
+	}
+	if rule.StackedTarget != "" && !validTarget(rule.StackedTarget) {
+		return fmt.Errorf(
+			"unsupported stacked target %q",
+			rule.StackedTarget,
+		)
+	}
+	return nil
+}
+
+func validTarget(target Target) bool {
+	switch target {
+	case TargetPullRequest,
+		TargetStack,
+		TargetChecks,
+		TargetBranch,
+		TargetResolveStackMembership:
+		return true
+	default:
+		return false
+	}
 }
 
 type payloadEnvelope struct {

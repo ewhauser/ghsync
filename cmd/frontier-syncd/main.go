@@ -28,12 +28,14 @@ import (
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/config"
 	"github.com/acme/frontier/internal/dispatch"
+	"github.com/acme/frontier/internal/drift"
 	"github.com/acme/frontier/internal/fetch"
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/ingress"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
+	"github.com/acme/frontier/internal/sweep"
 )
 
 var version = "dev"
@@ -47,6 +49,9 @@ const (
 	roleIngress            = "ingress"
 	roleDispatch           = "dispatch"
 	roleFetch              = "fetch"
+	roleSweep              = "sweep"
+	roleDrift              = "drift"
+	rolePruner             = "pruner"
 )
 
 func main() {
@@ -219,7 +224,7 @@ func serve(args []string) error {
 	rolesFlag := fs.String(
 		"roles",
 		"all",
-		"comma-separated roles: ingress,dispatch,fetch, or all",
+		"comma-separated roles: ingress,dispatch,fetch,sweep,drift,pruner, or all",
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -241,7 +246,7 @@ func serve(args []string) error {
 			return err
 		}
 	}
-	if roles[roleFetch] {
+	if roles[roleFetch] || roles[roleSweep] || roles[roleDrift] {
 		if err := cfg.RequireFetchCredentials(); err != nil {
 			return err
 		}
@@ -262,10 +267,13 @@ func serve(args []string) error {
 
 	serviceCtx, cancelServices := context.WithCancel(context.Background())
 	defer cancelServices()
-	serviceErrors := make(chan error, 3)
+	serviceErrors := make(chan error, 4)
 
 	var riverClient *river.Client[pgx.Tx]
 	var githubGate *budget.Gate
+	var rest *gh.RESTClient
+	var deliveryClient *gh.DeliveriesClient
+	var tokens gh.TokenProvider
 	budgetCtx, cancelBudget := context.WithCancel(context.Background())
 	defer func() {
 		if githubGate != nil {
@@ -278,55 +286,79 @@ func serve(args []string) error {
 		}
 		cancelBudget()
 	}()
-	if roles[roleDispatch] || roles[roleFetch] {
-		var fetchHandler *fetch.Handler
-		if roles[roleFetch] {
-			owner, hostErr := os.Hostname()
-			if hostErr != nil {
-				return fmt.Errorf("budget lease owner: %w", hostErr)
+	needsGitHub := roles[roleFetch] || roles[roleSweep] || roles[roleDrift]
+	if needsGitHub {
+		owner, hostErr := os.Hostname()
+		if hostErr != nil {
+			return fmt.Errorf("budget lease owner: %w", hostErr)
+		}
+		githubGate, err = budget.NewLeased(
+			budgetCtx,
+			http.DefaultClient,
+			budget.Options{},
+			budget.NewPostgresLeaseStore(pool),
+			budget.LeaseOptions{
+				InstallationID: cfg.GitHubInstallationID,
+				Owner:          owner,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("GitHub budget gate: %w", err)
+		}
+		var appTokens gh.TokenProvider
+		if cfg.GitHubToken != "" {
+			tokens = gh.StaticToken(cfg.GitHubToken)
+			appTokens = tokens
+		} else {
+			privateKeyPEM, readErr := os.ReadFile(cfg.GitHubPrivateKeyPath)
+			if readErr != nil {
+				return fmt.Errorf("read GitHub private key: %w", readErr)
 			}
-			githubGate, err = budget.NewLeased(
-				budgetCtx,
-				http.DefaultClient,
-				budget.Options{},
-				budget.NewPostgresLeaseStore(pool),
-				budget.LeaseOptions{
+			tokens, err = gh.NewInstallationTokens(
+				githubGate,
+				gh.InstallationTokenOptions{
+					BaseURL:        cfg.GitHubBaseURL,
+					AppID:          cfg.GitHubAppID,
 					InstallationID: cfg.GitHubInstallationID,
-					Owner:          owner,
+					PrivateKeyPEM:  privateKeyPEM,
 				},
 			)
 			if err != nil {
-				return fmt.Errorf("GitHub budget gate: %w", err)
+				return fmt.Errorf("GitHub installation tokens: %w", err)
 			}
-			var tokens gh.TokenProvider
-			if cfg.GitHubToken != "" {
-				tokens = gh.StaticToken(cfg.GitHubToken)
-			} else {
-				privateKeyPEM, readErr := os.ReadFile(cfg.GitHubPrivateKeyPath)
-				if readErr != nil {
-					return fmt.Errorf("read GitHub private key: %w", readErr)
-				}
-				tokens, err = gh.NewInstallationTokens(
-					githubGate,
-					gh.InstallationTokenOptions{
-						BaseURL:        cfg.GitHubBaseURL,
-						AppID:          cfg.GitHubAppID,
-						InstallationID: cfg.GitHubInstallationID,
-						PrivateKeyPEM:  privateKeyPEM,
-					},
-				)
-				if err != nil {
-					return fmt.Errorf("GitHub installation tokens: %w", err)
-				}
+			appTokens, err = gh.NewAppTokens(
+				cfg.GitHubAppID,
+				privateKeyPEM,
+			)
+			if err != nil {
+				return fmt.Errorf("GitHub App tokens: %w", err)
 			}
-			rest, restErr := gh.NewRESTClient(
+		}
+		rest, err = gh.NewRESTClient(
+			cfg.GitHubBaseURL,
+			githubGate,
+			tokens,
+		)
+		if err != nil {
+			return fmt.Errorf("GitHub REST client: %w", err)
+		}
+		if roles[roleSweep] {
+			deliveryClient, err = gh.NewDeliveriesClient(
 				cfg.GitHubBaseURL,
 				githubGate,
-				tokens,
+				appTokens,
 			)
-			if restErr != nil {
-				return fmt.Errorf("GitHub REST client: %w", restErr)
+			if err != nil {
+				return fmt.Errorf("GitHub deliveries client: %w", err)
 			}
+		}
+	}
+
+	needsRiver := roles[roleDispatch] || roles[roleFetch] ||
+		roles[roleSweep] || roles[roleDrift] || roles[rolePruner]
+	if needsRiver {
+		var fetchHandler *fetch.Handler
+		if needsGitHub {
 			graphQL, graphErr := gh.NewGraphQLClient(
 				cfg.GitHubBaseURL,
 				githubGate,
@@ -346,11 +378,92 @@ func serve(args []string) error {
 				return err
 			}
 		}
+		var sweepService *sweep.Service
+		if roles[roleSweep] || roles[rolePruner] {
+			sweepService, err = sweep.New(sweep.Options{
+				Pool:       pool,
+				REST:       rest,
+				Deliveries: deliveryClient,
+				Config: sweep.Config{
+					InstallationID: cfg.GitHubInstallationID,
+					OpenStackMaxStaleness: cfg.
+						SweepOpenStackMaxStaleness,
+					OpenPRMaxStaleness: cfg.SweepOpenPRMaxStaleness,
+					RepoRulesMaxStaleness: cfg.
+						SweepRepoRulesMaxStaleness,
+					ClosedMaxStaleness:   cfg.SweepClosedMaxStaleness,
+					RepositoryListPeriod: cfg.SweepRepositoryListPeriod,
+					PageSize:             cfg.SweepPageSize,
+					GapHealPeriod:        cfg.GapHealPeriod,
+					GapWindow:            cfg.GapWindow,
+					GapPageSize:          cfg.GapPageSize,
+					GapMaxPages:          cfg.GapMaxPages,
+					RetentionPeriod:      cfg.RetentionPeriod,
+					RetentionAge:         cfg.RetentionAge,
+					Observer:             sweep.LogObserver{},
+				},
+			})
+			if err != nil {
+				return err
+			}
+		}
+		var driftService *drift.Service
+		if roles[roleDrift] {
+			driftService, err = drift.New(drift.Options{
+				Pool: pool,
+				REST: rest,
+				Config: drift.Config{
+					InstallationID: cfg.GitHubInstallationID,
+					Period:         cfg.DriftPeriod,
+					SampleSize:     cfg.DriftSampleSize,
+					PageSize:       cfg.SweepPageSize,
+					Observer:       drift.LogObserver{},
+				},
+			})
+			if err != nil {
+				return err
+			}
+		}
 		var clientOptions []queue.ClientOption
 		if fetchHandler != nil {
 			clientOptions = append(
 				clientOptions,
 				queue.WithRefreshHandler(fetchHandler),
+			)
+		}
+		if roles[rolePruner] && !roles[roleDispatch] && !needsGitHub {
+			clientOptions = append(
+				clientOptions,
+				queue.WithoutRefreshWorkers(),
+			)
+		}
+		if roles[roleSweep] {
+			clientOptions = append(
+				clientOptions,
+				queue.WithWorkerRegistrar(
+					sweepService.RegisterReconciliationWorkers,
+				),
+				queue.WithPeriodicJobs(
+					sweepService.ReconciliationPeriodicJobs()...,
+				),
+			)
+		}
+		if roles[rolePruner] {
+			clientOptions = append(
+				clientOptions,
+				queue.WithWorkerRegistrar(
+					sweepService.RegisterPrunerWorker,
+				),
+				queue.WithPeriodicJobs(
+					sweepService.PrunerPeriodicJobs()...,
+				),
+			)
+		}
+		if driftService != nil {
+			clientOptions = append(
+				clientOptions,
+				queue.WithWorkerRegistrar(driftService.RegisterWorker),
+				queue.WithPeriodicJobs(driftService.PeriodicJobs()...),
 			)
 		}
 		riverClient, err = queue.NewClient(pool, clientOptions...)
@@ -360,18 +473,36 @@ func serve(args []string) error {
 		if fetchHandler != nil {
 			fetchHandler.SetRiverClient(riverClient)
 		}
-		if roles[roleFetch] {
+		if sweepService != nil {
+			sweepService.SetRiverClient(riverClient)
+		}
+		if driftService != nil {
+			driftService.SetRiverClient(riverClient)
+		}
+		worksJobs := roles[roleFetch] || roles[roleSweep] ||
+			roles[roleDrift] || roles[rolePruner]
+		if worksJobs {
 			if err := riverClient.Start(serviceCtx); err != nil {
 				return fmt.Errorf("river start: %w", err)
 			}
 		}
 		if roles[roleDispatch] {
+			classifier := dispatch.DefaultClassifier()
+			if cfg.DispatchRulesFile != "" {
+				rules, loadErr := dispatch.LoadRulesFile(
+					cfg.DispatchRulesFile,
+				)
+				if loadErr != nil {
+					return loadErr
+				}
+				classifier = dispatch.NewClassifier(rules)
+			}
 			dispatcher := dispatch.New(pool, riverClient, dispatch.Config{
 				BatchSize:    cfg.DispatchBatchSize,
 				MaxAttempts:  cfg.DispatchMaxAttempts,
 				Debounce:     cfg.DispatchDebounce,
 				PollInterval: cfg.DispatchPollInterval,
-				Classifier:   dispatch.DefaultClassifier(),
+				Classifier:   classifier,
 			})
 			go func() {
 				if err := dispatcher.Run(serviceCtx); err != nil {
@@ -427,7 +558,9 @@ func serve(args []string) error {
 			serviceErr = fmt.Errorf("ingress graceful shutdown: %w", httpErr)
 		}
 	}
-	if riverClient != nil && roles[roleFetch] {
+	if riverClient != nil &&
+		(roles[roleFetch] || roles[roleSweep] ||
+			roles[roleDrift] || roles[rolePruner]) {
 		riverCtx, cancelRiver := context.WithTimeout(
 			context.Background(),
 			riverShutdownTimeout,
@@ -479,16 +612,24 @@ func parseRoles(raw string) (map[string]bool, error) {
 			roleIngress:  true,
 			roleDispatch: true,
 			roleFetch:    true,
+			roleSweep:    true,
+			roleDrift:    true,
+			rolePruner:   true,
 		}, nil
 	}
-	roles := make(map[string]bool, 2)
+	roles := make(map[string]bool, 6)
 	for _, role := range strings.Split(raw, ",") {
 		switch role {
-		case roleIngress, roleDispatch, roleFetch:
+		case roleIngress,
+			roleDispatch,
+			roleFetch,
+			roleSweep,
+			roleDrift,
+			rolePruner:
 			roles[role] = true
 		default:
 			return nil, fmt.Errorf(
-				"--roles=%q contains unsupported role %q (want ingress, dispatch, fetch, or all)",
+				"--roles=%q contains unsupported role %q (want ingress, dispatch, fetch, sweep, drift, pruner, or all)",
 				raw,
 				role,
 			)

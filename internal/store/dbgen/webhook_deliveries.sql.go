@@ -24,7 +24,7 @@ SET status = 'processing',
     last_error = NULL
 FROM candidates
 WHERE delivery.delivery_guid = candidates.delivery_guid
-RETURNING delivery.delivery_guid, delivery.event, delivery.raw_body, delivery.headers, delivery.received_at, delivery.status, delivery.attempts, delivery.last_error
+RETURNING delivery.delivery_guid, delivery.event, delivery.raw_body, delivery.headers, delivery.received_at, delivery.status, delivery.attempts, delivery.last_error, delivery.payload_pruned_at
 `
 
 // C-P2/C-O2: claim a bounded batch without blocking another dispatcher. The
@@ -48,6 +48,7 @@ func (q *Queries) ClaimWebhookDeliveries(ctx context.Context, batchSize int32) (
 			&i.Status,
 			&i.Attempts,
 			&i.LastError,
+			&i.PayloadPrunedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -71,7 +72,7 @@ func (q *Queries) CountWebhookDeliveriesByStatus(ctx context.Context, status str
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error FROM webhook_deliveries WHERE delivery_guid = $1
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at FROM webhook_deliveries WHERE delivery_guid = $1
 `
 
 func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (WebhookDelivery, error) {
@@ -86,6 +87,7 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (
 		&i.Status,
 		&i.Attempts,
 		&i.LastError,
+		&i.PayloadPrunedAt,
 	)
 	return i, err
 }
@@ -118,7 +120,7 @@ func (q *Queries) InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDe
 }
 
 const listParkedWebhookDeliveries = `-- name: ListParkedWebhookDeliveries :many
-SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at
 FROM webhook_deliveries
 WHERE status = 'parked'
 ORDER BY received_at, delivery_guid
@@ -145,6 +147,7 @@ func (q *Queries) ListParkedWebhookDeliveries(ctx context.Context, resultLimit i
 			&i.Status,
 			&i.Attempts,
 			&i.LastError,
+			&i.PayloadPrunedAt,
 		); err != nil {
 			return nil, err
 		}

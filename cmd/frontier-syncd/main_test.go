@@ -8,7 +8,10 @@ func TestValidateRoles(t *testing.T) {
 		"ingress",
 		"dispatch",
 		"fetch",
-		"ingress,dispatch,fetch",
+		"sweep",
+		"drift",
+		"pruner",
+		"ingress,dispatch,fetch,sweep,drift,pruner",
 	} {
 		if err := validateRoles(roles); err != nil {
 			t.Fatalf("%q rejected: %v", roles, err)

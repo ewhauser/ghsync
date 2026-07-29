@@ -102,6 +102,49 @@ func (tokenRealClock) Now() time.Time {
 	return time.Now()
 }
 
+// AppTokens signs short-lived GitHub App JWTs for App-only endpoints such as
+// the webhook deliveries API used by C-R4.
+type AppTokens struct {
+	appID  int64
+	signer ghinstallation.Signer
+	clock  interface{ Now() time.Time }
+}
+
+func NewAppTokens(
+	appID int64,
+	privateKeyPEM []byte,
+) (*AppTokens, error) {
+	if appID <= 0 {
+		return nil, fmt.Errorf("GitHub App ID must be positive")
+	}
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(privateKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse GitHub App private key: %w", err)
+	}
+	return &AppTokens{
+		appID: appID,
+		signer: ghinstallation.NewRSASigner(
+			jwt.SigningMethodRS256,
+			privateKey,
+		),
+		clock: tokenRealClock{},
+	}, nil
+}
+
+func (m *AppTokens) Token(_ context.Context) (string, error) {
+	now := m.clock.Now()
+	claims := &jwt.RegisteredClaims{
+		IssuedAt:  jwt.NewNumericDate(now.Add(-30 * time.Second).Truncate(time.Second)),
+		ExpiresAt: jwt.NewNumericDate(now.Add(90 * time.Second).Truncate(time.Second)),
+		Issuer:    strconv.FormatInt(m.appID, 10),
+	}
+	token, err := m.signer.Sign(claims)
+	if err != nil {
+		return "", fmt.Errorf("sign GitHub App JWT: %w", err)
+	}
+	return token, nil
+}
+
 func (m *InstallationTokens) Token(ctx context.Context) (string, error) {
 	if token, ok := m.cached(); ok {
 		return token, nil
