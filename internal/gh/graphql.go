@@ -450,7 +450,7 @@ func (c *GraphQLClient) Call(
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, decodeHTTPError(resp)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var envelope struct {
 		Data   json.RawMessage `json:"data"`
 		Errors []GraphQLError  `json:"errors"`

@@ -61,7 +61,7 @@ func TestLeasedGatePersistsPeriodicallyNotPerRequest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.HTTP.Body.Close()
+		_ = resp.HTTP.Body.Close()
 	}
 	if saves := store.saveCount(); saves != 0 {
 		t.Fatalf("request-path snapshot saves = %d, want 0", saves)

@@ -54,7 +54,7 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		message, _ := io.ReadAll(response.Body)
 		t.Fatalf("control emit status = %d: %s", response.StatusCode, message)
@@ -88,7 +88,7 @@ func TestControlTruthReportsLatestMutatedPullState(t *testing.T) {
 		"http://fake.test"+ControlTruthPath,
 		nil,
 	)
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var truth SoakTruth
 	if err := json.NewDecoder(response.Body).Decode(&truth); err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 		nil,
 	)
 	etag := first.Header.Get("ETag")
-	first.Body.Close()
+	_ = first.Body.Close()
 	if first.StatusCode != http.StatusOK || etag == "" {
 		t.Fatalf("first PR status=%d etag=%q", first.StatusCode, etag)
 	}
@@ -212,7 +212,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	fake.ServeHTTP(recorder, request)
 	notModified := recorder.Result()
-	notModified.Body.Close()
+	_ = notModified.Body.Close()
 	if notModified.StatusCode != http.StatusNotModified {
 		t.Fatalf("conditional PR status=%d, want 304", notModified.StatusCode)
 	}
@@ -223,7 +223,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 		"http://fake.test/repos/acme/monolith/commits/8f31c2d/check-runs",
 		nil,
 	)
-	defer checks.Body.Close()
+	defer func() { _ = checks.Body.Close() }()
 	checksETag := checks.Header.Get("ETag")
 	var payload struct {
 		CheckRuns []CheckRun `json:"check_runs"`
@@ -245,7 +245,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	fake.ServeHTTP(recorder, request)
 	notModified = recorder.Result()
-	notModified.Body.Close()
+	_ = notModified.Body.Close()
 	if notModified.StatusCode != http.StatusNotModified ||
 		fake.NotModifiedCount(http.MethodGet, checksPath) != 1 {
 		t.Fatalf(
@@ -262,7 +262,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 		"http://fake.test"+path,
 		nil,
 	)
-	missing.Body.Close()
+	_ = missing.Body.Close()
 	if missing.StatusCode != http.StatusNotFound {
 		t.Fatalf("scripted status=%d, want 404", missing.StatusCode)
 	}
@@ -272,7 +272,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 		"http://fake.test"+path,
 		nil,
 	)
-	restored.Body.Close()
+	_ = restored.Body.Close()
 	if restored.StatusCode != http.StatusOK {
 		t.Fatalf("post-script status=%d, want 200", restored.StatusCode)
 	}
@@ -597,7 +597,7 @@ func TestInstallationTokenEndpointValidatesJWTAndReturnsCreated(t *testing.T) {
 	}
 
 	valid := call(sign(strconv.FormatInt(99, 10), key))
-	valid.Body.Close()
+	_ = valid.Body.Close()
 	if valid.StatusCode != http.StatusCreated {
 		t.Fatalf("valid token status = %d, want 201", valid.StatusCode)
 	}
@@ -766,7 +766,7 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		"http://fake.test/app/hook/deliveries?per_page=2",
 		nil,
 	)
-	unauthorized.Body.Close()
+	_ = unauthorized.Body.Close()
 	if unauthorized.StatusCode != http.StatusUnauthorized {
 		t.Fatalf(
 			"installation bearer on deliveries status = %d, want 401",
@@ -780,7 +780,7 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		nil,
 		"Bearer "+appJWT,
 	)
-	defer first.Body.Close()
+	defer func() { _ = first.Body.Close() }()
 	link := first.Header.Get("Link")
 	if first.StatusCode != http.StatusOK ||
 		!strings.Contains(link, "cursor=") {
@@ -817,7 +817,7 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		nil,
 		"Bearer "+appJWT,
 	)
-	defer second.Body.Close()
+	defer func() { _ = second.Body.Close() }()
 	var remaining []HookDelivery
 	if err := json.NewDecoder(second.Body).Decode(&remaining); err != nil {
 		t.Fatal(err)
@@ -835,7 +835,7 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		nil,
 		"Bearer "+appJWT,
 	)
-	defer redelivery.Body.Close()
+	defer func() { _ = redelivery.Body.Close() }()
 	if redelivery.StatusCode != http.StatusAccepted {
 		t.Fatalf("redelivery status = %d", redelivery.StatusCode)
 	}

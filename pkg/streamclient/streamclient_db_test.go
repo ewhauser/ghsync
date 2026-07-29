@@ -977,10 +977,12 @@ func TestBootstrapTailOverlapConvergesWithoutLostOrDoubleAppliedEffect(
 	`, projection, applied)); err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Exec(
-		context.Background(),
-		"DROP TABLE "+projection+", "+applied,
-	) //nolint:errcheck
+	defer func() {
+		_, _ = pool.Exec(
+			context.Background(),
+			"DROP TABLE "+projection+", "+applied,
+		)
+	}()
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -1302,10 +1304,12 @@ func TestRetentionResyncBootstrapConvergesWithoutDuplicateSeqApplication(
 	`, projection, applied)); err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Exec(
-		context.Background(),
-		"DROP TABLE "+projection+", "+applied,
-	) //nolint:errcheck
+	defer func() {
+		_, _ = pool.Exec(
+			context.Background(),
+			"DROP TABLE "+projection+", "+applied,
+		)
+	}()
 
 	snapshot, err = client.Bootstrap(ctx, consumer, streamName)
 	if err != nil {

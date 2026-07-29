@@ -481,7 +481,7 @@ func (c client) getJSON(
 		NextCursor: nextCursor,
 	}
 	if resp.StatusCode == http.StatusNotModified {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		meta.NotModified = true
 		return meta, nil
 	}

@@ -94,7 +94,7 @@ jobs:
           TEST_DATABASE_URL: postgres://frontier:frontier@127.0.0.1:5432/frontier_test?sslmode=disable
           GITHUB_WEBHOOK_SECRET: smoke-secret
           GITHUB_BASE_URL: http://127.0.0.1:19797
-          GITHUB_TOKEN: smoke-token
+          GITHUB_TOKEN: fake-installation-smoke
           GITHUB_INSTALLATION_ID: "1"
           GITHUB_ORG_ID: "1"
           HTTP_ADDR: 127.0.0.1:18080
