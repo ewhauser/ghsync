@@ -357,12 +357,7 @@ loadLoop:
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-restartTimer.C:
-			restartCtx, cancelRestart := context.WithTimeout(
-				ctx, 5*time.Second,
-			)
-			restartErr := streamConsumer.restart(restartCtx)
-			cancelRestart()
-			if restartErr != nil {
+			if restartErr := streamConsumer.restart(ctx); restartErr != nil {
 				return restartErr
 			}
 		case emission = <-emittedCh:
@@ -613,10 +608,15 @@ func (c *soakStreamConsumer) restart(ctx context.Context) error {
 	if c.restarted {
 		return fmt.Errorf("soak stream consumer restarted more than once")
 	}
-	if err := c.stop(ctx); err != nil {
+	// Bound only the teardown and progress read. The restarted tail below
+	// must inherit the run-lifetime ctx: a short-lived restart deadline
+	// would cancel it the moment this call returns.
+	stopCtx, cancelStop := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelStop()
+	if err := c.stop(stopCtx); err != nil {
 		return fmt.Errorf("stop soak stream consumer for restart: %w", err)
 	}
-	counts, err := c.counts(ctx)
+	counts, err := c.counts(stopCtx)
 	if err != nil {
 		return err
 	}
