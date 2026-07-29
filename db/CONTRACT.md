@@ -148,6 +148,8 @@ JSON value may be empty.
 | `consumer_cursors` | `stream` | `text` | no | primary key part |
 | `consumer_cursors` | `seq` | `bigint` | no | last transactionally applied event |
 | `consumer_cursors` | `updated_at` | `timestamp with time zone` | no | last cursor change |
+| `consumer_cursors` | `resync_count` | `bigint` | no | monotonic C-S4 resync count |
+| `consumer_cursors` | `last_resync_at` | `timestamp with time zone` | yes | latest RESYNC_REQUIRED time |
 | `stream_horizons` | `stream` | `text` | no | primary key |
 | `stream_horizons` | `pruned_through_seq` | `bigint` | no | greatest removed sequence |
 | `stream_horizons` | `updated_at` | `timestamp with time zone` | no | last horizon change |
@@ -232,7 +234,9 @@ retained from applied migration `0013` but are no longer the safety proof.
 ## Cursor paging and snapshot then stream
 
 For `(consumer, stream)`, `consumer_cursors.seq` is the last event whose
-handler effects committed. A page transaction uses `REPEATABLE READ`, locks
+handler effects committed. `resync_count` and `last_resync_at` are operational
+evidence updated when the client detects a cursor below the pruned horizon;
+they do not change cursor semantics. A page transaction uses `REPEATABLE READ`, locks
 the cursor row, checks the pruned horizon, reads `safe_seq`, and selects:
 
 ```sql

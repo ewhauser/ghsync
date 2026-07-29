@@ -31,6 +31,7 @@ type Options struct {
 	OrgID            int64
 	BatchWindow      time.Duration
 	BackfillPageSize int
+	CacheObserver    store.CacheObserver
 }
 
 type Handler struct {
@@ -59,7 +60,7 @@ func New(options Options) (*Handler, error) {
 	if options.BackfillPageSize <= 0 {
 		options.BackfillPageSize = 100
 	}
-	writer := store.NewEntityWriter(options.Pool)
+	writer := store.NewEntityWriter(options.Pool, options.CacheObserver)
 	handler := &Handler{
 		pool:             options.Pool,
 		rest:             options.REST,

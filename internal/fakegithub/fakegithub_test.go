@@ -23,6 +23,57 @@ import (
 	jwt "github.com/golang-jwt/jwt/v4"
 )
 
+func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
+	received := make(chan *http.Request, 1)
+	target := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			received <- r.Clone(context.Background())
+			w.WriteHeader(http.StatusOK)
+		},
+	))
+	defer target.Close()
+	fakeServer := New(DefaultFixture(), "secret")
+	fake := httptest.NewServer(fakeServer)
+	defer fake.Close()
+	body := []byte(fmt.Sprintf(`{
+		"target_url": %q,
+		"event": "pull_request",
+		"guid": "soak-guid",
+		"payload": {
+			"action": "synchronize",
+			"number": 4812,
+			"repository": {"full_name": "acme/monolith"}
+		}
+	}`, target.URL))
+	response, err := http.Post(
+		fake.URL+ControlEmitPath,
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(response.Body)
+		t.Fatalf("control emit status = %d: %s", response.StatusCode, message)
+	}
+	select {
+	case request := <-received:
+		if request.Header.Get("X-GitHub-Delivery") != "soak-guid" ||
+			request.Header.Get("X-GitHub-Event") != "pull_request" ||
+			request.Header.Get("X-Hub-Signature-256") == "" {
+			t.Fatalf("emitted headers = %#v", request.Header)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control emit did not deliver webhook")
+	}
+	if deliveries := fakeServer.Deliveries(); len(deliveries) != 1 ||
+		deliveries[0].GUID != "soak-guid" {
+		t.Fatalf("recorded deliveries = %#v", deliveries)
+	}
+}
+
 func TestServesStacksWithRateHeaders(t *testing.T) {
 	resp := serve(
 		New(DefaultFixture(), "secret"),

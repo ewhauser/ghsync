@@ -61,7 +61,11 @@ type Config struct {
 
 	Now      func() time.Time
 	Observer Observer
+	OnPrune  PruneHook
 }
+
+// PruneHook is M6's C-R retention-deletion accounting seam.
+type PruneHook func(context.Context, string, int64)
 
 func (c Config) validate() error {
 	for name, value := range map[string]time.Duration{
@@ -186,6 +190,45 @@ func (noopObserver) SweepOverrun(
 }
 func (noopObserver) GapRedelivery(context.Context, int64, string)     {}
 func (noopObserver) GapWindowIncomplete(context.Context, string, int) {}
+
+type Observers []Observer
+
+func (observers Observers) SweepOverrun(
+	ctx context.Context,
+	kind string,
+	scope string,
+	elapsed time.Duration,
+) {
+	for _, observer := range observers {
+		if observer != nil {
+			observer.SweepOverrun(ctx, kind, scope, elapsed)
+		}
+	}
+}
+
+func (observers Observers) GapRedelivery(
+	ctx context.Context,
+	deliveryID int64,
+	guid string,
+) {
+	for _, observer := range observers {
+		if observer != nil {
+			observer.GapRedelivery(ctx, deliveryID, guid)
+		}
+	}
+}
+
+func (observers Observers) GapWindowIncomplete(
+	ctx context.Context,
+	cursor string,
+	pages int,
+) {
+	for _, observer := range observers {
+		if observer != nil {
+			observer.GapWindowIncomplete(ctx, cursor, pages)
+		}
+	}
+}
 
 type Options struct {
 	Pool       *pgxpool.Pool

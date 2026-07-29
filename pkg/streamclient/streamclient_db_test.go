@@ -485,6 +485,17 @@ func TestRetentionResyncBootstrapConvergesWithoutDuplicateSeqApplication(
 	if !errors.As(err, &resync) || resync.PrunedThrough < oldSeq {
 		t.Fatalf("tail error = %#v, want RESYNC through %d", err, oldSeq)
 	}
+	var resyncCount int64
+	if err := pool.QueryRow(ctx, `
+		SELECT resync_count
+		FROM consumer_cursors
+		WHERE consumer = $1 AND stream = $2
+	`, consumer, streamName).Scan(&resyncCount); err != nil {
+		t.Fatal(err)
+	}
+	if resyncCount != 1 {
+		t.Fatalf("durable resync count = %d, want 1", resyncCount)
+	}
 
 	projection := testTableName("projection")
 	applied := testTableName("applied")

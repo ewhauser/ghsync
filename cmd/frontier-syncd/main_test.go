@@ -1,15 +1,68 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/acme/frontier/internal/config"
+	"github.com/acme/frontier/internal/ingress"
+	frontiermetrics "github.com/acme/frontier/internal/metrics"
 	"github.com/acme/frontier/internal/queue"
 )
+
+func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
+	metricsHandler := http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		_, _ = w.Write([]byte("frontier_c_o4_test 1\n"))
+	})
+	workerMux := serviceMux(nil, metricsHandler)
+	for path, wantStatus := range map[string]int{
+		ingress.HealthPath:   http.StatusNoContent,
+		frontiermetrics.Path: http.StatusOK,
+		ingress.WebhookPath:  http.StatusNotFound,
+	} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		if path == ingress.WebhookPath {
+			request = httptest.NewRequest(http.MethodPost, path, nil)
+		}
+		response := httptest.NewRecorder()
+		workerMux.ServeHTTP(response, request)
+		if response.Code != wantStatus {
+			t.Fatalf("%s status = %d, want %d", path, response.Code, wantStatus)
+		}
+	}
+
+	ingressMux := serviceMux(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+		}),
+		metricsHandler,
+	)
+	response := httptest.NewRecorder()
+	ingressMux.ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodPost, ingress.WebhookPath, nil),
+	)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("ingress webhook status = %d", response.Code)
+	}
+	metricsResponse := httptest.NewRecorder()
+	ingressMux.ServeHTTP(
+		metricsResponse,
+		httptest.NewRequest(http.MethodGet, frontiermetrics.Path, nil),
+	)
+	if !strings.Contains(metricsResponse.Body.String(), "frontier_c_o4_test") {
+		t.Fatal("ingress mux omitted metrics handler")
+	}
+}
 
 func TestValidateRoles(t *testing.T) {
 	for _, roles := range []string{

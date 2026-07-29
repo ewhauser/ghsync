@@ -36,6 +36,7 @@ type Options struct {
 	GraphQLPointEstimate   int64
 	SecondaryLimitFallback time.Duration
 	OnStarvation           StarvationHook
+	OnRequest              RequestHook
 	Clock                  Clock
 }
 
@@ -61,6 +62,7 @@ type Gate struct {
 	unavailable            error
 	leaseUntil             time.Time
 	onStarvation           StarvationHook
+	onRequest              RequestHook
 	nextAdmissionID        uint64
 	admissions             map[uint64]*admission
 
@@ -135,6 +137,7 @@ func New(client *http.Client, options Options) *Gate {
 		graphqlEstimate:        options.GraphQLPointEstimate,
 		secondaryLimitFallback: options.SecondaryLimitFallback,
 		onStarvation:           options.OnStarvation,
+		onRequest:              options.OnRequest,
 		admissions:             make(map[uint64]*admission),
 	}
 }
@@ -153,7 +156,7 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 	// covered by the outer C-B6 accounting.
 	if parent, ok := ctx.Value(admissionContextKey{}).(*admission); ok &&
 		parent.gate == g && req.resource == Auth {
-		return g.doAdmitted(ctx, req, nil)
+		return g.doAdmitted(ctx, class, req, nil)
 	}
 
 	reportedStarvation := false
@@ -182,7 +185,7 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 		}
 	}
 
-	return g.doAdmitted(admitted.ctx, req, admitted)
+	return g.doAdmitted(admitted.ctx, class, req, admitted)
 }
 
 func validateDo(ctx context.Context, class Class, req *Request) error {
@@ -206,6 +209,7 @@ func validateDo(ctx context.Context, class Class, req *Request) error {
 
 func (g *Gate) doAdmitted(
 	ctx context.Context,
+	class Class,
 	req *Request,
 	admitted *admission,
 ) (*Response, error) {
@@ -268,6 +272,20 @@ func (g *Gate) doAdmitted(
 	}
 
 	result := &Response{HTTP: resp, GraphQLRate: graphQLRate}
+	var statusCode int
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
+	if g.onRequest != nil {
+		g.onRequest(RequestObservation{
+			Class:       class,
+			Resource:    req.resource,
+			StatusCode:  statusCode,
+			Conditional: httpReq.Header.Get("If-None-Match") != "",
+			NotModified: statusCode == http.StatusNotModified,
+			Err:         joinErrors(requestErr, observeErr),
+		})
+	}
 	if requestErr != nil {
 		return result, requestErr
 	}

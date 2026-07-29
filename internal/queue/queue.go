@@ -47,6 +47,7 @@ type clientOptions struct {
 	queuesExplicit        bool
 	maxWorkers            map[string]int
 	deadlineObserver      DeadlineObserver
+	refreshObserver       RefreshObserver
 	now                   func() time.Time
 }
 
@@ -117,9 +118,48 @@ func (LogDeadlineObserver) RefreshDeadlineMissed(
 	)
 }
 
+type DeadlineObservers []DeadlineObserver
+
+func (observers DeadlineObservers) RefreshDeadlineMissed(
+	ctx context.Context,
+	kind string,
+	key string,
+	deadline time.Time,
+	completedAt time.Time,
+) {
+	for _, observer := range observers {
+		if observer != nil {
+			observer.RefreshDeadlineMissed(
+				ctx, kind, key, deadline, completedAt,
+			)
+		}
+	}
+}
+
 func WithDeadlineObserver(observer DeadlineObserver) ClientOption {
 	return func(options *clientOptions) {
 		options.deadlineObserver = observer
+	}
+}
+
+// RefreshObservation describes one authoritative fetch attempt. C-Q2's
+// event-to-cache latency is populated only for event-originated generations.
+type RefreshObservation struct {
+	Kind            string
+	Queue           string
+	EventReceivedAt time.Time
+	StartedAt       time.Time
+	CompletedAt     time.Time
+	Err             error
+}
+
+type RefreshObserver interface {
+	RefreshFinished(context.Context, RefreshObservation)
+}
+
+func WithRefreshObserver(observer RefreshObserver) ClientOption {
+	return func(options *clientOptions) {
+		options.refreshObserver = observer
 	}
 }
 
@@ -164,6 +204,7 @@ func NewClient(
 			pool,
 			configured.refreshHandler,
 			configured.deadlineObserver,
+			configured.refreshObserver,
 			configured.now,
 		)
 	}

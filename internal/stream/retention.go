@@ -16,6 +16,7 @@ type RetentionOptions struct {
 	Period    time.Duration
 	BatchSize int
 	Now       func() time.Time
+	OnPrune   func(context.Context, string, int64)
 }
 
 // Retention prunes change events without consulting consumer cursors and
@@ -26,6 +27,7 @@ type Retention struct {
 	period    time.Duration
 	batchSize int
 	now       func() time.Time
+	onPrune   func(context.Context, string, int64)
 }
 
 // NewRetention validates the locked seven-day C-S7 floor.
@@ -57,6 +59,7 @@ func NewRetention(
 		period:    options.Period,
 		batchSize: options.BatchSize,
 		now:       options.Now,
+		onPrune:   options.OnPrune,
 	}, nil
 }
 
@@ -107,6 +110,9 @@ func (r *Retention) Prune(ctx context.Context) (int64, error) {
 		deleted := tag.RowsAffected()
 		total += deleted
 		if deleted < int64(r.batchSize) {
+			if r.onPrune != nil {
+				r.onPrune(ctx, "change_events", total)
+			}
 			return total, nil
 		}
 	}

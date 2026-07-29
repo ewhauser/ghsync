@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +27,10 @@ import (
 	"github.com/acme/frontier/internal/gh"
 	jwt "github.com/golang-jwt/jwt/v4"
 )
+
+// ControlEmitPath is a development-only control surface used by cmd/soak to
+// ask the standalone fake to record and emit a signed delivery.
+const ControlEmitPath = "/_frontier/emit"
 
 type StackRef struct {
 	ID       int64 `json:"id"`
@@ -362,6 +367,7 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
+	mux.HandleFunc("POST "+ControlEmitPath, s.controlEmit)
 	mux.HandleFunc("GET /repos/{owner}/{repo}", s.getRepository)
 	mux.HandleFunc("GET /installation/repositories", s.listInstallationRepositories)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets", s.listRepositoryRules)
@@ -400,7 +406,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	if r.URL.Path == "/healthz" {
+	if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/_frontier/") {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
@@ -458,6 +464,99 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mux.ServeHTTP(w, r)
+}
+
+type controlEmitRequest struct {
+	TargetURL string          `json:"target_url"`
+	Event     string          `json:"event"`
+	GUID      string          `json:"guid,omitempty"`
+	Mutate    bool            `json:"mutate,omitempty"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+func (s *Server) controlEmit(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request controlEmitRequest
+	if err := decoder.Decode(&request); err != nil {
+		http.Error(w, "decode emit request", http.StatusBadRequest)
+		return
+	}
+	target, err := url.Parse(request.TargetURL)
+	if err != nil || target.Scheme != "http" || !loopbackHost(target.Hostname()) {
+		http.Error(
+			w,
+			"target_url must be an http loopback address",
+			http.StatusBadRequest,
+		)
+		return
+	}
+	if request.Event == "" || len(request.Payload) == 0 {
+		http.Error(w, "event and payload are required", http.StatusBadRequest)
+		return
+	}
+	if request.Mutate {
+		s.applySoakMutation(request.Event, request.Payload)
+	}
+	guid, err := s.EmitWebhookWithGUID(
+		r.Context(),
+		request.TargetURL,
+		request.Event,
+		request.GUID,
+		request.Payload,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"guid": guid})
+}
+
+func (s *Server) applySoakMutation(event string, payload json.RawMessage) {
+	if event != "pull_request" {
+		return
+	}
+	var envelope struct {
+		Number       int   `json:"number"`
+		SoakRevision int64 `json:"soak_revision"`
+	}
+	if json.Unmarshal(payload, &envelope) != nil || envelope.Number <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := range s.fixture.PullRequests {
+		pull := &s.fixture.PullRequests[index]
+		if pull.Number != envelope.Number {
+			continue
+		}
+		pull.Title = fmt.Sprintf(
+			"Soak revision %d for PR %d",
+			envelope.SoakRevision,
+			envelope.Number,
+		)
+		pull.UpdatedAt = s.now().UTC()
+		for stackIndex := range s.fixture.Stacks {
+			for prIndex := range s.fixture.Stacks[stackIndex].PullRequests {
+				stackPull := &s.fixture.Stacks[stackIndex].PullRequests[prIndex]
+				if stackPull.Number == envelope.Number {
+					stackPull.UpdatedAt = pull.UpdatedAt
+				}
+			}
+		}
+		return
+	}
+}
+
+func loopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
 }
 
 // ScriptNotFound makes the next count exact method/path requests return 404.

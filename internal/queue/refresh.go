@@ -266,18 +266,21 @@ type resolveStackMembershipWorker struct {
 type backfillRepoPageWorker struct {
 	river.WorkerDefaults[BackfillRepoPageArgs]
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type backfillInstallationPageWorker struct {
 	river.WorkerDefaults[BackfillInstallationPageArgs]
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type refreshWork func(context.Context, RefreshArgs) error
 
 type refreshDeadlineMonitor struct {
-	observer DeadlineObserver
-	now      func() time.Time
+	deadlineObserver DeadlineObserver
+	refreshObserver  RefreshObserver
+	now              func() time.Time
 }
 
 func (w *refreshPRWorker) Work(
@@ -416,7 +419,18 @@ func (w *backfillRepoPageWorker) Work(
 	if w.handler == nil {
 		return fmt.Errorf("backfill worker is not configured")
 	}
-	return w.handler.BackfillRepoPage(ctx, job.Args)
+	startedAt := w.monitor.now()
+	err := w.handler.BackfillRepoPage(ctx, job.Args)
+	w.monitor.observeRefresh(
+		ctx,
+		KindBackfillRepoPage,
+		job.Queue,
+		time.Time{},
+		startedAt,
+		w.monitor.now(),
+		err,
+	)
+	return err
 }
 
 func (w *backfillInstallationPageWorker) Work(
@@ -426,20 +440,36 @@ func (w *backfillInstallationPageWorker) Work(
 	if w.handler == nil {
 		return fmt.Errorf("installation backfill worker is not configured")
 	}
-	return w.handler.BackfillInstallationPage(ctx, job.Args)
+	startedAt := w.monitor.now()
+	err := w.handler.BackfillInstallationPage(ctx, job.Args)
+	w.monitor.observeRefresh(
+		ctx,
+		KindBackfillInstallation,
+		job.Queue,
+		time.Time{},
+		startedAt,
+		w.monitor.now(),
+		err,
+	)
+	return err
 }
 
 func registerRefreshWorkers(
 	workers *river.Workers,
 	pool *pgxpool.Pool,
 	handler RefreshHandler,
-	observer DeadlineObserver,
+	deadlineObserver DeadlineObserver,
+	refreshObserver RefreshObserver,
 	now func() time.Time,
 ) {
 	if now == nil {
 		now = time.Now
 	}
-	monitor := refreshDeadlineMonitor{observer: observer, now: now}
+	monitor := refreshDeadlineMonitor{
+		deadlineObserver: deadlineObserver,
+		refreshObserver:  refreshObserver,
+		now:              now,
+	}
 	river.AddWorker(workers, &refreshPRWorker{
 		pool: pool, handler: handler, monitor: monitor,
 	})
@@ -470,10 +500,14 @@ func registerRefreshWorkers(
 			pool: pool, handler: handler, monitor: monitor,
 		},
 	)
-	river.AddWorker(workers, &backfillRepoPageWorker{handler: handler})
+	river.AddWorker(workers, &backfillRepoPageWorker{
+		handler: handler, monitor: monitor,
+	})
 	river.AddWorker(
 		workers,
-		&backfillInstallationPageWorker{handler: handler},
+		&backfillInstallationPageWorker{
+			handler: handler, monitor: monitor,
+		},
 	)
 }
 
@@ -496,22 +530,41 @@ func runRefresh[T river.JobArgs](
 		return fmt.Errorf("snapshot refresh generation: %w", err)
 	}
 
+	now := monitor.now
+	if now == nil {
+		now = time.Now
+	}
+	startedAt := now()
 	if work == nil {
 		return fmt.Errorf(
 			"refresh worker %s is not configured",
 			args.PointerKind,
 		)
-	} else if err := work(ctx, args); err != nil {
-		return err
-	}
-	now := monitor.now
-	if now == nil {
-		now = time.Now
+	} else if workErr := work(ctx, args); workErr != nil {
+		monitor.observeRefresh(
+			ctx,
+			args.PointerKind,
+			job.Queue,
+			started.EventReceivedAt.Time,
+			startedAt,
+			now(),
+			workErr,
+		)
+		return workErr
 	}
 	completedAt := now()
-	if monitor.observer != nil && started.DeadlineAt.Valid &&
+	monitor.observeRefresh(
+		ctx,
+		args.PointerKind,
+		job.Queue,
+		started.EventReceivedAt.Time,
+		startedAt,
+		completedAt,
+		nil,
+	)
+	if monitor.deadlineObserver != nil && started.DeadlineAt.Valid &&
 		completedAt.After(started.DeadlineAt.Time) {
-		monitor.observer.RefreshDeadlineMissed(
+		monitor.deadlineObserver.RefreshDeadlineMissed(
 			ctx,
 			args.PointerKind,
 			args.Key,
@@ -520,6 +573,28 @@ func runRefresh[T river.JobArgs](
 		)
 	}
 	return completeRefresh(ctx, pool, job, args, started.Generation)
+}
+
+func (m refreshDeadlineMonitor) observeRefresh(
+	ctx context.Context,
+	kind string,
+	queueName string,
+	eventReceivedAt time.Time,
+	startedAt time.Time,
+	completedAt time.Time,
+	err error,
+) {
+	if m.refreshObserver == nil {
+		return
+	}
+	m.refreshObserver.RefreshFinished(ctx, RefreshObservation{
+		Kind:            kind,
+		Queue:           queueName,
+		EventReceivedAt: eventReceivedAt,
+		StartedAt:       startedAt,
+		CompletedAt:     completedAt,
+		Err:             err,
+	})
 }
 
 // InsertRefreshesTx atomically advances M2's durable generations and inserts

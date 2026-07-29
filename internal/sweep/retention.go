@@ -23,6 +23,10 @@ func (s *Service) Prune(ctx context.Context) (int64, int64, error) {
 		totalHistory += history
 		if payloads < int64(s.config.RetentionBatchSize) &&
 			history < int64(s.config.RetentionBatchSize) {
+			if s.config.OnPrune != nil {
+				s.config.OnPrune(ctx, "webhook_payload", totalPayloads)
+				s.config.OnPrune(ctx, "check_history", totalHistory)
+			}
 			return totalPayloads, totalHistory, nil
 		}
 	}

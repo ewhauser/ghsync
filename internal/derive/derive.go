@@ -89,7 +89,17 @@ type Options struct {
 	Deriver      Deriver
 	DirtyCap     int
 	PollInterval time.Duration
+	Observer     Observer
 }
+
+// Observer is M6's C-P5 pass-duration seam.
+type Observer interface {
+	DeriverPass(context.Context, int, time.Duration, error)
+}
+
+type noopObserver struct{}
+
+func (noopObserver) DeriverPass(context.Context, int, time.Duration, error) {}
 
 // Service drains dirty scopes and applies each derivation batch atomically.
 type Service struct {
@@ -98,6 +108,7 @@ type Service struct {
 	loader       SnapshotLoader
 	dirtyCap     int
 	pollInterval time.Duration
+	observer     Observer
 }
 
 // New constructs a C-D2/C-P5 derivation service. NoopDeriver is wired when no
@@ -121,12 +132,16 @@ func New(options Options) (*Service, error) {
 	if options.PollInterval < 0 {
 		return nil, fmt.Errorf("deriver poll interval must be positive")
 	}
+	if options.Observer == nil {
+		options.Observer = noopObserver{}
+	}
 	return &Service{
 		pool:         options.Pool,
 		deriver:      options.Deriver,
 		loader:       SnapshotLoader{},
 		dirtyCap:     options.DirtyCap,
 		pollInterval: options.PollInterval,
+		observer:     options.Observer,
 	}, nil
 }
 
@@ -134,6 +149,13 @@ func New(options Options) (*Service, error) {
 // loads one cache snapshot, calls the pure deriver once, and writes work items,
 // work_items events, and dirty-row deletes in one transaction (C-P5).
 func (s *Service) RunOnce(ctx context.Context) (int, error) {
+	startedAt := time.Now()
+	count, err := s.runOnce(ctx)
+	s.observer.DeriverPass(ctx, count, time.Since(startedAt), err)
+	return count, err
+}
+
+func (s *Service) runOnce(ctx context.Context) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin derivation pass: %w", err)

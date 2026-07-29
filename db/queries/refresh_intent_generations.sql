@@ -5,13 +5,15 @@ WITH intents AS (
     SELECT DISTINCT
         element->>'kind' AS kind,
         element->>'refresh_key' AS refresh_key,
-        NULLIF(element->>'deadline_at', '')::timestamptz AS deadline_at
+        NULLIF(element->>'deadline_at', '')::timestamptz AS deadline_at,
+        NULLIF(element->>'event_received_at', '')::timestamptz
+            AS event_received_at
     FROM jsonb_array_elements(sqlc.arg(intents)::jsonb) AS element
 )
 INSERT INTO refresh_intent_generations (
-    kind, refresh_key, generation, deadline_at
+    kind, refresh_key, generation, deadline_at, event_received_at
 )
-SELECT kind, refresh_key, 1, deadline_at
+SELECT kind, refresh_key, 1, deadline_at, event_received_at
 FROM intents
 ON CONFLICT (kind, refresh_key) DO UPDATE
 SET generation = refresh_intent_generations.generation + 1,
@@ -25,8 +27,18 @@ SET generation = refresh_intent_generations.generation + 1,
             EXCLUDED.deadline_at
         )
     END,
+    event_received_at = CASE
+        WHEN EXCLUDED.event_received_at IS NULL
+        THEN refresh_intent_generations.event_received_at
+        WHEN refresh_intent_generations.event_received_at IS NULL
+        THEN EXCLUDED.event_received_at
+        ELSE LEAST(
+            refresh_intent_generations.event_received_at,
+            EXCLUDED.event_received_at
+        )
+    END,
     updated_at = now()
-RETURNING kind, refresh_key, generation, deadline_at;
+RETURNING kind, refresh_key, generation, deadline_at, event_received_at;
 
 -- name: GetRefreshIntentGeneration :one
 -- A running worker snapshots the generation before fetching authoritative
@@ -36,7 +48,7 @@ FROM refresh_intent_generations
 WHERE kind = $1 AND refresh_key = $2;
 
 -- name: GetRefreshIntentState :one
-SELECT generation, completed_generation, deadline_at
+SELECT generation, completed_generation, deadline_at, event_received_at
 FROM refresh_intent_generations
 WHERE kind = $1 AND refresh_key = $2;
 
@@ -59,6 +71,11 @@ SET completed_generation = GREATEST(
         WHEN generation = sqlc.arg(completed_generation)
         THEN NULL
         ELSE deadline_at
+    END,
+    event_received_at = CASE
+        WHEN generation = sqlc.arg(completed_generation)
+        THEN NULL
+        ELSE event_received_at
     END,
     updated_at = now()
 WHERE kind = sqlc.arg(kind)

@@ -29,11 +29,26 @@ type WatermarkOptions struct {
 	RefreshInterval time.Duration
 	LeaseTTL        time.Duration
 	Owner           string
+	Observer        WatermarkObserver
+}
+
+// WatermarkObserver is M6's C-S2 progress seam.
+type WatermarkObserver interface {
+	WatermarkStep(context.Context, WatermarkProgress)
+}
+
+type noopWatermarkObserver struct{}
+
+func (noopWatermarkObserver) WatermarkStep(
+	context.Context,
+	WatermarkProgress,
+) {
 }
 
 // WatermarkProgress is one observed state of the public stream watermark.
 type WatermarkProgress struct {
 	SafeSeq      int64
+	MaxSeq       int64
 	CandidateSeq *int64
 	Advanced     bool
 }
@@ -45,6 +60,7 @@ type Watermarker struct {
 	refreshInterval time.Duration
 	leaseTTL        time.Duration
 	token           string
+	observer        WatermarkObserver
 	testBeforeFence func()
 }
 
@@ -75,11 +91,15 @@ func NewWatermarker(
 	if owner == "" {
 		owner = "frontier-watermarker"
 	}
+	if options.Observer == nil {
+		options.Observer = noopWatermarkObserver{}
+	}
 	return &Watermarker{
 		pool:            pool,
 		refreshInterval: options.RefreshInterval,
 		leaseTTL:        options.LeaseTTL,
 		token:           owner + ":" + hex.EncodeToString(tokenBytes),
+		observer:        options.Observer,
 	}, nil
 }
 
@@ -141,10 +161,13 @@ func (w *Watermarker) Step(
 			"commit stream watermark: %w", err,
 		)
 	}
-	return WatermarkProgress{
+	progress := WatermarkProgress{
 		SafeSeq:  safe,
+		MaxSeq:   target,
 		Advanced: safe > prior,
-	}, nil
+	}
+	w.observer.WatermarkStep(ctx, progress)
+	return progress, nil
 }
 
 // Run maintains the watermark at approximately RefreshInterval. Standby

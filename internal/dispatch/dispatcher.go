@@ -25,7 +25,18 @@ type Config struct {
 	PollInterval time.Duration
 	Now          func() time.Time
 	Classifier   Classifier
+	Observer     Observer
 }
+
+// Observer is M6's C-P2/C-I5 observability seam. Implementations run only
+// after the delivery batch and its River pointers commit.
+type Observer interface {
+	DispatchBatch(context.Context, int, int)
+}
+
+type noopObserver struct{}
+
+func (noopObserver) DispatchBatch(context.Context, int, int) {}
 
 // Dispatcher owns the delivery → River transaction boundary (C-P2).
 type Dispatcher struct {
@@ -50,6 +61,9 @@ func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *
 	}
 	if len(config.Classifier.rules) == 0 {
 		config.Classifier = DefaultClassifier()
+	}
+	if config.Observer == nil {
+		config.Observer = noopObserver{}
 	}
 	return &Dispatcher{pool: pool, river: riverClient, config: config}
 }
@@ -103,6 +117,8 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	}
 	results := make([]deliveryResult, 0, len(deliveries))
 	intents := make([]Intent, 0, len(deliveries))
+	intentReceivedAt := make(map[Intent]time.Time, len(deliveries))
+	parked := 0
 	for _, delivery := range deliveries {
 		classified, classifyErr := d.config.Classifier.Classify(
 			delivery.Event,
@@ -112,6 +128,7 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 			status := "pending"
 			if int(delivery.Attempts) >= d.config.MaxAttempts {
 				status = "parked"
+				parked++
 			}
 			results = append(results, deliveryResult{
 				DeliveryGUID: delivery.DeliveryGuid,
@@ -121,6 +138,13 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 			continue
 		}
 		intents = append(intents, classified...)
+		for _, intent := range classified {
+			receivedAt := delivery.ReceivedAt.Time
+			prior, exists := intentReceivedAt[intent]
+			if !exists || receivedAt.Before(prior) {
+				intentReceivedAt[intent] = receivedAt
+			}
+		}
 		results = append(results, deliveryResult{
 			DeliveryGUID: delivery.DeliveryGuid,
 			Status:       "processed",
@@ -129,7 +153,9 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 
 	if len(intents) > 0 {
 		intents = dedupeIntents(intents)
-		encodedIntents, err := json.Marshal(intentGenerationPointers(intents))
+		encodedIntents, err := json.Marshal(
+			intentGenerationPointers(intents, intentReceivedAt),
+		)
 		if err != nil {
 			return 0, fmt.Errorf("encode refresh generation pointers: %w", err)
 		}
@@ -172,6 +198,7 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit dispatch batch: %w", err)
 	}
+	d.config.Observer.DispatchBatch(ctx, len(deliveries), parked)
 	return len(deliveries), nil
 }
 
@@ -229,17 +256,25 @@ func dedupeIntents(intents []Intent) []Intent {
 }
 
 type intentGenerationPointer struct {
-	Kind       string `json:"kind"`
-	RefreshKey string `json:"refresh_key"`
+	Kind            string `json:"kind"`
+	RefreshKey      string `json:"refresh_key"`
+	EventReceivedAt string `json:"event_received_at,omitempty"`
 }
 
-func intentGenerationPointers(intents []Intent) []intentGenerationPointer {
+func intentGenerationPointers(
+	intents []Intent,
+	receivedAt map[Intent]time.Time,
+) []intentGenerationPointer {
 	pointers := make([]intentGenerationPointer, 0, len(intents))
 	for _, intent := range intents {
-		pointers = append(pointers, intentGenerationPointer{
+		pointer := intentGenerationPointer{
 			Kind:       intent.Kind,
 			RefreshKey: intent.Key,
-		})
+		}
+		if at := receivedAt[intent]; !at.IsZero() {
+			pointer.EventReceivedAt = at.UTC().Format(time.RFC3339Nano)
+		}
+		pointers = append(pointers, pointer)
 	}
 	return pointers
 }

@@ -219,6 +219,28 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 	if generation != 20 {
 		t.Fatalf("storm generation = %d, want 20 exact dispatch signals", generation)
 	}
+	var eventReceivedAt, firstReceivedAt time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT generations.event_received_at, min(deliveries.received_at)
+		FROM refresh_intent_generations AS generations
+		CROSS JOIN webhook_deliveries AS deliveries
+		WHERE generations.kind = $1
+		  AND generations.refresh_key = $2
+		  AND deliveries.delivery_guid LIKE 'storm-%'
+		GROUP BY generations.event_received_at
+	`, queue.KindRefreshStack, stackKey).Scan(
+		&eventReceivedAt,
+		&firstReceivedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !eventReceivedAt.Equal(firstReceivedAt) {
+		t.Fatalf(
+			"event SLO origin = %s, want earliest delivery %s",
+			eventReceivedAt,
+			firstReceivedAt,
+		)
+	}
 }
 
 func TestRunningRefreshRetryableTransitionCannotCollide(t *testing.T) {

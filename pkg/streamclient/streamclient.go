@@ -354,12 +354,28 @@ func (c *Client) deliverPage(
 		return 0, fmt.Errorf("read stream horizon: %w", err)
 	}
 	if cursor < prunedThrough {
-		return 0, &ErrResyncRequired{
+		resyncErr := &ErrResyncRequired{
 			Consumer:      consumer,
 			Stream:        stream,
 			Cursor:        cursor,
 			PrunedThrough: prunedThrough,
 		}
+		// C-S4/C-O4: record the protocol-level resync before returning it.
+		// There are no event-handler effects in this transaction, so committing
+		// the monotonic counter leaves the consumer cursor unchanged.
+		if _, err := tx.Exec(ctx, `
+			UPDATE consumer_cursors
+			SET resync_count = resync_count + 1,
+			    last_resync_at = clock_timestamp(),
+			    updated_at = clock_timestamp()
+			WHERE consumer = $1 AND stream = $2
+		`, consumer, stream); err != nil {
+			return 0, fmt.Errorf("record stream resync: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, fmt.Errorf("commit stream resync: %w", err)
+		}
+		return 0, resyncErr
 	}
 	if hook := c.testHooks.afterHorizon; hook != nil {
 		hook()

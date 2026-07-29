@@ -93,6 +93,30 @@ func (noopObserver) PersistentDivergence(
 ) {
 }
 
+type Observers []Observer
+
+func (observers Observers) Divergence(
+	ctx context.Context,
+	finding dbgen.DriftFinding,
+) {
+	for _, observer := range observers {
+		if observer != nil {
+			observer.Divergence(ctx, finding)
+		}
+	}
+}
+
+func (observers Observers) PersistentDivergence(
+	ctx context.Context,
+	finding dbgen.DriftFinding,
+) {
+	for _, observer := range observers {
+		if observer != nil {
+			observer.PersistentDivergence(ctx, finding)
+		}
+	}
+}
+
 type Options struct {
 	Pool    *pgxpool.Pool
 	REST    *gh.RESTClient

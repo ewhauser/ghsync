@@ -77,10 +77,12 @@ type CheckRun struct {
 }
 
 type ConsumerCursor struct {
-	Consumer  string
-	Stream    string
-	Seq       int64
-	UpdatedAt pgtype.Timestamptz
+	Consumer     string
+	Stream       string
+	Seq          int64
+	UpdatedAt    pgtype.Timestamptz
+	ResyncCount  int64
+	LastResyncAt pgtype.Timestamptz
 }
 
 type DerivationDirty struct {
@@ -186,6 +188,7 @@ type RefreshIntentGeneration struct {
 	UpdatedAt           pgtype.Timestamptz
 	CompletedGeneration int64
 	DeadlineAt          pgtype.Timestamptz
+	EventReceivedAt     pgtype.Timestamptz
 }
 
 type Repo struct {

@@ -23,10 +23,12 @@ make gen       # regenerate sqlc code after editing db/queries or db/migrations
 `frontier-syncd` commands: `serve --roles=...`, `migrate`,
 `backfill` (the configured installation), `requeue --guid=…|--all-parked`,
 `version`.
-Serve roles are `ingress`, `dispatch`, `fetch`, `sweep`, `drift`, and
-`pruner`, `watermarker`, and `deriver`; `all` enables the complete pipeline.
+Serve roles are `ingress`, `dispatch`, `fetch`, `sweep`, `drift`, `pruner`,
+`watermarker`, and `deriver`; `all` enables the complete pipeline.
 `fake-github` (cmd/fake-github) serves a canned enrolled repo and emits
 HMAC-signed webhooks; docker-compose runs it beside Postgres.
+Every serve role exposes `/healthz` and OpenTelemetry-backed Prometheus
+exposition at `/metrics`; only `ingress` exposes the webhook POST.
 
 The `webhook_deliveries.headers` JSONB value is a semantic request envelope:
 the canonical header map plus host, parsed content length, and transfer
@@ -97,6 +99,20 @@ settings are `STREAM_WATERMARK_REFRESH`, `STREAM_WATERMARK_LEASE_TTL`,
 `STREAM_RETENTION_BATCH_SIZE`, `DERIVER_POLL_INTERVAL`, and
 `DERIVER_DIRTY_CAP`.
 
+### M6 hardening and operations
+
+Every C-O4 metric includes its verifying constraint in the metric name. The
+single cache-trust view is in [`ops/DASHBOARD.md`](ops/DASHBOARD.md),
+Prometheus rules in [`ops/alerts.yaml`](ops/alerts.yaml), and incident
+procedures under [`ops/runbooks/`](ops/runbooks/). Deployment, complete
+configuration, migrations, rolling safety, and Postgres backup/restore are in
+[`ops/DEPLOYMENT.md`](ops/DEPLOYMENT.md).
+
+`cmd/soak` replays synthetic or recorded traffic through fake GitHub while
+enforcing C-Q2 latency, C-B3 floors, zero drift/parking, and watermark
+progress. CI runs the two-minute profile against fresh Postgres; the 48-hour
+release profile is in [`ops/SOAK.md`](ops/SOAK.md).
+
 ## Status
 
 - [x] M0 — foundations: module, migrations (River + own), three River
@@ -106,4 +122,4 @@ settings are `STREAM_WATERMARK_REFRESH`, `STREAM_WATERMARK_LEASE_TTL`,
 - [x] M3 — cache & fetchers
 - [x] M4 — reconciliation & webhook validation
 - [x] M5 — change stream, derivation seam, contract
-- [ ] M6 — hardening & operations
+- [x] M6 — hardening & operations

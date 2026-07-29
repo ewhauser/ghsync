@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/acme/frontier/internal/fetch"
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/ingress"
+	frontiermetrics "github.com/acme/frontier/internal/metrics"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
@@ -283,6 +285,41 @@ func serve(args []string) error {
 	}
 	defer pool.Close()
 
+	metricRegistry, err := frontiermetrics.New()
+	if err != nil {
+		return err
+	}
+	runtimeMetrics, err := frontiermetrics.NewRuntime(
+		frontiermetrics.RuntimeOptions{
+			Pool:               pool,
+			InstallationID:     cfg.GitHubInstallationID,
+			Roles:              enabledRoles(roles),
+			OpenStackStaleness: cfg.SweepOpenStackMaxStaleness,
+			OpenPRStaleness:    cfg.SweepOpenPRMaxStaleness,
+			RepoRulesStaleness: cfg.SweepRepoRulesMaxStaleness,
+			ClosedStaleness:    cfg.SweepClosedMaxStaleness,
+			RepositoryPeriod:   cfg.SweepRepositoryListPeriod,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if err := metricRegistry.Register(
+		"github.com/acme/frontier/frontier-syncd",
+		runtimeMetrics,
+	); err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		if shutdownErr := metricRegistry.Shutdown(shutdownCtx); shutdownErr != nil {
+			slog.Error("metrics shutdown failed", "error", shutdownErr)
+		}
+		cancel()
+	}()
+
 	serviceCtx, cancelServices := context.WithCancel(context.Background())
 	defer cancelServices()
 	serviceErrors := make(chan error, 8)
@@ -298,6 +335,7 @@ func serve(args []string) error {
 				RefreshInterval: cfg.WatermarkRefresh,
 				LeaseTTL:        cfg.WatermarkLeaseTTL,
 				Owner:           owner,
+				Observer:        runtimeMetrics,
 			},
 		)
 		if createErr != nil {
@@ -315,6 +353,7 @@ func serve(args []string) error {
 			Deriver:      derive.NoopDeriver{},
 			DirtyCap:     cfg.DeriverDirtyCap,
 			PollInterval: cfg.DeriverPollInterval,
+			Observer:     runtimeMetrics,
 		})
 		if createErr != nil {
 			return createErr
@@ -332,6 +371,7 @@ func serve(args []string) error {
 				Age:       cfg.StreamRetentionAge,
 				Period:    cfg.StreamRetentionPeriod,
 				BatchSize: cfg.StreamRetentionBatch,
+				OnPrune:   runtimeMetrics.PrunerDelete,
 			},
 		)
 		if createErr != nil {
@@ -373,7 +413,10 @@ func serve(args []string) error {
 		githubGate, err = budget.NewLeased(
 			budgetCtx,
 			http.DefaultClient,
-			budget.Options{},
+			budget.Options{
+				OnStarvation: runtimeMetrics.BudgetStarvation,
+				OnRequest:    runtimeMetrics.BudgetRequest,
+			},
 			budget.NewPostgresLeaseStore(pool),
 			budget.LeaseOptions{
 				InstallationID: cfg.GitHubInstallationID,
@@ -451,6 +494,7 @@ func serve(args []string) error {
 				GraphQL:        graphQL,
 				InstallationID: cfg.GitHubInstallationID,
 				OrgID:          cfg.GitHubOrgID,
+				CacheObserver:  runtimeMetrics,
 			})
 			if err != nil {
 				return err
@@ -458,11 +502,17 @@ func serve(args []string) error {
 		}
 		var sweepService *sweep.Service
 		if roles[roleSweep] || roles[rolePruner] {
+			sweepCfg := sweepConfig(cfg)
+			sweepCfg.Observer = sweep.Observers{
+				sweep.LogObserver{},
+				runtimeMetrics,
+			}
+			sweepCfg.OnPrune = runtimeMetrics.PrunerDelete
 			sweepService, err = sweep.New(sweep.Options{
 				Pool:       pool,
 				REST:       rest,
 				Deliveries: deliveryClient,
-				Config:     sweepConfig(cfg),
+				Config:     sweepCfg,
 			})
 			if err != nil {
 				return err
@@ -470,11 +520,16 @@ func serve(args []string) error {
 		}
 		var driftService *drift.Service
 		if roles[roleDrift] {
+			driftCfg := driftConfig(cfg)
+			driftCfg.Observer = drift.Observers{
+				drift.LogObserver{},
+				runtimeMetrics,
+			}
 			driftService, err = drift.New(drift.Options{
 				Pool:    pool,
 				REST:    rest,
 				GraphQL: graphQL,
-				Config:  driftConfig(cfg),
+				Config:  driftCfg,
 			})
 			if err != nil {
 				return err
@@ -491,8 +546,12 @@ func serve(args []string) error {
 				clientOptions,
 				queue.WithRefreshHandler(fetchHandler),
 				queue.WithDeadlineObserver(
-					queue.LogDeadlineObserver{},
+					queue.DeadlineObservers{
+						queue.LogDeadlineObserver{},
+						runtimeMetrics,
+					},
 				),
+				queue.WithRefreshObserver(runtimeMetrics),
 			)
 		} else {
 			clientOptions = append(
@@ -558,6 +617,7 @@ func serve(args []string) error {
 				Debounce:     cfg.DispatchDebounce,
 				PollInterval: cfg.DispatchPollInterval,
 				Classifier:   classifier,
+				Observer:     runtimeMetrics,
 			})
 			go func() {
 				if err := dispatcher.Run(serviceCtx); err != nil {
@@ -567,7 +627,7 @@ func serve(args []string) error {
 		}
 	}
 
-	var httpServer *http.Server
+	var webhookHandler http.Handler
 	if roles[roleIngress] {
 		handler := ingress.NewHandler(
 			dbgen.New(pool),
@@ -575,23 +635,29 @@ func serve(args []string) error {
 			cfg.WebhookMaxBodyBytes,
 			webhookRequestTimeout,
 		)
-		httpServer = &http.Server{
-			Addr:              cfg.HTTPAddr,
-			Handler:           handler.Mux(),
-			ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout:       httpReadTimeout,
-		}
-		listener, err := net.Listen("tcp", cfg.HTTPAddr)
-		if err != nil {
-			return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
-		}
-		go func() {
-			err := httpServer.Serve(listener)
-			if err != nil && err != http.ErrServerClosed {
-				serviceErrors <- fmt.Errorf("ingress HTTP server: %w", err)
-			}
-		}()
+		webhookHandler = handler
 	}
+	// C-O4 role separation: every role has health and metrics, while only an
+	// ingress role registers the externally writable webhook route.
+	httpServer := &http.Server{
+		Addr: cfg.HTTPAddr,
+		Handler: serviceMux(
+			webhookHandler,
+			metricRegistry.Handler(),
+		),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       httpReadTimeout,
+	}
+	listener, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
+	}
+	go func() {
+		err := httpServer.Serve(listener)
+		if err != nil && err != http.ErrServerClosed {
+			serviceErrors <- fmt.Errorf("health/metrics HTTP server: %w", err)
+		}
+	}()
 
 	slog.Info("frontier-syncd running", "version", version, "roles", *rolesFlag)
 	var serviceErr error
@@ -602,16 +668,14 @@ func serve(args []string) error {
 	slog.Info("shutting down")
 	cancelServices()
 
-	if httpServer != nil {
-		httpCtx, cancelHTTP := context.WithTimeout(
-			context.Background(),
-			httpShutdownTimeout,
-		)
-		httpErr := httpServer.Shutdown(httpCtx)
-		cancelHTTP()
-		if httpErr != nil && serviceErr == nil {
-			serviceErr = fmt.Errorf("ingress graceful shutdown: %w", httpErr)
-		}
+	httpCtx, cancelHTTP := context.WithTimeout(
+		context.Background(),
+		httpShutdownTimeout,
+	)
+	httpErr := httpServer.Shutdown(httpCtx)
+	cancelHTTP()
+	if httpErr != nil && serviceErr == nil {
+		serviceErr = fmt.Errorf("HTTP graceful shutdown: %w", httpErr)
 	}
 	if riverClient != nil &&
 		(roles[roleFetch] || roles[roleSweep] ||
@@ -654,6 +718,35 @@ func serve(args []string) error {
 		}
 	}
 	return serviceErr
+}
+
+func serviceMux(
+	webhook http.Handler,
+	metricsHandler http.Handler,
+) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc(
+		"GET "+ingress.HealthPath,
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		},
+	)
+	mux.Handle("GET "+frontiermetrics.Path, metricsHandler)
+	if webhook != nil {
+		mux.Handle("POST "+ingress.WebhookPath, webhook)
+	}
+	return mux
+}
+
+func enabledRoles(roles map[string]bool) []string {
+	result := make([]string, 0, len(roles))
+	for role, enabled := range roles {
+		if enabled {
+			result = append(result, role)
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func dispatcherClassifier(path string) (dispatch.Classifier, error) {

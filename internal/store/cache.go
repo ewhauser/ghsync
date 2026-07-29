@@ -256,15 +256,34 @@ func (o *Observation) begin(ctx context.Context) (pgx.Tx, error) {
 
 // EntityWriter owns C-C1..C-C5. Network fetches never enter this package.
 type EntityWriter struct {
-	pool *pgxpool.Pool
-	now  func() time.Time
+	pool     *pgxpool.Pool
+	now      func() time.Time
+	observer CacheObserver
 }
 
-func NewEntityWriter(pool *pgxpool.Pool) *EntityWriter {
+// CacheObserver is M6's C-C2 compare-and-swap accounting seam.
+type CacheObserver interface {
+	CacheWrite(context.Context, string, bool, bool)
+}
+
+type noopCacheObserver struct{}
+
+func (noopCacheObserver) CacheWrite(context.Context, string, bool, bool) {}
+
+func NewEntityWriter(
+	pool *pgxpool.Pool,
+	observers ...CacheObserver,
+) *EntityWriter {
 	if pool == nil {
 		panic("entity writer requires Postgres")
 	}
-	return &EntityWriter{pool: pool, now: time.Now}
+	var observer CacheObserver = noopCacheObserver{}
+	if len(observers) > 0 && observers[0] != nil {
+		observer = observers[0]
+	}
+	return &EntityWriter{
+		pool: pool, now: time.Now, observer: observer,
+	}
 }
 
 func (w *EntityWriter) BeginObservation(
@@ -395,6 +414,7 @@ func (w *EntityWriter) ApplyRepository(
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit repository write: %w", err)
 	}
+	w.observer.CacheWrite(ctx, "repository", applied, false)
 	return applied, nil
 }
 
@@ -430,6 +450,7 @@ func (w *EntityWriter) ApplyRepositoryObserved(
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit observed repository write: %w", err)
 	}
+	w.observer.CacheWrite(ctx, "repository", applied, false)
 	return applied, nil
 }
 
@@ -499,6 +520,7 @@ func (w *EntityWriter) TombstoneRepositoryObserved(
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit repository tombstone: %w", err)
 	}
+	w.observer.CacheWrite(ctx, "repository", applied, true)
 	return applied, nil
 }
 
@@ -824,6 +846,12 @@ func (w *EntityWriter) applyPullRequest(
 	if err := tx.Commit(ctx); err != nil {
 		return ApplyPullRequestResult{}, fmt.Errorf("commit PR write: %w", err)
 	}
+	w.observer.CacheWrite(
+		ctx,
+		"pull_request",
+		result.DomainChanged,
+		false,
+	)
 	return result, nil
 }
 
@@ -942,6 +970,7 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 	if err := tx.Commit(ctx); err != nil {
 		return ApplyPullRequestResult{}, fmt.Errorf("commit PR tombstone: %w", err)
 	}
+	w.observer.CacheWrite(ctx, "pull_request", result.Applied, true)
 	return result, nil
 }
 
@@ -1098,6 +1127,7 @@ func (w *EntityWriter) applyStack(
 	if err := tx.Commit(ctx); err != nil {
 		return ApplyStackResult{}, fmt.Errorf("commit stack write: %w", err)
 	}
+	w.observer.CacheWrite(ctx, "stack", result.Applied, false)
 	return result, nil
 }
 
@@ -1218,6 +1248,7 @@ func (w *EntityWriter) TombstoneStackObserved(
 	if err := tx.Commit(ctx); err != nil {
 		return ApplyStackResult{}, fmt.Errorf("commit stack tombstone: %w", err)
 	}
+	w.observer.CacheWrite(ctx, "stack", result.Applied, true)
 	return result, nil
 }
 
@@ -1336,7 +1367,9 @@ func (w *EntityWriter) ApplyChecksObserved(
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit checks write: %w", err)
 	}
-	return len(changed) > 0, nil
+	applied := len(changed) > 0
+	w.observer.CacheWrite(ctx, "checks", applied, false)
+	return applied, nil
 }
 
 func (w *EntityWriter) ApplyRepoRulesObserved(
@@ -1417,7 +1450,9 @@ func (w *EntityWriter) ApplyRepoRulesObserved(
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit repository rules: %w", err)
 	}
-	return len(changed) > 0, nil
+	applied := len(changed) > 0
+	w.observer.CacheWrite(ctx, "repo_rules", applied, false)
+	return applied, nil
 }
 
 func (w *EntityWriter) TouchRepoRules(
