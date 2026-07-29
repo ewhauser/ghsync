@@ -40,8 +40,10 @@ const (
 	defaultMultiplier     = 10.0
 	defaultScrapeInterval = 2 * time.Second
 	defaultDrainTimeout   = 90 * time.Second
-	emitterConcurrency    = 16
-	soakStream            = "entities"
+	// Matches the GhsyncDriftOpen alert's `for: 1m` in ops/alerts.yaml.
+	driftOpenGrace     = time.Minute
+	emitterConcurrency = 16
+	soakStream         = "entities"
 )
 
 type event struct {
@@ -87,6 +89,7 @@ type runState struct {
 	histogramWindows     int
 	samples              int
 	budgetSamples        int
+	driftOpenSince       time.Time
 }
 
 type soakStreamConsumer struct {
@@ -428,7 +431,12 @@ loadLoop:
 			)
 		}
 		streamReady := false
-		if pipelineDrained(final) {
+		driftClean := metricValue(
+			final,
+			"ghsync_c_o3_drift_findings",
+			map[string]string{"state": "open", "entity_kind": "all"},
+		) == 0
+		if pipelineDrained(final) && driftClean {
 			if err := assertConverged(ctx, cfg, pool); err == nil &&
 				postPopulationTrustCompleted(final, state) {
 				caughtUp, streamErr := streamConsumer.caughtUp(ctx)
@@ -1213,12 +1221,27 @@ func assertLive(
 	); parked > 0 {
 		return fmt.Errorf("C-I5 parked deliveries = %.0f", parked)
 	}
-	if open := metricValue(
+	open := metricValue(
 		families,
 		"ghsync_c_o3_drift_findings",
 		map[string]string{"state": "open", "entity_kind": "all"},
-	); open > 0 {
-		return fmt.Errorf("C-O3 open drift findings = %.0f", open)
+	)
+	if open > 0 {
+		// Mirror the GhsyncDriftOpen alert's `for: 1m`: findings recorded
+		// against a mutation whose webhook has not landed yet are designed
+		// self-healing behavior, not soak failures. Only sustained openness
+		// pages, so only sustained openness fails the soak.
+		if state.driftOpenSince.IsZero() {
+			state.driftOpenSince = time.Now()
+		} else if since := time.Since(state.driftOpenSince); since >= driftOpenGrace {
+			return fmt.Errorf(
+				"C-O3 drift findings open for %s without healing (open = %.0f)",
+				since.Round(time.Second),
+				open,
+			)
+		}
+	} else {
+		state.driftOpenSince = time.Time{}
 	}
 	starvations := metricValue(
 		families,
@@ -1303,6 +1326,16 @@ func assertFinal(
 ) error {
 	if state.budgetSamples == 0 {
 		return fmt.Errorf("C-B3 budget metrics were never observed")
+	}
+	if open := metricValue(
+		families,
+		"ghsync_c_o3_drift_findings",
+		map[string]string{"state": "open", "entity_kind": "all"},
+	); open > 0 {
+		return fmt.Errorf(
+			"C-O3 drift findings still open at soak end = %.0f",
+			open,
+		)
 	}
 	endWatermark := metricValue(
 		families,
