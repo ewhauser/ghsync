@@ -276,7 +276,7 @@ consumer.
   `lock_timeout`; a busy or stuck writer produces a retryable, metered timeout
   instead of leaving a pending exclusive acquisition that freezes new
   writers. Every pooled connection also has an
-  `idle_in_transaction_session_timeout`, and migration `0024` installs a
+  `idle_in_transaction_session_timeout`, and migration `0002` installs a
   database-enforced `BEFORE INSERT` trigger that rejects an unfenced
   `change_events` write. A stuck writer therefore times out rather than
   freezing the stream, and the trigger prevents a new writer from bypassing

@@ -1,8 +1,8 @@
 # ghsync Postgres delivery contract
 
-Contract version: **v1**, introduced by migration `0013`, extended
-additively by migrations `0014`–`0019` and `0021`, and hardened by the
-database-enforced writer fence in migration `0024`.
+Contract version: **v1**. The schema lives in the squashed baseline
+migrations (`0001` tables, `0002` functions and the database-enforced
+writer fence trigger, `0003` views).
 
 Postgres is the ghsync sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
@@ -319,7 +319,7 @@ SELECT pg_advisory_xact_lock_shared(5076242250190120306);
 
 The value is the ASCII bytes for `ghsync` interpreted as a signed `BIGINT`;
 clients pass it as a parameter. All internal entity-writer and deriver paths use
-`internal/outbox.AcquireWriterFence`. Migration `0024` adds a
+`internal/outbox.AcquireWriterFence`. Migration `0002` adds a
 `BEFORE INSERT` trigger that rejects any `change_events` write whose backend
 does not already hold this shared fence, so the obligation is enforced by
 Postgres rather than convention.
@@ -338,7 +338,7 @@ abandoned writer cannot hold the shared side forever.
 `change_events.outbox_txid` and
 `stream_watermark.{candidate_seq,candidate_xid,lease_token,lease_until}` are
 private compatibility/coordination columns. The candidate/XID columns are
-retained from applied migration `0013` but are no longer the safety proof.
+retained for compatibility but are no longer the safety proof.
 
 ## Cursor paging and snapshot then stream
 

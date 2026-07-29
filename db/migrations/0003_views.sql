@@ -1,12 +1,12 @@
--- C-O3: per-member updated_at is freshness metadata, not stack semantics.
--- Dispatcher rules deliberately do not fan every member-PR event out to a
--- stack refresh (reviews and comments bump the member's updated_at without
--- changing stack composition or heads), so a cached stack legitimately lags
--- upstream on that field. Comparing it made stack drift findings guaranteed
--- noise under member churn: each pass recorded a new finding that could
--- never heal. Strip updated_at from the drift projection only — the stored
--- stack entries keep it for consumers. The upstream projection in
--- internal/drift/drift.go drops the same field.
+-- Views on top of tables and functions.
+--
+-- drift_entities is the C-O3 drift detector's cache-side projection: one
+-- row per sampled entity with a SEMANTIC snapshot. Volatile freshness
+-- fields are deliberately excluded (stack entries drop member updated_at:
+-- dispatcher rules owe no stack refresh for member events that only bump
+-- it, so comparing it made findings unhealable noise). Explicit ::text
+-- casts on the key columns are load-bearing for sqlc's type inference.
+
 CREATE OR REPLACE VIEW drift_entities AS
 SELECT repos.installation_id,
        'repository'::text AS entity_kind,

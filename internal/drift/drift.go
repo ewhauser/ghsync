@@ -655,7 +655,8 @@ func (s *Service) recordAndHeal(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	now := s.config.Now().UTC()
-	// Match the upgrade backfill in migration 0011. This is a content
+	// Must match diff_hash values already stored in drift_findings (md5 of
+	// the canonical diff). This is a content
 	// identity for deduplication, not a security boundary.
 	hash := fmt.Sprintf("%x", md5.Sum(diff)) //nolint:gosec // deterministic non-security use
 	queries := dbgen.New(tx)
