@@ -32,10 +32,29 @@ func (*noopWorker) Work(ctx context.Context, job *river.Job[NoopArgs]) error {
 }
 
 // NewClient builds the River client with the three queues configured.
-func NewClient(pool *pgxpool.Pool) (*river.Client[pgx.Tx], error) {
+type clientOptions struct {
+	refreshHandler RefreshHandler
+}
+
+type ClientOption func(*clientOptions)
+
+func WithRefreshHandler(handler RefreshHandler) ClientOption {
+	return func(options *clientOptions) {
+		options.refreshHandler = handler
+	}
+}
+
+func NewClient(
+	pool *pgxpool.Pool,
+	options ...ClientOption,
+) (*river.Client[pgx.Tx], error) {
+	var configured clientOptions
+	for _, option := range options {
+		option(&configured)
+	}
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &noopWorker{})
-	registerRefreshWorkers(workers, pool)
+	registerRefreshWorkers(workers, pool, configured.refreshHandler)
 	return river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Queues: map[string]river.QueueConfig{
 			QueueInteractive: {MaxWorkers: 4},

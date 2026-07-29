@@ -13,6 +13,7 @@ import (
 )
 
 const defaultGraphQLResponseBytes = 10 << 20
+const MaxPullRequestBatch = 25
 
 type GraphQLClient struct {
 	client           client
@@ -62,6 +63,155 @@ func (e GraphQLErrors) Error() string {
 type GraphQLResponse struct {
 	RateLimit budget.GraphQLRate
 	Errors    []GraphQLError
+}
+
+// PullRequestNode is the authoritative GraphQL detail shape used by the M3
+// nodes() coordinator. Stack membership is intentionally absent from the
+// query because the private-preview stack extension is REST-only; the
+// resolve_stack_membership worker covers that authoritative dimension.
+type PullRequestNode struct {
+	ID             string    `json:"id"`
+	DatabaseID     int64     `json:"databaseId"`
+	Number         int       `json:"number"`
+	Title          string    `json:"title"`
+	State          string    `json:"state"`
+	IsDraft        bool      `json:"isDraft"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+	ReviewDecision string    `json:"reviewDecision"`
+	Mergeable      string    `json:"mergeable"`
+	HeadRefName    string    `json:"headRefName"`
+	HeadRefOID     string    `json:"headRefOid"`
+	BaseRefName    string    `json:"baseRefName"`
+	BaseRefOID     string    `json:"baseRefOid"`
+	Author         struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Repository    RepositoryNode `json:"repository"`
+	ReviewThreads struct {
+		Nodes []ReviewThreadNode `json:"nodes"`
+	} `json:"reviewThreads"`
+}
+
+type RepositoryNode struct {
+	ID               string    `json:"id"`
+	DatabaseID       int64     `json:"databaseId"`
+	Name             string    `json:"name"`
+	NameWithOwner    string    `json:"nameWithOwner"`
+	IsArchived       bool      `json:"isArchived"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+	DefaultBranchRef *struct {
+		Name   string `json:"name"`
+		Target struct {
+			OID string `json:"oid"`
+		} `json:"target"`
+	} `json:"defaultBranchRef"`
+	Owner struct {
+		Login string `json:"login"`
+	} `json:"owner"`
+}
+
+type ReviewThreadNode struct {
+	ID         string `json:"id"`
+	IsResolved bool   `json:"isResolved"`
+	IsOutdated bool   `json:"isOutdated"`
+	Path       string `json:"path"`
+	Line       *int   `json:"line"`
+	Comments   struct {
+		Nodes []ReviewCommentNode `json:"nodes"`
+	} `json:"comments"`
+}
+
+type ReviewCommentNode struct {
+	ID        string    `json:"id"`
+	Body      string    `json:"body"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	Author    *struct {
+		Login string `json:"login"`
+	} `json:"author"`
+}
+
+const pullRequestNodesQuery = `query FrontierPullRequestNodes($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on PullRequest {
+      id
+      databaseId
+      number
+      title
+      state
+      isDraft
+      updatedAt
+      reviewDecision
+      mergeable
+      headRefName
+      headRefOid
+      baseRefName
+      baseRefOid
+      author { login }
+      repository {
+        id
+        databaseId
+        name
+        nameWithOwner
+        isArchived
+        updatedAt
+        owner { login }
+        defaultBranchRef { name target { oid } }
+      }
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          comments(first: 100) {
+            nodes { id body updatedAt author { login } }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { cost limit remaining resetAt }
+}`
+
+// BatchPullRequests satisfies up to 25 due PR refreshes with one nodes() call
+// (C-P4). The returned order matches the input node-ID order.
+func (c *GraphQLClient) BatchPullRequests(
+	ctx context.Context,
+	class budget.Class,
+	nodeIDs []string,
+) ([]*PullRequestNode, *GraphQLResponse, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil, fmt.Errorf("GraphQL PR batch must not be empty")
+	}
+	if len(nodeIDs) > MaxPullRequestBatch {
+		return nil, nil, fmt.Errorf(
+			"GraphQL PR batch has %d nodes, maximum is %d",
+			len(nodeIDs),
+			MaxPullRequestBatch,
+		)
+	}
+	var data struct {
+		Nodes []*PullRequestNode `json:"nodes"`
+	}
+	response, err := c.Call(
+		ctx,
+		class,
+		pullRequestNodesQuery,
+		map[string]any{"ids": nodeIDs},
+		&data,
+	)
+	if err != nil {
+		return nil, response, err
+	}
+	if len(data.Nodes) != len(nodeIDs) {
+		return nil, response, fmt.Errorf(
+			"GraphQL PR batch returned %d nodes for %d IDs",
+			len(data.Nodes),
+			len(nodeIDs),
+		)
+	}
+	return data.Nodes, response, nil
 }
 
 // Call executes a query that includes a top-level data.rateLimit block.

@@ -12,7 +12,9 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -42,13 +44,20 @@ type PullRequestBranch struct {
 }
 
 type PullRequest struct {
-	Number    int               `json:"number"`
-	Title     string            `json:"title"`
-	State     string            `json:"state"`
-	Head      PullRequestBranch `json:"head"`
-	Base      PullRequestBranch `json:"base"`
-	UpdatedAt time.Time         `json:"updated_at"`
-	Stack     *StackRef         `json:"stack"`
+	ID             int64             `json:"id"`
+	NodeID         string            `json:"node_id"`
+	Number         int               `json:"number"`
+	Title          string            `json:"title"`
+	State          string            `json:"state"`
+	Draft          bool              `json:"draft"`
+	AuthorLogin    string            `json:"-"`
+	ReviewDecision string            `json:"review_decision"`
+	MergeableState string            `json:"mergeable_state"`
+	Head           PullRequestBranch `json:"head"`
+	Base           PullRequestBranch `json:"base"`
+	UpdatedAt      time.Time         `json:"updated_at"`
+	Stack          *StackRef         `json:"stack"`
+	ReviewThreads  []ReviewThread    `json:"-"`
 }
 
 type Stack struct {
@@ -59,22 +68,90 @@ type Stack struct {
 	Base         Base               `json:"base"`
 	Open         bool               `json:"open"`
 	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
 	PullRequests []StackPullRequest `json:"pull_requests"` // bottom → top
 }
 
 type StackPullRequest struct {
-	Number   int               `json:"number"`
-	State    string            `json:"state"`
-	Draft    bool              `json:"draft"`
-	MergedAt *time.Time        `json:"merged_at"`
-	Head     PullRequestBranch `json:"head"`
+	Number    int               `json:"number"`
+	State     string            `json:"state"`
+	Draft     bool              `json:"draft"`
+	MergedAt  *time.Time        `json:"merged_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
+	Head      PullRequestBranch `json:"head"`
+}
+
+type Repository struct {
+	ID               int64     `json:"id"`
+	NodeID           string    `json:"node_id"`
+	Owner            string    `json:"-"`
+	Name             string    `json:"name"`
+	FullName         string    `json:"full_name"`
+	DefaultBranch    string    `json:"default_branch"`
+	DefaultBranchSHA string    `json:"-"`
+	Archived         bool      `json:"archived"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	PushedAt         time.Time `json:"pushed_at"`
+}
+
+func (r Repository) MarshalJSON() ([]byte, error) {
+	type wireRepository Repository
+	return json.Marshal(struct {
+		wireRepository
+		Owner map[string]string `json:"owner"`
+	}{
+		wireRepository: wireRepository(r),
+		Owner:          map[string]string{"login": r.Owner},
+	})
+}
+
+type ReviewThread struct {
+	ID         string
+	IsResolved bool
+	IsOutdated bool
+	Path       string
+	Line       *int
+	Comments   []ReviewComment
+}
+
+type ReviewComment struct {
+	ID          string
+	Body        string
+	UpdatedAt   time.Time
+	AuthorLogin string
+}
+
+type CheckRun struct {
+	ID          int64      `json:"id"`
+	NodeID      string     `json:"node_id"`
+	HeadSHA     string     `json:"head_sha"`
+	Name        string     `json:"name"`
+	Status      string     `json:"status"`
+	Conclusion  string     `json:"conclusion"`
+	DetailsURL  string     `json:"details_url"`
+	AppSlug     string     `json:"-"`
+	StartedAt   *time.Time `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at"`
+}
+
+func (c CheckRun) MarshalJSON() ([]byte, error) {
+	type wireCheckRun CheckRun
+	return json.Marshal(struct {
+		wireCheckRun
+		App map[string]string `json:"app"`
+	}{
+		wireCheckRun: wireCheckRun(c),
+		App:          map[string]string{"slug": c.AppSlug},
+	})
 }
 
 type Fixture struct {
 	Owner        string
 	Repo         string
+	Repository   Repository
 	Stacks       []Stack
 	PullRequests []PullRequest
+	CheckRuns    []CheckRun
 }
 
 type rateBudget struct {
@@ -195,6 +272,8 @@ type Server struct {
 	now            func() time.Time
 	mux            *http.ServeMux
 	client         *http.Client
+	requestCounts  map[string]int
+	notFound       map[string]int
 }
 
 func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
@@ -214,18 +293,26 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 			resetAt:   resetAt,
 			resource:  "graphql",
 		},
-		tokenTTL: time.Hour,
-		now:      time.Now,
-		client:   &http.Client{Timeout: 10 * time.Second},
+		tokenTTL:      time.Hour,
+		now:           time.Now,
+		client:        &http.Client{Timeout: 10 * time.Second},
+		requestCounts: make(map[string]int),
+		notFound:      make(map[string]int),
 	}
 	for _, option := range options {
 		option(s)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
+	mux.HandleFunc("GET /repos/{owner}/{repo}", s.getRepository)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks", s.listStacks)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks/{number}", s.getStack)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", s.listPulls)
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", s.getPull)
+	mux.HandleFunc(
+		"GET /repos/{owner}/{repo}/commits/{sha}/check-runs",
+		s.listCheckRuns,
+	)
 	mux.HandleFunc("POST /graphql", s.graphql)
 	mux.HandleFunc("POST /app/installations/{id}/access_tokens", s.installationToken)
 	s.mux = mux
@@ -233,6 +320,17 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestKey := r.Method + " " + r.URL.Path
+	s.mu.Lock()
+	s.requestCounts[requestKey]++
+	if s.notFound[requestKey] > 0 {
+		s.notFound[requestKey]--
+		s.mu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	s.mu.Unlock()
+
 	if r.URL.Path == "/healthz" {
 		s.mux.ServeHTTP(w, r)
 		return
@@ -293,6 +391,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// ScriptNotFound makes the next count exact method/path requests return 404.
+// It is used to exercise C-C4 without mutating unrelated fixture entities.
+func (s *Server) ScriptNotFound(method, path string, count int) {
+	if count < 0 {
+		panic("not-found count cannot be negative")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notFound[method+" "+path] = count
+}
+
+func (s *Server) RequestCount(method, path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requestCounts[method+" "+path]
+}
+
 // SetFixture swaps the served state; tests use this to script scenarios.
 func (s *Server) SetFixture(fixture Fixture) {
 	s.mu.Lock()
@@ -339,6 +454,14 @@ func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, boo
 	return fx, true
 }
 
+func (s *Server) getRepository(w http.ResponseWriter, r *http.Request) {
+	fx, ok := s.checkRepo(w, r)
+	if !ok {
+		return
+	}
+	s.writeConditionalJSON(w, r, "core", fx.Repository)
+}
+
 func (s *Server) listStacks(w http.ResponseWriter, r *http.Request) {
 	fx, ok := s.checkRepo(w, r)
 	if !ok {
@@ -361,6 +484,7 @@ func (s *Server) listStacks(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	stacks = paginate(stacks, r, w)
 	s.writeConditionalJSON(w, r, "core", stacks)
 }
 
@@ -395,22 +519,174 @@ func (s *Server) listPulls(w http.ResponseWriter, r *http.Request) {
 			pulls = append(pulls, pull)
 		}
 	}
+	pulls = paginate(pulls, r, w)
 	s.writeConditionalJSON(w, r, "core", pulls)
 }
 
 func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Query     string `json:"query"`
+		Variables struct {
+			IDs []string `json:"ids"`
+		} `json:"variables"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil &&
+		!errors.Is(err, io.EOF) {
+		http.Error(w, "invalid GraphQL request", http.StatusBadRequest)
+		return
+	}
 	budget := s.snapshot("graphql")
+	data := map[string]any{
+		"rateLimit": map[string]any{
+			"cost":      1,
+			"limit":     budget.limit,
+			"remaining": budget.remaining,
+			"resetAt":   budget.resetAt.Format(time.RFC3339),
+			"used":      budget.limit - budget.remaining,
+		},
+	}
+	if len(request.Variables.IDs) > 0 {
+		s.mu.Lock()
+		fx := s.fixture
+		s.mu.Unlock()
+		nodes := make([]any, 0, len(request.Variables.IDs))
+		for _, id := range request.Variables.IDs {
+			var node any
+			for _, pull := range fx.PullRequests {
+				if pull.NodeID == id {
+					node = graphQLPullRequest(fx.Repository, pull)
+					break
+				}
+			}
+			nodes = append(nodes, node)
+		}
+		data["nodes"] = nodes
+	}
 	writeJSON(w, map[string]any{
-		"data": map[string]any{
-			"rateLimit": map[string]any{
-				"cost":      1,
-				"limit":     budget.limit,
-				"remaining": budget.remaining,
-				"resetAt":   budget.resetAt.Format(time.RFC3339),
-				"used":      budget.limit - budget.remaining,
+		"data": data,
+	})
+}
+
+func (s *Server) getPull(w http.ResponseWriter, r *http.Request) {
+	fx, ok := s.checkRepo(w, r)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		http.Error(w, "bad pull request number", http.StatusBadRequest)
+		return
+	}
+	for _, pull := range fx.PullRequests {
+		if pull.Number == number {
+			s.writeConditionalJSON(w, r, "core", pull)
+			return
+		}
+	}
+	http.NotFound(w, r)
+}
+
+func (s *Server) listCheckRuns(w http.ResponseWriter, r *http.Request) {
+	fx, ok := s.checkRepo(w, r)
+	if !ok {
+		return
+	}
+	headSHA := r.PathValue("sha")
+	runs := make([]CheckRun, 0)
+	for _, run := range fx.CheckRuns {
+		if run.HeadSHA == headSHA {
+			runs = append(runs, run)
+		}
+	}
+	runs = paginate(runs, r, w)
+	s.writeConditionalJSON(w, r, "core", map[string]any{
+		"total_count": len(runs),
+		"check_runs":  runs,
+	})
+}
+
+func graphQLPullRequest(repository Repository, pull PullRequest) map[string]any {
+	threads := make([]map[string]any, 0, len(pull.ReviewThreads))
+	for _, thread := range pull.ReviewThreads {
+		comments := make([]map[string]any, 0, len(thread.Comments))
+		for _, comment := range thread.Comments {
+			comments = append(comments, map[string]any{
+				"id":        comment.ID,
+				"body":      comment.Body,
+				"updatedAt": comment.UpdatedAt.Format(time.RFC3339Nano),
+				"author":    map[string]any{"login": comment.AuthorLogin},
+			})
+		}
+		threads = append(threads, map[string]any{
+			"id":         thread.ID,
+			"isResolved": thread.IsResolved,
+			"isOutdated": thread.IsOutdated,
+			"path":       thread.Path,
+			"line":       thread.Line,
+			"comments":   map[string]any{"nodes": comments},
+		})
+	}
+	return map[string]any{
+		"id":             pull.NodeID,
+		"databaseId":     pull.ID,
+		"number":         pull.Number,
+		"title":          pull.Title,
+		"state":          strings.ToUpper(pull.State),
+		"isDraft":        pull.Draft,
+		"updatedAt":      pull.UpdatedAt.Format(time.RFC3339Nano),
+		"reviewDecision": pull.ReviewDecision,
+		"mergeable":      strings.ToUpper(pull.MergeableState),
+		"headRefName":    pull.Head.Ref,
+		"headRefOid":     pull.Head.SHA,
+		"baseRefName":    pull.Base.Ref,
+		"baseRefOid":     pull.Base.SHA,
+		"author":         map[string]any{"login": pull.AuthorLogin},
+		"repository": map[string]any{
+			"id":            repository.NodeID,
+			"databaseId":    repository.ID,
+			"name":          repository.Name,
+			"nameWithOwner": repository.FullName,
+			"isArchived":    repository.Archived,
+			"updatedAt":     repository.UpdatedAt.Format(time.RFC3339Nano),
+			"owner":         map[string]any{"login": repository.Owner},
+			"defaultBranchRef": map[string]any{
+				"name": repository.DefaultBranch,
+				"target": map[string]any{
+					"oid": repository.DefaultBranchSHA,
+				},
 			},
 		},
-	})
+		"reviewThreads": map[string]any{"nodes": threads},
+	}
+}
+
+func paginate[T any](values []T, r *http.Request, w http.ResponseWriter) []T {
+	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if perPage <= 0 {
+		perPage = 30
+	}
+	if page <= 0 {
+		page = 1
+	}
+	start := min((page-1)*perPage, len(values))
+	end := min(start+perPage, len(values))
+	if end < len(values) {
+		next := *r.URL
+		query := next.Query()
+		query.Set("page", strconv.Itoa(page+1))
+		query.Set("per_page", strconv.Itoa(perPage))
+		next.RawQuery = query.Encode()
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		w.Header().Set(
+			"Link",
+			fmt.Sprintf("<%s://%s%s>; rel=\"next\"", scheme, r.Host, next.String()),
+		)
+	}
+	return values[start:end]
 }
 
 func (s *Server) installationToken(w http.ResponseWriter, r *http.Request) {

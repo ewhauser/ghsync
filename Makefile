@@ -26,6 +26,9 @@ dev:
 	DATABASE_URL=postgres://frontier:frontier@localhost:5433/frontier?sslmode=disable \
 	GITHUB_WEBHOOK_SECRET=dev-secret \
 	GITHUB_BASE_URL=http://localhost:9797 \
+	GITHUB_TOKEN=dev-token \
+	GITHUB_INSTALLATION_ID=1 \
+	GITHUB_ORG_ID=1 \
 		go run ./cmd/frontier-syncd serve
 
 clean:

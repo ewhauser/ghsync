@@ -21,11 +21,12 @@ type StackBase struct {
 }
 
 type StackPullRequest struct {
-	Number   int               `json:"number"`
-	State    string            `json:"state"`
-	Draft    bool              `json:"draft"`
-	MergedAt *time.Time        `json:"merged_at"`
-	Head     PullRequestBranch `json:"head"`
+	Number    int               `json:"number"`
+	State     string            `json:"state"`
+	Draft     bool              `json:"draft"`
+	MergedAt  *time.Time        `json:"merged_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
+	Head      PullRequestBranch `json:"head"`
 }
 
 type PullRequestBranch struct {
@@ -42,6 +43,7 @@ type Stack struct {
 	Base         StackBase          `json:"base"`
 	Open         bool               `json:"open"`
 	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
 	PullRequests []StackPullRequest `json:"pull_requests"` // bottom to top
 }
 
@@ -59,7 +61,8 @@ type StackRef struct {
 // the preview-only stack extension that the library does not yet model.
 type PullRequest struct {
 	*github.PullRequest
-	Stack *StackRef
+	Stack          *StackRef `json:"stack,omitempty"`
+	ReviewDecision string    `json:"review_decision,omitempty"`
 }
 
 func (p *PullRequest) UnmarshalJSON(data []byte) error {
@@ -68,14 +71,113 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var extension struct {
-		Stack *StackRef `json:"stack"`
+		Stack          *StackRef `json:"stack"`
+		ReviewDecision string    `json:"review_decision"`
 	}
 	if err := json.Unmarshal(data, &extension); err != nil {
 		return err
 	}
 	p.PullRequest = &core
 	p.Stack = extension.Stack
+	p.ReviewDecision = extension.ReviewDecision
 	return nil
+}
+
+// Repository is the subset of repository truth needed by the mirror.
+type Repository struct {
+	ID            int64     `json:"id"`
+	NodeID        string    `json:"node_id"`
+	Owner         string    `json:"-"`
+	Name          string    `json:"name"`
+	FullName      string    `json:"full_name"`
+	DefaultBranch string    `json:"default_branch"`
+	Archived      bool      `json:"archived"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	PushedAt      time.Time `json:"pushed_at"`
+}
+
+func (r *Repository) UnmarshalJSON(data []byte) error {
+	type wireRepository struct {
+		ID            int64     `json:"id"`
+		NodeID        string    `json:"node_id"`
+		Name          string    `json:"name"`
+		FullName      string    `json:"full_name"`
+		DefaultBranch string    `json:"default_branch"`
+		Archived      bool      `json:"archived"`
+		UpdatedAt     time.Time `json:"updated_at"`
+		PushedAt      time.Time `json:"pushed_at"`
+		Owner         struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	}
+	var wire wireRepository
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*r = Repository{
+		ID:            wire.ID,
+		NodeID:        wire.NodeID,
+		Owner:         wire.Owner.Login,
+		Name:          wire.Name,
+		FullName:      wire.FullName,
+		DefaultBranch: wire.DefaultBranch,
+		Archived:      wire.Archived,
+		UpdatedAt:     wire.UpdatedAt,
+		PushedAt:      wire.PushedAt,
+	}
+	return nil
+}
+
+type CheckRun struct {
+	ID          int64      `json:"id"`
+	NodeID      string     `json:"node_id"`
+	HeadSHA     string     `json:"head_sha"`
+	Name        string     `json:"name"`
+	Status      string     `json:"status"`
+	Conclusion  string     `json:"conclusion"`
+	DetailsURL  string     `json:"details_url"`
+	AppSlug     string     `json:"-"`
+	StartedAt   *time.Time `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at"`
+}
+
+func (c *CheckRun) UnmarshalJSON(data []byte) error {
+	type wireCheckRun struct {
+		ID          int64      `json:"id"`
+		NodeID      string     `json:"node_id"`
+		HeadSHA     string     `json:"head_sha"`
+		Name        string     `json:"name"`
+		Status      string     `json:"status"`
+		Conclusion  string     `json:"conclusion"`
+		DetailsURL  string     `json:"details_url"`
+		StartedAt   *time.Time `json:"started_at"`
+		CompletedAt *time.Time `json:"completed_at"`
+		App         struct {
+			Slug string `json:"slug"`
+		} `json:"app"`
+	}
+	var wire wireCheckRun
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*c = CheckRun{
+		ID:          wire.ID,
+		NodeID:      wire.NodeID,
+		HeadSHA:     wire.HeadSHA,
+		Name:        wire.Name,
+		Status:      wire.Status,
+		Conclusion:  wire.Conclusion,
+		DetailsURL:  wire.DetailsURL,
+		AppSlug:     wire.App.Slug,
+		StartedAt:   wire.StartedAt,
+		CompletedAt: wire.CompletedAt,
+	}
+	return nil
+}
+
+type ListCheckRunsOptions struct {
+	PerPage int
+	Page    int
 }
 
 type ListStacksOptions struct {
@@ -115,6 +217,22 @@ func NewRESTClient(
 		return nil, err
 	}
 	return &RESTClient{client: common}, nil
+}
+
+func (c *RESTClient) GetRepository(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	etag string,
+) (*Repository, *RESTResponse, error) {
+	path := fmt.Sprintf("repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo))
+	var repository Repository
+	response, err := c.getJSON(ctx, class, path, nil, etag, &repository)
+	if err != nil || response.NotModified {
+		return nil, response, err
+	}
+	return &repository, response, nil
 }
 
 func (c *RESTClient) ListStacks(
@@ -181,6 +299,52 @@ func (c *RESTClient) ListPulls(
 	var pulls []PullRequest
 	response, err := c.getJSON(ctx, class, path, query, etag, &pulls)
 	return pulls, response, err
+}
+
+func (c *RESTClient) GetPull(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	number int,
+	etag string,
+) (*PullRequest, *RESTResponse, error) {
+	path := fmt.Sprintf(
+		"repos/%s/%s/pulls/%d",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		number,
+	)
+	var pull PullRequest
+	response, err := c.getJSON(ctx, class, path, nil, etag, &pull)
+	if err != nil || response.NotModified {
+		return nil, response, err
+	}
+	return &pull, response, nil
+}
+
+func (c *RESTClient) ListCheckRuns(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	headSHA string,
+	options ListCheckRunsOptions,
+	etag string,
+) ([]CheckRun, *RESTResponse, error) {
+	query := make(url.Values)
+	setPagination(query, options.PerPage, options.Page)
+	path := fmt.Sprintf(
+		"repos/%s/%s/commits/%s/check-runs",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		url.PathEscape(headSHA),
+	)
+	var payload struct {
+		CheckRuns []CheckRun `json:"check_runs"`
+	}
+	response, err := c.getJSON(ctx, class, path, query, etag, &payload)
+	return payload.CheckRuns, response, err
 }
 
 func (c *RESTClient) getJSON(

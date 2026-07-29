@@ -56,6 +56,70 @@ func TestUnknownRepoIs404(t *testing.T) {
 	}
 }
 
+func TestSinglePullETagChecksAndScripted404(t *testing.T) {
+	fake := New(DefaultFixture(), "secret")
+	path := "/repos/acme/monolith/pulls/4812"
+	first := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test"+path,
+		nil,
+	)
+	etag := first.Header.Get("ETag")
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK || etag == "" {
+		t.Fatalf("first PR status=%d etag=%q", first.StatusCode, etag)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://fake.test"+path, nil)
+	request.Header.Set("If-None-Match", etag)
+	recorder := httptest.NewRecorder()
+	fake.ServeHTTP(recorder, request)
+	notModified := recorder.Result()
+	notModified.Body.Close()
+	if notModified.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional PR status=%d, want 304", notModified.StatusCode)
+	}
+
+	checks := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/commits/8f31c2d/check-runs",
+		nil,
+	)
+	defer checks.Body.Close()
+	var payload struct {
+		CheckRuns []CheckRun `json:"check_runs"`
+	}
+	if err := json.NewDecoder(checks.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.CheckRuns) != 2 {
+		t.Fatalf("check runs = %d, want 2", len(payload.CheckRuns))
+	}
+
+	fake.ScriptNotFound(http.MethodGet, path, 1)
+	missing := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test"+path,
+		nil,
+	)
+	missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("scripted status=%d, want 404", missing.StatusCode)
+	}
+	restored := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test"+path,
+		nil,
+	)
+	restored.Body.Close()
+	if restored.StatusCode != http.StatusOK {
+		t.Fatalf("post-script status=%d, want 200", restored.StatusCode)
+	}
+}
+
 func TestPullsGoldenResponseDecodesThroughClientContract(t *testing.T) {
 	fake := New(DefaultFixture(), "secret")
 	resp := serve(

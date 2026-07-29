@@ -3,7 +3,13 @@ package main
 import "testing"
 
 func TestValidateRoles(t *testing.T) {
-	for _, roles := range []string{"all", "ingress", "dispatch", "ingress,dispatch"} {
+	for _, roles := range []string{
+		"all",
+		"ingress",
+		"dispatch",
+		"fetch",
+		"ingress,dispatch,fetch",
+	} {
 		if err := validateRoles(roles); err != nil {
 			t.Fatalf("%q rejected: %v", roles, err)
 		}

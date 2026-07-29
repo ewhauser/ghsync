@@ -12,47 +12,78 @@ func DefaultFixture() Fixture {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	pulls := []PullRequest{
 		{
+			ID: 804810, NodeID: "PR_kwDOABCDEF4810",
 			Number: 4810, Title: "Tokenizer rewrite for query parser", State: "closed",
+			AuthorLogin: "octocat", ReviewDecision: "APPROVED", MergeableState: "MERGEABLE",
 			Head:      PullRequestBranch{Ref: "refactor/tokenizer", SHA: "bbbb001"},
 			Base:      PullRequestBranch{Ref: "main", SHA: "aaaa000"},
 			UpdatedAt: now, Stack: stackRef(1),
 		},
 		{
+			ID: 804812, NodeID: "PR_kwDOABCDEF4812",
 			Number: 4812, Title: "BM25F ranker integration", State: "open",
-			Head:      PullRequestBranch{Ref: "refactor/bm25f-ranker", SHA: "8f31c2d"},
-			Base:      PullRequestBranch{Ref: "refactor/tokenizer", SHA: "bbbb001"},
-			UpdatedAt: now, Stack: stackRef(2),
+			AuthorLogin: "octocat", ReviewDecision: "CHANGES_REQUESTED",
+			MergeableState: "CONFLICTING",
+			Head:           PullRequestBranch{Ref: "refactor/bm25f-ranker", SHA: "8f31c2d"},
+			Base:           PullRequestBranch{Ref: "refactor/tokenizer", SHA: "bbbb001"},
+			UpdatedAt:      now, Stack: stackRef(2),
+			ReviewThreads: []ReviewThread{{
+				ID: "PRRT_kwDOABCDEF4812_1", Path: "internal/ranker.go",
+				IsResolved: false, IsOutdated: false,
+				Comments: []ReviewComment{{
+					ID: "PRRC_kwDOABCDEF4812_1", Body: "Please cover the tie case.",
+					UpdatedAt: now, AuthorLogin: "reviewer",
+				}},
+			}},
 		},
 		{
+			ID: 804815, NodeID: "PR_kwDOABCDEF4815",
 			Number: 4815, Title: "Relevance debug API endpoint", State: "open",
-			Head:      PullRequestBranch{Ref: "feat/relevance-debug", SHA: "bbbb003"},
-			Base:      PullRequestBranch{Ref: "refactor/bm25f-ranker", SHA: "8f31c2d"},
-			UpdatedAt: now, Stack: stackRef(3),
+			AuthorLogin: "octocat", ReviewDecision: "REVIEW_REQUIRED",
+			MergeableState: "MERGEABLE",
+			Head:           PullRequestBranch{Ref: "feat/relevance-debug", SHA: "bbbb003"},
+			Base:           PullRequestBranch{Ref: "refactor/bm25f-ranker", SHA: "8f31c2d"},
+			UpdatedAt:      now, Stack: stackRef(3),
 		},
 		{
+			ID: 804816, NodeID: "PR_kwDOABCDEF4816",
 			Number: 4816, Title: "Results page rewiring", State: "open",
-			Head:      PullRequestBranch{Ref: "feat/results-rewire", SHA: "bbbb004"},
-			Base:      PullRequestBranch{Ref: "feat/relevance-debug", SHA: "bbbb003"},
-			UpdatedAt: now, Stack: stackRef(4),
+			AuthorLogin: "octocat", ReviewDecision: "REVIEW_REQUIRED",
+			MergeableState: "MERGEABLE",
+			Head:           PullRequestBranch{Ref: "feat/results-rewire", SHA: "bbbb004"},
+			Base:           PullRequestBranch{Ref: "feat/relevance-debug", SHA: "bbbb003"},
+			UpdatedAt:      now, Stack: stackRef(4),
 		},
 		{
+			ID: 804820, NodeID: "PR_kwDOABCDEF4820",
 			Number: 4820, Title: "Relevance telemetry dashboards", State: "open",
-			Head:      PullRequestBranch{Ref: "feat/relevance-telemetry", SHA: "bbbb005"},
-			Base:      PullRequestBranch{Ref: "feat/results-rewire", SHA: "bbbb004"},
-			UpdatedAt: now, Stack: stackRef(5),
+			AuthorLogin: "octocat", ReviewDecision: "REVIEW_REQUIRED",
+			MergeableState: "MERGEABLE",
+			Head:           PullRequestBranch{Ref: "feat/relevance-telemetry", SHA: "bbbb005"},
+			Base:           PullRequestBranch{Ref: "feat/results-rewire", SHA: "bbbb004"},
+			UpdatedAt:      now, Stack: stackRef(5),
 		},
 	}
 	stackPulls := make([]StackPullRequest, 0, len(pulls))
 	for _, pull := range pulls {
 		stackPulls = append(stackPulls, StackPullRequest{
-			Number: pull.Number,
-			State:  pull.State,
-			Head:   pull.Head,
+			Number:    pull.Number,
+			State:     pull.State,
+			Draft:     pull.Draft,
+			UpdatedAt: pull.UpdatedAt,
+			Head:      pull.Head,
 		})
 	}
+	started := now.Add(-8 * time.Minute)
+	completed := now.Add(-5 * time.Minute)
 	return Fixture{
 		Owner: "acme",
 		Repo:  "monolith",
+		Repository: Repository{
+			ID: 1001, NodeID: "R_kwDOABCDEF", Owner: "acme", Name: "monolith",
+			FullName: "acme/monolith", DefaultBranch: "main",
+			DefaultBranchSHA: base.SHA, UpdatedAt: now, PushedAt: now,
+		},
 		Stacks: []Stack{
 			{
 				ID:           9876543,
@@ -62,9 +93,24 @@ func DefaultFixture() Fixture {
 				Base:         base,
 				Open:         true,
 				CreatedAt:    now.Add(-24 * time.Hour),
+				UpdatedAt:    now,
 				PullRequests: stackPulls,
 			},
 		},
 		PullRequests: pulls,
+		CheckRuns: []CheckRun{
+			{
+				ID: 99001, NodeID: "CR_kwDOABCDEF99001", HeadSHA: "8f31c2d",
+				Name: "unit", Status: "completed", Conclusion: "failure",
+				DetailsURL: "https://github.com/acme/monolith/actions/runs/99001",
+				AppSlug:    "github-actions", StartedAt: &started, CompletedAt: &completed,
+			},
+			{
+				ID: 99002, NodeID: "CR_kwDOABCDEF99002", HeadSHA: "8f31c2d",
+				Name: "lint", Status: "completed", Conclusion: "success",
+				DetailsURL: "https://github.com/acme/monolith/actions/runs/99002",
+				AppSlug:    "github-actions", StartedAt: &started, CompletedAt: &completed,
+			},
+		},
 	}
 }

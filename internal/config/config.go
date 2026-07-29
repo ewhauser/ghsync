@@ -27,6 +27,12 @@ type Config struct {
 	// GitHubInstallationID is the single-org App installation
 	// (GITHUB_INSTALLATION_ID).
 	GitHubInstallationID int64
+	// GitHubOrgID is the constant organization identity stored on mirror rows
+	// (GITHUB_ORG_ID).
+	GitHubOrgID int64
+	// GitHubToken is a development/test escape hatch for fake GitHub. Production
+	// uses App credentials and installation-token caching.
+	GitHubToken string
 	// GitHubPrivateKeyPath points at the App's PEM key (GITHUB_PRIVATE_KEY_PATH).
 	GitHubPrivateKeyPath string
 	// GitHubWebhookSecret verifies X-Hub-Signature-256 (GITHUB_WEBHOOK_SECRET).
@@ -57,6 +63,7 @@ func FromEnv() (Config, error) {
 		HTTPAddr:             envOr("HTTP_ADDR", ":8080"),
 		GitHubPrivateKeyPath: os.Getenv("GITHUB_PRIVATE_KEY_PATH"),
 		GitHubWebhookSecret:  os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		GitHubToken:          os.Getenv("GITHUB_TOKEN"),
 		GitHubBaseURL:        envOr("GITHUB_BASE_URL", "https://api.github.com"),
 		WebhookMaxBodyBytes:  defaultWebhookMaxBodyBytes,
 		DispatchBatchSize:    defaultDispatchBatchSize,
@@ -77,6 +84,13 @@ func FromEnv() (Config, error) {
 			return Config{}, fmt.Errorf("GITHUB_INSTALLATION_ID: %w", err)
 		}
 		cfg.GitHubInstallationID = id
+	}
+	if raw := os.Getenv("GITHUB_ORG_ID"); raw != "" {
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("GITHUB_ORG_ID: %w", err)
+		}
+		cfg.GitHubOrgID = id
 	}
 	if raw := os.Getenv("WEBHOOK_MAX_BODY_BYTES"); raw != "" {
 		value, err := strconv.ParseInt(raw, 10, 64)
@@ -135,6 +149,23 @@ func (c Config) RequireDatabase() error {
 func (c Config) RequireWebhookSecret() error {
 	if c.GitHubWebhookSecret == "" {
 		return fmt.Errorf("GITHUB_WEBHOOK_SECRET is required for the ingress role")
+	}
+	return nil
+}
+
+func (c Config) RequireFetchCredentials() error {
+	if c.GitHubInstallationID <= 0 || c.GitHubOrgID <= 0 {
+		return fmt.Errorf(
+			"GITHUB_INSTALLATION_ID and GITHUB_ORG_ID are required for fetch",
+		)
+	}
+	if c.GitHubToken != "" {
+		return nil
+	}
+	if c.GitHubAppID <= 0 || c.GitHubPrivateKeyPath == "" {
+		return fmt.Errorf(
+			"GITHUB_APP_ID and GITHUB_PRIVATE_KEY_PATH are required for fetch",
+		)
 	}
 	return nil
 }

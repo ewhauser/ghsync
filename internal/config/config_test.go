@@ -82,6 +82,29 @@ func TestRequireWebhookSecret(t *testing.T) {
 	}
 }
 
+func TestRequireFetchCredentials(t *testing.T) {
+	if err := (Config{}).RequireFetchCredentials(); err == nil {
+		t.Fatal("empty fetch credentials accepted")
+	}
+	static := Config{
+		GitHubInstallationID: 1,
+		GitHubOrgID:          2,
+		GitHubToken:          "dev-token",
+	}
+	if err := static.RequireFetchCredentials(); err != nil {
+		t.Fatalf("static fake-GitHub token rejected: %v", err)
+	}
+	app := Config{
+		GitHubInstallationID: 1,
+		GitHubOrgID:          2,
+		GitHubAppID:          3,
+		GitHubPrivateKeyPath: "/tmp/key.pem",
+	}
+	if err := app.RequireFetchCredentials(); err != nil {
+		t.Fatalf("App credentials rejected: %v", err)
+	}
+}
+
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
@@ -89,6 +112,8 @@ func clearConfigEnv(t *testing.T) {
 		"HTTP_ADDR",
 		"GITHUB_APP_ID",
 		"GITHUB_INSTALLATION_ID",
+		"GITHUB_ORG_ID",
+		"GITHUB_TOKEN",
 		"GITHUB_PRIVATE_KEY_PATH",
 		"GITHUB_WEBHOOK_SECRET",
 		"GITHUB_BASE_URL",

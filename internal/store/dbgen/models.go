@@ -8,6 +8,64 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type BackfillCursor struct {
+	InstallationID int64
+	RepoFullName   string
+	Phase          string
+	Page           int32
+	CompletedAt    pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+}
+
+type ChangeEvent struct {
+	Seq        int64
+	Stream     string
+	Kind       string
+	EntityKey  string
+	OccurredAt pgtype.Timestamptz
+	Payload    []byte
+}
+
+type CheckHistory struct {
+	ID           int64
+	CheckRunGhID int64
+	RepoID       int64
+	Name         string
+	Status       string
+	Conclusion   string
+	Observed     []byte
+	GhUpdatedAt  pgtype.Timestamptz
+	HeadSha      string
+	SyncedAt     pgtype.Timestamptz
+	Etag         string
+	SyncSource   string
+	TombstonedAt pgtype.Timestamptz
+}
+
+type CheckRun struct {
+	GhID         int64
+	RepoID       int64
+	NodeID       string
+	Name         string
+	Status       string
+	Conclusion   string
+	DetailsUrl   string
+	AppSlug      string
+	StartedAt    pgtype.Timestamptz
+	CompletedAt  pgtype.Timestamptz
+	GhUpdatedAt  pgtype.Timestamptz
+	HeadSha      string
+	SyncedAt     pgtype.Timestamptz
+	Etag         string
+	SyncSource   string
+	TombstonedAt pgtype.Timestamptz
+}
+
+type DerivationDirty struct {
+	ScopeKey string
+	MarkedAt pgtype.Timestamptz
+}
+
 type InstallationBudget struct {
 	InstallationID int64
 	Class          string
@@ -20,11 +78,102 @@ type InstallationBudget struct {
 	BackoffUntil   pgtype.Timestamptz
 }
 
+type PullRequest struct {
+	ID             int64
+	RepoID         int64
+	GhID           pgtype.Int8
+	NodeID         string
+	Number         int32
+	Title          string
+	State          string
+	Draft          bool
+	AuthorLogin    string
+	HeadRef        string
+	HeadSha        string
+	BaseRef        string
+	BaseSha        string
+	ReviewDecision string
+	MergeableState string
+	StackNumber    pgtype.Int4
+	StackPosition  pgtype.Int4
+	GhUpdatedAt    pgtype.Timestamptz
+	SyncedAt       pgtype.Timestamptz
+	Etag           string
+	SyncSource     string
+	TombstonedAt   pgtype.Timestamptz
+}
+
 type RefreshIntentGeneration struct {
 	Kind       string
 	RefreshKey string
 	Generation int64
 	UpdatedAt  pgtype.Timestamptz
+}
+
+type Repo struct {
+	ID             int64
+	InstallationID int64
+	OrgID          int64
+	GhID           int64
+	NodeID         string
+	Owner          string
+	Name           string
+	FullName       string
+	DefaultBranch  string
+	Archived       bool
+	GhUpdatedAt    pgtype.Timestamptz
+	HeadSha        string
+	SyncedAt       pgtype.Timestamptz
+	Etag           string
+	SyncSource     string
+	TombstonedAt   pgtype.Timestamptz
+}
+
+type RepoRule struct {
+	RepoID       int64
+	RuleKey      string
+	Rule         []byte
+	GhUpdatedAt  pgtype.Timestamptz
+	HeadSha      string
+	SyncedAt     pgtype.Timestamptz
+	Etag         string
+	SyncSource   string
+	TombstonedAt pgtype.Timestamptz
+}
+
+type ReviewThread struct {
+	ID           string
+	RepoID       int64
+	PrNumber     int32
+	IsResolved   bool
+	IsOutdated   bool
+	Path         string
+	Line         pgtype.Int4
+	Comments     []byte
+	GhUpdatedAt  pgtype.Timestamptz
+	HeadSha      string
+	SyncedAt     pgtype.Timestamptz
+	Etag         string
+	SyncSource   string
+	TombstonedAt pgtype.Timestamptz
+}
+
+type Stack struct {
+	ID           int64
+	RepoID       int64
+	GhID         pgtype.Int8
+	NodeID       string
+	Number       int32
+	BaseRef      string
+	BaseSha      string
+	Open         bool
+	Entries      []byte
+	GhUpdatedAt  pgtype.Timestamptz
+	HeadSha      string
+	SyncedAt     pgtype.Timestamptz
+	Etag         string
+	SyncSource   string
+	TombstonedAt pgtype.Timestamptz
 }
 
 type WebhookDelivery struct {

@@ -4,6 +4,7 @@
 //
 //	frontier-syncd serve [--roles=all]   run the engine (default command)
 //	frontier-syncd migrate               apply River + schema migrations
+//	frontier-syncd backfill --repo=...   start/resume one repo backfill
 //	frontier-syncd requeue --guid=...    replay parked deliveries
 //	frontier-syncd version               print the build version
 package main
@@ -24,8 +25,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/riverqueue/river"
 
+	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/config"
 	"github.com/acme/frontier/internal/dispatch"
+	"github.com/acme/frontier/internal/fetch"
+	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/ingress"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
@@ -42,6 +46,7 @@ const (
 	riverForcedStopTimeout = 5 * time.Second
 	roleIngress            = "ingress"
 	roleDispatch           = "dispatch"
+	roleFetch              = "fetch"
 )
 
 func main() {
@@ -63,15 +68,69 @@ func run(args []string) error {
 		return migrate()
 	case "requeue":
 		return requeue(args)
+	case "backfill":
+		return backfill(args)
 	case "version":
 		fmt.Println(version)
 		return nil
 	default:
 		return fmt.Errorf(
-			"unknown command %q (want serve, migrate, requeue, or version)",
+			"unknown command %q (want serve, migrate, requeue, backfill, or version)",
 			cmd,
 		)
 	}
+}
+
+func backfill(args []string) error {
+	fs := flag.NewFlagSet("backfill", flag.ContinueOnError)
+	repo := fs.String("repo", "", "repository in owner/name form")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *repo == "" {
+		return fmt.Errorf("backfill requires --repo=owner/name")
+	}
+	cfg, err := config.FromEnv()
+	if err != nil {
+		return err
+	}
+	if err := cfg.RequireDatabase(); err != nil {
+		return err
+	}
+	if cfg.GitHubInstallationID <= 0 {
+		return fmt.Errorf("GITHUB_INSTALLATION_ID is required for backfill")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	riverClient, err := queue.NewClient(pool)
+	if err != nil {
+		return fmt.Errorf("River client: %w", err)
+	}
+	cursor, err := fetch.StartBackfill(
+		ctx,
+		pool,
+		riverClient,
+		cfg.GitHubInstallationID,
+		*repo,
+	)
+	if err != nil {
+		return err
+	}
+	slog.Info(
+		"backfill started or resumed",
+		"repo",
+		*repo,
+		"phase",
+		cursor.Phase,
+		"page",
+		cursor.Page,
+	)
+	return nil
 }
 
 type requeueOptions struct {
@@ -162,7 +221,7 @@ func serve(args []string) error {
 	rolesFlag := fs.String(
 		"roles",
 		"all",
-		"comma-separated roles: ingress,dispatch, or all",
+		"comma-separated roles: ingress,dispatch,fetch, or all",
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -184,6 +243,11 @@ func serve(args []string) error {
 			return err
 		}
 	}
+	if roles[roleFetch] {
+		if err := cfg.RequireFetchCredentials(); err != nil {
+			return err
+		}
+	}
 
 	signalCtx, stopSignals := signal.NotifyContext(
 		context.Background(),
@@ -200,29 +264,123 @@ func serve(args []string) error {
 
 	serviceCtx, cancelServices := context.WithCancel(context.Background())
 	defer cancelServices()
-	serviceErrors := make(chan error, 2)
+	serviceErrors := make(chan error, 3)
 
 	var riverClient *river.Client[pgx.Tx]
-	if roles[roleDispatch] {
-		riverClient, err = queue.NewClient(pool)
+	var githubGate *budget.Gate
+	budgetCtx, cancelBudget := context.WithCancel(context.Background())
+	defer func() {
+		if githubGate != nil {
+			closeCtx, cancelClose := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			_ = githubGate.Close(closeCtx)
+			cancelClose()
+		}
+		cancelBudget()
+	}()
+	if roles[roleDispatch] || roles[roleFetch] {
+		var fetchHandler *fetch.Handler
+		if roles[roleFetch] {
+			owner, hostErr := os.Hostname()
+			if hostErr != nil {
+				return fmt.Errorf("budget lease owner: %w", hostErr)
+			}
+			githubGate, err = budget.NewLeased(
+				budgetCtx,
+				http.DefaultClient,
+				budget.Options{},
+				budget.NewPostgresLeaseStore(pool),
+				budget.LeaseOptions{
+					InstallationID: cfg.GitHubInstallationID,
+					Owner:          owner,
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("GitHub budget gate: %w", err)
+			}
+			var tokens gh.TokenProvider
+			if cfg.GitHubToken != "" {
+				tokens = gh.StaticToken(cfg.GitHubToken)
+			} else {
+				privateKeyPEM, readErr := os.ReadFile(cfg.GitHubPrivateKeyPath)
+				if readErr != nil {
+					return fmt.Errorf("read GitHub private key: %w", readErr)
+				}
+				tokens, err = gh.NewInstallationTokens(
+					githubGate,
+					gh.InstallationTokenOptions{
+						BaseURL:        cfg.GitHubBaseURL,
+						AppID:          cfg.GitHubAppID,
+						InstallationID: cfg.GitHubInstallationID,
+						PrivateKeyPEM:  privateKeyPEM,
+					},
+				)
+				if err != nil {
+					return fmt.Errorf("GitHub installation tokens: %w", err)
+				}
+			}
+			rest, restErr := gh.NewRESTClient(
+				cfg.GitHubBaseURL,
+				githubGate,
+				tokens,
+			)
+			if restErr != nil {
+				return fmt.Errorf("GitHub REST client: %w", restErr)
+			}
+			graphQL, graphErr := gh.NewGraphQLClient(
+				cfg.GitHubBaseURL,
+				githubGate,
+				tokens,
+			)
+			if graphErr != nil {
+				return fmt.Errorf("GitHub GraphQL client: %w", graphErr)
+			}
+			fetchHandler, err = fetch.New(fetch.Options{
+				Pool:           pool,
+				REST:           rest,
+				GraphQL:        graphQL,
+				InstallationID: cfg.GitHubInstallationID,
+				OrgID:          cfg.GitHubOrgID,
+			})
+			if err != nil {
+				return err
+			}
+		}
+		var clientOptions []queue.ClientOption
+		if fetchHandler != nil {
+			clientOptions = append(
+				clientOptions,
+				queue.WithRefreshHandler(fetchHandler),
+			)
+		}
+		riverClient, err = queue.NewClient(pool, clientOptions...)
 		if err != nil {
 			return fmt.Errorf("river client: %w", err)
 		}
-		if err := riverClient.Start(serviceCtx); err != nil {
-			return fmt.Errorf("river start: %w", err)
+		if fetchHandler != nil {
+			fetchHandler.SetRiverClient(riverClient)
 		}
-		dispatcher := dispatch.New(pool, riverClient, dispatch.Config{
-			BatchSize:    cfg.DispatchBatchSize,
-			MaxAttempts:  cfg.DispatchMaxAttempts,
-			Debounce:     cfg.DispatchDebounce,
-			PollInterval: cfg.DispatchPollInterval,
-			Classifier:   dispatch.DefaultClassifier(),
-		})
-		go func() {
-			if err := dispatcher.Run(serviceCtx); err != nil {
-				serviceErrors <- fmt.Errorf("dispatcher: %w", err)
+		if roles[roleFetch] {
+			if err := riverClient.Start(serviceCtx); err != nil {
+				return fmt.Errorf("river start: %w", err)
 			}
-		}()
+		}
+		if roles[roleDispatch] {
+			dispatcher := dispatch.New(pool, riverClient, dispatch.Config{
+				BatchSize:    cfg.DispatchBatchSize,
+				MaxAttempts:  cfg.DispatchMaxAttempts,
+				Debounce:     cfg.DispatchDebounce,
+				PollInterval: cfg.DispatchPollInterval,
+				Classifier:   dispatch.DefaultClassifier(),
+			})
+			go func() {
+				if err := dispatcher.Run(serviceCtx); err != nil {
+					serviceErrors <- fmt.Errorf("dispatcher: %w", err)
+				}
+			}()
+		}
 	}
 
 	var httpServer *http.Server
@@ -271,7 +429,7 @@ func serve(args []string) error {
 			serviceErr = fmt.Errorf("ingress graceful shutdown: %w", httpErr)
 		}
 	}
-	if riverClient != nil {
+	if riverClient != nil && roles[roleFetch] {
 		riverCtx, cancelRiver := context.WithTimeout(
 			context.Background(),
 			riverShutdownTimeout,
@@ -298,6 +456,17 @@ func serve(args []string) error {
 			}
 		}
 	}
+	if githubGate != nil {
+		closeCtx, cancelGate := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		gateErr := githubGate.Close(closeCtx)
+		cancelGate()
+		if gateErr != nil && serviceErr == nil {
+			serviceErr = fmt.Errorf("GitHub budget gate shutdown: %w", gateErr)
+		}
+	}
 	return serviceErr
 }
 
@@ -308,16 +477,20 @@ func validateRoles(roles string) error {
 
 func parseRoles(raw string) (map[string]bool, error) {
 	if raw == "all" {
-		return map[string]bool{roleIngress: true, roleDispatch: true}, nil
+		return map[string]bool{
+			roleIngress:  true,
+			roleDispatch: true,
+			roleFetch:    true,
+		}, nil
 	}
 	roles := make(map[string]bool, 2)
 	for _, role := range strings.Split(raw, ",") {
 		switch role {
-		case roleIngress, roleDispatch:
+		case roleIngress, roleDispatch, roleFetch:
 			roles[role] = true
 		default:
 			return nil, fmt.Errorf(
-				"--roles=%q contains unsupported role %q (want ingress, dispatch, or all)",
+				"--roles=%q contains unsupported role %q (want ingress, dispatch, fetch, or all)",
 				raw,
 				role,
 			)

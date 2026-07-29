@@ -133,7 +133,10 @@ func TestMigrateIdempotent(t *testing.T) {
 
 	var riverTables int
 	err = pool.QueryRow(ctx,
-		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'river_job'`).Scan(&riverTables)
+		`SELECT count(*)
+		 FROM information_schema.tables
+		 WHERE table_schema = current_schema()
+		   AND table_name = 'river_job'`).Scan(&riverTables)
 	if err != nil || riverTables != 1 {
 		t.Fatalf("river_job table missing (err=%v, count=%d)", err, riverTables)
 	}

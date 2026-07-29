@@ -21,7 +21,7 @@ make gen       # regenerate sqlc code after editing db/queries or db/migrations
 ```
 
 `frontier-syncd` commands: `serve --roles=...`, `migrate`,
-`requeue --guid=…|--all-parked`, `version`.
+`backfill --repo=owner/name`, `requeue --guid=…|--all-parked`, `version`.
 `fake-github` (cmd/fake-github) serves a canned enrolled repo and emits
 HMAC-signed webhooks; docker-compose runs it beside Postgres.
 
@@ -29,13 +29,24 @@ The `webhook_deliveries.headers` JSONB value is a semantic request envelope:
 the canonical header map plus host, parsed content length, and transfer
 encoding. Wire-exact header casing and ordering are intentionally not retained.
 
+### M3 fetch coordination
+
+River continues to claim and acknowledge one `refresh_pr` pointer at a time.
+The workers call a shared 5 ms fetch coordinator that gangs concurrently due,
+already-known PR node IDs into `nodes(ids:)` calls of at most 25. Results are
+sorted by entity key before the cache writer takes transaction-scoped advisory
+locks. This keeps M2's per-job refresh-generation recheck intact while meeting
+C-P4 without custom multi-job River acknowledgement. New PRs and explicit
+stack-membership resolution use conditional REST GETs until a node ID is
+cached.
+
 ## Status
 
 - [x] M0 — foundations: module, migrations (River + own), three River
       queues, config, fake GitHub skeleton, CI
 - [x] M1 — GitHub plumbing & budgeter
 - [x] M2 — ingestion, dispatch, coalescing
-- [ ] M3 — cache & fetchers
+- [x] M3 — cache & fetchers
 - [ ] M4 — reconciliation & webhook validation
 - [ ] M5 — change stream, derivation seam, contract
 - [ ] M6 — hardening & operations
