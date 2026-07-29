@@ -817,6 +817,10 @@ func waitForCacheSeed(
 		var repositories int64
 		var incompleteRepos int64
 		var pendingChildren int64
+		// Readiness means no DUE cache-writer work: future-scheduled debounce
+		// and backoff jobs are routine steady-state (drift/sweep enqueue them
+		// continuously) and are excluded; final truth convergence is the
+		// correctness gate.
 		var cacheWriters int64
 		err := pool.QueryRow(ctx, `
 			SELECT
@@ -843,9 +847,12 @@ func waitForCacheSeed(
 			     WHERE queue IN (
 			         'interactive', 'event', 'sweep', 'reconcile'
 			     )
-			       AND state IN (
-			           'available', 'pending', 'retryable',
-			           'running', 'scheduled'
+			       AND (
+			           state IN ('available', 'pending', 'running')
+			           OR (
+			               state IN ('retryable', 'scheduled')
+			               AND scheduled_at <= now()
+			           )
 			       ))
 		`, cfg.installationID).Scan(
 			&installationDone,
