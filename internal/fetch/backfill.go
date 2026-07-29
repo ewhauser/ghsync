@@ -597,28 +597,21 @@ func unseenBackfillSpecs(
 	for _, spec := range specs {
 		keys = append(keys, spec.Key)
 	}
-	rows, err := tx.Query(ctx, `
-		SELECT refresh_key
-		FROM backfill_children
-		WHERE installation_id = $1
-		  AND repo_full_name = $2
-		  AND kind = $3
-		  AND refresh_key = ANY($4::text[])
-	`, args.InstallationID, args.RepoFullName, queue.KindRefreshPR, keys)
+	seenKeys, err := dbgen.New(tx).ListSeenBackfillRefreshKeys(
+		ctx,
+		dbgen.ListSeenBackfillRefreshKeysParams{
+			InstallationID: args.InstallationID,
+			RepoFullName:   args.RepoFullName,
+			Kind:           queue.KindRefreshPR,
+			RefreshKeys:    keys,
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("read seen pull request backfill keys: %w", err)
 	}
-	defer rows.Close()
 	seen := make(map[string]struct{}, len(specs))
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, fmt.Errorf("scan seen pull request backfill key: %w", err)
-		}
+	for _, key := range seenKeys {
 		seen[key] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read seen pull request backfill keys: %w", err)
 	}
 	unseen := make([]queue.RefreshSpec, 0, len(specs))
 	for _, spec := range specs {

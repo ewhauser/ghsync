@@ -1,3 +1,21 @@
+-- name: HasOutstandingRefresh :one
+SELECT COALESCE((
+    EXISTS (
+        SELECT 1
+        FROM refresh_intent_generations
+        WHERE refresh_key = sqlc.arg(refresh_key)
+          AND completed_generation < generation
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM river_job
+        WHERE args->>'key' = sqlc.arg(refresh_key)
+          AND state IN (
+              'available', 'pending', 'retryable', 'running', 'scheduled'
+          )
+    )
+), false)::boolean;
+
 -- name: GetDriftSampleCursor :one
 SELECT source_id
 FROM drift_sample_cursors

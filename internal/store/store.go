@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const defaultIdleInTransactionSessionTimeout = 30 * time.Second
@@ -39,10 +41,8 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	var synchronousCommit string
-	if err := pool.QueryRow(ctx, "SHOW synchronous_commit").Scan(
-		&synchronousCommit,
-	); err != nil {
+	synchronousCommit, err := dbgen.New(pool).ShowSynchronousCommit(ctx)
+	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("verify synchronous_commit: %w", err)
 	}

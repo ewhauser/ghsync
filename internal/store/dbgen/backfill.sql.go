@@ -291,6 +291,64 @@ func (q *Queries) GetInstallationBackfillCursorForUpdate(ctx context.Context, in
 	return i, err
 }
 
+const isInstallationBackfillDone = `-- name: IsInstallationBackfillDone :one
+SELECT EXISTS (
+    SELECT 1
+    FROM installation_backfill_cursors
+    WHERE installation_id = $1
+      AND phase = 'done'
+      AND completed_at IS NOT NULL
+)
+`
+
+func (q *Queries) IsInstallationBackfillDone(ctx context.Context, installationID int64) (bool, error) {
+	row := q.db.QueryRow(ctx, isInstallationBackfillDone, installationID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const listSeenBackfillRefreshKeys = `-- name: ListSeenBackfillRefreshKeys :many
+SELECT refresh_key
+FROM backfill_children
+WHERE installation_id = $1
+  AND repo_full_name = $2
+  AND kind = $3
+  AND refresh_key = ANY($4::text[])
+`
+
+type ListSeenBackfillRefreshKeysParams struct {
+	InstallationID int64
+	RepoFullName   string
+	Kind           string
+	RefreshKeys    []string
+}
+
+func (q *Queries) ListSeenBackfillRefreshKeys(ctx context.Context, arg ListSeenBackfillRefreshKeysParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listSeenBackfillRefreshKeys,
+		arg.InstallationID,
+		arg.RepoFullName,
+		arg.Kind,
+		arg.RefreshKeys,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var refresh_key string
+		if err := rows.Scan(&refresh_key); err != nil {
+			return nil, err
+		}
+		items = append(items, refresh_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markCompletedBackfillChildren = `-- name: MarkCompletedBackfillChildren :execrows
 UPDATE backfill_children AS child
 SET completed_at = now()

@@ -274,3 +274,13 @@ func (q *Queries) SaveInstallationBudgetSnapshot(ctx context.Context, arg SaveIn
 	}
 	return result.RowsAffected(), nil
 }
+
+const setBudgetLeaseTransactionTimeouts = `-- name: SetBudgetLeaseTransactionTimeouts :exec
+SELECT set_config('lock_timeout', $1, true),
+       set_config('statement_timeout', $1, true)
+`
+
+func (q *Queries) SetBudgetLeaseTransactionTimeouts(ctx context.Context, timeout string) error {
+	_, err := q.db.Exec(ctx, setBudgetLeaseTransactionTimeouts, timeout)
+	return err
+}

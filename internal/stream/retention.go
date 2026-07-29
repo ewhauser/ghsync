@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const minimumRetentionAge = 7 * 24 * time.Hour
@@ -69,45 +72,19 @@ func (r *Retention) Prune(ctx context.Context) (int64, error) {
 	cutoff := r.now().UTC().Add(-r.age)
 	var total int64
 	for {
-		tag, err := r.pool.Exec(ctx, `
-				WITH doomed AS MATERIALIZED (
-				    SELECT events.seq, events.stream
-				    FROM change_events AS events
-				    CROSS JOIN stream_watermark AS watermark
-				    WHERE events.occurred_at < $1
-				      -- C-S2/C-S7: never publish a pruned horizon above the
-				      -- greatest sequence consumers were allowed to observe.
-				      AND events.seq <= watermark.safe_seq
-				    ORDER BY events.occurred_at, events.seq
-				    LIMIT $2
-				    FOR UPDATE OF events SKIP LOCKED
-			),
-			advanced AS (
-			    INSERT INTO stream_horizons (
-			        stream, pruned_through_seq, updated_at
-			    )
-			    SELECT stream, max(seq), clock_timestamp()
-			    FROM doomed
-			    GROUP BY stream
-			    ON CONFLICT (stream) DO UPDATE
-			    SET pruned_through_seq = GREATEST(
-			            stream_horizons.pruned_through_seq,
-			            EXCLUDED.pruned_through_seq
-			        ),
-			        updated_at = EXCLUDED.updated_at
-			    RETURNING stream
-			)
-			DELETE FROM change_events AS events
-			USING doomed
-			WHERE events.seq = doomed.seq
-			  -- Reference the data-changing CTE explicitly: horizon and delete
-			  -- are one atomic RESYNC boundary (C-S4/C-S7).
-			  AND (SELECT count(*) FROM advanced) >= 0
-		`, cutoff, r.batchSize)
+		deleted, err := dbgen.New(r.pool).PruneChangeEvents(
+			ctx,
+			dbgen.PruneChangeEventsParams{
+				Cutoff: pgtype.Timestamptz{
+					Time:  cutoff,
+					Valid: true,
+				},
+				BatchSize: int32(r.batchSize),
+			},
+		)
 		if err != nil {
 			return total, fmt.Errorf("prune change events: %w", err)
 		}
-		deleted := tag.RowsAffected()
 		total += deleted
 		if deleted < int64(r.batchSize) {
 			if r.onPrune != nil {

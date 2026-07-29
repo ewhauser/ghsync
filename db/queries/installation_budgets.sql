@@ -1,3 +1,7 @@
+-- name: SetBudgetLeaseTransactionTimeouts :exec
+SELECT set_config('lock_timeout', sqlc.arg(timeout), true),
+       set_config('statement_timeout', sqlc.arg(timeout), true);
+
 -- name: EnsureInstallationBudget :exec
 INSERT INTO installation_budgets (installation_id, class)
 VALUES ($1, $2)

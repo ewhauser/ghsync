@@ -30,6 +30,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/fakegithub"
 	"github.com/ewhauser/ghsync/internal/ingress"
 	ghsyncmetrics "github.com/ewhauser/ghsync/internal/metrics"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 	"github.com/ewhauser/ghsync/pkg/streamclient"
 )
 
@@ -513,6 +514,8 @@ func newSoakStreamConsumer(
 ) (*soakStreamConsumer, error) {
 	table := "ghsync_soak_applied_" + runID
 	tableSQL := pgx.Identifier{table}.Sanitize()
+	// Raw SQL exception: this run-scoped scratch-table identifier is dynamic,
+	// sanitized, and cannot be parameterized by PostgreSQL or modeled by sqlc.
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE `+tableSQL+` (
 		    seq BIGINT PRIMARY KEY,
@@ -568,6 +571,8 @@ func (c *soakStreamConsumer) start(ctx context.Context) error {
 			c.consumer,
 			soakStream,
 			func(ctx context.Context, tx pgx.Tx, event streamclient.Event) error {
+				// Raw SQL exception: this INSERT targets the dynamic,
+				// sanitized run-scoped scratch table created above.
 				if _, err := tx.Exec(
 					ctx,
 					"INSERT INTO "+c.tableSQL+" (seq) VALUES ($1)",
@@ -717,6 +722,8 @@ func (c *soakStreamConsumer) assertFinal(
 
 func (c *soakStreamConsumer) counts(ctx context.Context) (streamCounts, error) {
 	var result streamCounts
+	// Raw SQL exception: the aggregate reads the dynamic, sanitized run-scoped
+	// scratch table; PostgreSQL cannot parameterize that table identifier.
 	err := c.pool.QueryRow(ctx, `
 		SELECT
 		    (SELECT count(*) FROM `+c.tableSQL+`),
@@ -757,13 +764,18 @@ func (c *soakStreamConsumer) cleanup(ctx context.Context) {
 	defer cancel()
 	_ = c.stop(ctx)
 	if c.tableSQL != "" {
+		// Raw SQL exception: this DROP targets the dynamic, sanitized
+		// run-scoped scratch-table identifier.
 		_, _ = c.pool.Exec(ctx, "DROP TABLE IF EXISTS "+c.tableSQL)
 	}
 	if c.consumer != "" {
-		_, _ = c.pool.Exec(ctx, `
-			DELETE FROM consumer_cursors
-			WHERE consumer = $1 AND stream = $2
-		`, c.consumer, soakStream)
+		_ = dbgen.New(c.pool).DeleteSoakConsumerCursor(
+			ctx,
+			dbgen.DeleteSoakConsumerCursorParams{
+				Consumer: c.consumer,
+				Stream:   soakStream,
+			},
+		)
 	}
 }
 
@@ -816,53 +828,13 @@ func waitForCacheSeed(
 	deadline := time.Now().Add(cfg.drainTimeout)
 	var lastState string
 	for {
-		var installationDone bool
-		var repositories int64
-		var incompleteRepos int64
-		var pendingChildren int64
 		// Readiness means no DUE cache-writer work: future-scheduled debounce
 		// and backoff jobs are routine steady-state (drift/sweep enqueue them
 		// continuously) and are excluded; final truth convergence is the
 		// correctness gate.
-		var cacheWriters int64
-		err := pool.QueryRow(ctx, `
-			SELECT
-			    EXISTS (
-			        SELECT 1
-			        FROM installation_backfill_cursors
-			        WHERE installation_id = $1
-			          AND phase = 'done'
-			          AND completed_at IS NOT NULL
-			    ),
-			    (SELECT count(*)
-			     FROM backfill_cursors
-			     WHERE installation_id = $1),
-			    (SELECT count(*)
-			     FROM backfill_cursors
-			     WHERE installation_id = $1
-			       AND phase <> 'done'),
-			    (SELECT count(*)
-			     FROM backfill_children
-			     WHERE installation_id = $1
-			       AND completed_at IS NULL),
-			    (SELECT count(*)
-			     FROM river_job
-			     WHERE queue IN (
-			         'interactive', 'event', 'sweep', 'reconcile'
-			     )
-			       AND (
-			           state IN ('available', 'pending', 'running')
-			           OR (
-			               state IN ('retryable', 'scheduled')
-			               AND scheduled_at <= now()
-			           )
-			       ))
-		`, cfg.installationID).Scan(
-			&installationDone,
-			&repositories,
-			&incompleteRepos,
-			&pendingChildren,
-			&cacheWriters,
+		state, err := dbgen.New(pool).GetSoakCacheSeedState(
+			ctx,
+			cfg.installationID,
 		)
 		if err != nil {
 			return fmt.Errorf("check completed cache seed: %w", err)
@@ -870,15 +842,15 @@ func waitForCacheSeed(
 		lastState = fmt.Sprintf(
 			"installation_done=%t repositories=%d incomplete_repositories=%d "+
 				"pending_children=%d cache_writer_jobs=%d",
-			installationDone,
-			repositories,
-			incompleteRepos,
-			pendingChildren,
-			cacheWriters,
+			state.InstallationDone,
+			state.Repositories,
+			state.IncompleteRepos,
+			state.PendingChildren,
+			state.CacheWriters,
 		)
-		if installationDone && repositories > 0 &&
-			incompleteRepos == 0 && pendingChildren == 0 &&
-			cacheWriters == 0 {
+		if state.InstallationDone && state.Repositories > 0 &&
+			state.IncompleteRepos == 0 && state.PendingChildren == 0 &&
+			state.CacheWriters == 0 {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -1424,32 +1396,17 @@ func assertConverged(
 	if len(truth.PullRequests) == 0 {
 		return fmt.Errorf("fake truth contains no mutated pull requests")
 	}
-	rows, err := pool.Query(ctx, `
-		SELECT pull.number, pull.title
-		FROM pull_requests AS pull
-		JOIN repos AS repo ON repo.id = pull.repo_id
-		WHERE repo.full_name = $1
-		  AND repo.tombstoned_at IS NULL
-		  AND pull.tombstoned_at IS NULL
-	`, truth.Repository)
+	rows, err := dbgen.New(pool).ListSoakCachedPullRequests(
+		ctx,
+		truth.Repository,
+	)
 	if err != nil {
 		return fmt.Errorf("query cached truth: %w", err)
 	}
 	cached := make(map[int]string)
-	for rows.Next() {
-		var number int
-		var title string
-		if err := rows.Scan(&number, &title); err != nil {
-			rows.Close()
-			return err
-		}
-		cached[number] = title
+	for _, row := range rows {
+		cached[int(row.Number)] = row.Title
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	for _, pull := range truth.PullRequests {
 		got, ok := cached[pull.Number]
 		if !ok {

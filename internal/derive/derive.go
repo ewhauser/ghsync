@@ -18,6 +18,7 @@ import (
 
 	"github.com/ewhauser/ghsync/internal/opsstate"
 	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const (
@@ -200,29 +201,14 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		return 0, err
 	}
+	queries := dbgen.New(tx)
 
-	rows, err := tx.Query(ctx, `
-		SELECT scope_key
-		FROM derivation_dirty
-		ORDER BY marked_at, scope_key
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
-	`, s.dirtyCap)
-	if err != nil {
-		return 0, fmt.Errorf("claim derivation dirty set: %w", err)
-	}
-	scopeKeys, err := pgx.CollectRows(
-		rows,
-		func(row pgx.CollectableRow) (string, error) {
-			var key string
-			if err := row.Scan(&key); err != nil {
-				return "", err
-			}
-			return key, nil
-		},
+	scopeKeys, err := queries.ClaimDerivationDirtyScopes(
+		ctx,
+		int32(s.dirtyCap),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("scan derivation dirty set: %w", err)
+		return 0, fmt.Errorf("claim derivation dirty set: %w", err)
 	}
 	if len(scopeKeys) == 0 {
 		if err := s.recordHeartbeat(ctx, tx, 0); err != nil {
@@ -253,96 +239,18 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 
 	// C-P5: each claimed scope's complete prior set is reconciled with the
 	// returned set. Changed and removed references share this transaction.
-	eventRows, err := tx.Query(ctx, `
-			WITH claimed(scope_key) AS (
-			    SELECT unnest($1::text[])
-			),
-			input AS (
-			    SELECT scope_key, identity_key, org_id, payload
-			    FROM jsonb_to_recordset($2::jsonb) AS item(
-			        scope_key text,
-			        identity_key text,
-			        org_id bigint,
-			        payload jsonb
-			    )
-			),
-			upserted AS (
-			    INSERT INTO work_items (
-			        scope_key, identity_key, org_id, payload, updated_at
-			    )
-			    SELECT scope_key, identity_key, org_id, payload,
-			           clock_timestamp()
-			    FROM input
-			    ON CONFLICT (identity_key) DO UPDATE
-			    SET scope_key = EXCLUDED.scope_key,
-			        org_id = EXCLUDED.org_id,
-			        payload = EXCLUDED.payload,
-			        updated_at = EXCLUDED.updated_at
-			    WHERE ROW(
-			            work_items.scope_key,
-			            work_items.org_id,
-			            work_items.payload
-			        )
-			        IS DISTINCT FROM
-			        ROW(
-			            EXCLUDED.scope_key,
-			            EXCLUDED.org_id,
-			            EXCLUDED.payload
-			        )
-			    RETURNING scope_key, identity_key
-			),
-			removed AS (
-			    DELETE FROM work_items AS prior
-			    USING claimed
-			    WHERE prior.scope_key = claimed.scope_key
-			      AND NOT EXISTS (
-			          SELECT 1
-			          FROM input
-			          WHERE input.identity_key = prior.identity_key
-			      )
-			    RETURNING prior.scope_key, prior.identity_key
-			),
-			events AS (
-			    SELECT scope_key, identity_key, $4::text AS kind
-			    FROM upserted
-			    UNION ALL
-			    SELECT scope_key, identity_key, $5::text AS kind
-			    FROM removed
-			)
-			INSERT INTO change_events (
-			    stream, kind, entity_key, occurred_at, payload
-			)
-			SELECT $3, kind, identity_key, clock_timestamp(),
-			       jsonb_build_object(
-			           'version', 1,
-			           'identity_key', identity_key,
-			           'scope_key', scope_key
-			       )
-			FROM events
-			ORDER BY identity_key, kind
-			RETURNING seq
-		`,
-		scopeKeys,
-		encoded,
-		outbox.WorkItemsStream,
-		outbox.WorkItemChangedKind,
-		outbox.WorkItemRemovedKind,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("apply derived work-item batch: %w", err)
-	}
-	eventSeqs, err := pgx.CollectRows(
-		eventRows,
-		func(row pgx.CollectableRow) (int64, error) {
-			var seq int64
-			if err := row.Scan(&seq); err != nil {
-				return 0, err
-			}
-			return seq, nil
+	eventSeqs, err := queries.ApplyDerivedWorkItemBatch(
+		ctx,
+		dbgen.ApplyDerivedWorkItemBatchParams{
+			Stream:      outbox.WorkItemsStream,
+			ScopeKeys:   scopeKeys,
+			Items:       encoded,
+			ChangedKind: outbox.WorkItemChangedKind,
+			RemovedKind: outbox.WorkItemRemovedKind,
 		},
 	)
 	if err != nil {
-		return 0, fmt.Errorf("scan derived change sequences: %w", err)
+		return 0, fmt.Errorf("apply derived work-item batch: %w", err)
 	}
 	for _, seq := range eventSeqs {
 		if err := outbox.AfterSequenceAllocated(
@@ -359,10 +267,7 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 	// A writer that marks a claimed key during Derive waits on its row lock.
 	// After this delete commits, that upsert creates a fresh mark, so work
 	// arriving mid-pass survives (C-D2).
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM derivation_dirty
-		WHERE scope_key = ANY($1::text[])
-	`, scopeKeys); err != nil {
+	if err := queries.ClearDerivationDirtyScopes(ctx, scopeKeys); err != nil {
 		return 0, fmt.Errorf("clear derived dirty set: %w", err)
 	}
 	if err := s.recordHeartbeat(ctx, tx, int64(len(scopeKeys))); err != nil {
@@ -462,6 +367,8 @@ func (s *Service) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Raw SQL exception: PostgreSQL does not parameterize LISTEN channel
+	// identifiers, so this fixed protocol channel cannot be expressed in sqlc.
 	if _, err := listener.Exec(
 		acquireCtx,
 		"LISTEN "+dirtyNotifyChannel,
@@ -478,6 +385,8 @@ func releaseListener(ctx context.Context, listener *pgxpool.Conn) {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
+	// Raw SQL exception: PostgreSQL does not parameterize UNLISTEN channel
+	// identifiers, so this fixed protocol channel cannot be expressed in sqlc.
 	_, _ = listener.Exec(ctx, "UNLISTEN "+dirtyNotifyChannel)
 	listener.Release()
 }

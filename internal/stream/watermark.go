@@ -17,6 +17,7 @@ import (
 
 	"github.com/ewhauser/ghsync/internal/opsstate"
 	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const (
@@ -145,9 +146,9 @@ func (w *Watermarker) Step(
 	if w.testBeforeFence != nil {
 		w.testBeforeFence()
 	}
-	if _, err := tx.Exec(
+	queries := dbgen.New(tx)
+	if err := queries.SetLocalLockTimeout(
 		ctx,
-		`SELECT set_config('lock_timeout', $1, true)`,
 		w.fenceLockTimeout.String(),
 	); err != nil {
 		return WatermarkProgress{}, fmt.Errorf(
@@ -163,38 +164,29 @@ func (w *Watermarker) Step(
 		return WatermarkProgress{}, err
 	}
 
-	var prior, target int64
-	var leaseValid bool
-	if err := tx.QueryRow(ctx, `
-		SELECT watermark.safe_seq,
-		       COALESCE((SELECT max(seq) FROM change_events), 0),
-		       watermark.lease_token = $1
-		           AND watermark.lease_until > clock_timestamp()
-		FROM stream_watermark AS watermark
-		WHERE watermark.singleton
-	`, w.token).Scan(&prior, &target, &leaseValid); err != nil {
+	targetState, err := queries.ReadStreamWatermarkTarget(ctx, w.token)
+	if err != nil {
 		return WatermarkProgress{}, fmt.Errorf(
 			"read committed change-event maximum: %w", err,
 		)
 	}
+	prior := targetState.SafeSeq
+	target := targetState.TargetSeq
+	leaseValid := targetState.LeaseValid
 	if !leaseValid {
 		return WatermarkProgress{}, ErrLeaseHeld
 	}
 
 	safe := prior
 	if target > prior {
-		if err := tx.QueryRow(ctx, `
-			UPDATE stream_watermark
-			SET safe_seq = $2,
-			    candidate_seq = NULL,
-			    candidate_xid = NULL,
-			    updated_at = clock_timestamp()
-			WHERE singleton
-			  AND lease_token = $1
-			  AND lease_until > clock_timestamp()
-			  AND safe_seq < $2
-			RETURNING safe_seq
-		`, w.token, target).Scan(&safe); err != nil {
+		safe, err = queries.PublishStreamWatermark(
+			ctx,
+			dbgen.PublishStreamWatermarkParams{
+				SafeSeq:    target,
+				LeaseToken: w.token,
+			},
+		)
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return WatermarkProgress{}, ErrLeaseHeld
 			}
@@ -273,19 +265,13 @@ func (w *Watermarker) Close(ctx context.Context) error {
 }
 
 func (w *Watermarker) acquireOrRenew(ctx context.Context) error {
-	var token string
-	err := w.pool.QueryRow(ctx, `
-		UPDATE stream_watermark
-		SET lease_token = $1,
-		    lease_until = clock_timestamp() + $2::interval
-		WHERE singleton
-		  AND (
-		      lease_token IS NULL
-		      OR lease_until <= clock_timestamp()
-		      OR lease_token = $1
-		  )
-		RETURNING lease_token
-	`, w.token, w.leaseTTL.String()).Scan(&token)
+	_, err := dbgen.New(w.pool).AcquireOrRenewStreamWatermarkLease(
+		ctx,
+		dbgen.AcquireOrRenewStreamWatermarkLeaseParams{
+			LeaseToken: w.token,
+			LeaseTtl:   w.leaseTTL.String(),
+		},
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrLeaseHeld
 	}
@@ -298,11 +284,7 @@ func (w *Watermarker) acquireOrRenew(ctx context.Context) error {
 func (w *Watermarker) release(parent context.Context) error {
 	ctx, cancel := context.WithTimeout(parent, time.Second)
 	defer cancel()
-	_, err := w.pool.Exec(ctx, `
-		UPDATE stream_watermark
-		SET lease_token = NULL, lease_until = NULL
-		WHERE singleton AND lease_token = $1
-	`, w.token)
+	err := dbgen.New(w.pool).ReleaseStreamWatermarkLease(ctx, w.token)
 	if err != nil {
 		return fmt.Errorf("release stream watermark lease: %w", err)
 	}

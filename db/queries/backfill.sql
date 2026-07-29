@@ -120,3 +120,20 @@ SELECT count(*)
 FROM backfill_cursors
 WHERE installation_id = sqlc.arg(installation_id)
   AND phase <> 'done';
+
+-- name: ListSeenBackfillRefreshKeys :many
+SELECT refresh_key
+FROM backfill_children
+WHERE installation_id = sqlc.arg(installation_id)
+  AND repo_full_name = sqlc.arg(repo_full_name)
+  AND kind = sqlc.arg(kind)
+  AND refresh_key = ANY(sqlc.arg(refresh_keys)::text[]);
+
+-- name: IsInstallationBackfillDone :one
+SELECT EXISTS (
+    SELECT 1
+    FROM installation_backfill_cursors
+    WHERE installation_id = sqlc.arg(installation_id)
+      AND phase = 'done'
+      AND completed_at IS NOT NULL
+);

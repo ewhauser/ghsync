@@ -8,6 +8,8 @@ import (
 	"strconv"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const (
@@ -87,7 +89,7 @@ var V1Definitions = []Definition{
 // AcquireWriterFence registers tx as an outbox writer. It must be called
 // before tx inserts its first change_events row and remains held through commit.
 func AcquireWriterFence(ctx context.Context, tx pgx.Tx) error {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, FenceKey); err != nil {
+	if err := dbgen.New(tx).AcquireOutboxWriterFence(ctx, FenceKey); err != nil {
 		return fmt.Errorf("acquire outbox writer fence: %w", err)
 	}
 	return nil
@@ -96,7 +98,7 @@ func AcquireWriterFence(ctx context.Context, tx pgx.Tx) error {
 // AcquireWatermarkFence waits for every registered writer transaction to end
 // and prevents a new writer from allocating a sequence until tx commits.
 func AcquireWatermarkFence(ctx context.Context, tx pgx.Tx) error {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, FenceKey); err != nil {
+	if err := dbgen.New(tx).AcquireOutboxWatermarkFence(ctx, FenceKey); err != nil {
 		return fmt.Errorf("acquire outbox watermark fence: %w", err)
 	}
 	return nil

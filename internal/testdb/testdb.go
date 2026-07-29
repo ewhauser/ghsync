@@ -41,6 +41,8 @@ func Open(
 	if err != nil {
 		return nil, err
 	}
+	// Raw SQL exception: PostgreSQL cannot parameterize this computed schema
+	// identifier; pgx.Identifier sanitizes it before the test-only DDL runs.
 	if _, err := admin.Exec(
 		ctx,
 		"CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize(),
@@ -97,6 +99,8 @@ func dropSchema(
 		10*time.Second,
 	)
 	defer cancel()
+	// Raw SQL exception: PostgreSQL cannot parameterize this computed schema
+	// identifier; pgx.Identifier sanitizes it before the test-only DDL runs.
 	_, _ = admin.Exec(
 		ctx,
 		"DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE",

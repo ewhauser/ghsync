@@ -28,6 +28,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("migration lock connection: %w", err)
 	}
 	defer lockConn.Close(context.WithoutCancel(ctx)) //nolint:errcheck // close releases the session lock
+	// Raw SQL exception: the migration runner must bootstrap its advisory lock
+	// and schema_migrations ledger, then apply DDL before generated queries can
+	// safely assume that the application schema exists.
 	if _, err := lockConn.Exec(ctx,
 		`SELECT pg_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
@@ -41,6 +44,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("river migrations: %w", err)
 	}
 
+	// Raw SQL exception: schema_migrations is the migration runner's bootstrap
+	// ledger and must exist before generated application queries are usable.
 	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		name TEXT PRIMARY KEY,
 		checksum BYTEA NOT NULL,
@@ -48,9 +53,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	)`); err != nil {
 		return fmt.Errorf("ensure schema_migrations: %w", err)
 	}
-	// Older M0 databases may have the pre-checksum ledger shape. Leave any
-	// existing rows NULL so applyOne fails closed instead of silently blessing
-	// migration contents it cannot verify.
+	// Raw SQL exception: older M0 databases may have the pre-checksum bootstrap
+	// ledger shape. Leave any existing rows NULL so applyOne fails closed instead
+	// of silently blessing migration contents it cannot verify.
 	if _, err := pool.Exec(ctx,
 		`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum BYTEA`); err != nil {
 		return fmt.Errorf("ensure schema_migrations checksum: %w", err)
@@ -65,6 +70,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("migration %s: %w", name, err)
 		}
 	}
+	// Raw SQL exception: this final ledger constraint is part of migration
+	// bootstrap and cannot rely on generated application queries.
 	if _, err := pool.Exec(ctx,
 		`ALTER TABLE schema_migrations ALTER COLUMN checksum SET NOT NULL`); err != nil {
 		return fmt.Errorf("enforce schema_migrations checksum: %w", err)
@@ -102,6 +109,8 @@ func applyOne(ctx context.Context, pool *pgxpool.Pool, name string) error {
 
 	// The insert doubles as a lock: a concurrent migrator blocks here and
 	// then sees the row exists.
+	// Raw SQL exception: schema_migrations is the migration runner's bootstrap
+	// ledger and must work before generated application queries are usable.
 	tag, err := tx.Exec(ctx,
 		`INSERT INTO schema_migrations (name, checksum)
 		 VALUES ($1, $2)
@@ -112,6 +121,8 @@ func applyOne(ctx context.Context, pool *pgxpool.Pool, name string) error {
 	}
 	if tag.RowsAffected() == 0 {
 		var appliedChecksum []byte
+		// Raw SQL exception: this reads the migration runner's bootstrap ledger
+		// before generated application queries may be usable.
 		if err := tx.QueryRow(ctx,
 			`SELECT checksum FROM schema_migrations WHERE name = $1`, name).
 			Scan(&appliedChecksum); err != nil {
@@ -122,6 +133,8 @@ func applyOne(ctx context.Context, pool *pgxpool.Pool, name string) error {
 		}
 		return tx.Commit(ctx)
 	}
+	// Raw SQL exception: the SQL string is an embedded migration body, not an
+	// application query; the migration runner intentionally executes it raw.
 	if _, err := tx.Exec(ctx, string(sql)); err != nil {
 		return err
 	}

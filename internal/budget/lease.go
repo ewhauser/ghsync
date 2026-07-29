@@ -566,10 +566,8 @@ func setLeaseTransactionTimeouts(
 	}
 	timeout = max(time.Millisecond, timeout)
 	value := fmt.Sprintf("%dms", timeout.Milliseconds())
-	if _, err := tx.Exec(
+	if err := dbgen.New(tx).SetBudgetLeaseTransactionTimeouts(
 		ctx,
-		`SELECT set_config('lock_timeout', $1, true),
-		        set_config('statement_timeout', $1, true)`,
 		value,
 	); err != nil {
 		return fmt.Errorf("set budget lease transaction timeouts: %w", err)

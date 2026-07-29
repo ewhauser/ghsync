@@ -258,11 +258,11 @@ func (w *EntityWriter) markAndEmit(
 }
 
 func databaseClock(ctx context.Context, tx pgx.Tx) (time.Time, error) {
-	var now time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+	now, err := dbgen.New(tx).GetDatabaseClock(ctx)
+	if err != nil {
 		return time.Time{}, fmt.Errorf("read PostgreSQL clock: %w", err)
 	}
-	return now, nil
+	return now.Time, nil
 }
 
 func (w *EntityWriter) commitEntityTx(ctx context.Context, tx pgx.Tx) error {
@@ -272,16 +272,13 @@ func (w *EntityWriter) commitEntityTx(ctx context.Context, tx pgx.Tx) error {
 	if pipeline.EventReceivedAt(ctx).IsZero() {
 		return nil
 	}
-	var committedAt time.Time
-	if err := w.pool.QueryRow(
-		ctx,
-		`SELECT clock_timestamp()`,
-	).Scan(&committedAt); err != nil {
+	committedAt, err := dbgen.New(w.pool).GetDatabaseClock(ctx)
+	if err != nil {
 		return fmt.Errorf(
 			"read PostgreSQL clock after cache commit: %w",
 			err,
 		)
 	}
-	pipeline.MarkCacheCommitted(ctx, committedAt)
+	pipeline.MarkCacheCommitted(ctx, committedAt.Time)
 	return nil
 }

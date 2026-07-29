@@ -210,6 +210,32 @@ func (q *Queries) GetOpenDriftFindingByHash(ctx context.Context, arg GetOpenDrif
 	return i, err
 }
 
+const hasOutstandingRefresh = `-- name: HasOutstandingRefresh :one
+SELECT COALESCE((
+    EXISTS (
+        SELECT 1
+        FROM refresh_intent_generations
+        WHERE refresh_key = $1
+          AND completed_generation < generation
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM river_job
+        WHERE args->>'key' = $1
+          AND state IN (
+              'available', 'pending', 'retryable', 'running', 'scheduled'
+          )
+    )
+), false)::boolean
+`
+
+func (q *Queries) HasOutstandingRefresh(ctx context.Context, refreshKey string) (bool, error) {
+	row := q.db.QueryRow(ctx, hasOutstandingRefresh, refreshKey)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const insertDriftFinding = `-- name: InsertDriftFinding :one
 INSERT INTO drift_findings (
     installation_id, entity_kind, entity_key, detected_at, cache_snapshot,

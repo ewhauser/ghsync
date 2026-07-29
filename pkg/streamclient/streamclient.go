@@ -19,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const (
@@ -320,43 +322,48 @@ func (c *Client) Bootstrap(
 			_ = tx.Rollback(context.WithoutCancel(ctx))
 		}
 	}()
+	queries := dbgen.New(tx)
 
 	// Establish and lock the cursor before selecting the watermark. One
 	// (consumer, stream) has only one active delivery transaction (C-D4).
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO consumer_cursors (consumer, stream, seq, updated_at)
-		VALUES ($1, $2, 0, clock_timestamp())
-		ON CONFLICT (consumer, stream) DO NOTHING
-	`, consumer, stream); err != nil {
+	if err := queries.EnsureConsumerCursor(
+		ctx,
+		dbgen.EnsureConsumerCursorParams{
+			Consumer: consumer,
+			Stream:   stream,
+		},
+	); err != nil {
 		if isSerializationFailure(err) {
 			return nil, newCursorContention(consumer, stream, err)
 		}
 		return nil, fmt.Errorf("ensure bootstrap cursor: %w", err)
 	}
-	var prior int64
-	if err := tx.QueryRow(ctx, `
-		SELECT seq
-		FROM consumer_cursors
-		WHERE consumer = $1 AND stream = $2
-		FOR UPDATE
-	`, consumer, stream).Scan(&prior); err != nil {
+	prior, err := queries.GetConsumerCursorForUpdate(
+		ctx,
+		dbgen.GetConsumerCursorForUpdateParams{
+			Consumer: consumer,
+			Stream:   stream,
+		},
+	)
+	if err != nil {
 		if isSerializationFailure(err) {
 			return nil, newCursorContention(consumer, stream, err)
 		}
 		return nil, fmt.Errorf("lock bootstrap cursor: %w", err)
 	}
 
-	var safeSeq int64
-	if err := tx.QueryRow(ctx, `
-		SELECT safe_seq FROM stream_watermark WHERE singleton
-	`).Scan(&safeSeq); err != nil {
+	safeSeq, err := queries.GetStreamSafeSequence(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("read bootstrap watermark: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE consumer_cursors
-		SET seq = $3, updated_at = clock_timestamp()
-		WHERE consumer = $1 AND stream = $2
-	`, consumer, stream, safeSeq); err != nil {
+	if err := queries.UpdateConsumerCursor(
+		ctx,
+		dbgen.UpdateConsumerCursorParams{
+			Seq:      safeSeq,
+			Consumer: consumer,
+			Stream:   stream,
+		},
+	); err != nil {
 		return nil, fmt.Errorf("reset bootstrap cursor: %w", err)
 	}
 	ok = true
@@ -509,6 +516,8 @@ func (c *Client) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Raw SQL exception: PostgreSQL does not parameterize LISTEN channel
+	// identifiers, so this fixed protocol channel cannot be expressed in sqlc.
 	if _, err := listener.Exec(
 		acquireCtx,
 		"LISTEN "+notificationChannel,
@@ -525,6 +534,8 @@ func releaseListener(ctx context.Context, listener *pgxpool.Conn) {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
+	// Raw SQL exception: PostgreSQL does not parameterize UNLISTEN channel
+	// identifiers, so this fixed protocol channel cannot be expressed in sqlc.
 	_, _ = listener.Exec(ctx, "UNLISTEN "+notificationChannel)
 	listener.Release()
 }
@@ -553,12 +564,15 @@ func (c *Client) deliverPage(
 		return 0, fmt.Errorf("begin stream page: %w", err)
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	queries := dbgen.New(tx)
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO consumer_cursors (consumer, stream, seq, updated_at)
-		VALUES ($1, $2, 0, clock_timestamp())
-		ON CONFLICT (consumer, stream) DO NOTHING
-	`, consumer, stream); err != nil {
+	if err := queries.EnsureConsumerCursor(
+		ctx,
+		dbgen.EnsureConsumerCursorParams{
+			Consumer: consumer,
+			Stream:   stream,
+		},
+	); err != nil {
 		if isSerializationFailure(err) {
 			return 0, errCursorFirstTouchRace
 		}
@@ -567,30 +581,27 @@ func (c *Client) deliverPage(
 	if hook := c.testHooks.afterEnsureCursor; hook != nil {
 		hook()
 	}
-	var cursor int64
-	if err := tx.QueryRow(ctx, `
-		SELECT seq
-		FROM consumer_cursors
-		WHERE consumer = $1 AND stream = $2
-		FOR UPDATE
-	`, consumer, stream).Scan(&cursor); errors.Is(err, pgx.ErrNoRows) {
+	cursor, err := queries.GetConsumerCursorForUpdate(
+		ctx,
+		dbgen.GetConsumerCursorForUpdateParams{
+			Consumer: consumer,
+			Stream:   stream,
+		},
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
 		// REPEATABLE READ can observe a concurrent INSERT's uniqueness conflict
 		// without seeing the newly committed row in this transaction snapshot.
 		// Tail retries in a new snapshot; no handler or cursor effects exist yet.
 		return 0, errCursorFirstTouchRace
-	} else if isSerializationFailure(err) {
+	}
+	if isSerializationFailure(err) {
 		return 0, newCursorContention(consumer, stream, err)
-	} else if err != nil {
+	}
+	if err != nil {
 		return 0, fmt.Errorf("lock consumer cursor: %w", err)
 	}
-	var prunedThrough int64
-	if err := tx.QueryRow(ctx, `
-		SELECT COALESCE((
-		    SELECT pruned_through_seq
-		    FROM stream_horizons
-		    WHERE stream = $1
-		), 0)
-	`, stream).Scan(&prunedThrough); err != nil {
+	prunedThrough, err := queries.GetStreamPrunedThroughSequence(ctx, stream)
+	if err != nil {
 		return 0, fmt.Errorf("read stream horizon: %w", err)
 	}
 	if cursor < prunedThrough {
@@ -603,13 +614,13 @@ func (c *Client) deliverPage(
 		// C-S4/C-O4: record the protocol-level resync before returning it.
 		// There are no event-handler effects in this transaction, so committing
 		// the monotonic counter leaves the consumer cursor unchanged.
-		if _, err := tx.Exec(ctx, `
-			UPDATE consumer_cursors
-			SET resync_count = resync_count + 1,
-			    last_resync_at = clock_timestamp(),
-			    updated_at = clock_timestamp()
-			WHERE consumer = $1 AND stream = $2
-		`, consumer, stream); err != nil {
+		if err := queries.RecordConsumerResync(
+			ctx,
+			dbgen.RecordConsumerResyncParams{
+				Consumer: consumer,
+				Stream:   stream,
+			},
+		); err != nil {
 			return 0, fmt.Errorf("record stream resync: %w", err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -621,30 +632,34 @@ func (c *Client) deliverPage(
 		hook()
 	}
 
-	var safeSeq int64
-	if err := tx.QueryRow(ctx, `
-		SELECT safe_seq FROM stream_watermark WHERE singleton
-	`).Scan(&safeSeq); err != nil {
+	safeSeq, err := queries.GetStreamSafeSequence(ctx)
+	if err != nil {
 		return 0, fmt.Errorf("read stream watermark: %w", err)
 	}
-	rows, err := tx.Query(ctx, `
-		SELECT seq, stream, kind, entity_key, occurred_at, payload
-		FROM change_events
-		WHERE stream = $1
-		  AND seq > $2
-		  AND seq <= $3
-		ORDER BY seq
-		LIMIT $4
-	`, stream, cursor, safeSeq, c.batchSize)
+	eventRows, err := queries.PageChangeEvents(
+		ctx,
+		dbgen.PageChangeEventsParams{
+			Stream:     stream,
+			AfterSeq:   cursor,
+			ThroughSeq: safeSeq,
+			PageSize:   int32(c.batchSize),
+		},
+	)
 	if err != nil {
 		return 0, fmt.Errorf("page change events: %w", err)
 	}
-	events, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Event])
-	if err != nil {
-		return 0, fmt.Errorf("scan change events: %w", err)
+	events := make([]Event, 0, len(eventRows))
+	for _, row := range eventRows {
+		events = append(events, Event{
+			Seq:        row.Seq,
+			Stream:     row.Stream,
+			Kind:       row.Kind,
+			EntityKey:  row.EntityKey,
+			OccurredAt: row.OccurredAt.Time,
+			Payload:    append(json.RawMessage(nil), row.Payload...),
+		})
 	}
 	for _, event := range events {
-		event.Payload = append(json.RawMessage(nil), event.Payload...)
 		if err := handler(ctx, tx, event); err != nil {
 			return 0, fmt.Errorf(
 				"handle stream event %d: %w", event.Seq, err,
@@ -653,11 +668,14 @@ func (c *Client) deliverPage(
 		cursor = event.Seq
 	}
 	if len(events) > 0 {
-		if _, err := tx.Exec(ctx, `
-			UPDATE consumer_cursors
-			SET seq = $3, updated_at = clock_timestamp()
-			WHERE consumer = $1 AND stream = $2
-		`, consumer, stream, cursor); err != nil {
+		if err := queries.UpdateConsumerCursor(
+			ctx,
+			dbgen.UpdateConsumerCursorParams{
+				Seq:      cursor,
+				Consumer: consumer,
+				Stream:   stream,
+			},
+		); err != nil {
 			return 0, fmt.Errorf("advance consumer cursor: %w", err)
 		}
 	}

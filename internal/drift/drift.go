@@ -244,16 +244,11 @@ func (s *Service) Detect(
 	// differ from upstream; sampling then records noise findings that
 	// outlive the seed (observed as instant soak failures on slow CI
 	// runners). Skip the pass — with a heartbeat — until backfill is done.
-	var backfillDone bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1
-			FROM installation_backfill_cursors
-			WHERE installation_id = $1
-			  AND phase = 'done'
-			  AND completed_at IS NOT NULL
-		)
-	`, args.InstallationID).Scan(&backfillDone); err != nil {
+	backfillDone, err := dbgen.New(s.pool).IsInstallationBackfillDone(
+		ctx,
+		args.InstallationID,
+	)
+	if err != nil {
 		return nil, fmt.Errorf("check backfill completion: %w", err)
 	}
 	if !backfillDone {
@@ -591,25 +586,8 @@ func (s *Service) skipForOutstandingRefresh(
 	ctx context.Context,
 	spec *queue.RefreshSpec,
 ) (bool, error) {
-	var outstanding bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT
-		    EXISTS (
-		        SELECT 1
-		        FROM refresh_intent_generations
-		        WHERE refresh_key = $1
-		          AND completed_generation < generation
-		    )
-		    OR EXISTS (
-		        SELECT 1
-		        FROM river_job
-		        WHERE args->>'key' = $1
-		          AND state IN (
-		              'available', 'pending', 'retryable',
-		              'running', 'scheduled'
-		          )
-		    )
-	`, spec.Key).Scan(&outstanding); err != nil {
+	outstanding, err := dbgen.New(s.pool).HasOutstandingRefresh(ctx, spec.Key)
+	if err != nil {
 		return false, fmt.Errorf(
 			"check drift sample %s refresh quiescence: %w",
 			spec.Key,
