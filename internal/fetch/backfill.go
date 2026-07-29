@@ -108,7 +108,7 @@ func (h *Handler) advanceInstallationBackfill(
 ) error {
 	client := h.riverClient(ctx)
 	if client == nil {
-		return fmt.Errorf("River client missing from installation backfill")
+		return fmt.Errorf("river client missing from installation backfill")
 	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -480,7 +480,7 @@ func (h *Handler) advancePullRequestBackfill(
 ) error {
 	client := h.riverClient(ctx)
 	if client == nil {
-		return fmt.Errorf("River client missing from backfill context")
+		return fmt.Errorf("river client missing from backfill context")
 	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -675,7 +675,7 @@ func (h *Handler) advanceBackfill(
 ) error {
 	client := h.riverClient(ctx)
 	if client == nil {
-		return fmt.Errorf("River client missing from backfill context")
+		return fmt.Errorf("river client missing from backfill context")
 	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {

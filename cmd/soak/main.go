@@ -1117,7 +1117,7 @@ func waitHealthy(
 		}
 		response, err := client.Do(request)
 		if err == nil {
-			response.Body.Close()
+			_ = response.Body.Close()
 			if response.StatusCode >= 200 && response.StatusCode <= 299 {
 				return nil
 			}
@@ -1162,7 +1162,7 @@ func scrape(
 	if err != nil {
 		return nil, fmt.Errorf("scrape metrics: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		return nil, fmt.Errorf(
@@ -1395,7 +1395,7 @@ func assertConverged(
 	if err != nil {
 		return fmt.Errorf("read fake truth: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("read fake truth status %d", response.StatusCode)
 	}

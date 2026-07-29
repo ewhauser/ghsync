@@ -224,7 +224,7 @@ func (m *InstallationTokens) renew(ctx context.Context) (string, error) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return "", decodeHTTPError(resp)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var tokenResponse struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`

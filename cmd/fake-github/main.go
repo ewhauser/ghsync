@@ -29,7 +29,7 @@ func main() {
 			slog.Error("fake-github healthcheck failed", "error", err)
 			os.Exit(1)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			slog.Error("fake-github healthcheck failed", "status", resp.StatusCode)
 			os.Exit(1)

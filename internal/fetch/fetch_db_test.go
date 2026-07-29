@@ -832,7 +832,7 @@ func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
 		return err
 	}
 	if err := apply(); err == nil ||
-		!strings.Contains(err.Error(), "River client missing") {
+		!strings.Contains(err.Error(), "river client missing") {
 		t.Fatalf("missing River transaction error = %v", err)
 	}
 	var rolledBackRows int

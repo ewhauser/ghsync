@@ -238,7 +238,7 @@ func NewClient(
 		}
 		if maxWorkers <= 0 {
 			return nil, fmt.Errorf(
-				"River queue %q max workers must be positive",
+				"river queue %q max workers must be positive",
 				name,
 			)
 		}

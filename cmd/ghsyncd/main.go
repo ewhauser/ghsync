@@ -120,7 +120,7 @@ func backfill(args []string) error {
 	defer pool.Close()
 	riverClient, err := queue.NewClient(pool)
 	if err != nil {
-		return fmt.Errorf("River client: %w", err)
+		return fmt.Errorf("river client: %w", err)
 	}
 	cursor, err := fetch.StartInstallationBackfill(
 		ctx,

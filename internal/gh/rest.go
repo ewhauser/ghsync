@@ -488,7 +488,7 @@ func (c client) getJSON(
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return meta, decodeHTTPError(resp)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
 		return meta, fmt.Errorf("decode GitHub response: %w", err)
 	}

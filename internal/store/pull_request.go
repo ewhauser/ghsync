@@ -466,15 +466,7 @@ func encodeReviewThreads(threads []ReviewThreadRecord) ([]byte, error) {
 	}
 	encoded := make([]encodedThread, 0, len(threads))
 	for _, thread := range threads {
-		encoded = append(encoded, encodedThread{
-			ID:              thread.ID,
-			IsResolved:      thread.IsResolved,
-			IsOutdated:      thread.IsOutdated,
-			Path:            thread.Path,
-			Line:            thread.Line,
-			Comments:        thread.Comments,
-			GitHubUpdatedAt: thread.GitHubUpdatedAt,
-		})
+		encoded = append(encoded, encodedThread(thread))
 	}
 	value, err := json.Marshal(encoded)
 	if err != nil {

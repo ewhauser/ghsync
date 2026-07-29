@@ -108,7 +108,7 @@ func TestServesStacksWithRateHeaders(t *testing.T) {
 		"http://fake.test/repos/acme/monolith/stacks",
 		nil,
 	)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -131,7 +131,7 @@ func TestUnknownRepoIs404(t *testing.T) {
 		"http://fake.test/repos/acme/other/stacks",
 		nil,
 	)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
@@ -287,7 +287,7 @@ func TestPullsGoldenResponseDecodesThroughClientContract(t *testing.T) {
 		nil,
 	)
 	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +347,7 @@ func TestPullListHonorsSortDirectionAndPagination(t *testing.T) {
 	readNumbers := func(target string) []int {
 		t.Helper()
 		resp := serve(fake, http.MethodGet, target, nil)
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s status = %d", target, resp.StatusCode)
 		}
@@ -447,7 +447,7 @@ func TestSeparateFixedWindowRateBudgets(t *testing.T) {
 			"http://fake.test/graphql",
 			bytes.NewReader(nil),
 		)
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		var body map[string]any
 		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 			t.Fatal(err)
@@ -462,7 +462,7 @@ func TestSeparateFixedWindowRateBudgets(t *testing.T) {
 			"http://fake.test/repos/acme/monolith/stacks",
 			nil,
 		)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode, resp.Header
 	}
 
@@ -542,7 +542,7 @@ func TestSecondaryLimitModelsHeaderAndHeaderlessForms(t *testing.T) {
 			nil,
 		)
 		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -618,7 +618,7 @@ func TestInstallationTokenEndpointValidatesJWTAndReturnsCreated(t *testing.T) {
 		sign("99", wrongKey),
 	} {
 		resp := call(invalid)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("invalid JWT status = %d, want 401", resp.StatusCode)
 		}
@@ -891,7 +891,7 @@ func listPullRequests(
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var pulls []clientPullRequest
 	if err := json.NewDecoder(resp.Body).Decode(&pulls); err != nil {
 		return nil, resp.StatusCode, err

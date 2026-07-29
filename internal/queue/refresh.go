@@ -717,7 +717,7 @@ func InsertRefreshesTxReturning(
 		return nil, nil
 	}
 	if client == nil {
-		return nil, fmt.Errorf("River client is required")
+		return nil, fmt.Errorf("river client is required")
 	}
 	type generationPointer struct {
 		Kind            string `json:"kind"`
@@ -893,7 +893,7 @@ func completeRefresh[T river.JobArgs](
 	if generation > startedGeneration {
 		client := river.ClientFromContext[pgx.Tx](ctx)
 		if client == nil {
-			return fmt.Errorf("River client missing from refresh worker context")
+			return fmt.Errorf("river client missing from refresh worker context")
 		}
 		if _, err := client.InsertTx(
 			ctx,

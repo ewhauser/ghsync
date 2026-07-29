@@ -73,10 +73,10 @@ func (s *Server) validateAppAuthorization(
 		claims.Issuer != expectedIssuer ||
 		claims.IssuedAt == nil ||
 		claims.ExpiresAt == nil ||
-		claims.IssuedAt.Time.After(now) ||
-		claims.IssuedAt.Time.Before(now.Add(-time.Minute)) ||
-		!claims.ExpiresAt.Time.After(now) ||
-		claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time) > 10*time.Minute {
+		claims.IssuedAt.After(now) ||
+		claims.IssuedAt.Before(now.Add(-time.Minute)) ||
+		!claims.ExpiresAt.After(now) ||
+		claims.ExpiresAt.Sub(claims.IssuedAt.Time) > 10*time.Minute {
 		http.Error(w, "valid App JWT required", http.StatusUnauthorized)
 		return false
 	}
@@ -323,7 +323,7 @@ func (s *Server) sendWebhook(
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return resp.StatusCode, fmt.Errorf(
 			"webhook target returned %d",

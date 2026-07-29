@@ -772,7 +772,7 @@ func (h *Handler) insertFollowupsHook(
 	return func(ctx context.Context, tx pgx.Tx) error {
 		client := h.riverClient(ctx)
 		if client == nil {
-			return fmt.Errorf("River client missing from fetch transaction")
+			return fmt.Errorf("river client missing from fetch transaction")
 		}
 		return queue.InsertRefreshesTx(
 			ctx,
@@ -794,7 +794,7 @@ func (h *Handler) enqueue(
 	}
 	client := h.riverClient(ctx)
 	if client == nil {
-		return fmt.Errorf("River client missing from fetch context")
+		return fmt.Errorf("river client missing from fetch context")
 	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {

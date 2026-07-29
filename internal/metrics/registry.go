@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/otlptranslator"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -42,7 +43,7 @@ func New() (*Registry, error) {
 		otelprom.WithRegisterer(promRegistry),
 		otelprom.WithoutScopeInfo(),
 		otelprom.WithoutTargetInfo(),
-		otelprom.WithoutUnits(),
+		otelprom.WithTranslationStrategy(otlptranslator.UnderscoreEscapingWithSuffixes),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create Prometheus exporter: %w", err)

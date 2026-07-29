@@ -2,3 +2,4 @@
 /fake-github
 *.pem
 .env
+.tools/
