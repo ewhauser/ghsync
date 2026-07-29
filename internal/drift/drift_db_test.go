@@ -408,6 +408,159 @@ func TestDetectRecordsZeroSampleHeartbeat(t *testing.T) {
 	}
 }
 
+func TestStackDriftIgnoresMemberUpdatedAtChurn(t *testing.T) {
+	pool := driftTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake := fakegithub.New(fixture, "drift-secret")
+	server := httptest.NewServer(fake)
+	defer server.Close()
+	gate := budget.New(server.Client(), budget.Options{})
+	rest, err := gh.NewRESTClient(
+		server.URL,
+		gate,
+		gh.StaticToken("fake-installation-drift"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphQL, err := gh.NewGraphQLClient(
+		server.URL,
+		gate,
+		gh.StaticToken("fake-installation-drift"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := fetch.New(fetch.Options{
+		Pool:           pool,
+		REST:           rest,
+		GraphQL:        graphQL,
+		InstallationID: 1,
+		OrgID:          1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(Options{
+		Pool:    pool,
+		REST:    rest,
+		GraphQL: graphQL,
+		Config: Config{
+			InstallationID:     1,
+			Period:             time.Hour,
+			SampleSize:         100,
+			PageSize:           100,
+			ResolvedRetention:  30 * 24 * time.Hour,
+			RetentionBatchSize: 100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	riverClient, err := queue.NewClient(
+		pool,
+		queue.WithRefreshHandler(handler),
+		queue.WithWorkerRegistrar(service.RegisterWorker),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.SetRiverClient(riverClient)
+	service.SetRiverClient(riverClient)
+	ctx := context.Background()
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := riverClient.Start(runCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	}()
+	if err := handler.ResolveStackMembership(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewResolveStackMembershipArgs(
+				"pr:acme/monolith:4812",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.RefreshPR(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshPRArgs(
+				"pr:acme/monolith:4812",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.RefreshStack(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshStackArgs(
+				"stack:acme/monolith:142",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.RefreshChecks(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshChecksArgs(
+				"checks:acme/monolith:8f31c2d",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.RefreshRepoRules(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshRepoRulesArgs(
+				"repo_rules:acme/monolith:rules",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForCacheProducers(t, pool)
+
+	// A review or comment on a member bumps only its updated_at upstream.
+	// Dispatcher rules owe no stack refresh for that, so the cached stack
+	// legitimately lags on the field; drift must not treat it as
+	// divergence.
+	fixture.PullRequests[1].UpdatedAt = fixture.PullRequests[1].UpdatedAt.Add(
+		time.Minute,
+	)
+	fake.SetFixture(fixture)
+	findings, err := service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf(
+			"member updated_at churn produced drift findings: %+v",
+			findings,
+		)
+	}
+}
+
 func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	t *testing.T,
 ) {

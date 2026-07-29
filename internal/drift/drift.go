@@ -919,13 +919,16 @@ func (s *Service) fullFetch(
 		}
 		entries := make([]map[string]any, 0, len(stack.PullRequests))
 		for _, pull := range stack.PullRequests {
+			// updated_at is deliberately absent: it is freshness
+			// metadata, and dispatcher rules do not refresh stacks on
+			// every member event that bumps it. drift_entities strips
+			// the same field from the cache-side entries.
 			entry := map[string]any{
-				"number":     pull.Number,
-				"state":      pull.State,
-				"draft":      pull.Draft,
-				"updated_at": pull.UpdatedAt,
-				"head_ref":   pull.Head.Ref,
-				"head_sha":   pull.Head.SHA,
+				"number":   pull.Number,
+				"state":    pull.State,
+				"draft":    pull.Draft,
+				"head_ref": pull.Head.Ref,
+				"head_sha": pull.Head.SHA,
 			}
 			if pull.MergedAt != nil {
 				entry["merged_at"] = pull.MergedAt
