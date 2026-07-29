@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
 
 	"github.com/acme/frontier/internal/fakegithub"
 	"github.com/acme/frontier/internal/ingress"
@@ -23,6 +24,209 @@ import (
 )
 
 const testWebhookSecret = "dispatch-test-secret"
+
+func TestConcurrentDispatchersLockGenerationKeysInDeterministicOrder(t *testing.T) {
+	pool := dispatchTestDatabase(t)
+	poolA := cloneDispatchPool(t, pool)
+	poolB := cloneDispatchPool(t, pool)
+	riverA, err := queue.NewClient(poolA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	riverB, err := queue.NewClient(poolB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		iterations = 30
+		keyCount   = 20
+	)
+	dispatchTime := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	newDispatcher := func(
+		dispatchPool *pgxpool.Pool,
+		riverClient *river.Client[pgx.Tx],
+	) *Dispatcher {
+		return New(dispatchPool, riverClient, Config{
+			BatchSize:    keyCount,
+			MaxAttempts:  3,
+			Debounce:     5 * time.Second,
+			PollInterval: time.Millisecond,
+			Now:          func() time.Time { return dispatchTime },
+			Classifier: NewClassifier([]Rule{{
+				Event:  "pull_request",
+				Action: ActionAny,
+				Target: TargetPullRequest,
+			}}),
+		})
+	}
+	dispatcherA := newDispatcher(poolA, riverA)
+	dispatcherB := newDispatcher(poolB, riverB)
+
+	for iteration := 0; iteration < iterations; iteration++ {
+		repo := fmt.Sprintf("acme/concurrent-%02d", iteration)
+		guidPrefix := fmt.Sprintf("concurrent-%02d-", iteration)
+		receivedAt := dispatchTime.Add(time.Duration(iteration) * time.Minute)
+		batch := &pgx.Batch{}
+		for index := 0; index < keyCount; index++ {
+			for _, group := range []struct {
+				name   string
+				number int
+				offset time.Duration
+			}{
+				{name: "a", number: index + 1},
+				{
+					name:   "b",
+					number: keyCount - index,
+					offset: time.Second,
+				},
+			} {
+				payload, marshalErr := json.Marshal(map[string]any{
+					"action":     "opened",
+					"number":     group.number,
+					"repository": map[string]any{"full_name": repo},
+					"pull_request": map[string]any{
+						"number": group.number,
+						"stack":  nil,
+					},
+				})
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
+				batch.Queue(`
+					INSERT INTO webhook_deliveries (
+						delivery_guid, event, raw_body, headers, received_at
+					)
+					VALUES ($1, 'pull_request', $2, '{}'::jsonb, $3)
+				`,
+					fmt.Sprintf(
+						"%s%s-%02d",
+						guidPrefix,
+						group.name,
+						index,
+					),
+					payload,
+					receivedAt.Add(group.offset),
+				)
+			}
+		}
+		results := pool.SendBatch(context.Background(), batch)
+		if err := results.Close(); err != nil {
+			t.Fatalf("iteration %d seed deliveries: %v", iteration, err)
+		}
+
+		claimedA := make(chan struct{})
+		claimedB := make(chan struct{})
+		releaseClaims := make(chan struct{})
+		dispatcherA.afterClaim = func() {
+			close(claimedA)
+			<-releaseClaims
+		}
+		dispatcherB.afterClaim = func() {
+			close(claimedB)
+			<-releaseClaims
+		}
+		outcomes := make(chan error, 2)
+		runDispatcher := func(dispatcher *Dispatcher) {
+			go func(dispatcher *Dispatcher) {
+				ctx, cancel := context.WithTimeout(
+					context.Background(),
+					10*time.Second,
+				)
+				defer cancel()
+				count, dispatchErr := dispatcher.DispatchBatch(ctx)
+				if dispatchErr == nil && count != keyCount {
+					dispatchErr = fmt.Errorf(
+						"claimed %d deliveries, want %d",
+						count,
+						keyCount,
+					)
+				}
+				outcomes <- dispatchErr
+			}(dispatcher)
+		}
+		runDispatcher(dispatcherA)
+		select {
+		case <-claimedA:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("iteration %d dispatcher A did not claim", iteration)
+		}
+		runDispatcher(dispatcherB)
+		select {
+		case <-claimedB:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("iteration %d dispatcher B did not claim", iteration)
+		}
+		close(releaseClaims)
+		for range 2 {
+			if err := <-outcomes; err != nil {
+				t.Fatalf("iteration %d concurrent dispatch: %v", iteration, err)
+			}
+		}
+
+		var deliveries, processedOnce int
+		if err := pool.QueryRow(context.Background(), `
+			SELECT
+				count(*),
+				count(*) FILTER (
+					WHERE status = 'processed' AND attempts = 1
+				)
+			FROM webhook_deliveries
+			WHERE delivery_guid LIKE $1
+		`, guidPrefix+"%").Scan(&deliveries, &processedOnce); err != nil {
+			t.Fatal(err)
+		}
+		if deliveries != 2*keyCount || processedOnce != deliveries {
+			t.Fatalf(
+				"iteration %d deliveries=%d processed_once=%d, want %d",
+				iteration,
+				deliveries,
+				processedOnce,
+				2*keyCount,
+			)
+		}
+
+		var generationKeys, generationTwo int
+		if err := pool.QueryRow(context.Background(), `
+			SELECT
+				count(*),
+				count(*) FILTER (WHERE generation = 2)
+			FROM refresh_intent_generations
+			WHERE refresh_key LIKE $1
+		`, "pr:"+repo+":%").Scan(&generationKeys, &generationTwo); err != nil {
+			t.Fatal(err)
+		}
+		if generationKeys != keyCount || generationTwo != generationKeys {
+			t.Fatalf(
+				"iteration %d generation keys=%d at_generation_2=%d, want %d",
+				iteration,
+				generationKeys,
+				generationTwo,
+				keyCount,
+			)
+		}
+
+		var jobs, duplicateJobs int
+		if err := pool.QueryRow(context.Background(), `
+			SELECT
+				count(*),
+				count(*) - count(DISTINCT (kind, args->>'key'))
+			FROM river_job
+			WHERE args->>'key' LIKE $1
+		`, "%:"+repo+":%").Scan(&jobs, &duplicateJobs); err != nil {
+			t.Fatal(err)
+		}
+		if jobs != keyCount || duplicateJobs != 0 {
+			t.Fatalf(
+				"iteration %d River jobs=%d duplicate kind/keys=%d, want %d/0",
+				iteration,
+				jobs,
+				duplicateJobs,
+				keyCount,
+			)
+		}
+	}
+}
 
 func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 	pool := dispatchTestDatabase(t)
@@ -352,6 +556,7 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	)
 	defer server.Close()
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
+	observer := &recordingDispatchObserver{}
 	dispatcher := New(pool, riverClient, Config{
 		BatchSize:    10,
 		MaxAttempts:  2,
@@ -359,6 +564,7 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 		PollInterval: time.Millisecond,
 		Now:          time.Now,
 		Classifier:   DefaultClassifier(),
+		Observer:     observer,
 	})
 
 	if _, err := fake.EmitWebhookWithGUID(
@@ -408,6 +614,12 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	}
 	if unknown.Status != "processed" || unknown.LastError.Valid {
 		t.Fatalf("unknown delivery = %+v", unknown)
+	}
+	if !reflect.DeepEqual(observer.unmatchedEvents, []string{"unknown_event"}) {
+		t.Fatalf(
+			"unmatched event signals = %#v, want [unknown_event]",
+			observer.unmatchedEvents,
+		)
 	}
 
 	requeued, err := dbgen.New(pool).RequeueParkedWebhookDeliveries(
@@ -514,6 +726,19 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	}
 }
 
+type recordingDispatchObserver struct {
+	unmatchedEvents []string
+}
+
+func (*recordingDispatchObserver) DispatchBatch(context.Context, int, int) {}
+
+func (observer *recordingDispatchObserver) DispatchUnmatchedEvent(
+	_ context.Context,
+	event string,
+) {
+	observer.unmatchedEvents = append(observer.unmatchedEvents, event)
+}
+
 func dispatchTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
@@ -565,6 +790,22 @@ func dispatchTestDatabase(t *testing.T) *pgxpool.Pool {
 		admin.Close()
 	})
 	return pool
+}
+
+func cloneDispatchPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	clone, err := pgxpool.NewWithConfig(ctx, pool.Config())
+	if err != nil {
+		t.Fatalf("clone dispatch pool: %v", err)
+	}
+	if err := clone.Ping(ctx); err != nil {
+		clone.Close()
+		t.Fatalf("ping cloned dispatch pool: %v", err)
+	}
+	t.Cleanup(clone.Close)
+	return clone
 }
 
 func drainDispatcher(t *testing.T, dispatcher *Dispatcher) {

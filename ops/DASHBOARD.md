@@ -29,10 +29,19 @@ This row alone answers the on-call question. Link each stat to its runbook.
 - Event-to-cache p50/p95/p99 with fixed 20s and 60s lines.
 - Queue depth by queue, oldest delivery age, and dispatch batch-size heatmap.
 - Fetch rate by kind, CAS reject ratio, tombstones, and the 15-minute
-  sweep-scoped ratio
-  `rate(frontier_c_b4_conditional_304s_total{class="sweep"}[15m]) /
-  rate(frontier_c_b4_conditional_requests_total{class="sweep"}[15m]`
-  with a fixed 0.80 line.
+  sweep-scoped ratio below, with a fixed 0.80 line. The denominator gate
+  leaves quiet windows blank; the alert separately treats absent counters as
+  a signal failure.
+
+  ```promql
+  (
+    sum(increase(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
+    /
+    sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))
+  )
+  and
+  sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])) > 0
+  ```
 
 ## Row 3: reconciliation and budget
 

@@ -1,5 +1,8 @@
 [
   {"kind":"refresh_pr","key":"pr:acme/monolith:4800","priority":"event"},
+  {"kind":"refresh_pr","key":"pr:acme/monolith:4830","priority":"event"},
+  {"kind":"refresh_pr","key":"pr:acme/monolith:4831","priority":"event"},
+  {"kind":"refresh_pr","key":"pr:acme/monolith:4832","priority":"event"},
   {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4800","priority":"event"},
   {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4810","priority":"event"},
   {"kind":"resolve_stack_membership","key":"pr:acme/monolith:4812","priority":"event"},

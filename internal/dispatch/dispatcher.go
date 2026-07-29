@@ -3,10 +3,17 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"net"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
@@ -34,6 +41,14 @@ type Observer interface {
 	DispatchBatch(context.Context, int, int)
 }
 
+// UnmatchedEventObserver is an optional coverage-gap signal. Dispatcher also
+// logs every committed delivery that matched zero configured rules so the
+// signal remains visible when the batch observer does not implement this
+// interface.
+type UnmatchedEventObserver interface {
+	DispatchUnmatchedEvent(context.Context, string)
+}
+
 type noopObserver struct{}
 
 func (noopObserver) DispatchBatch(context.Context, int, int) {}
@@ -43,6 +58,10 @@ type Dispatcher struct {
 	pool   *pgxpool.Pool
 	river  *river.Client[pgx.Tx]
 	config Config
+
+	dispatchBatch func(context.Context) (int, error)
+	retryDelay    func(time.Duration) time.Duration
+	afterClaim    func()
 }
 
 func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *Dispatcher {
@@ -65,27 +84,92 @@ func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *
 	if config.Observer == nil {
 		config.Observer = noopObserver{}
 	}
-	return &Dispatcher{pool: pool, river: riverClient, config: config}
+	dispatcher := &Dispatcher{
+		pool:   pool,
+		river:  riverClient,
+		config: config,
+	}
+	dispatcher.dispatchBatch = dispatcher.DispatchBatch
+	dispatcher.retryDelay = jitteredRetryDelay
+	return dispatcher
 }
 
 // Run continuously drains available batches and polls when idle.
 func (d *Dispatcher) Run(ctx context.Context) error {
-	timer := time.NewTimer(d.config.PollInterval)
-	defer timer.Stop()
 	for {
-		count, err := d.DispatchBatch(ctx)
+		count, err := d.dispatchBatch(ctx)
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return nil
+			}
+			if !retryableDispatchError(err) {
+				return err
+			}
+			delay := d.retryDelay(d.config.PollInterval)
+			slog.WarnContext(
+				ctx,
+				"retryable dispatcher batch error",
+				"error", err,
+				"retry_in", delay,
+			)
+			if !waitForDispatch(ctx, delay) {
+				return nil
+			}
+			continue
 		}
 		if count > 0 {
 			continue
 		}
-		timer.Reset(d.config.PollInterval)
+		if !waitForDispatch(ctx, d.config.PollInterval) {
+			return nil
+		}
+	}
+}
+
+func retryableDispatchError(err error) bool {
+	var sqlState interface{ SQLState() string }
+	if errors.As(err, &sqlState) {
+		code := sqlState.SQLState()
+		if code == "40001" ||
+			code == "40P01" ||
+			strings.HasPrefix(code, "08") {
+			return true
+		}
+	}
+	var connectError *pgconn.ConnectError
+	if errors.As(err, &connectError) ||
+		errors.Is(err, pgconn.ErrConnClosed) ||
+		pgconn.SafeToRetry(err) ||
+		pgconn.Timeout(err) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
+}
+
+func jitteredRetryDelay(interval time.Duration) time.Duration {
+	if interval <= time.Nanosecond {
+		return interval
+	}
+	return interval/2 + time.Duration(rand.Int64N(int64(interval)))
+}
+
+func waitForDispatch(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-timer.C:
+			return false
+		default:
+			return true
 		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -109,6 +193,9 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 		}
 		return 0, nil
 	}
+	if d.afterClaim != nil {
+		d.afterClaim()
+	}
 
 	type deliveryResult struct {
 		DeliveryGUID string `json:"delivery_guid"`
@@ -118,9 +205,10 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	results := make([]deliveryResult, 0, len(deliveries))
 	intents := make([]Intent, 0, len(deliveries))
 	intentReceivedAt := make(map[Intent]time.Time, len(deliveries))
+	unmatchedEvents := make([]string, 0)
 	parked := 0
 	for _, delivery := range deliveries {
-		classified, classifyErr := d.config.Classifier.Classify(
+		result, classifyErr := d.config.Classifier.classify(
 			delivery.Event,
 			delivery.RawBody,
 		)
@@ -137,6 +225,10 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 			})
 			continue
 		}
+		if result.matchedRules == 0 {
+			unmatchedEvents = append(unmatchedEvents, delivery.Event)
+		}
+		classified := result.intents
 		intents = append(intents, classified...)
 		for _, intent := range classified {
 			receivedAt := delivery.ReceivedAt.Time
@@ -199,6 +291,16 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("commit dispatch batch: %w", err)
 	}
 	d.config.Observer.DispatchBatch(ctx, len(deliveries), parked)
+	for _, event := range unmatchedEvents {
+		slog.WarnContext(
+			ctx,
+			"webhook event matched zero dispatcher rules",
+			"event", event,
+		)
+		if observer, ok := d.config.Observer.(UnmatchedEventObserver); ok {
+			observer.DispatchUnmatchedEvent(ctx, event)
+		}
+	}
 	return len(deliveries), nil
 }
 
@@ -252,6 +354,16 @@ func dedupeIntents(intents []Intent) []Intent {
 		seen[intent] = struct{}{}
 		deduped = append(deduped, intent)
 	}
+	// Match the SQL upsert's conflict-row lock order across dispatcher replicas.
+	sort.Slice(deduped, func(i, j int) bool {
+		if deduped[i].Kind != deduped[j].Kind {
+			return deduped[i].Kind < deduped[j].Kind
+		}
+		if deduped[i].Key != deduped[j].Key {
+			return deduped[i].Key < deduped[j].Key
+		}
+		return deduped[i].Priority < deduped[j].Priority
+	})
 	return deduped
 }
 

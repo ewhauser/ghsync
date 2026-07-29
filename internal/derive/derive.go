@@ -162,6 +162,13 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
 
+	// Q1: the writer fence is deliberately the outermost lock in this
+	// outbox-writing transaction. Taking dirty-row locks first lets a pending
+	// watermarker and a fenced entity writer form a soft-deadlock cycle.
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+		return 0, err
+	}
+
 	rows, err := tx.Query(ctx, `
 		SELECT scope_key
 		FROM derivation_dirty
@@ -207,9 +214,6 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 	encoded, err := json.Marshal(items)
 	if err != nil {
 		return 0, fmt.Errorf("encode derived work items: %w", err)
-	}
-	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
-		return 0, err
 	}
 
 	// C-P5: each claimed scope's complete prior set is reconciled with the

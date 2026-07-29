@@ -22,9 +22,17 @@ FROM pg_stat_activity
 WHERE datname = current_database()
 ORDER BY xact_start NULLS LAST;
 
-SELECT locktype, mode, granted, pid
-FROM pg_locks WHERE locktype = 'advisory'
-ORDER BY granted, pid;
+SELECT locks.pid, activity.application_name, locks.mode, locks.granted,
+       pg_blocking_pids(locks.pid) AS blocking_pids,
+       activity.state, activity.xact_start,
+       activity.wait_event_type, activity.wait_event,
+       left(activity.query, 160) AS query
+FROM pg_locks AS locks
+JOIN pg_stat_activity AS activity USING (pid)
+WHERE locks.locktype = 'advisory'
+  AND locks.classid = 1181904750
+  AND locks.objid = 1953064306
+ORDER BY locks.granted, locks.pid;
 ```
 
 The exclusive fence waits only for registered outbox writers; bootstrap

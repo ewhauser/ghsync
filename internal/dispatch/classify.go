@@ -66,6 +66,21 @@ func DefaultRules() []Rule {
 			Action: ActionAny,
 			Target: TargetResolveStackMembership,
 		},
+		{
+			Event:  "pull_request_review",
+			Action: ActionAny,
+			Target: TargetPullRequest,
+		},
+		{
+			Event:  "pull_request_review_comment",
+			Action: ActionAny,
+			Target: TargetPullRequest,
+		},
+		{
+			Event:  "pull_request_review_thread",
+			Action: ActionAny,
+			Target: TargetPullRequest,
+		},
 		{Event: "check_run", Action: ActionAny, Target: TargetChecks},
 		{Event: "check_suite", Action: ActionAny, Target: TargetChecks},
 		{
@@ -146,7 +161,14 @@ func validateRule(rule Rule) error {
 		)
 	}
 	switch rule.Target {
-	case TargetPullRequest, TargetResolveStackMembership:
+	case TargetPullRequest:
+		if !isPullRequestEvent(rule.Event) {
+			return fmt.Errorf(
+				"target %q requires a pull-request event",
+				rule.Target,
+			)
+		}
+	case TargetResolveStackMembership:
 		if rule.Event != "pull_request" {
 			return fmt.Errorf(
 				"target %q requires event pull_request",
@@ -180,6 +202,18 @@ func validateRule(rule Rule) error {
 		}
 	}
 	return nil
+}
+
+func isPullRequestEvent(event string) bool {
+	switch event {
+	case "pull_request",
+		"pull_request_review",
+		"pull_request_review_comment",
+		"pull_request_review_thread":
+		return true
+	default:
+		return false
+	}
 }
 
 func validTarget(target Target) bool {
@@ -221,9 +255,19 @@ type payloadEnvelope struct {
 	} `json:"check_suite"`
 }
 
+type classification struct {
+	intents      []Intent
+	matchedRules int
+}
+
 // Classify parses only events that have a configured rule. Unknown events are
 // successful no-ops even when their bodies are malformed (C-I5).
 func (c Classifier) Classify(event string, body []byte) ([]Intent, error) {
+	result, err := c.classify(event, body)
+	return result.intents, err
+}
+
+func (c Classifier) classify(event string, body []byte) (classification, error) {
 	eventRules := make([]Rule, 0, 1)
 	for _, rule := range c.rules {
 		if rule.Event == event {
@@ -231,34 +275,36 @@ func (c Classifier) Classify(event string, body []byte) ([]Intent, error) {
 		}
 	}
 	if len(eventRules) == 0 {
-		return nil, nil
+		return classification{}, nil
 	}
 
 	var payload payloadEnvelope
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decode %s payload: %w", event, err)
+		return classification{}, fmt.Errorf("decode %s payload: %w", event, err)
 	}
 
+	matchedRules := 0
 	seen := make(map[string]struct{}, len(eventRules))
 	intents := make([]Intent, 0, len(eventRules))
 	for _, rule := range eventRules {
 		if rule.Action != ActionAny && rule.Action != payload.Action {
 			continue
 		}
+		matchedRules++
 		target := rule.Target
 		if rule.StackedTarget != "" && payloadStack(payload) != nil {
 			target = rule.StackedTarget
 		}
 		key, emit, err := intentKey(target, event, payload)
 		if err != nil {
-			return nil, err
+			return classification{}, err
 		}
 		if !emit {
 			continue
 		}
 		kind, err := jobKind(target)
 		if err != nil {
-			return nil, err
+			return classification{}, err
 		}
 		identity := kind + "\x00" + key
 		if _, duplicate := seen[identity]; duplicate {
@@ -271,7 +317,10 @@ func (c Classifier) Classify(event string, body []byte) ([]Intent, error) {
 			Priority: PriorityEvent,
 		})
 	}
-	return intents, nil
+	return classification{
+		intents:      intents,
+		matchedRules: matchedRules,
+	}, nil
 }
 
 func intentKey(

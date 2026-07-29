@@ -311,6 +311,9 @@ func (g *Gate) tryAdmit(
 	if g.unavailable == nil && !g.leaseUntil.IsZero() &&
 		!now.Before(g.leaseUntil) {
 		g.unavailable = ErrLeaseLost
+		if g.lease != nil {
+			g.lease.cancel()
+		}
 		g.signalLocked()
 	}
 	if g.unavailable != nil {
@@ -591,8 +594,19 @@ func (g *Gate) observeSecondaryLimit(
 	// Secondary-limit coordination is the deliberate exception to C-P6's
 	// periodic snapshots: losing this installation-wide closure on handoff is
 	// unsafe, so persist it synchronously under the lease token.
-	if err := g.persistBackoff(ctx, until); err != nil {
-		g.loseLease(fmt.Errorf("%w: persist secondary-limit backoff: %v", ErrLeaseLost, err))
+	ok, err := g.persistBackoff(ctx, until)
+	if err != nil {
+		// The in-memory closure remains authoritative and the periodic snapshot
+		// loop will retry persistence. A transport error does not prove that
+		// this runtime lost the lease.
+		return err
+	}
+	if !ok {
+		err := fmt.Errorf(
+			"%w: persist secondary-limit backoff: ownership lost",
+			ErrLeaseLost,
+		)
+		g.loseLease(err)
 		return err
 	}
 	return nil
@@ -745,6 +759,11 @@ func (g *Gate) stopAdmission(err error) {
 func (g *Gate) loseLease(err error) {
 	if err == nil {
 		err = ErrLeaseLost
+	}
+	if g.lease != nil {
+		// Refusing admission and renewing the lease must be one state
+		// transition. Otherwise no replacement process can acquire the gate.
+		g.lease.cancel()
 	}
 	g.stopAdmission(err)
 	g.cancelAdmissions()

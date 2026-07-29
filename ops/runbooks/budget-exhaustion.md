@@ -2,8 +2,8 @@
 
 ## Symptoms
 
-- `FrontierBudgetFloorBreached`, `FrontierBudgetClassStarved`, or
-  `FrontierSecondaryGateClosed`.
+- `FrontierBudgetClassStarved`, `FrontierSecondaryGateClosed`, or
+  `FrontierSweepConditionalHitRateLow`.
 - Event/sweep queues grow while interactive work continues.
 - Sweep 304 ratio falls below 80 percent.
 

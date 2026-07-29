@@ -9,6 +9,8 @@ WITH intents AS (
         NULLIF(element->>'event_received_at', '')::timestamptz
             AS event_received_at
     FROM jsonb_array_elements(sqlc.arg(intents)::jsonb) AS element
+    -- Upsert conflict-row locks must be acquired in the same order everywhere.
+    ORDER BY kind, refresh_key
 )
 INSERT INTO refresh_intent_generations (
     kind, refresh_key, generation, deadline_at, event_received_at

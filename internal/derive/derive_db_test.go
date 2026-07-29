@@ -12,6 +12,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/acme/frontier/internal/outbox"
+	"github.com/acme/frontier/internal/store"
+	"github.com/acme/frontier/internal/stream"
 	"github.com/acme/frontier/internal/testdb"
 )
 
@@ -130,6 +133,209 @@ func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
 	}
 	if marked.Before(remarkedAt) {
 		t.Fatalf("surviving mark = %s, want >= %s", marked, remarkedAt)
+	}
+}
+
+func TestFencedDirtyMarkWithConcurrentWatermarkerDoesNotStall(t *testing.T) {
+	pool := deriveDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "fence-order")
+	identity := PullRequestIdentity(repositoryID, 42)
+	entered := make(chan Snapshot, 1)
+	release := make(chan struct{})
+	service, err := New(Options{
+		Pool: pool,
+		Deriver: blockingDeriver{
+			entered: entered,
+			release: release,
+			next: fixedDeriver{item: &WorkItem{
+				IdentityKey: identity,
+				OrgID:       1,
+				Payload:     json.RawMessage(`{"state":"before-writer"}`),
+			}},
+		},
+		DirtyCap: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type passResult struct {
+		count int
+		err   error
+	}
+	passDone := make(chan passResult, 1)
+	go func() {
+		count, err := service.RunOnce(ctx)
+		passDone <- passResult{count: count, err: err}
+	}()
+	<-entered
+
+	// Establish how many shared fence holders the deriver contributes. Before
+	// the Q1 fix this is zero; after it, this is one. Waiting for one additional
+	// holder proves the real entity writer has acquired the fence before the
+	// watermarker queues its exclusive request.
+	baselineWriters := fenceLockCount(t, ctx, pool, "ShareLock", true)
+	writer := store.NewEntityWriter(pool)
+	entityKey := store.PullRequestEntityKey(1, repositoryID, 42)
+	observation, err := writer.BeginObservation(ctx, entityKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observation.Close() //nolint:errcheck
+	now := time.Now().UTC().Add(time.Minute)
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := writer.ApplyPullRequestObserved(
+			ctx,
+			observation,
+			store.PullRequestRecord{
+				Repository: store.RepositoryRecord{
+					InstallationID: 1,
+					OrgID:          1,
+					GitHubID:       repositoryID,
+					NodeID:         fmt.Sprintf("R_%d", repositoryID),
+					Owner:          "m5-fence-order",
+					Name:           fmt.Sprintf("repo-%d", repositoryID),
+					FullName: fmt.Sprintf(
+						"m5-fence-order/repo-%d",
+						repositoryID,
+					),
+					DefaultBranch:   "main",
+					DefaultHeadSHA:  "base-sha",
+					GitHubUpdatedAt: now,
+				},
+				GitHubID:        repositoryID*100 + 42,
+				NodeID:          fmt.Sprintf("PR_%d", repositoryID),
+				Number:          42,
+				Title:           "M5 test updated mid-pass",
+				State:           "open",
+				AuthorLogin:     "tester",
+				HeadRef:         "feature",
+				HeadSHA:         fmt.Sprintf("head-%d", repositoryID),
+				BaseRef:         "main",
+				BaseSHA:         "base-sha",
+				GitHubUpdatedAt: now,
+				SyncedAt:        now,
+				Source:          store.SyncSourceManual,
+			},
+			nil,
+		)
+		writerDone <- err
+	}()
+	waitForFenceLocks(
+		t,
+		ctx,
+		pool,
+		"ShareLock",
+		true,
+		baselineWriters+1,
+	)
+
+	watermarker, err := stream.NewWatermarker(
+		pool,
+		stream.WatermarkOptions{
+			RefreshInterval: 10 * time.Millisecond,
+			LeaseTTL:        time.Second,
+			Owner: fmt.Sprintf(
+				"derive-fence-order-%d",
+				time.Now().UnixNano(),
+			),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	type stepResult struct {
+		progress stream.WatermarkProgress
+		err      error
+	}
+	stepDone := make(chan stepResult, 1)
+	go func() {
+		progress, err := watermarker.Step(ctx)
+		stepDone <- stepResult{progress: progress, err: err}
+	}()
+	waitForFenceLocks(t, ctx, pool, "ExclusiveLock", false, 1)
+
+	releasedAt := time.Now()
+	close(release)
+	pass := <-passDone
+	passDuration := time.Since(releasedAt)
+	if pass.err != nil {
+		t.Fatal(pass.err)
+	}
+	if pass.count != 1 {
+		t.Fatalf("claimed dirty scopes = %d, want 1", pass.count)
+	}
+	if passDuration >= 500*time.Millisecond {
+		t.Fatalf(
+			"derivation pass stalled %s after release; want < 500ms",
+			passDuration,
+		)
+	}
+	if err := <-writerDone; err != nil {
+		t.Fatal(err)
+	}
+	step := <-stepDone
+	if step.err != nil {
+		t.Fatal(step.err)
+	}
+
+	var dirty int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM derivation_dirty
+		WHERE scope_key = $1
+	`, scope).Scan(&dirty); err != nil {
+		t.Fatal(err)
+	}
+	if dirty != 1 {
+		t.Fatalf("mid-pass fenced writer left %d dirty marks, want 1", dirty)
+	}
+
+	var eventCount int
+	var greatestSeq int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), COALESCE(max(seq), 0)
+		FROM change_events
+		WHERE (
+		    stream = $1
+		    AND kind = $2
+		    AND entity_key = $3
+		) OR (
+		    stream = $4
+		    AND kind = $5
+		    AND entity_key = $6
+		)
+	`,
+		outbox.WorkItemsStream,
+		outbox.WorkItemChangedKind,
+		identity,
+		outbox.EntitiesStream,
+		outbox.PullRequestChangedKind,
+		entityKey,
+	).Scan(&eventCount, &greatestSeq); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 2 {
+		t.Fatalf("concurrent transactions retained %d events, want 2", eventCount)
+	}
+	if step.progress.SafeSeq < greatestSeq {
+		t.Fatalf(
+			"watermark safe seq %d did not cover concurrent event seq %d",
+			step.progress.SafeSeq,
+			greatestSeq,
+		)
+	}
+
+	service.deriver = NoopDeriver{}
+	if count, err := service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	} else if count != 1 {
+		t.Fatalf("follow-up pass claimed %d dirty scopes, want 1", count)
 	}
 }
 
@@ -300,11 +506,15 @@ func TestStableIdentityHelpers(t *testing.T) {
 type blockingDeriver struct {
 	entered chan<- Snapshot
 	release <-chan struct{}
+	next    Deriver
 }
 
 func (d blockingDeriver) Derive(snapshot Snapshot) []ScopeResult {
 	d.entered <- snapshot
 	<-d.release
+	if d.next != nil {
+		return d.next.Derive(snapshot)
+	}
 	return NoopDeriver{}.Derive(snapshot)
 }
 
@@ -409,4 +619,63 @@ func deriveDatabase(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(database.Close)
 	return database.Pool
+}
+
+func waitForFenceLocks(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	mode string,
+	granted bool,
+	want int,
+) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if fenceLockCount(t, ctx, pool, mode, granted) >= want {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-deadline.C:
+			t.Fatalf(
+				"timed out waiting for %d outbox fence locks (%s, granted=%t)",
+				want,
+				mode,
+				granted,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func fenceLockCount(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	mode string,
+	granted bool,
+) int {
+	t.Helper()
+	fenceKey := uint64(outbox.FenceKey)
+	classID := int64(fenceKey >> 32)
+	objectID := int64(uint32(fenceKey))
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = $1
+		  AND objid = $2
+		  AND objsubid = 1
+		  AND mode = $3
+		  AND granted = $4
+	`, classID, objectID, mode, granted).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
 }

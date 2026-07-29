@@ -50,7 +50,7 @@ func runContext(
 	bootstrap := fs.Bool(
 		"bootstrap",
 		false,
-		"reset the cursor after taking a cache snapshot transaction",
+		"replace this logging stub's snapshot (throwaway consumer names only)",
 	)
 	batchSize := fs.Int("batch-size", 256, "events per cursor transaction")
 	poll := fs.Duration(
@@ -81,41 +81,104 @@ func runContext(
 		return err
 	}
 	if *bootstrap {
-		snapshot, err := client.Bootstrap(ctx, *consumer, *stream)
-		if err != nil {
+		if err := bootstrapAndRebuild(
+			ctx, client, *consumer, *stream,
+		); err != nil {
 			return err
 		}
-		// A real consumer reads the public cache tables through snapshot.Tx and
-		// replaces its projection before commit. This logger has no projection.
-		if err := snapshot.Tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit bootstrap snapshot: %w", err)
-		}
-		slog.Info(
-			"stream snapshot established",
-			"consumer", *consumer,
-			"stream", *stream,
-			"safe_seq", snapshot.SafeSeq,
-		)
 	}
-	err = client.Tail(
-		ctx,
-		*consumer,
-		*stream,
-		func(_ context.Context, _ pgx.Tx, event streamclient.Event) error {
-			slog.Info(
-				"change event",
-				"seq", event.Seq,
-				"stream", event.Stream,
-				"kind", event.Kind,
-				"entity_key", event.EntityKey,
-				"occurred_at", event.OccurredAt,
-				"payload", string(event.Payload),
-			)
-			return nil
-		},
-	)
+	err = tailWithResync(ctx, client, *consumer, *stream)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
 	return err
+}
+
+// tailWithResync is THE reference implementation of Frontier's consumer
+// resync protocol: detect ErrResyncRequired, Bootstrap and rebuild the
+// projection transactionally, then resume Tail from the newly committed
+// cursor. Production consumers should preserve this loop and replace only the
+// projection stub and event handler with their own transactional writes.
+func tailWithResync(
+	ctx context.Context,
+	client *streamclient.Client,
+	consumer string,
+	stream string,
+) error {
+	for {
+		err := client.Tail(
+			ctx,
+			consumer,
+			stream,
+			func(
+				_ context.Context,
+				_ pgx.Tx,
+				event streamclient.Event,
+			) error {
+				slog.Info(
+					"change event",
+					"seq", event.Seq,
+					"stream", event.Stream,
+					"kind", event.Kind,
+					"entity_key", event.EntityKey,
+					"occurred_at", event.OccurredAt,
+					"payload", string(event.Payload),
+				)
+				return nil
+			},
+		)
+		var resync *streamclient.ErrResyncRequired
+		if !errors.As(err, &resync) {
+			return err
+		}
+		slog.Warn(
+			"stream resync required; rebuilding projection",
+			"consumer", resync.Consumer,
+			"stream", resync.Stream,
+			"cursor", resync.Cursor,
+			"pruned_through", resync.PrunedThrough,
+		)
+		if err := bootstrapAndRebuild(
+			ctx, client, consumer, stream,
+		); err != nil {
+			return fmt.Errorf("resync stream: %w", err)
+		}
+	}
+}
+
+func bootstrapAndRebuild(
+	ctx context.Context,
+	client *streamclient.Client,
+	consumer string,
+	stream string,
+) error {
+	snapshot, err := client.Bootstrap(ctx, consumer, stream)
+	if err != nil {
+		return fmt.Errorf("bootstrap stream snapshot: %w", err)
+	}
+	// The projection replacement and cursor reset share snapshot.Tx. A real
+	// consumer deletes/replaces its projection from Frontier's public cache
+	// tables here. This logging reference has no materialized projection, so
+	// its rebuild is intentionally a stub. Never move a real rebuild after
+	// Commit: doing so would acknowledge events without applying their state.
+	if err := rebuildProjection(ctx, snapshot.Tx); err != nil {
+		_ = snapshot.Tx.Rollback(context.WithoutCancel(ctx))
+		return fmt.Errorf("rebuild projection: %w", err)
+	}
+	if err := snapshot.Tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit bootstrap snapshot: %w", err)
+	}
+	slog.Info(
+		"stream snapshot established",
+		"consumer", consumer,
+		"stream", stream,
+		"safe_seq", snapshot.SafeSeq,
+	)
+	return nil
+}
+
+func rebuildProjection(context.Context, pgx.Tx) error {
+	// Projection stub for the logging CLI. Production reference consumers
+	// replace their complete projection here using only the supplied tx.
+	return nil
 }

@@ -27,6 +27,10 @@ const (
 // LeaseStore coordinates the one active budgeter for an installation and
 // persists periodic C-P6 state snapshots. Acquire and Renew return Postgres's
 // authoritative lease expiry; callers must never derive it from local time.
+// Acquire's boolean reports whether the lease was acquired. For Renew, Save,
+// and SaveBackoff, false means the store has proven that the caller no longer
+// owns the lease. Transport failures must be returned as errors; returning
+// false for a transport failure violates this contract.
 type LeaseStore interface {
 	Acquire(
 		context.Context,
@@ -248,7 +252,6 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 				)
 			case !ok || until.IsZero() || !runtime.clock.Now().Before(until):
 				g.loseLease(ErrLeaseLost)
-				runtime.cancel()
 				return
 			default:
 				runtime.confirmExpiry(until)
@@ -260,7 +263,6 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 			ok, err := runtime.save(g.Snapshot())
 			if err == nil && !ok {
 				g.loseLease(ErrLeaseLost)
-				runtime.cancel()
 				return
 			}
 			// Snapshot transport errors do not disprove ownership; renewal and
@@ -290,7 +292,6 @@ func (g *Gate) watchLeaseExpiry(runtime *leaseRuntime) {
 			)
 		case <-timer.C():
 			g.loseLease(ErrLeaseLost)
-			runtime.cancel()
 			return
 		}
 	}
@@ -351,7 +352,10 @@ func (g *Gate) unavailableError() error {
 	return g.unavailable
 }
 
-func (g *Gate) persistBackoff(ctx context.Context, until time.Time) error {
+func (g *Gate) persistBackoff(
+	ctx context.Context,
+	until time.Time,
+) (bool, error) {
 	runtime := g.lease
 	opCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
@@ -364,13 +368,7 @@ func (g *Gate) persistBackoff(ctx context.Context, until time.Time) error {
 		runtime.token,
 		until,
 	)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return ErrLeaseLost
-	}
-	return nil
+	return ok, err
 }
 
 // Close stops admission, keeps renewal alive while admitted calls drain, then

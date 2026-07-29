@@ -2,7 +2,11 @@ package budget
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,4 +115,128 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 	if err := leases.Release(ctx, installationID, "owner-b"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPostgresLeaseOwnershipLossStopsRenewalAndAllowsFailover(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := store.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := store.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	installationID := time.Now().UnixNano()
+	t.Cleanup(func() {
+		_, _ = pool.Exec(
+			context.Background(),
+			`DELETE FROM installation_budgets WHERE installation_id = $1`,
+			installationID,
+		)
+	})
+	leases := NewPostgresLeaseStore(pool)
+	ttl := 2 * time.Second
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		headers := make(http.Header)
+		headers.Set("Retry-After", "1")
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     headers,
+			Body:       io.NopCloser(strings.NewReader("secondary rate limit")),
+		}, nil
+	})}
+	first, err := NewLeased(
+		ctx,
+		client,
+		Options{},
+		&saveBackoffOwnershipLossStore{LeaseStore: leases},
+		LeaseOptions{
+			InstallationID:   installationID,
+			Owner:            "first-process",
+			TTL:              ttl,
+			RenewInterval:    200 * time.Millisecond,
+			SnapshotInterval: time.Hour,
+			StoreTimeout:     100 * time.Millisecond,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = first.Close(context.Background())
+	})
+
+	lostAt := time.Now()
+	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	response, err := first.Do(
+		context.Background(),
+		Interactive,
+		NewRESTRequest(req),
+	)
+	if response != nil && response.HTTP != nil {
+		_ = response.HTTP.Body.Close()
+	}
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("SaveBackoff ownership loss error = %v, want ErrLeaseLost", err)
+	}
+	select {
+	case <-first.lease.done:
+	case <-time.After(time.Second):
+		t.Fatal("lease runtime kept renewing after proven ownership loss")
+	}
+
+	deadline := lostAt.Add(ttl + 500*time.Millisecond)
+	var second *Gate
+	for time.Now().Before(deadline) {
+		second, err = NewLeased(
+			ctx,
+			http.DefaultClient,
+			Options{},
+			leases,
+			LeaseOptions{
+				InstallationID:   installationID,
+				Owner:            "replacement-process",
+				TTL:              ttl,
+				RenewInterval:    200 * time.Millisecond,
+				SnapshotInterval: time.Hour,
+				StoreTimeout:     100 * time.Millisecond,
+			},
+		)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrLeaseHeld) {
+			t.Fatalf("replacement acquire = %v", err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if second == nil {
+		t.Fatalf("replacement did not acquire within lease TTL; last error = %v", err)
+	}
+	if elapsed := time.Since(lostAt); elapsed > ttl+500*time.Millisecond {
+		t.Fatalf("replacement acquisition took %v, TTL = %v", elapsed, ttl)
+	}
+	if err := second.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type saveBackoffOwnershipLossStore struct {
+	LeaseStore
+}
+
+func (*saveBackoffOwnershipLossStore) SaveBackoff(
+	context.Context,
+	int64,
+	string,
+	time.Time,
+) (bool, error) {
+	return false, nil
 }

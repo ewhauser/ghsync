@@ -8,6 +8,15 @@ rules:
   - event: pull_request
     action: "*"
     target: resolve_stack_membership
+  - event: pull_request_review
+    action: "*"
+    target: pull_request
+  - event: pull_request_review_comment
+    action: "*"
+    target: pull_request
+  - event: pull_request_review_thread
+    action: "*"
+    target: pull_request
   - event: check_run
     action: "*"
     target: checks

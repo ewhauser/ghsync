@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -668,7 +669,6 @@ func InsertRefreshesTxReturning(
 	}
 	seen := make(map[refreshKey]int, len(specs))
 	deduped := make([]RefreshSpec, 0, len(specs))
-	pointers := make([]generationPointer, 0, len(specs))
 	for _, spec := range specs {
 		if spec.EventReceivedAt.IsZero() {
 			spec.EventReceivedAt = pipeline.EventReceivedAt(ctx)
@@ -682,8 +682,6 @@ func InsertRefreshesTxReturning(
 				(deduped[index].Deadline.IsZero() ||
 					spec.Deadline.Before(deduped[index].Deadline)) {
 				deduped[index].Deadline = spec.Deadline
-				pointers[index].DeadlineAt = spec.Deadline.
-					UTC().Format(time.RFC3339Nano)
 			}
 			if !spec.EventReceivedAt.IsZero() &&
 				(deduped[index].EventReceivedAt.IsZero() ||
@@ -691,13 +689,21 @@ func InsertRefreshesTxReturning(
 						deduped[index].EventReceivedAt,
 					)) {
 				deduped[index].EventReceivedAt = spec.EventReceivedAt
-				pointers[index].EventReceivedAt = spec.EventReceivedAt.
-					UTC().Format(time.RFC3339Nano)
 			}
 			continue
 		}
 		seen[key] = len(deduped)
 		deduped = append(deduped, spec)
+	}
+	// Match the SQL upsert's conflict-row lock order across every fan-out path.
+	sort.Slice(deduped, func(i, j int) bool {
+		if deduped[i].Kind != deduped[j].Kind {
+			return deduped[i].Kind < deduped[j].Kind
+		}
+		return deduped[i].Key < deduped[j].Key
+	})
+	pointers := make([]generationPointer, 0, len(deduped))
+	for _, spec := range deduped {
 		pointer := generationPointer{
 			Kind:       spec.Kind,
 			RefreshKey: spec.Key,

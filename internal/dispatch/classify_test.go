@@ -78,6 +78,45 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 			},
 		},
 		{
+			name:  "pull request review",
+			event: "pull_request_review",
+			body: `{
+				"action":"submitted",
+				"repository":{"full_name":"acme/monolith"},
+				"pull_request":{"number":4812}
+			}`,
+			want: []Intent{{
+				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4812",
+				Priority: PriorityEvent,
+			}},
+		},
+		{
+			name:  "pull request review comment",
+			event: "pull_request_review_comment",
+			body: `{
+				"action":"created",
+				"repository":{"full_name":"acme/monolith"},
+				"pull_request":{"number":4815}
+			}`,
+			want: []Intent{{
+				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4815",
+				Priority: PriorityEvent,
+			}},
+		},
+		{
+			name:  "pull request review thread",
+			event: "pull_request_review_thread",
+			body: `{
+				"action":"resolved",
+				"repository":{"full_name":"acme/monolith"},
+				"pull_request":{"number":4816}
+			}`,
+			want: []Intent{{
+				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4816",
+				Priority: PriorityEvent,
+			}},
+		},
+		{
 			name:  "check run by SHA",
 			event: "check_run",
 			body: `{

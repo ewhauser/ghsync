@@ -4,10 +4,14 @@ groups:
       - alert: FrontierSweepConditionalHitRateLow
         expr: >-
           (
-            sum(rate(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
-            /
-            clamp_min(sum(rate(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])), 1)
-          ) < 0.80
+            (
+              sum(increase(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
+              /
+              sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))
+            ) < 0.80
+            and
+            sum(increase(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])) > 0
+          )
           or absent(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"})
           or absent(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"})
         for: 15m
@@ -247,11 +251,10 @@ groups:
       - alert: FrontierResyncStorm
         expr: >-
           increase(frontier_c_s4_resyncs_total[15m]) > 3
-          or absent(frontier_c_s4_resyncs_total)
         labels: {severity: page}
         annotations:
           constraint: C-S4
-          summary: A consumer repeatedly entered RESYNC_REQUIRED or the metric is absent
+          summary: A consumer repeatedly entered RESYNC_REQUIRED
           description: Repeated bootstrap failure or retention churn is preventing convergence.
       - alert: FrontierDeriverBacklog
         expr: >-

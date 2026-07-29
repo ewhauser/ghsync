@@ -202,6 +202,98 @@ func TestSecondaryBackoffPersistsImmediatelyAndRestoresOnHandoff(t *testing.T) {
 	}
 }
 
+func TestTransientSaveBackoffErrorRetriesThroughPeriodicSnapshot(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	store := newRuntimeLeaseStore(clock)
+	transportErr := errors.New("temporary budget store transport failure")
+	store.backoffErr = transportErr
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		headers := make(http.Header)
+		headers.Set("X-RateLimit-Limit", "100")
+		headers.Set("X-RateLimit-Remaining", "80")
+		headers.Set("X-RateLimit-Reset", "1785258000")
+		if calls == 1 {
+			headers.Set("Retry-After", "1")
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     headers,
+				Body: io.NopCloser(
+					&singleReadBuffer{
+						data: []byte(`{"message":"secondary rate limit"}`),
+					},
+				),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     headers,
+			Body:       io.NopCloser(&singleReadBuffer{}),
+		}, nil
+	})}
+	gate := newRuntimeLeasedGateWithOptions(
+		t,
+		clock,
+		store,
+		client,
+		LeaseOptions{SnapshotInterval: 2 * time.Second},
+	)
+
+	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	response, err := gate.Do(
+		context.Background(),
+		Interactive,
+		NewRESTRequest(req),
+	)
+	if response == nil || response.HTTP == nil {
+		t.Fatal("secondary-limit response was not returned")
+	}
+	_ = response.HTTP.Body.Close()
+	if !errors.Is(err, transportErr) {
+		t.Fatalf("SaveBackoff transport error = %v, want %v", err, transportErr)
+	}
+	if unavailable := gate.unavailableError(); unavailable != nil {
+		t.Fatalf("gate became unavailable after transport error: %v", unavailable)
+	}
+	wantBackoff := now.Add(time.Second)
+	if got := gate.Snapshot().BackoffUntil; !got.Equal(wantBackoff) {
+		t.Fatalf("in-memory backoff = %v, want %v", got, wantBackoff)
+	}
+
+	clock.Advance(2 * time.Second)
+	select {
+	case snapshot := <-store.snapshotSaved:
+		if !snapshot.BackoffUntil.Equal(wantBackoff) {
+			t.Fatalf(
+				"periodically persisted backoff = %v, want %v",
+				snapshot.BackoffUntil,
+				wantBackoff,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("periodic snapshot did not retry backoff persistence")
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	response, err = gate.Do(
+		context.Background(),
+		Interactive,
+		NewRESTRequest(req),
+	)
+	if err != nil {
+		t.Fatalf("admission after transient persistence failure = %v", err)
+	}
+	_ = response.HTTP.Body.Close()
+	if calls != 2 {
+		t.Fatalf("transport calls after backoff elapsed = %d, want 2", calls)
+	}
+	if err := gate.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNewLeasedUsesUniqueRuntimeTokenNotOwnerName(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	clock := newManualClock(now)
@@ -232,20 +324,38 @@ func newRuntimeLeasedGate(
 	client *http.Client,
 ) *Gate {
 	t.Helper()
+	return newRuntimeLeasedGateWithOptions(
+		t,
+		clock,
+		store,
+		client,
+		LeaseOptions{},
+	)
+}
+
+func newRuntimeLeasedGateWithOptions(
+	t *testing.T,
+	clock Clock,
+	store LeaseStore,
+	client *http.Client,
+	leaseOptions LeaseOptions,
+) *Gate {
+	t.Helper()
+	leaseOptions.InstallationID = 1234
+	leaseOptions.Owner = "same-process-name"
+	leaseOptions.TTL = 10 * time.Second
+	leaseOptions.RenewInterval = 3 * time.Second
+	leaseOptions.StoreTimeout = time.Second
+	leaseOptions.Clock = clock
+	if leaseOptions.SnapshotInterval <= 0 {
+		leaseOptions.SnapshotInterval = time.Hour
+	}
 	gate, err := NewLeased(
 		context.Background(),
 		client,
 		Options{Clock: clock},
 		store,
-		LeaseOptions{
-			InstallationID:   1234,
-			Owner:            "same-process-name",
-			TTL:              10 * time.Second,
-			RenewInterval:    3 * time.Second,
-			SnapshotInterval: time.Hour,
-			StoreTimeout:     time.Second,
-			Clock:            clock,
-		},
+		leaseOptions,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -288,21 +398,24 @@ func eventIndex(events []string, want string) int {
 }
 
 type runtimeLeaseStore struct {
-	clock        *manualClock
-	mu           sync.Mutex
-	tokens       []string
-	events       []string
-	snapshot     Snapshot
-	renewBlock   chan struct{}
-	renewStarted chan struct{}
-	backoffSaved chan time.Time
+	clock         *manualClock
+	mu            sync.Mutex
+	tokens        []string
+	events        []string
+	snapshot      Snapshot
+	renewBlock    chan struct{}
+	renewStarted  chan struct{}
+	backoffSaved  chan time.Time
+	snapshotSaved chan Snapshot
+	backoffErr    error
 }
 
 func newRuntimeLeaseStore(clock *manualClock) *runtimeLeaseStore {
 	return &runtimeLeaseStore{
-		clock:        clock,
-		renewStarted: make(chan struct{}, 8),
-		backoffSaved: make(chan time.Time, 8),
+		clock:         clock,
+		renewStarted:  make(chan struct{}, 8),
+		backoffSaved:  make(chan time.Time, 8),
+		snapshotSaved: make(chan Snapshot, 8),
 	}
 }
 
@@ -347,6 +460,7 @@ func (s *runtimeLeaseStore) Save(
 	s.events = append(s.events, "save")
 	s.snapshot = snapshot
 	s.mu.Unlock()
+	s.snapshotSaved <- snapshot
 	return true, nil
 }
 
@@ -358,6 +472,12 @@ func (s *runtimeLeaseStore) SaveBackoff(
 ) (bool, error) {
 	s.mu.Lock()
 	s.events = append(s.events, "backoff")
+	if s.backoffErr != nil {
+		err := s.backoffErr
+		s.backoffErr = nil
+		s.mu.Unlock()
+		return false, err
+	}
 	if until.After(s.snapshot.BackoffUntil) {
 		s.snapshot.BackoffUntil = until
 	}
