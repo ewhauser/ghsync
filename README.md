@@ -21,7 +21,8 @@ make gen       # regenerate sqlc code after editing db/queries or db/migrations
 ```
 
 `frontier-syncd` commands: `serve --roles=...`, `migrate`,
-`backfill --repo=owner/name`, `requeue --guid=…|--all-parked`, `version`.
+`backfill` (the configured installation), `requeue --guid=…|--all-parked`,
+`version`.
 `fake-github` (cmd/fake-github) serves a canned enrolled repo and emits
 HMAC-signed webhooks; docker-compose runs it beside Postgres.
 
@@ -34,11 +35,18 @@ encoding. Wire-exact header casing and ordering are intentionally not retained.
 River continues to claim and acknowledge one `refresh_pr` pointer at a time.
 The workers call a shared 5 ms fetch coordinator that gangs concurrently due,
 already-known PR node IDs into `nodes(ids:)` calls of at most 25. Results are
-sorted by entity key before the cache writer takes transaction-scoped advisory
-locks. This keeps M2's per-job refresh-generation recheck intact while meeting
-C-P4 without custom multi-job River acknowledgement. New PRs and explicit
+sorted by immutable installation/repository/entity key. A dedicated Postgres
+connection holds a session advisory lock from before the GitHub observation
+through the cache transaction; repository observations take their own
+immutable lock. This keeps M2's per-job refresh-generation recheck intact while
+meeting C-P4 without custom multi-job River acknowledgement. Follow-up
+generations/jobs commit in the entity transaction. New PRs and explicit
 stack-membership resolution use conditional REST GETs until a node ID is
-cached.
+cached; review connections are fully paginated.
+
+Installation backfill enumerates repositories, refreshes repository rules,
+stacks, and PR detail as ordinary jobs, moves long tails to the `sweep` queue,
+and marks cursors complete only after durable child generations complete.
 
 ## Status
 

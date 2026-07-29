@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +49,9 @@ type Handler struct {
 
 func New(options Options) (*Handler, error) {
 	if options.Pool == nil || options.REST == nil || options.GraphQL == nil {
-		return nil, fmt.Errorf("fetch handler requires Postgres, REST, and GraphQL")
+		return nil, fmt.Errorf(
+			"fetch handler requires Postgres, REST, and GraphQL",
+		)
 	}
 	if options.InstallationID <= 0 || options.OrgID <= 0 {
 		return nil, fmt.Errorf("fetch handler IDs must be positive")
@@ -76,12 +79,169 @@ func New(options Options) (*Handler, error) {
 	return handler, nil
 }
 
-// SetRiverClient is the construction-cycle seam: queue workers need Handler,
-// while Handler's fan-out paths need the resulting client.
 func (h *Handler) SetRiverClient(client *river.Client[pgx.Tx]) {
 	h.riverMu.Lock()
 	h.river = client
 	h.riverMu.Unlock()
+}
+
+func (h *Handler) RefreshRepository(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
+	key, err := parseEntityKey(request.Args.Key, "repo")
+	if err != nil {
+		return err
+	}
+	class, source, err := classAndSource(request.Queue)
+	if err != nil {
+		return err
+	}
+	repository, err := h.writer.Repository(ctx, key.Repo)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = h.ensureRepository(ctx, class, source, key.Repo)
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("read repository metadata: %w", err)
+	}
+	observation, err := h.writer.BeginObservation(
+		ctx,
+		store.RepositoryEntityKey(
+			repository.InstallationID,
+			repository.GitHubID,
+		),
+	)
+	if err != nil {
+		return err
+	}
+	defer observation.Close() //nolint:errcheck
+	owner, name, err := splitRepo(key.Repo)
+	if err != nil {
+		return err
+	}
+	startedAt := time.Now()
+	fetched, response, err := h.rest.GetRepository(
+		ctx,
+		class,
+		owner,
+		name,
+		repository.ETag,
+	)
+	if isNotFound(err) {
+		// TODO(M4, C-R3): installation reconciliation owns authoritative
+		// repository-disappearance tombstones.
+		return fmt.Errorf("repository %s disappeared during refresh", key.Repo)
+	}
+	if err != nil {
+		return fmt.Errorf("fetch repository %s: %w", key.Repo, err)
+	}
+	if response.NotModified {
+		_, err = h.writer.ApplyRepositoryObserved(
+			ctx,
+			observation,
+			repository,
+			source,
+			repository.ETag,
+			startedAt,
+		)
+		return err
+	}
+	record := repositoryRecordFromREST(
+		fetched,
+		h.installationID,
+		h.orgID,
+	)
+	_, err = h.writer.ApplyRepositoryObserved(
+		ctx,
+		observation,
+		record,
+		source,
+		response.ETag,
+		startedAt,
+	)
+	return err
+}
+
+func (h *Handler) RefreshRepoRules(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
+	key, err := parseEntityKey(request.Args.Key, "repo_rules")
+	if err != nil {
+		return err
+	}
+	class, source, err := classAndSource(request.Queue)
+	if err != nil {
+		return err
+	}
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	if err != nil {
+		return err
+	}
+	metadata, _, err := h.writer.RepoRulesMetadata(ctx, key.Repo)
+	if err != nil {
+		return fmt.Errorf("read repository rules metadata: %w", err)
+	}
+	observation, err := h.writer.BeginObservation(
+		ctx,
+		store.RepoRulesEntityKey(
+			repository.InstallationID,
+			repository.GitHubID,
+		),
+	)
+	if err != nil {
+		return err
+	}
+	defer observation.Close() //nolint:errcheck
+	owner, name, err := splitRepo(key.Repo)
+	if err != nil {
+		return err
+	}
+	startedAt := time.Now()
+	rules, response, err := h.rest.ListRepositoryRules(
+		ctx,
+		class,
+		owner,
+		name,
+		metadata.ETag,
+	)
+	if err != nil {
+		return fmt.Errorf("fetch repository rules %s: %w", key.Repo, err)
+	}
+	if response.NotModified {
+		return h.writer.TouchRepoRules(
+			ctx,
+			observation,
+			repository,
+			startedAt,
+			metadata.ETag,
+		)
+	}
+	records := make([]store.RepoRuleRecord, 0, len(rules))
+	for _, rule := range rules {
+		if rule.ID <= 0 {
+			return fmt.Errorf("repository rules response has invalid ID")
+		}
+		records = append(records, store.RepoRuleRecord{
+			Key:             strconv.FormatInt(rule.ID, 10),
+			Rule:            rule.Raw,
+			GitHubUpdatedAt: rule.UpdatedAt,
+			HeadSHA:         repository.DefaultHeadSHA,
+		})
+	}
+	_, err = h.writer.ApplyRepoRulesObserved(
+		ctx,
+		observation,
+		store.RepoRulesRecord{
+			Repository: repository,
+			Rules:      records,
+			ETag:       response.ETag,
+			SyncedAt:   startedAt,
+			Source:     source,
+		},
+	)
+	return err
 }
 
 func (h *Handler) RefreshPR(
@@ -96,7 +256,11 @@ func (h *Handler) RefreshPR(
 	if err != nil {
 		return err
 	}
-	metadata, err := h.writer.PullRequestMetadata(ctx, key.Repo, key.Number)
+	metadata, err := h.writer.PullRequestMetadata(
+		ctx,
+		key.Repo,
+		key.Number,
+	)
 	if err == nil && metadata.NodeID != "" {
 		result, err := h.coordinator.submit(
 			ctx,
@@ -105,6 +269,9 @@ func (h *Handler) RefreshPR(
 			metadata,
 			class,
 			source,
+			func(repo string) store.PullRequestHook {
+				return h.pullRequestHook(repo, key.Number, request.Queue)
+			},
 		)
 		if err != nil {
 			if errors.Is(err, errGraphQLNodeNotFound) {
@@ -118,7 +285,8 @@ func (h *Handler) RefreshPR(
 			}
 			return err
 		}
-		return h.enqueuePRFollowups(ctx, key, result, request.Queue)
+		_ = result
+		return nil
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("read PR fetch metadata: %w", err)
@@ -148,6 +316,22 @@ func (h *Handler) refreshPRREST(
 	source store.SyncSource,
 	queueName string,
 ) error {
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	if err != nil {
+		return err
+	}
+	observation, err := h.writer.BeginObservation(
+		ctx,
+		store.PullRequestEntityKey(
+			repository.InstallationID,
+			repository.GitHubID,
+			key.Number,
+		),
+	)
+	if err != nil {
+		return err
+	}
+	defer observation.Close() //nolint:errcheck
 	startedAt := time.Now()
 	owner, repoName, err := splitRepo(key.Repo)
 	if err != nil {
@@ -172,33 +356,35 @@ func (h *Handler) refreshPRREST(
 		key.Number,
 		etag,
 	)
+	hook := h.pullRequestHook(
+		repository.FullName,
+		key.Number,
+		queueName,
+	)
 	if isNotFound(err) {
-		result, tombstoneErr := h.writer.TombstonePullRequest(
+		_, tombstoneErr := h.writer.TombstonePullRequestObserved(
 			ctx,
-			key.Repo,
+			observation,
+			repository,
 			key.Number,
 			source,
 			startedAt,
+			hook,
 		)
-		if tombstoneErr != nil {
-			return tombstoneErr
-		}
-		return h.enqueuePRFollowups(ctx, key, result, queueName)
+		return tombstoneErr
 	}
 	if err != nil {
 		return fmt.Errorf("fetch PR %s: %w", requestKey(key), err)
 	}
 	if response.NotModified {
-		return nil
-	}
-	repository, err := h.ensureRepository(
-		ctx,
-		class,
-		source,
-		key.Repo,
-	)
-	if err != nil {
-		return err
+		return h.writer.TouchPullRequest(
+			ctx,
+			observation,
+			repository,
+			key.Number,
+			startedAt,
+			etag,
+		)
 	}
 	record := pullRecordFromREST(
 		repository,
@@ -208,11 +394,13 @@ func (h *Handler) refreshPRREST(
 		startedAt,
 	)
 	record.MembershipKnown = true
-	result, err := h.writer.ApplyPullRequest(ctx, record)
-	if err != nil {
-		return err
-	}
-	return h.enqueuePRFollowups(ctx, key, result, queueName)
+	_, err = h.writer.ApplyPullRequestObserved(
+		ctx,
+		observation,
+		record,
+		hook,
+	)
+	return err
 }
 
 func (h *Handler) RefreshStack(
@@ -227,14 +415,37 @@ func (h *Handler) RefreshStack(
 	if err != nil {
 		return err
 	}
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	if err != nil {
+		return err
+	}
+	observation, err := h.writer.BeginObservation(
+		ctx,
+		store.StackEntityKey(
+			repository.InstallationID,
+			repository.GitHubID,
+			key.Number,
+		),
+	)
+	if err != nil {
+		return err
+	}
+	defer observation.Close() //nolint:errcheck
 	startedAt := time.Now()
 	owner, repoName, err := splitRepo(key.Repo)
 	if err != nil {
 		return err
 	}
-	etag, err := h.writer.StackETag(ctx, key.Repo, key.Number)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("read stack ETag: %w", err)
+	var etag string
+	metadata, metadataErr := h.writer.StackMetadata(
+		ctx,
+		key.Repo,
+		key.Number,
+	)
+	if metadataErr == nil {
+		etag = metadata.ETag
+	} else if !errors.Is(metadataErr, pgx.ErrNoRows) {
+		return fmt.Errorf("read stack ETag: %w", metadataErr)
 	}
 	stack, response, err := h.rest.GetStack(
 		ctx,
@@ -244,33 +455,31 @@ func (h *Handler) RefreshStack(
 		key.Number,
 		etag,
 	)
+	hook := h.stackHook(repository.FullName, request.Queue)
 	if isNotFound(err) {
-		result, tombstoneErr := h.writer.TombstoneStack(
+		_, tombstoneErr := h.writer.TombstoneStackObserved(
 			ctx,
-			key.Repo,
+			observation,
+			repository,
 			key.Number,
 			source,
 			startedAt,
+			hook,
 		)
-		if tombstoneErr != nil {
-			return tombstoneErr
-		}
-		return h.enqueueStackDiff(ctx, key.Repo, result, request.Queue)
+		return tombstoneErr
 	}
 	if err != nil {
 		return fmt.Errorf("fetch stack %s: %w", requestKey(key), err)
 	}
 	if response.NotModified {
-		return nil
-	}
-	repository, err := h.ensureRepository(
-		ctx,
-		class,
-		source,
-		key.Repo,
-	)
-	if err != nil {
-		return err
+		return h.writer.TouchStack(
+			ctx,
+			observation,
+			repository,
+			key.Number,
+			startedAt,
+			etag,
+		)
 	}
 	record := stackRecordFromREST(
 		repository,
@@ -279,11 +488,13 @@ func (h *Handler) RefreshStack(
 		source,
 		startedAt,
 	)
-	result, err := h.writer.ApplyStack(ctx, record)
-	if err != nil {
-		return err
-	}
-	return h.enqueueStackDiff(ctx, key.Repo, result, request.Queue)
+	_, err = h.writer.ApplyStackObserved(
+		ctx,
+		observation,
+		record,
+		hook,
+	)
+	return err
 }
 
 func (h *Handler) RefreshChecks(
@@ -298,6 +509,22 @@ func (h *Handler) RefreshChecks(
 	if err != nil {
 		return err
 	}
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	if err != nil {
+		return err
+	}
+	observation, err := h.writer.BeginObservation(
+		ctx,
+		store.ChecksEntityKey(
+			repository.InstallationID,
+			repository.GitHubID,
+			key.Value,
+		),
+	)
+	if err != nil {
+		return err
+	}
+	defer observation.Close() //nolint:errcheck
 	startedAt := time.Now()
 	owner, repoName, err := splitRepo(key.Repo)
 	if err != nil {
@@ -321,7 +548,11 @@ func (h *Handler) RefreshChecks(
 			break
 		}
 		if fetchErr != nil {
-			return fmt.Errorf("fetch checks %s: %w", requestKey(key), fetchErr)
+			return fmt.Errorf(
+				"fetch checks %s: %w",
+				requestKey(key),
+				fetchErr,
+			)
 		}
 		if page == 1 {
 			etag = response.ETag
@@ -332,21 +563,17 @@ func (h *Handler) RefreshChecks(
 		}
 		page = response.NextPage
 	}
-	if _, err := h.ensureRepository(ctx, class, source, key.Repo); err != nil {
-		return err
-	}
 	records := make([]store.CheckRunRecord, 0, len(all))
 	for _, run := range all {
 		observed, err := json.Marshal(run)
 		if err != nil {
 			return fmt.Errorf("encode check observation: %w", err)
 		}
-		updated := startedAt
-		if run.StartedAt != nil {
-			updated = *run.StartedAt
-		}
-		if run.CompletedAt != nil && run.CompletedAt.After(updated) {
-			updated = *run.CompletedAt
+		var semanticTime *time.Time
+		if run.CompletedAt != nil {
+			semanticTime = run.CompletedAt
+		} else if run.StartedAt != nil {
+			semanticTime = run.StartedAt
 		}
 		records = append(records, store.CheckRunRecord{
 			GitHubID:        run.ID,
@@ -358,18 +585,22 @@ func (h *Handler) RefreshChecks(
 			AppSlug:         run.AppSlug,
 			StartedAt:       run.StartedAt,
 			CompletedAt:     run.CompletedAt,
-			GitHubUpdatedAt: updated,
+			GitHubUpdatedAt: semanticTime,
 			Observed:        observed,
 		})
 	}
-	_, err = h.writer.ApplyChecks(ctx, store.ChecksRecord{
-		RepoFullName: key.Repo,
-		HeadSHA:      key.Value,
-		Runs:         records,
-		ETag:         etag,
-		SyncedAt:     startedAt,
-		Source:       source,
-	})
+	_, err = h.writer.ApplyChecksObserved(
+		ctx,
+		observation,
+		store.ChecksRecord{
+			Repository: repository,
+			HeadSHA:    key.Value,
+			Runs:       records,
+			ETag:       etag,
+			SyncedAt:   startedAt,
+			Source:     source,
+		},
+	)
 	return err
 }
 
@@ -396,20 +627,30 @@ func (h *Handler) RefreshBranch(
 	return h.enqueue(ctx, specs, request.Queue)
 }
 
-func (h *Handler) enqueuePRFollowups(
-	ctx context.Context,
-	key entityKey,
-	result store.ApplyPullRequestResult,
+func (h *Handler) pullRequestHook(
+	repo string,
+	number int,
 	queueName string,
-) error {
-	if !result.Applied {
-		return nil
+) store.PullRequestHook {
+	return func(result store.ApplyPullRequestResult) store.TransactionHook {
+		if !result.DomainChanged {
+			return nil
+		}
+		specs := pullRequestFollowupSpecs(repo, number, result)
+		return h.insertFollowupsHook(specs, queueName)
 	}
+}
+
+func pullRequestFollowupSpecs(
+	repo string,
+	number int,
+	result store.ApplyPullRequestResult,
+) []queue.RefreshSpec {
 	specs := make([]queue.RefreshSpec, 0, 3)
 	if result.NewHeadSHA != "" && result.NewHeadSHA != result.OldHeadSHA {
 		specs = append(specs, queue.RefreshSpec{
 			Kind: queue.KindRefreshChecks,
-			Key:  fmt.Sprintf("checks:%s:%s", key.Repo, result.NewHeadSHA),
+			Key:  fmt.Sprintf("checks:%s:%s", repo, result.NewHeadSHA),
 		})
 	}
 	stackNumbers := make(map[int]struct{}, 2)
@@ -419,30 +660,42 @@ func (h *Handler) enqueuePRFollowups(
 	if result.NewStackNumber != nil {
 		stackNumbers[*result.NewStackNumber] = struct{}{}
 	}
-	for number := range stackNumbers {
+	for stackNumber := range stackNumbers {
 		specs = append(specs, queue.RefreshSpec{
 			Kind: queue.KindRefreshStack,
-			Key:  fmt.Sprintf("stack:%s:%d", key.Repo, number),
+			Key:  fmt.Sprintf("stack:%s:%d", repo, stackNumber),
 		})
 	}
-	return h.enqueue(ctx, specs, queueName)
+	return specs
 }
 
-func (h *Handler) enqueueStackDiff(
-	ctx context.Context,
+func (h *Handler) stackHook(
+	repo string,
+	queueName string,
+) store.StackHook {
+	return func(result store.ApplyStackResult) store.TransactionHook {
+		if !result.Applied {
+			return nil
+		}
+		specs := stackFollowupSpecs(repo, result)
+		return h.insertFollowupsHook(specs, queueName)
+	}
+}
+
+func stackFollowupSpecs(
 	repo string,
 	result store.ApplyStackResult,
-	queueName string,
-) error {
-	if !result.Applied {
-		return nil
-	}
+) []queue.RefreshSpec {
 	specs := make([]queue.RefreshSpec, 0)
 	seenPRs := make(map[int]struct{})
-	for _, number := range append(
-		append([]int(nil), result.JoinedPRs...),
-		result.LeftPRs...,
-	) {
+	affected := append(
+		append(
+			append([]int(nil), result.JoinedPRs...),
+			result.LeftPRs...,
+		),
+		result.MovedPRs...,
+	)
+	for _, number := range affected {
 		if _, seen := seenPRs[number]; seen {
 			continue
 		}
@@ -458,7 +711,29 @@ func (h *Handler) enqueueStackDiff(
 			Key:  fmt.Sprintf("stack:%s:%d", repo, oldStack),
 		})
 	}
-	return h.enqueue(ctx, specs, queueName)
+	return specs
+}
+
+func (h *Handler) insertFollowupsHook(
+	specs []queue.RefreshSpec,
+	queueName string,
+) store.TransactionHook {
+	if len(specs) == 0 {
+		return nil
+	}
+	return func(ctx context.Context, tx pgx.Tx) error {
+		client := h.riverClient(ctx)
+		if client == nil {
+			return fmt.Errorf("River client missing from fetch transaction")
+		}
+		return queue.InsertRefreshesTx(
+			ctx,
+			tx,
+			client,
+			specs,
+			queueName,
+		)
+	}
 }
 
 func (h *Handler) enqueue(
@@ -469,12 +744,7 @@ func (h *Handler) enqueue(
 	if len(specs) == 0 {
 		return nil
 	}
-	client, _ := river.ClientFromContextSafely[pgx.Tx](ctx)
-	if client == nil {
-		h.riverMu.RLock()
-		client = h.river
-		h.riverMu.RUnlock()
-	}
+	client := h.riverClient(ctx)
 	if client == nil {
 		return fmt.Errorf("River client missing from fetch context")
 	}
@@ -509,7 +779,23 @@ func (h *Handler) ensureRepository(
 		return repository, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return store.RepositoryRecord{}, fmt.Errorf("read repository cache: %w", err)
+		return store.RepositoryRecord{}, fmt.Errorf(
+			"read repository cache: %w",
+			err,
+		)
+	}
+	discovery, err := h.writer.BeginObservation(
+		ctx,
+		store.RepositoryDiscoveryKey(h.installationID, fullName),
+	)
+	if err != nil {
+		return store.RepositoryRecord{}, err
+	}
+	defer discovery.Close() //nolint:errcheck
+	if repository, err = h.writer.Repository(ctx, fullName); err == nil {
+		return repository, nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return store.RepositoryRecord{}, err
 	}
 	owner, repoName, err := splitRepo(fullName)
 	if err != nil {
@@ -523,26 +809,33 @@ func (h *Handler) ensureRepository(
 		"",
 	)
 	if err != nil {
-		return store.RepositoryRecord{}, fmt.Errorf("fetch repository: %w", err)
+		return store.RepositoryRecord{}, fmt.Errorf(
+			"fetch repository: %w",
+			err,
+		)
 	}
 	record := repositoryRecordFromREST(
 		fetched,
 		h.installationID,
 		h.orgID,
 	)
+	record.ETag = response.ETag
+	record.LastCheckedAt = time.Now()
 	if _, err := h.writer.ApplyRepository(
 		ctx,
 		record,
 		source,
 		response.ETag,
-		time.Now(),
+		record.LastCheckedAt,
 	); err != nil {
 		return store.RepositoryRecord{}, err
 	}
 	return record, nil
 }
 
-func classAndSource(queueName string) (budget.Class, store.SyncSource, error) {
+func classAndSource(
+	queueName string,
+) (budget.Class, store.SyncSource, error) {
 	switch queueName {
 	case queue.QueueInteractive:
 		return budget.Interactive, store.SyncSourceBackfill, nil

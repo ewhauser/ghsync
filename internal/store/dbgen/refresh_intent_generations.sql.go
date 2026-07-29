@@ -53,6 +53,29 @@ func (q *Queries) BumpRefreshIntentGenerations(ctx context.Context, intents []by
 	return items, nil
 }
 
+const completeRefreshIntentGeneration = `-- name: CompleteRefreshIntentGeneration :exec
+UPDATE refresh_intent_generations
+SET completed_generation = GREATEST(
+        completed_generation,
+        $1
+    ),
+    updated_at = now()
+WHERE kind = $2
+  AND refresh_key = $3
+  AND generation >= $1
+`
+
+type CompleteRefreshIntentGenerationParams struct {
+	CompletedGeneration int64
+	Kind                string
+	RefreshKey          string
+}
+
+func (q *Queries) CompleteRefreshIntentGeneration(ctx context.Context, arg CompleteRefreshIntentGenerationParams) error {
+	_, err := q.db.Exec(ctx, completeRefreshIntentGeneration, arg.CompletedGeneration, arg.Kind, arg.RefreshKey)
+	return err
+}
+
 const getRefreshIntentGeneration = `-- name: GetRefreshIntentGeneration :one
 SELECT generation
 FROM refresh_intent_generations

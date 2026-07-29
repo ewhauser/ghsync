@@ -15,35 +15,54 @@ const acquireEntityAdvisoryLock = `-- name: AcquireEntityAdvisoryLock :exec
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
 `
 
-// C-C1: transaction-scoped serialization survives process crashes.
+// C-C1 transaction-scoped serialization for direct writer calls.
 func (q *Queries) AcquireEntityAdvisoryLock(ctx context.Context, entityKey string) error {
 	_, err := q.db.Exec(ctx, acquireEntityAdvisoryLock, entityKey)
 	return err
 }
 
-const appendCheckHistory = `-- name: AppendCheckHistory :exec
+const acquireEntitySessionLock = `-- name: AcquireEntitySessionLock :exec
+SELECT pg_advisory_lock(hashtextextended($1::text, 0))
+`
+
+// Fetch workers use a dedicated connection and hold this lock from before
+// observation until after the state transaction commits.
+func (q *Queries) AcquireEntitySessionLock(ctx context.Context, entityKey string) error {
+	_, err := q.db.Exec(ctx, acquireEntitySessionLock, entityKey)
+	return err
+}
+
+const appendAcceptedCheckHistory = `-- name: AppendAcceptedCheckHistory :exec
 WITH input AS (
     SELECT (element->>'gh_id')::bigint AS gh_id,
            element->>'name' AS name,
            element->>'status' AS status,
            element->>'conclusion' AS conclusion,
            (element->>'gh_updated_at')::timestamptz AS gh_updated_at,
+           element->>'semantic_version' AS semantic_version,
            element->'observed' AS observed
     FROM jsonb_array_elements($6::jsonb) AS element
 )
 INSERT INTO check_history (
     check_run_gh_id, repo_id, name, status, conclusion, observed,
-    gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at
+    gh_updated_at, semantic_version, head_sha, synced_at, etag, sync_source,
+    tombstoned_at
 )
 SELECT input.gh_id, $1, input.name, input.status,
        input.conclusion, input.observed, input.gh_updated_at,
-       $2, $3, $4,
-       $5, NULL
+       input.semantic_version, $2, $3,
+       $4, $5, NULL
 FROM input
-ON CONFLICT DO NOTHING
+JOIN check_runs ON check_runs.gh_id = input.gh_id
+WHERE check_runs.repo_id = $1
+  AND check_runs.head_sha = $2
+  AND check_runs.synced_at = $3
+  AND check_runs.status = input.status
+  AND check_runs.conclusion = input.conclusion
+  AND check_runs.semantic_version = input.semantic_version
 `
 
-type AppendCheckHistoryParams struct {
+type AppendAcceptedCheckHistoryParams struct {
 	RepoID     int64
 	HeadSha    string
 	SyncedAt   pgtype.Timestamptz
@@ -52,9 +71,8 @@ type AppendCheckHistoryParams struct {
 	CheckRuns  []byte
 }
 
-// check_history is append-only raw material for later flake-rate derivation.
-func (q *Queries) AppendCheckHistory(ctx context.Context, arg AppendCheckHistoryParams) error {
-	_, err := q.db.Exec(ctx, appendCheckHistory,
+func (q *Queries) AppendAcceptedCheckHistory(ctx context.Context, arg AppendAcceptedCheckHistoryParams) error {
+	_, err := q.db.Exec(ctx, appendAcceptedCheckHistory,
 		arg.RepoID,
 		arg.HeadSha,
 		arg.SyncedAt,
@@ -65,11 +83,84 @@ func (q *Queries) AppendCheckHistory(ctx context.Context, arg AppendCheckHistory
 	return err
 }
 
-const getPullRequestByKey = `-- name: GetPullRequestByKey :one
-SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, repos.full_name AS repo_full_name
+const getPullRequestByIdentity = `-- name: GetPullRequestByIdentity :one
+SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, pull_requests.last_checked_at, repos.full_name AS repo_full_name
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
-WHERE repos.full_name = $1
+WHERE repos.gh_id = $1
+  AND pull_requests.number = $2
+`
+
+type GetPullRequestByIdentityParams struct {
+	RepoGhID int64
+	PrNumber int32
+}
+
+type GetPullRequestByIdentityRow struct {
+	ID             int64
+	RepoID         int64
+	GhID           pgtype.Int8
+	NodeID         string
+	Number         int32
+	Title          string
+	State          string
+	Draft          bool
+	AuthorLogin    string
+	HeadRef        string
+	HeadSha        string
+	BaseRef        string
+	BaseSha        string
+	ReviewDecision string
+	MergeableState string
+	StackNumber    pgtype.Int4
+	StackPosition  pgtype.Int4
+	GhUpdatedAt    pgtype.Timestamptz
+	SyncedAt       pgtype.Timestamptz
+	Etag           string
+	SyncSource     string
+	TombstonedAt   pgtype.Timestamptz
+	LastCheckedAt  pgtype.Timestamptz
+	RepoFullName   string
+}
+
+func (q *Queries) GetPullRequestByIdentity(ctx context.Context, arg GetPullRequestByIdentityParams) (GetPullRequestByIdentityRow, error) {
+	row := q.db.QueryRow(ctx, getPullRequestByIdentity, arg.RepoGhID, arg.PrNumber)
+	var i GetPullRequestByIdentityRow
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.GhID,
+		&i.NodeID,
+		&i.Number,
+		&i.Title,
+		&i.State,
+		&i.Draft,
+		&i.AuthorLogin,
+		&i.HeadRef,
+		&i.HeadSha,
+		&i.BaseRef,
+		&i.BaseSha,
+		&i.ReviewDecision,
+		&i.MergeableState,
+		&i.StackNumber,
+		&i.StackPosition,
+		&i.GhUpdatedAt,
+		&i.SyncedAt,
+		&i.Etag,
+		&i.SyncSource,
+		&i.TombstonedAt,
+		&i.LastCheckedAt,
+		&i.RepoFullName,
+	)
+	return i, err
+}
+
+const getPullRequestByKey = `-- name: GetPullRequestByKey :one
+SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, pull_requests.last_checked_at, repos.full_name AS repo_full_name
+FROM pull_requests
+JOIN repos ON repos.id = pull_requests.repo_id
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
   AND pull_requests.number = $2
 `
 
@@ -101,6 +192,7 @@ type GetPullRequestByKeyRow struct {
 	Etag           string
 	SyncSource     string
 	TombstonedAt   pgtype.Timestamptz
+	LastCheckedAt  pgtype.Timestamptz
 	RepoFullName   string
 }
 
@@ -130,17 +222,21 @@ func (q *Queries) GetPullRequestByKey(ctx context.Context, arg GetPullRequestByK
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
 		&i.RepoFullName,
 	)
 	return i, err
 }
 
 const getPullRequestFetchMetadata = `-- name: GetPullRequestFetchMetadata :one
-SELECT pull_requests.node_id, pull_requests.etag, pull_requests.stack_number,
-       pull_requests.stack_position, pull_requests.head_sha
+SELECT pull_requests.node_id, pull_requests.etag,
+       pull_requests.stack_number, pull_requests.stack_position,
+       pull_requests.head_sha, repos.gh_id AS repo_gh_id,
+       repos.installation_id, repos.full_name AS repo_full_name
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
-WHERE repos.full_name = $1
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
   AND pull_requests.number = $2
 `
 
@@ -150,11 +246,14 @@ type GetPullRequestFetchMetadataParams struct {
 }
 
 type GetPullRequestFetchMetadataRow struct {
-	NodeID        string
-	Etag          string
-	StackNumber   pgtype.Int4
-	StackPosition pgtype.Int4
-	HeadSha       string
+	NodeID         string
+	Etag           string
+	StackNumber    pgtype.Int4
+	StackPosition  pgtype.Int4
+	HeadSha        string
+	RepoGhID       int64
+	InstallationID int64
+	RepoFullName   string
 }
 
 func (q *Queries) GetPullRequestFetchMetadata(ctx context.Context, arg GetPullRequestFetchMetadataParams) (GetPullRequestFetchMetadataRow, error) {
@@ -166,14 +265,18 @@ func (q *Queries) GetPullRequestFetchMetadata(ctx context.Context, arg GetPullRe
 		&i.StackNumber,
 		&i.StackPosition,
 		&i.HeadSha,
+		&i.RepoGhID,
+		&i.InstallationID,
+		&i.RepoFullName,
 	)
 	return i, err
 }
 
 const getRepoByFullName = `-- name: GetRepoByFullName :one
-SELECT id, installation_id, org_id, gh_id, node_id, owner, name, full_name, default_branch, archived, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at
-FROM repos
-WHERE full_name = $1
+SELECT repos.id, repos.installation_id, repos.org_id, repos.gh_id, repos.node_id, repos.owner, repos.name, repos.full_name, repos.default_branch, repos.archived, repos.gh_updated_at, repos.head_sha, repos.synced_at, repos.etag, repos.sync_source, repos.tombstoned_at, repos.last_checked_at
+FROM repo_aliases
+JOIN repos ON repos.id = repo_aliases.repo_id
+WHERE repo_aliases.full_name = $1
 `
 
 func (q *Queries) GetRepoByFullName(ctx context.Context, fullName string) (Repo, error) {
@@ -196,15 +299,138 @@ func (q *Queries) GetRepoByFullName(ctx context.Context, fullName string) (Repo,
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
+	)
+	return i, err
+}
+
+const getRepoByGitHubID = `-- name: GetRepoByGitHubID :one
+SELECT id, installation_id, org_id, gh_id, node_id, owner, name, full_name, default_branch, archived, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at
+FROM repos
+WHERE gh_id = $1
+`
+
+func (q *Queries) GetRepoByGitHubID(ctx context.Context, ghID int64) (Repo, error) {
+	row := q.db.QueryRow(ctx, getRepoByGitHubID, ghID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.InstallationID,
+		&i.OrgID,
+		&i.GhID,
+		&i.NodeID,
+		&i.Owner,
+		&i.Name,
+		&i.FullName,
+		&i.DefaultBranch,
+		&i.Archived,
+		&i.GhUpdatedAt,
+		&i.HeadSha,
+		&i.SyncedAt,
+		&i.Etag,
+		&i.SyncSource,
+		&i.TombstonedAt,
+		&i.LastCheckedAt,
+	)
+	return i, err
+}
+
+const getRepoRulesFetchMetadata = `-- name: GetRepoRulesFetchMetadata :one
+SELECT repos.id AS repo_id, repos.gh_id AS repo_gh_id,
+       repos.installation_id, repos.full_name,
+       COALESCE(repo_rule_sync_state.etag, '') AS etag
+FROM repos
+LEFT JOIN repo_rule_sync_state
+    ON repo_rule_sync_state.repo_id = repos.id
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
+`
+
+type GetRepoRulesFetchMetadataRow struct {
+	RepoID         int64
+	RepoGhID       int64
+	InstallationID int64
+	FullName       string
+	Etag           string
+}
+
+func (q *Queries) GetRepoRulesFetchMetadata(ctx context.Context, repoFullName string) (GetRepoRulesFetchMetadataRow, error) {
+	row := q.db.QueryRow(ctx, getRepoRulesFetchMetadata, repoFullName)
+	var i GetRepoRulesFetchMetadataRow
+	err := row.Scan(
+		&i.RepoID,
+		&i.RepoGhID,
+		&i.InstallationID,
+		&i.FullName,
+		&i.Etag,
+	)
+	return i, err
+}
+
+const getStackByIdentity = `-- name: GetStackByIdentity :one
+SELECT stacks.id, stacks.repo_id, stacks.gh_id, stacks.node_id, stacks.number, stacks.base_ref, stacks.base_sha, stacks.open, stacks.entries, stacks.gh_updated_at, stacks.head_sha, stacks.synced_at, stacks.etag, stacks.sync_source, stacks.tombstoned_at, stacks.last_checked_at, repos.full_name AS repo_full_name
+FROM stacks
+JOIN repos ON repos.id = stacks.repo_id
+WHERE repos.gh_id = $1
+  AND stacks.number = $2
+`
+
+type GetStackByIdentityParams struct {
+	RepoGhID    int64
+	StackNumber int32
+}
+
+type GetStackByIdentityRow struct {
+	ID            int64
+	RepoID        int64
+	GhID          pgtype.Int8
+	NodeID        string
+	Number        int32
+	BaseRef       string
+	BaseSha       string
+	Open          bool
+	Entries       []byte
+	GhUpdatedAt   pgtype.Timestamptz
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
+	TombstonedAt  pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+	RepoFullName  string
+}
+
+func (q *Queries) GetStackByIdentity(ctx context.Context, arg GetStackByIdentityParams) (GetStackByIdentityRow, error) {
+	row := q.db.QueryRow(ctx, getStackByIdentity, arg.RepoGhID, arg.StackNumber)
+	var i GetStackByIdentityRow
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.GhID,
+		&i.NodeID,
+		&i.Number,
+		&i.BaseRef,
+		&i.BaseSha,
+		&i.Open,
+		&i.Entries,
+		&i.GhUpdatedAt,
+		&i.HeadSha,
+		&i.SyncedAt,
+		&i.Etag,
+		&i.SyncSource,
+		&i.TombstonedAt,
+		&i.LastCheckedAt,
+		&i.RepoFullName,
 	)
 	return i, err
 }
 
 const getStackByKey = `-- name: GetStackByKey :one
-SELECT stacks.id, stacks.repo_id, stacks.gh_id, stacks.node_id, stacks.number, stacks.base_ref, stacks.base_sha, stacks.open, stacks.entries, stacks.gh_updated_at, stacks.head_sha, stacks.synced_at, stacks.etag, stacks.sync_source, stacks.tombstoned_at, repos.full_name AS repo_full_name
+SELECT stacks.id, stacks.repo_id, stacks.gh_id, stacks.node_id, stacks.number, stacks.base_ref, stacks.base_sha, stacks.open, stacks.entries, stacks.gh_updated_at, stacks.head_sha, stacks.synced_at, stacks.etag, stacks.sync_source, stacks.tombstoned_at, stacks.last_checked_at, repos.full_name AS repo_full_name
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
-WHERE repos.full_name = $1
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
   AND stacks.number = $2
 `
 
@@ -214,22 +440,23 @@ type GetStackByKeyParams struct {
 }
 
 type GetStackByKeyRow struct {
-	ID           int64
-	RepoID       int64
-	GhID         pgtype.Int8
-	NodeID       string
-	Number       int32
-	BaseRef      string
-	BaseSha      string
-	Open         bool
-	Entries      []byte
-	GhUpdatedAt  pgtype.Timestamptz
-	HeadSha      string
-	SyncedAt     pgtype.Timestamptz
-	Etag         string
-	SyncSource   string
-	TombstonedAt pgtype.Timestamptz
-	RepoFullName string
+	ID            int64
+	RepoID        int64
+	GhID          pgtype.Int8
+	NodeID        string
+	Number        int32
+	BaseRef       string
+	BaseSha       string
+	Open          bool
+	Entries       []byte
+	GhUpdatedAt   pgtype.Timestamptz
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
+	TombstonedAt  pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+	RepoFullName  string
 }
 
 func (q *Queries) GetStackByKey(ctx context.Context, arg GetStackByKeyParams) (GetStackByKeyRow, error) {
@@ -251,16 +478,20 @@ func (q *Queries) GetStackByKey(ctx context.Context, arg GetStackByKeyParams) (G
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
 		&i.RepoFullName,
 	)
 	return i, err
 }
 
 const getStackFetchMetadata = `-- name: GetStackFetchMetadata :one
-SELECT stacks.etag, stacks.entries, stacks.head_sha
+SELECT stacks.etag, stacks.entries, stacks.head_sha,
+       repos.gh_id AS repo_gh_id, repos.installation_id,
+       repos.full_name AS repo_full_name
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
-WHERE repos.full_name = $1
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
   AND stacks.number = $2
 `
 
@@ -270,15 +501,25 @@ type GetStackFetchMetadataParams struct {
 }
 
 type GetStackFetchMetadataRow struct {
-	Etag    string
-	Entries []byte
-	HeadSha string
+	Etag           string
+	Entries        []byte
+	HeadSha        string
+	RepoGhID       int64
+	InstallationID int64
+	RepoFullName   string
 }
 
 func (q *Queries) GetStackFetchMetadata(ctx context.Context, arg GetStackFetchMetadataParams) (GetStackFetchMetadataRow, error) {
 	row := q.db.QueryRow(ctx, getStackFetchMetadata, arg.RepoFullName, arg.StackNumber)
 	var i GetStackFetchMetadataRow
-	err := row.Scan(&i.Etag, &i.Entries, &i.HeadSha)
+	err := row.Scan(
+		&i.Etag,
+		&i.Entries,
+		&i.HeadSha,
+		&i.RepoGhID,
+		&i.InstallationID,
+		&i.RepoFullName,
+	)
 	return i, err
 }
 
@@ -300,7 +541,6 @@ type InsertChangeEventParams struct {
 	Payload    []byte
 }
 
-// C-C3/C-S1: called inside the same transaction as the accepted entity write.
 func (q *Queries) InsertChangeEvent(ctx context.Context, arg InsertChangeEventParams) (int64, error) {
 	row := q.db.QueryRow(ctx, insertChangeEvent,
 		arg.Stream,
@@ -317,16 +557,14 @@ func (q *Queries) InsertChangeEvent(ctx context.Context, arg InsertChangeEventPa
 const listCachedPRMemberships = `-- name: ListCachedPRMemberships :many
 SELECT pull_requests.number, pull_requests.stack_number
 FROM pull_requests
-WHERE pull_requests.repo_id = (
-        SELECT id FROM repos WHERE full_name = $1
-      )
+WHERE pull_requests.repo_id = $1
   AND pull_requests.number = ANY($2::int[])
 ORDER BY pull_requests.number
 `
 
 type ListCachedPRMembershipsParams struct {
-	RepoFullName string
-	PrNumbers    []int32
+	RepoID    int64
+	PrNumbers []int32
 }
 
 type ListCachedPRMembershipsRow struct {
@@ -335,7 +573,7 @@ type ListCachedPRMembershipsRow struct {
 }
 
 func (q *Queries) ListCachedPRMemberships(ctx context.Context, arg ListCachedPRMembershipsParams) ([]ListCachedPRMembershipsRow, error) {
-	rows, err := q.db.Query(ctx, listCachedPRMemberships, arg.RepoFullName, arg.PrNumbers)
+	rows, err := q.db.Query(ctx, listCachedPRMemberships, arg.RepoID, arg.PrNumbers)
 	if err != nil {
 		return nil, err
 	}
@@ -355,10 +593,12 @@ func (q *Queries) ListCachedPRMemberships(ctx context.Context, arg ListCachedPRM
 }
 
 const listPRScopesByHeadSHA = `-- name: ListPRScopesByHeadSHA :many
-SELECT pull_requests.number, pull_requests.stack_number
+SELECT pull_requests.number, pull_requests.stack_number,
+       repos.gh_id AS repo_gh_id, repos.installation_id
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
-WHERE repos.full_name = $1
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
   AND pull_requests.head_sha = $2
   AND pull_requests.tombstoned_at IS NULL
 ORDER BY pull_requests.number
@@ -370,8 +610,10 @@ type ListPRScopesByHeadSHAParams struct {
 }
 
 type ListPRScopesByHeadSHARow struct {
-	Number      int32
-	StackNumber pgtype.Int4
+	Number         int32
+	StackNumber    pgtype.Int4
+	RepoGhID       int64
+	InstallationID int64
 }
 
 func (q *Queries) ListPRScopesByHeadSHA(ctx context.Context, arg ListPRScopesByHeadSHAParams) ([]ListPRScopesByHeadSHARow, error) {
@@ -383,7 +625,12 @@ func (q *Queries) ListPRScopesByHeadSHA(ctx context.Context, arg ListPRScopesByH
 	var items []ListPRScopesByHeadSHARow
 	for rows.Next() {
 		var i ListPRScopesByHeadSHARow
-		if err := rows.Scan(&i.Number, &i.StackNumber); err != nil {
+		if err := rows.Scan(
+			&i.Number,
+			&i.StackNumber,
+			&i.RepoGhID,
+			&i.InstallationID,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -398,7 +645,8 @@ const listPRsAffectedByBranch = `-- name: ListPRsAffectedByBranch :many
 SELECT DISTINCT pull_requests.number, pull_requests.stack_number
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
-WHERE repos.full_name = $1
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
   AND pull_requests.tombstoned_at IS NULL
   AND (
       pull_requests.head_ref = $2
@@ -437,11 +685,53 @@ func (q *Queries) ListPRsAffectedByBranch(ctx context.Context, arg ListPRsAffect
 	return items, nil
 }
 
+const listRepositoryDerivationScopes = `-- name: ListRepositoryDerivationScopes :many
+SELECT scopes.scope_key::text
+FROM (
+    SELECT 'stack:' || repos.installation_id::text || ':' ||
+           repos.gh_id::text || ':' || stacks.number::text AS scope_key
+    FROM stacks
+    JOIN repos ON repos.id = stacks.repo_id
+    WHERE repos.id = $1
+      AND stacks.tombstoned_at IS NULL
+    UNION
+    SELECT 'pr:' || repos.installation_id::text || ':' ||
+           repos.gh_id::text || ':' || pull_requests.number::text AS scope_key
+    FROM pull_requests
+    JOIN repos ON repos.id = pull_requests.repo_id
+    WHERE repos.id = $1
+      AND pull_requests.tombstoned_at IS NULL
+      AND pull_requests.stack_number IS NULL
+) AS scopes
+ORDER BY scope_key
+`
+
+func (q *Queries) ListRepositoryDerivationScopes(ctx context.Context, repoID int64) ([]string, error) {
+	rows, err := q.db.Query(ctx, listRepositoryDerivationScopes, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var scopes_scope_key string
+		if err := rows.Scan(&scopes_scope_key); err != nil {
+			return nil, err
+		}
+		items = append(items, scopes_scope_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStacksAffectedByBranch = `-- name: ListStacksAffectedByBranch :many
 SELECT DISTINCT stacks.number
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
-WHERE repos.full_name = $1
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $1
   AND stacks.tombstoned_at IS NULL
   AND (
       stacks.base_ref = $2
@@ -492,9 +782,17 @@ type MarkDerivationDirtyParams struct {
 	ScopeKeys []string
 }
 
-// C-D2: the caller supplies only stack or loose-PR scope keys.
 func (q *Queries) MarkDerivationDirty(ctx context.Context, arg MarkDerivationDirtyParams) error {
 	_, err := q.db.Exec(ctx, markDerivationDirty, arg.MarkedAt, arg.ScopeKeys)
+	return err
+}
+
+const releaseEntitySessionLock = `-- name: ReleaseEntitySessionLock :exec
+SELECT pg_advisory_unlock(hashtextextended($1::text, 0))
+`
+
+func (q *Queries) ReleaseEntitySessionLock(ctx context.Context, entityKey string) error {
+	_, err := q.db.Exec(ctx, releaseEntitySessionLock, entityKey)
 	return err
 }
 
@@ -510,20 +808,22 @@ WITH input AS (
            (element->>'started_at')::timestamptz AS started_at,
            (element->>'completed_at')::timestamptz AS completed_at,
            (element->>'gh_updated_at')::timestamptz AS gh_updated_at,
+           element->>'semantic_version' AS semantic_version,
            element->'observed' AS observed
     FROM jsonb_array_elements($1::jsonb) AS element
 ),
 upserted AS (
     INSERT INTO check_runs (
         gh_id, repo_id, node_id, name, status, conclusion, details_url,
-        app_slug, started_at, completed_at, gh_updated_at, head_sha,
-        synced_at, etag, sync_source, tombstoned_at
+        app_slug, started_at, completed_at, gh_updated_at, semantic_version,
+        head_sha, synced_at, last_checked_at, etag, sync_source, tombstoned_at
     )
     SELECT input.gh_id, $2, input.node_id, input.name,
            input.status, input.conclusion, input.details_url, input.app_slug,
            input.started_at, input.completed_at, input.gh_updated_at,
-           $3, $4, $5,
-           $6, NULL
+           input.semantic_version, $3, $4,
+           $5, $6,
+           $7, NULL
     FROM input
     ON CONFLICT (gh_id) DO UPDATE
     SET repo_id = EXCLUDED.repo_id,
@@ -536,31 +836,50 @@ upserted AS (
         started_at = EXCLUDED.started_at,
         completed_at = EXCLUDED.completed_at,
         gh_updated_at = EXCLUDED.gh_updated_at,
+        semantic_version = EXCLUDED.semantic_version,
         head_sha = EXCLUDED.head_sha,
         synced_at = EXCLUDED.synced_at,
+        last_checked_at = EXCLUDED.last_checked_at,
         etag = EXCLUDED.etag,
         sync_source = EXCLUDED.sync_source,
         tombstoned_at = NULL
-    WHERE check_runs.gh_updated_at IS NULL
+    WHERE (
+           check_runs.gh_updated_at IS NULL
+           AND EXCLUDED.gh_updated_at IS NOT NULL
+       )
        OR EXCLUDED.gh_updated_at > check_runs.gh_updated_at
        OR (
-           EXCLUDED.gh_updated_at = check_runs.gh_updated_at
-           AND EXCLUDED.head_sha = check_runs.head_sha
-           AND EXCLUDED.synced_at >= check_runs.synced_at
-           AND check_runs.tombstoned_at IS NULL
+           EXCLUDED.gh_updated_at IS NOT DISTINCT FROM check_runs.gh_updated_at
+           AND ROW(
+               EXCLUDED.repo_id, EXCLUDED.node_id, EXCLUDED.name,
+               EXCLUDED.status, EXCLUDED.conclusion, EXCLUDED.details_url,
+               EXCLUDED.app_slug, EXCLUDED.started_at, EXCLUDED.completed_at,
+               EXCLUDED.semantic_version, EXCLUDED.head_sha
+           ) IS DISTINCT FROM ROW(
+               check_runs.repo_id, check_runs.node_id, check_runs.name,
+               check_runs.status, check_runs.conclusion,
+               check_runs.details_url, check_runs.app_slug,
+               check_runs.started_at, check_runs.completed_at,
+               check_runs.semantic_version, check_runs.head_sha
+           )
+       )
+       OR (
+           check_runs.tombstoned_at IS NOT NULL
+           AND EXCLUDED.last_checked_at > check_runs.tombstoned_at
        )
     RETURNING gh_id
 ),
 tombstoned AS (
     UPDATE check_runs
-    SET tombstoned_at = $4,
+    SET tombstoned_at = $5,
         synced_at = $4,
-        etag = $5,
-        sync_source = $6
+        last_checked_at = $5,
+        etag = $6,
+        sync_source = $7
     WHERE repo_id = $2
       AND head_sha = $3
       AND tombstoned_at IS NULL
-      AND synced_at <= $4
+      AND last_checked_at <= $5
       AND NOT EXISTS (
           SELECT 1 FROM input WHERE input.gh_id = check_runs.gh_id
       )
@@ -572,21 +891,22 @@ SELECT gh_id FROM tombstoned
 `
 
 type ReplaceCheckRunsParams struct {
-	CheckRuns  []byte
-	RepoID     int64
-	HeadSha    string
-	SyncedAt   pgtype.Timestamptz
-	Etag       string
-	SyncSource string
+	CheckRuns     []byte
+	RepoID        int64
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
 }
 
-// C-P3: one unnest-like json recordset upsert replaces row-at-a-time writes.
 func (q *Queries) ReplaceCheckRuns(ctx context.Context, arg ReplaceCheckRunsParams) ([]int64, error) {
 	rows, err := q.db.Query(ctx, replaceCheckRuns,
 		arg.CheckRuns,
 		arg.RepoID,
 		arg.HeadSha,
 		arg.SyncedAt,
+		arg.LastCheckedAt,
 		arg.Etag,
 		arg.SyncSource,
 	)
@@ -608,6 +928,105 @@ func (q *Queries) ReplaceCheckRuns(ctx context.Context, arg ReplaceCheckRunsPara
 	return items, nil
 }
 
+const replaceRepoRules = `-- name: ReplaceRepoRules :many
+WITH input AS (
+    SELECT element->>'rule_key' AS rule_key,
+           element->'rule' AS rule,
+           (element->>'gh_updated_at')::timestamptz AS gh_updated_at,
+           element->>'head_sha' AS head_sha
+    FROM jsonb_array_elements($1::jsonb) AS element
+),
+upserted AS (
+    INSERT INTO repo_rules (
+        repo_id, rule_key, rule, gh_updated_at, head_sha, synced_at,
+        last_checked_at, etag, sync_source, tombstoned_at
+    )
+    SELECT $2, input.rule_key, input.rule,
+           input.gh_updated_at, input.head_sha, $3,
+           $4, $5,
+           $6, NULL
+    FROM input
+    ON CONFLICT (repo_id, rule_key) DO UPDATE
+    SET rule = EXCLUDED.rule,
+        gh_updated_at = EXCLUDED.gh_updated_at,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        last_checked_at = EXCLUDED.last_checked_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL
+    WHERE (
+           repo_rules.gh_updated_at IS NULL
+           AND EXCLUDED.gh_updated_at IS NOT NULL
+       )
+       OR EXCLUDED.gh_updated_at > repo_rules.gh_updated_at
+       OR (
+           EXCLUDED.gh_updated_at IS NOT DISTINCT FROM repo_rules.gh_updated_at
+           AND ROW(EXCLUDED.rule, EXCLUDED.head_sha)
+               IS DISTINCT FROM ROW(repo_rules.rule, repo_rules.head_sha)
+       )
+       OR (
+           repo_rules.tombstoned_at IS NOT NULL
+           AND EXCLUDED.last_checked_at > repo_rules.tombstoned_at
+       )
+    RETURNING rule_key
+),
+tombstoned AS (
+    UPDATE repo_rules
+    SET tombstoned_at = $4,
+        synced_at = $3,
+        last_checked_at = $4,
+        etag = $5,
+        sync_source = $6
+    WHERE repo_id = $2
+      AND tombstoned_at IS NULL
+      AND last_checked_at <= $4
+      AND NOT EXISTS (
+          SELECT 1 FROM input WHERE input.rule_key = repo_rules.rule_key
+      )
+    RETURNING rule_key
+)
+SELECT rule_key FROM upserted
+UNION ALL
+SELECT rule_key FROM tombstoned
+`
+
+type ReplaceRepoRulesParams struct {
+	Rules         []byte
+	RepoID        int64
+	SyncedAt      pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
+}
+
+func (q *Queries) ReplaceRepoRules(ctx context.Context, arg ReplaceRepoRulesParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, replaceRepoRules,
+		arg.Rules,
+		arg.RepoID,
+		arg.SyncedAt,
+		arg.LastCheckedAt,
+		arg.Etag,
+		arg.SyncSource,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var rule_key string
+		if err := rows.Scan(&rule_key); err != nil {
+			return nil, err
+		}
+		items = append(items, rule_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const replaceReviewThreads = `-- name: ReplaceReviewThreads :many
 WITH input AS (
     SELECT element->>'id' AS id,
@@ -622,16 +1041,19 @@ WITH input AS (
 upserted AS (
     INSERT INTO review_threads (
         id, repo_id, pr_number, is_resolved, is_outdated, path, line,
-        comments, gh_updated_at, head_sha, synced_at, etag, sync_source,
-        tombstoned_at
+        comments, gh_updated_at, head_sha, synced_at, last_checked_at,
+        etag, sync_source, tombstoned_at
     )
     SELECT input.id, $2, $3,
            input.is_resolved, input.is_outdated, input.path, input.line,
            input.comments, input.gh_updated_at, $4,
-           $5, $6, $7, NULL
+           $5, $6,
+           $7, $8, NULL
     FROM input
     ON CONFLICT (id) DO UPDATE
-    SET is_resolved = EXCLUDED.is_resolved,
+    SET repo_id = EXCLUDED.repo_id,
+        pr_number = EXCLUDED.pr_number,
+        is_resolved = EXCLUDED.is_resolved,
         is_outdated = EXCLUDED.is_outdated,
         path = EXCLUDED.path,
         line = EXCLUDED.line,
@@ -639,29 +1061,42 @@ upserted AS (
         gh_updated_at = EXCLUDED.gh_updated_at,
         head_sha = EXCLUDED.head_sha,
         synced_at = EXCLUDED.synced_at,
+        last_checked_at = EXCLUDED.last_checked_at,
         etag = EXCLUDED.etag,
         sync_source = EXCLUDED.sync_source,
         tombstoned_at = NULL
     WHERE review_threads.gh_updated_at IS NULL
        OR EXCLUDED.gh_updated_at > review_threads.gh_updated_at
        OR (
-           EXCLUDED.gh_updated_at = review_threads.gh_updated_at
-           AND EXCLUDED.head_sha = review_threads.head_sha
-           AND EXCLUDED.synced_at >= review_threads.synced_at
-           AND review_threads.tombstoned_at IS NULL
+           EXCLUDED.gh_updated_at IS NOT DISTINCT FROM review_threads.gh_updated_at
+           AND ROW(
+               EXCLUDED.repo_id, EXCLUDED.pr_number, EXCLUDED.is_resolved,
+               EXCLUDED.is_outdated, EXCLUDED.path, EXCLUDED.line,
+               EXCLUDED.comments, EXCLUDED.head_sha
+           ) IS DISTINCT FROM ROW(
+               review_threads.repo_id, review_threads.pr_number,
+               review_threads.is_resolved, review_threads.is_outdated,
+               review_threads.path, review_threads.line,
+               review_threads.comments, review_threads.head_sha
+           )
+       )
+       OR (
+           review_threads.tombstoned_at IS NOT NULL
+           AND EXCLUDED.last_checked_at > review_threads.tombstoned_at
        )
     RETURNING id
 ),
 tombstoned AS (
     UPDATE review_threads
-    SET tombstoned_at = $5,
+    SET tombstoned_at = $6,
         synced_at = $5,
-        etag = $6,
-        sync_source = $7
+        last_checked_at = $6,
+        etag = $7,
+        sync_source = $8
     WHERE repo_id = $2
       AND pr_number = $3
       AND tombstoned_at IS NULL
-      AND synced_at <= $5
+      AND last_checked_at <= $6
       AND NOT EXISTS (SELECT 1 FROM input WHERE input.id = review_threads.id)
     RETURNING id
 )
@@ -671,16 +1106,16 @@ SELECT id FROM tombstoned
 `
 
 type ReplaceReviewThreadsParams struct {
-	Threads    []byte
-	RepoID     int64
-	PrNumber   int32
-	HeadSha    string
-	SyncedAt   pgtype.Timestamptz
-	Etag       string
-	SyncSource string
+	Threads       []byte
+	RepoID        int64
+	PrNumber      int32
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
 }
 
-// C-P3: all threads returned for one PR are applied as a set.
 func (q *Queries) ReplaceReviewThreads(ctx context.Context, arg ReplaceReviewThreadsParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, replaceReviewThreads,
 		arg.Threads,
@@ -688,6 +1123,7 @@ func (q *Queries) ReplaceReviewThreads(ctx context.Context, arg ReplaceReviewThr
 		arg.PrNumber,
 		arg.HeadSha,
 		arg.SyncedAt,
+		arg.LastCheckedAt,
 		arg.Etag,
 		arg.SyncSource,
 	)
@@ -713,13 +1149,14 @@ const tombstonePullRequest = `-- name: TombstonePullRequest :one
 UPDATE pull_requests
 SET tombstoned_at = $1,
     synced_at = $2,
+    last_checked_at = GREATEST(last_checked_at, $1),
     etag = '',
     sync_source = $3
 WHERE repo_id = $4
   AND number = $5
   AND tombstoned_at IS NULL
-  AND synced_at <= $1
-RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at
+  AND last_checked_at <= $1
+RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at, last_checked_at
 `
 
 type TombstonePullRequestParams struct {
@@ -762,6 +1199,7 @@ func (q *Queries) TombstonePullRequest(ctx context.Context, arg TombstonePullReq
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
 	)
 	return i, err
 }
@@ -771,13 +1209,14 @@ UPDATE stacks
 SET tombstoned_at = $1,
     open = false,
     synced_at = $2,
+    last_checked_at = GREATEST(last_checked_at, $1),
     etag = '',
     sync_source = $3
 WHERE repo_id = $4
   AND number = $5
   AND tombstoned_at IS NULL
-  AND synced_at <= $1
-RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at
+  AND last_checked_at <= $1
+RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at
 `
 
 type TombstoneStackParams struct {
@@ -813,16 +1252,140 @@ func (q *Queries) TombstoneStack(ctx context.Context, arg TombstoneStackParams) 
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
 	)
 	return i, err
+}
+
+const touchCheckRunsCheckedAt = `-- name: TouchCheckRunsCheckedAt :exec
+UPDATE check_runs
+SET last_checked_at = GREATEST(last_checked_at, $1)
+WHERE repo_id = $2
+  AND head_sha = $3
+`
+
+type TouchCheckRunsCheckedAtParams struct {
+	CheckedAt pgtype.Timestamptz
+	RepoID    int64
+	HeadSha   string
+}
+
+func (q *Queries) TouchCheckRunsCheckedAt(ctx context.Context, arg TouchCheckRunsCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchCheckRunsCheckedAt, arg.CheckedAt, arg.RepoID, arg.HeadSha)
+	return err
+}
+
+const touchPullRequestCheckedAt = `-- name: TouchPullRequestCheckedAt :exec
+UPDATE pull_requests
+SET last_checked_at = GREATEST(last_checked_at, $1),
+    etag = CASE WHEN $2::text = '' THEN etag
+                ELSE $2::text END
+WHERE repo_id = $3
+  AND number = $4
+`
+
+type TouchPullRequestCheckedAtParams struct {
+	CheckedAt pgtype.Timestamptz
+	Etag      string
+	RepoID    int64
+	PrNumber  int32
+}
+
+func (q *Queries) TouchPullRequestCheckedAt(ctx context.Context, arg TouchPullRequestCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchPullRequestCheckedAt,
+		arg.CheckedAt,
+		arg.Etag,
+		arg.RepoID,
+		arg.PrNumber,
+	)
+	return err
+}
+
+const touchRepoRulesCheckedAt = `-- name: TouchRepoRulesCheckedAt :exec
+UPDATE repo_rules
+SET last_checked_at = GREATEST(last_checked_at, $1)
+WHERE repo_id = $2
+`
+
+type TouchRepoRulesCheckedAtParams struct {
+	CheckedAt pgtype.Timestamptz
+	RepoID    int64
+}
+
+func (q *Queries) TouchRepoRulesCheckedAt(ctx context.Context, arg TouchRepoRulesCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchRepoRulesCheckedAt, arg.CheckedAt, arg.RepoID)
+	return err
+}
+
+const touchRepositoryCheckedAt = `-- name: TouchRepositoryCheckedAt :exec
+UPDATE repos
+SET last_checked_at = GREATEST(last_checked_at, $1),
+    etag = CASE WHEN $2::text = '' THEN etag
+                ELSE $2::text END
+WHERE gh_id = $3
+`
+
+type TouchRepositoryCheckedAtParams struct {
+	CheckedAt pgtype.Timestamptz
+	Etag      string
+	GhID      int64
+}
+
+func (q *Queries) TouchRepositoryCheckedAt(ctx context.Context, arg TouchRepositoryCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchRepositoryCheckedAt, arg.CheckedAt, arg.Etag, arg.GhID)
+	return err
+}
+
+const touchReviewThreadsCheckedAt = `-- name: TouchReviewThreadsCheckedAt :exec
+UPDATE review_threads
+SET last_checked_at = GREATEST(last_checked_at, $1)
+WHERE repo_id = $2
+  AND pr_number = $3
+`
+
+type TouchReviewThreadsCheckedAtParams struct {
+	CheckedAt pgtype.Timestamptz
+	RepoID    int64
+	PrNumber  int32
+}
+
+func (q *Queries) TouchReviewThreadsCheckedAt(ctx context.Context, arg TouchReviewThreadsCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchReviewThreadsCheckedAt, arg.CheckedAt, arg.RepoID, arg.PrNumber)
+	return err
+}
+
+const touchStackCheckedAt = `-- name: TouchStackCheckedAt :exec
+UPDATE stacks
+SET last_checked_at = GREATEST(last_checked_at, $1),
+    etag = CASE WHEN $2::text = '' THEN etag
+                ELSE $2::text END
+WHERE repo_id = $3
+  AND number = $4
+`
+
+type TouchStackCheckedAtParams struct {
+	CheckedAt   pgtype.Timestamptz
+	Etag        string
+	RepoID      int64
+	StackNumber int32
+}
+
+func (q *Queries) TouchStackCheckedAt(ctx context.Context, arg TouchStackCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchStackCheckedAt,
+		arg.CheckedAt,
+		arg.Etag,
+		arg.RepoID,
+		arg.StackNumber,
+	)
+	return err
 }
 
 const upsertPullRequestWriteIfNewer = `-- name: UpsertPullRequestWriteIfNewer :one
 INSERT INTO pull_requests (
     repo_id, gh_id, node_id, number, title, state, draft, author_login,
     head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state,
-    stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source,
-    tombstoned_at
+    stack_number, stack_position, gh_updated_at, synced_at, last_checked_at,
+    etag, sync_source, tombstoned_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6, $7,
@@ -833,8 +1396,8 @@ INSERT INTO pull_requests (
          THEN $16::int ELSE NULL END,
     CASE WHEN $15::boolean
          THEN $17::int ELSE NULL END,
-    $18,
-    $19, $20, $21, NULL
+    $18, $19,
+    $20, $21, $22, NULL
 )
 ON CONFLICT (repo_id, number) DO UPDATE
 SET gh_id = EXCLUDED.gh_id,
@@ -861,18 +1424,38 @@ SET gh_id = EXCLUDED.gh_id,
     END,
     gh_updated_at = EXCLUDED.gh_updated_at,
     synced_at = EXCLUDED.synced_at,
+    last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
     sync_source = EXCLUDED.sync_source,
     tombstoned_at = NULL
 WHERE pull_requests.gh_updated_at IS NULL
    OR EXCLUDED.gh_updated_at > pull_requests.gh_updated_at
    OR (
-       EXCLUDED.gh_updated_at = pull_requests.gh_updated_at
-       AND EXCLUDED.head_sha = pull_requests.head_sha
-       AND EXCLUDED.synced_at >= pull_requests.synced_at
-       AND pull_requests.tombstoned_at IS NULL
+       EXCLUDED.gh_updated_at IS NOT DISTINCT FROM pull_requests.gh_updated_at
+       AND ROW(
+           EXCLUDED.gh_id, EXCLUDED.node_id, EXCLUDED.title, EXCLUDED.state,
+           EXCLUDED.draft, EXCLUDED.author_login, EXCLUDED.head_ref,
+           EXCLUDED.head_sha, EXCLUDED.base_ref, EXCLUDED.base_sha,
+           EXCLUDED.review_decision, EXCLUDED.mergeable_state,
+           CASE WHEN $15::boolean
+                THEN EXCLUDED.stack_number ELSE pull_requests.stack_number END,
+           CASE WHEN $15::boolean
+                THEN EXCLUDED.stack_position ELSE pull_requests.stack_position END
+       ) IS DISTINCT FROM ROW(
+           pull_requests.gh_id, pull_requests.node_id, pull_requests.title,
+           pull_requests.state, pull_requests.draft,
+           pull_requests.author_login, pull_requests.head_ref,
+           pull_requests.head_sha, pull_requests.base_ref,
+           pull_requests.base_sha, pull_requests.review_decision,
+           pull_requests.mergeable_state, pull_requests.stack_number,
+           pull_requests.stack_position
+       )
    )
-RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at
+   OR (
+       pull_requests.tombstoned_at IS NOT NULL
+       AND EXCLUDED.last_checked_at > pull_requests.tombstoned_at
+   )
+RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at, last_checked_at
 `
 
 type UpsertPullRequestWriteIfNewerParams struct {
@@ -895,11 +1478,11 @@ type UpsertPullRequestWriteIfNewerParams struct {
 	StackPosition   pgtype.Int4
 	GhUpdatedAt     pgtype.Timestamptz
 	SyncedAt        pgtype.Timestamptz
+	LastCheckedAt   pgtype.Timestamptz
 	Etag            string
 	SyncSource      string
 }
 
-// C-C2: (gh_updated_at, head_sha) is the monotonic PR version.
 func (q *Queries) UpsertPullRequestWriteIfNewer(ctx context.Context, arg UpsertPullRequestWriteIfNewerParams) (PullRequest, error) {
 	row := q.db.QueryRow(ctx, upsertPullRequestWriteIfNewer,
 		arg.RepoID,
@@ -921,6 +1504,7 @@ func (q *Queries) UpsertPullRequestWriteIfNewer(ctx context.Context, arg UpsertP
 		arg.StackPosition,
 		arg.GhUpdatedAt,
 		arg.SyncedAt,
+		arg.LastCheckedAt,
 		arg.Etag,
 		arg.SyncSource,
 	)
@@ -948,46 +1532,106 @@ func (q *Queries) UpsertPullRequestWriteIfNewer(ctx context.Context, arg UpsertP
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
 	)
 	return i, err
+}
+
+const upsertRepoRuleSyncState = `-- name: UpsertRepoRuleSyncState :exec
+INSERT INTO repo_rule_sync_state (repo_id, etag, last_checked_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (repo_id) DO UPDATE
+SET etag = CASE
+        WHEN EXCLUDED.etag = '' THEN repo_rule_sync_state.etag
+        ELSE EXCLUDED.etag
+    END,
+    last_checked_at = GREATEST(
+        repo_rule_sync_state.last_checked_at,
+        EXCLUDED.last_checked_at
+    )
+`
+
+type UpsertRepoRuleSyncStateParams struct {
+	RepoID    int64
+	Etag      string
+	CheckedAt pgtype.Timestamptz
+}
+
+func (q *Queries) UpsertRepoRuleSyncState(ctx context.Context, arg UpsertRepoRuleSyncStateParams) error {
+	_, err := q.db.Exec(ctx, upsertRepoRuleSyncState, arg.RepoID, arg.Etag, arg.CheckedAt)
+	return err
+}
+
+const upsertRepositoryAlias = `-- name: UpsertRepositoryAlias :exec
+INSERT INTO repo_aliases (full_name, repo_id, first_seen_at, last_seen_at)
+VALUES (
+    $1, $2,
+    $3, $3
+)
+ON CONFLICT (full_name) DO UPDATE
+SET repo_id = EXCLUDED.repo_id,
+    last_seen_at = GREATEST(repo_aliases.last_seen_at, EXCLUDED.last_seen_at)
+WHERE EXCLUDED.last_seen_at >= repo_aliases.last_seen_at
+`
+
+type UpsertRepositoryAliasParams struct {
+	FullName   string
+	RepoID     int64
+	ObservedAt pgtype.Timestamptz
+}
+
+func (q *Queries) UpsertRepositoryAlias(ctx context.Context, arg UpsertRepositoryAliasParams) error {
+	_, err := q.db.Exec(ctx, upsertRepositoryAlias, arg.FullName, arg.RepoID, arg.ObservedAt)
+	return err
 }
 
 const upsertRepositoryWriteIfNewer = `-- name: UpsertRepositoryWriteIfNewer :one
 INSERT INTO repos (
     installation_id, org_id, gh_id, node_id, owner, name, full_name,
-    default_branch, archived, gh_updated_at, head_sha, synced_at, etag,
-    sync_source, tombstoned_at
+    default_branch, archived, gh_updated_at, head_sha, synced_at,
+    last_checked_at, etag, sync_source, tombstoned_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6, $7,
     $8, $9,
     $10, $11, $12,
-    $13, $14, NULL
+    $13, $14, $15, NULL
 )
-ON CONFLICT (full_name) DO UPDATE
+ON CONFLICT (gh_id) DO UPDATE
 SET installation_id = EXCLUDED.installation_id,
     org_id = EXCLUDED.org_id,
-    gh_id = EXCLUDED.gh_id,
     node_id = EXCLUDED.node_id,
     owner = EXCLUDED.owner,
     name = EXCLUDED.name,
+    full_name = EXCLUDED.full_name,
     default_branch = EXCLUDED.default_branch,
     archived = EXCLUDED.archived,
     gh_updated_at = EXCLUDED.gh_updated_at,
     head_sha = EXCLUDED.head_sha,
     synced_at = EXCLUDED.synced_at,
+    last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
     sync_source = EXCLUDED.sync_source,
     tombstoned_at = NULL
 WHERE repos.gh_updated_at IS NULL
    OR EXCLUDED.gh_updated_at > repos.gh_updated_at
    OR (
-       EXCLUDED.gh_updated_at = repos.gh_updated_at
-       AND EXCLUDED.head_sha = repos.head_sha
-       AND EXCLUDED.synced_at >= repos.synced_at
-       AND repos.tombstoned_at IS NULL
+       EXCLUDED.gh_updated_at IS NOT DISTINCT FROM repos.gh_updated_at
+       AND ROW(
+           EXCLUDED.installation_id, EXCLUDED.org_id, EXCLUDED.node_id,
+           EXCLUDED.owner, EXCLUDED.name, EXCLUDED.full_name,
+           EXCLUDED.default_branch, EXCLUDED.archived, EXCLUDED.head_sha
+       ) IS DISTINCT FROM ROW(
+           repos.installation_id, repos.org_id, repos.node_id,
+           repos.owner, repos.name, repos.full_name,
+           repos.default_branch, repos.archived, repos.head_sha
+       )
    )
-RETURNING id, installation_id, org_id, gh_id, node_id, owner, name, full_name, default_branch, archived, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at
+   OR (
+       repos.tombstoned_at IS NOT NULL
+       AND EXCLUDED.last_checked_at > repos.tombstoned_at
+   )
+RETURNING id, installation_id, org_id, gh_id, node_id, owner, name, full_name, default_branch, archived, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at
 `
 
 type UpsertRepositoryWriteIfNewerParams struct {
@@ -1003,12 +1647,11 @@ type UpsertRepositoryWriteIfNewerParams struct {
 	GhUpdatedAt    pgtype.Timestamptz
 	HeadSha        string
 	SyncedAt       pgtype.Timestamptz
+	LastCheckedAt  pgtype.Timestamptz
 	Etag           string
 	SyncSource     string
 }
 
-// C-C2: equal versions are idempotent; only a strictly newer version may
-// resurrect a tombstone.
 func (q *Queries) UpsertRepositoryWriteIfNewer(ctx context.Context, arg UpsertRepositoryWriteIfNewerParams) (Repo, error) {
 	row := q.db.QueryRow(ctx, upsertRepositoryWriteIfNewer,
 		arg.InstallationID,
@@ -1023,6 +1666,7 @@ func (q *Queries) UpsertRepositoryWriteIfNewer(ctx context.Context, arg UpsertRe
 		arg.GhUpdatedAt,
 		arg.HeadSha,
 		arg.SyncedAt,
+		arg.LastCheckedAt,
 		arg.Etag,
 		arg.SyncSource,
 	)
@@ -1044,6 +1688,7 @@ func (q *Queries) UpsertRepositoryWriteIfNewer(ctx context.Context, arg UpsertRe
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
 	)
 	return i, err
 }
@@ -1051,13 +1696,14 @@ func (q *Queries) UpsertRepositoryWriteIfNewer(ctx context.Context, arg UpsertRe
 const upsertStackWriteIfNewer = `-- name: UpsertStackWriteIfNewer :one
 INSERT INTO stacks (
     repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries,
-    gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at
+    gh_updated_at, head_sha, synced_at, last_checked_at, etag, sync_source,
+    tombstoned_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     $7, $8, $9,
     $10, $11, $12,
-    $13, NULL
+    $13, $14, NULL
 )
 ON CONFLICT (repo_id, number) DO UPDATE
 SET gh_id = EXCLUDED.gh_id,
@@ -1069,34 +1715,45 @@ SET gh_id = EXCLUDED.gh_id,
     gh_updated_at = EXCLUDED.gh_updated_at,
     head_sha = EXCLUDED.head_sha,
     synced_at = EXCLUDED.synced_at,
+    last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
     sync_source = EXCLUDED.sync_source,
     tombstoned_at = NULL
 WHERE stacks.gh_updated_at IS NULL
    OR EXCLUDED.gh_updated_at > stacks.gh_updated_at
    OR (
-       EXCLUDED.gh_updated_at = stacks.gh_updated_at
-       AND EXCLUDED.head_sha = stacks.head_sha
-       AND EXCLUDED.synced_at >= stacks.synced_at
-       AND stacks.tombstoned_at IS NULL
+       EXCLUDED.gh_updated_at IS NOT DISTINCT FROM stacks.gh_updated_at
+       AND ROW(
+           EXCLUDED.gh_id, EXCLUDED.node_id, EXCLUDED.base_ref,
+           EXCLUDED.base_sha, EXCLUDED.open, EXCLUDED.entries,
+           EXCLUDED.head_sha
+       ) IS DISTINCT FROM ROW(
+           stacks.gh_id, stacks.node_id, stacks.base_ref,
+           stacks.base_sha, stacks.open, stacks.entries, stacks.head_sha
+       )
    )
-RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at
+   OR (
+       stacks.tombstoned_at IS NOT NULL
+       AND EXCLUDED.last_checked_at > stacks.tombstoned_at
+   )
+RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at
 `
 
 type UpsertStackWriteIfNewerParams struct {
-	RepoID      int64
-	GhID        pgtype.Int8
-	NodeID      string
-	StackNumber int32
-	BaseRef     string
-	BaseSha     string
-	Open        bool
-	Entries     []byte
-	GhUpdatedAt pgtype.Timestamptz
-	HeadSha     string
-	SyncedAt    pgtype.Timestamptz
-	Etag        string
-	SyncSource  string
+	RepoID        int64
+	GhID          pgtype.Int8
+	NodeID        string
+	StackNumber   int32
+	BaseRef       string
+	BaseSha       string
+	Open          bool
+	Entries       []byte
+	GhUpdatedAt   pgtype.Timestamptz
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
 }
 
 func (q *Queries) UpsertStackWriteIfNewer(ctx context.Context, arg UpsertStackWriteIfNewerParams) (Stack, error) {
@@ -1112,6 +1769,7 @@ func (q *Queries) UpsertStackWriteIfNewer(ctx context.Context, arg UpsertStackWr
 		arg.GhUpdatedAt,
 		arg.HeadSha,
 		arg.SyncedAt,
+		arg.LastCheckedAt,
 		arg.Etag,
 		arg.SyncSource,
 	)
@@ -1132,6 +1790,7 @@ func (q *Queries) UpsertStackWriteIfNewer(ctx context.Context, arg UpsertStackWr
 		&i.Etag,
 		&i.SyncSource,
 		&i.TombstonedAt,
+		&i.LastCheckedAt,
 	)
 	return i, err
 }

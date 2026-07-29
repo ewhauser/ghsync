@@ -13,21 +13,23 @@ const advanceBackfillCursor = `-- name: AdvanceBackfillCursor :one
 UPDATE backfill_cursors
 SET phase = $1,
     page = $2,
+    queue_name = $3,
     completed_at = CASE
         WHEN $1::text = 'done' THEN now()
         ELSE NULL
     END,
     updated_at = now()
-WHERE installation_id = $3
-  AND repo_full_name = $4
-  AND phase = $5
-  AND page = $6
-RETURNING installation_id, repo_full_name, phase, page, completed_at, updated_at
+WHERE installation_id = $4
+  AND repo_full_name = $5
+  AND phase = $6
+  AND page = $7
+RETURNING installation_id, repo_full_name, phase, page, completed_at, updated_at, queue_name
 `
 
 type AdvanceBackfillCursorParams struct {
 	NextPhase      string
 	NextPage       int32
+	QueueName      string
 	InstallationID int64
 	RepoFullName   string
 	ExpectedPhase  string
@@ -38,6 +40,7 @@ func (q *Queries) AdvanceBackfillCursor(ctx context.Context, arg AdvanceBackfill
 	row := q.db.QueryRow(ctx, advanceBackfillCursor,
 		arg.NextPhase,
 		arg.NextPage,
+		arg.QueueName,
 		arg.InstallationID,
 		arg.RepoFullName,
 		arg.ExpectedPhase,
@@ -51,8 +54,89 @@ func (q *Queries) AdvanceBackfillCursor(ctx context.Context, arg AdvanceBackfill
 		&i.Page,
 		&i.CompletedAt,
 		&i.UpdatedAt,
+		&i.QueueName,
 	)
 	return i, err
+}
+
+const advanceInstallationBackfillCursor = `-- name: AdvanceInstallationBackfillCursor :one
+UPDATE installation_backfill_cursors
+SET phase = $1,
+    page = $2,
+    queue_name = $3,
+    completed_at = CASE
+        WHEN $1::text = 'done' THEN now()
+        ELSE NULL
+    END,
+    updated_at = now()
+WHERE installation_id = $4
+  AND phase = $5
+  AND page = $6
+RETURNING installation_id, phase, page, queue_name, completed_at, updated_at
+`
+
+type AdvanceInstallationBackfillCursorParams struct {
+	NextPhase      string
+	NextPage       int32
+	QueueName      string
+	InstallationID int64
+	ExpectedPhase  string
+	ExpectedPage   int32
+}
+
+func (q *Queries) AdvanceInstallationBackfillCursor(ctx context.Context, arg AdvanceInstallationBackfillCursorParams) (InstallationBackfillCursor, error) {
+	row := q.db.QueryRow(ctx, advanceInstallationBackfillCursor,
+		arg.NextPhase,
+		arg.NextPage,
+		arg.QueueName,
+		arg.InstallationID,
+		arg.ExpectedPhase,
+		arg.ExpectedPage,
+	)
+	var i InstallationBackfillCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Phase,
+		&i.Page,
+		&i.QueueName,
+		&i.CompletedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const countPendingBackfillChildren = `-- name: CountPendingBackfillChildren :one
+SELECT count(*)
+FROM backfill_children
+WHERE installation_id = $1
+  AND repo_full_name = $2
+  AND completed_at IS NULL
+`
+
+type CountPendingBackfillChildrenParams struct {
+	InstallationID int64
+	RepoFullName   string
+}
+
+func (q *Queries) CountPendingBackfillChildren(ctx context.Context, arg CountPendingBackfillChildrenParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countPendingBackfillChildren, arg.InstallationID, arg.RepoFullName)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countPendingInstallationRepos = `-- name: CountPendingInstallationRepos :one
+SELECT count(*)
+FROM backfill_cursors
+WHERE installation_id = $1
+  AND phase <> 'done'
+`
+
+func (q *Queries) CountPendingInstallationRepos(ctx context.Context, installationID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, countPendingInstallationRepos, installationID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const ensureBackfillCursor = `-- name: EnsureBackfillCursor :one
@@ -63,7 +147,7 @@ INSERT INTO backfill_cursors (
 )
 ON CONFLICT (installation_id, repo_full_name) DO UPDATE
 SET updated_at = backfill_cursors.updated_at
-RETURNING installation_id, repo_full_name, phase, page, completed_at, updated_at
+RETURNING installation_id, repo_full_name, phase, page, completed_at, updated_at, queue_name
 `
 
 type EnsureBackfillCursorParams struct {
@@ -81,12 +165,38 @@ func (q *Queries) EnsureBackfillCursor(ctx context.Context, arg EnsureBackfillCu
 		&i.Page,
 		&i.CompletedAt,
 		&i.UpdatedAt,
+		&i.QueueName,
+	)
+	return i, err
+}
+
+const ensureInstallationBackfillCursor = `-- name: EnsureInstallationBackfillCursor :one
+INSERT INTO installation_backfill_cursors (
+    installation_id, phase, page
+) VALUES (
+    $1, 'repositories', 1
+)
+ON CONFLICT (installation_id) DO UPDATE
+SET updated_at = installation_backfill_cursors.updated_at
+RETURNING installation_id, phase, page, queue_name, completed_at, updated_at
+`
+
+func (q *Queries) EnsureInstallationBackfillCursor(ctx context.Context, installationID int64) (InstallationBackfillCursor, error) {
+	row := q.db.QueryRow(ctx, ensureInstallationBackfillCursor, installationID)
+	var i InstallationBackfillCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Phase,
+		&i.Page,
+		&i.QueueName,
+		&i.CompletedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
 
 const getBackfillCursor = `-- name: GetBackfillCursor :one
-SELECT installation_id, repo_full_name, phase, page, completed_at, updated_at
+SELECT installation_id, repo_full_name, phase, page, completed_at, updated_at, queue_name
 FROM backfill_cursors
 WHERE installation_id = $1
   AND repo_full_name = $2
@@ -107,12 +217,13 @@ func (q *Queries) GetBackfillCursor(ctx context.Context, arg GetBackfillCursorPa
 		&i.Page,
 		&i.CompletedAt,
 		&i.UpdatedAt,
+		&i.QueueName,
 	)
 	return i, err
 }
 
 const getBackfillCursorForUpdate = `-- name: GetBackfillCursorForUpdate :one
-SELECT installation_id, repo_full_name, phase, page, completed_at, updated_at
+SELECT installation_id, repo_full_name, phase, page, completed_at, updated_at, queue_name
 FROM backfill_cursors
 WHERE installation_id = $1
   AND repo_full_name = $2
@@ -134,6 +245,109 @@ func (q *Queries) GetBackfillCursorForUpdate(ctx context.Context, arg GetBackfil
 		&i.Page,
 		&i.CompletedAt,
 		&i.UpdatedAt,
+		&i.QueueName,
 	)
 	return i, err
+}
+
+const getInstallationBackfillCursor = `-- name: GetInstallationBackfillCursor :one
+SELECT installation_id, phase, page, queue_name, completed_at, updated_at
+FROM installation_backfill_cursors
+WHERE installation_id = $1
+`
+
+func (q *Queries) GetInstallationBackfillCursor(ctx context.Context, installationID int64) (InstallationBackfillCursor, error) {
+	row := q.db.QueryRow(ctx, getInstallationBackfillCursor, installationID)
+	var i InstallationBackfillCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Phase,
+		&i.Page,
+		&i.QueueName,
+		&i.CompletedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getInstallationBackfillCursorForUpdate = `-- name: GetInstallationBackfillCursorForUpdate :one
+SELECT installation_id, phase, page, queue_name, completed_at, updated_at
+FROM installation_backfill_cursors
+WHERE installation_id = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetInstallationBackfillCursorForUpdate(ctx context.Context, installationID int64) (InstallationBackfillCursor, error) {
+	row := q.db.QueryRow(ctx, getInstallationBackfillCursorForUpdate, installationID)
+	var i InstallationBackfillCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Phase,
+		&i.Page,
+		&i.QueueName,
+		&i.CompletedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markCompletedBackfillChildren = `-- name: MarkCompletedBackfillChildren :execrows
+UPDATE backfill_children AS child
+SET completed_at = now()
+FROM refresh_intent_generations AS generation
+WHERE child.installation_id = $1
+  AND child.repo_full_name = $2
+  AND child.completed_at IS NULL
+  AND generation.kind = child.kind
+  AND generation.refresh_key = child.refresh_key
+  AND generation.completed_generation >= child.target_generation
+`
+
+type MarkCompletedBackfillChildrenParams struct {
+	InstallationID int64
+	RepoFullName   string
+}
+
+func (q *Queries) MarkCompletedBackfillChildren(ctx context.Context, arg MarkCompletedBackfillChildrenParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markCompletedBackfillChildren, arg.InstallationID, arg.RepoFullName)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const upsertBackfillChildren = `-- name: UpsertBackfillChildren :exec
+WITH input AS (
+    SELECT element->>'kind' AS kind,
+           element->>'refresh_key' AS refresh_key,
+           (element->>'target_generation')::bigint AS target_generation
+    FROM jsonb_array_elements($3::jsonb) AS element
+)
+INSERT INTO backfill_children (
+    installation_id, repo_full_name, kind, refresh_key, target_generation
+)
+SELECT $1, $2,
+       input.kind, input.refresh_key, input.target_generation
+FROM input
+ON CONFLICT (installation_id, repo_full_name, kind, refresh_key) DO UPDATE
+SET target_generation = GREATEST(
+        backfill_children.target_generation,
+        EXCLUDED.target_generation
+    ),
+    completed_at = CASE
+        WHEN backfill_children.target_generation >= EXCLUDED.target_generation
+        THEN backfill_children.completed_at
+        ELSE NULL
+    END
+`
+
+type UpsertBackfillChildrenParams struct {
+	InstallationID int64
+	RepoFullName   string
+	Children       []byte
+}
+
+func (q *Queries) UpsertBackfillChildren(ctx context.Context, arg UpsertBackfillChildrenParams) error {
+	_, err := q.db.Exec(ctx, upsertBackfillChildren, arg.InstallationID, arg.RepoFullName, arg.Children)
+	return err
 }

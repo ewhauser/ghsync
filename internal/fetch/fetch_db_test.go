@@ -10,6 +10,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,6 +68,644 @@ func TestWriteRaceBothOrdersNewerWins(t *testing.T) {
 	}
 }
 
+func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	writer := store.NewEntityWriter(pool)
+	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	repository := testRepository("acme/equal-version", 2100, updatedAt)
+	first := testPull(repository, updatedAt, "head-one")
+	second := testPull(repository, updatedAt, "head-two")
+	second.Title = "equal timestamp changed truth"
+	second.SyncedAt = first.SyncedAt.Add(time.Second)
+	if _, err := writer.ApplyPullRequest(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	result, err := writer.ApplyPullRequest(context.Background(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DomainChanged || result.NewHeadSHA != "head-two" {
+		t.Fatalf("equal timestamp change result = %+v", result)
+	}
+
+	observation, err := writer.BeginObservation(
+		context.Background(),
+		store.PullRequestEntityKey(1, 2100, 42),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstonedAt := second.SyncedAt.Add(time.Second)
+	if _, err := writer.TombstonePullRequestObserved(
+		context.Background(),
+		observation,
+		repository,
+		42,
+		store.SyncSourceWebhook,
+		tombstonedAt,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := observation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resurrected := second
+	resurrected.SyncedAt = tombstonedAt.Add(time.Second)
+	observation, err = writer.BeginObservation(
+		context.Background(),
+		store.PullRequestEntityKey(1, 2100, 42),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ApplyPullRequestObserved(
+		context.Background(),
+		observation,
+		resurrected,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := observation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	row, err := dbgen.New(pool).GetPullRequestByKey(
+		context.Background(),
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: repository.FullName,
+			PrNumber:     42,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.TombstonedAt.Valid || row.HeadSha != "head-two" {
+		t.Fatalf("resurrected row = %+v", row)
+	}
+}
+
+func TestRepositoryRenameKeepsAliasesImmutableEventsAndDirtyScopes(
+	t *testing.T,
+) {
+	pool := fetchTestDatabase(t)
+	writer := store.NewEntityWriter(pool)
+	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	oldRepository := testRepository("acme/old-name", 2200, baseTime)
+	pull := testPull(oldRepository, baseTime, "rename-head")
+	if _, err := writer.ApplyPullRequest(context.Background(), pull); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(
+		context.Background(),
+		`TRUNCATE derivation_dirty`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	renamed := oldRepository
+	renamed.Owner = "platform"
+	renamed.Name = "new-name"
+	renamed.FullName = "platform/new-name"
+	renamed.GitHubUpdatedAt = baseTime.Add(time.Minute)
+	if _, err := writer.ApplyRepository(
+		context.Background(),
+		renamed,
+		store.SyncSourceWebhook,
+		`"renamed"`,
+		baseTime.Add(2*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, alias := range []string{"acme/old-name", "platform/new-name"} {
+		got, err := writer.Repository(context.Background(), alias)
+		if err != nil {
+			t.Fatalf("resolve alias %s: %v", alias, err)
+		}
+		if got.GitHubID != 2200 || got.FullName != "platform/new-name" {
+			t.Fatalf("alias %s resolved to %+v", alias, got)
+		}
+	}
+	var repos, dirty, immutableEvents int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT count(*) FROM repos WHERE gh_id = 2200`,
+	).Scan(&repos); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM derivation_dirty
+		WHERE scope_key = 'pr:1:2200:42'
+	`).Scan(&dirty); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM change_events
+		WHERE kind = 'repository.changed'
+		  AND entity_key = 'repo:1:2200'
+	`).Scan(&immutableEvents); err != nil {
+		t.Fatal(err)
+	}
+	if repos != 1 || dirty != 1 || immutableEvents < 1 {
+		t.Fatalf(
+			"rename repos=%d dirty=%d immutable_events=%d",
+			repos,
+			dirty,
+			immutableEvents,
+		)
+	}
+}
+
+func TestTimestampLessChecksOnlyAppendAcceptedTransitions(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	writer := store.NewEntityWriter(pool)
+	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	repository := testRepository("acme/check-transitions", 2300, baseTime)
+	pull := testPull(repository, baseTime, "checks-head")
+	if _, err := writer.ApplyPullRequest(context.Background(), pull); err != nil {
+		t.Fatal(err)
+	}
+	apply := func(status string, observedAt time.Time) bool {
+		t.Helper()
+		observation, err := writer.BeginObservation(
+			context.Background(),
+			store.ChecksEntityKey(1, 2300, "checks-head"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer observation.Close() //nolint:errcheck
+		changed, err := writer.ApplyChecksObserved(
+			context.Background(),
+			observation,
+			store.ChecksRecord{
+				Repository: repository,
+				HeadSHA:    "checks-head",
+				Runs: []store.CheckRunRecord{{
+					GitHubID:   9001,
+					NodeID:     "check-node",
+					Name:       "unit",
+					Status:     status,
+					DetailsURL: "https://example.test/check/9001",
+					Observed:   json.RawMessage(`{"id":9001}`),
+				}},
+				SyncedAt: observedAt,
+				Source:   store.SyncSourceWebhook,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return changed
+	}
+	if !apply("queued", baseTime.Add(time.Minute)) {
+		t.Fatal("initial queued check was not accepted")
+	}
+	var initialSynced, initialChecked time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT synced_at, last_checked_at FROM check_runs WHERE gh_id = 9001
+	`).Scan(&initialSynced, &initialChecked); err != nil {
+		t.Fatal(err)
+	}
+	if apply("queued", baseTime.Add(2*time.Minute)) {
+		t.Fatal("identical timestamp-less check was reported changed")
+	}
+	var afterSynced, afterChecked time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT synced_at, last_checked_at FROM check_runs WHERE gh_id = 9001
+	`).Scan(&afterSynced, &afterChecked); err != nil {
+		t.Fatal(err)
+	}
+	if !afterSynced.Equal(initialSynced) ||
+		!afterChecked.After(initialChecked) {
+		t.Fatalf(
+			"identical check provenance synced=%s->%s checked=%s->%s",
+			initialSynced,
+			afterSynced,
+			initialChecked,
+			afterChecked,
+		)
+	}
+	if !apply("in_progress", baseTime.Add(3*time.Minute)) {
+		t.Fatal("timestamp-less status transition was rejected")
+	}
+	var history, events int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT count(*) FROM check_history WHERE check_run_gh_id = 9001`,
+	).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM change_events
+		WHERE kind = 'checks.changed'
+		  AND entity_key = 'checks:1:2300:checks-head'
+	`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if history != 2 || events != 2 {
+		t.Fatalf("accepted transition history=%d events=%d, want 2/2", history, events)
+	}
+}
+
+func TestIdenticalPR200OnlyAdvancesLastCheckedAt(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	writer := store.NewEntityWriter(pool)
+	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	repository := testRepository("acme/recheck", 2400, baseTime)
+	pull := testPull(repository, baseTime, "same-head")
+	if _, err := writer.ApplyPullRequest(context.Background(), pull); err != nil {
+		t.Fatal(err)
+	}
+	row, err := dbgen.New(pool).GetPullRequestByKey(
+		context.Background(),
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: repository.FullName,
+			PrNumber:     42,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialSynced := row.SyncedAt.Time
+	initialChecked := row.LastCheckedAt.Time
+	pull.SyncedAt = pull.SyncedAt.Add(time.Minute)
+	result, err := writer.ApplyPullRequest(context.Background(), pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied || result.DomainChanged {
+		t.Fatalf("identical PR result = %+v", result)
+	}
+	row, err = dbgen.New(pool).GetPullRequestByKey(
+		context.Background(),
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: repository.FullName,
+			PrNumber:     42,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.SyncedAt.Time.Equal(initialSynced) ||
+		!row.LastCheckedAt.Time.After(initialChecked) {
+		t.Fatalf(
+			"identical PR synced=%s->%s checked=%s->%s",
+			initialSynced,
+			row.SyncedAt.Time,
+			initialChecked,
+			row.LastCheckedAt.Time,
+		)
+	}
+	var events int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM change_events
+		WHERE kind = 'pull_request.changed'
+		  AND entity_key = 'pr:1:2400:42'
+	`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("identical PR change events = %d, want 1 initial event", events)
+	}
+}
+
+func TestPullRequestBatchIsolatesPoisonEntity(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	writer := store.NewEntityWriter(pool)
+	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	goodRepo := testRepository("acme/good-batch", 2500, baseTime)
+	badRepo := testRepository("acme/bad-batch", 2501, baseTime)
+	good := testPull(goodRepo, baseTime, "good-head")
+	bad := testPull(badRepo, baseTime, "bad-head")
+	bad.NodeID = ""
+	outcomes := writer.ApplyPullRequestBatch(
+		context.Background(),
+		[]store.PullRequestApply{
+			{Record: bad},
+			{Record: good},
+		},
+	)
+	goodKey := store.PullRequestEntityKey(1, 2500, 42)
+	badKey := store.PullRequestEntityKey(1, 2501, 42)
+	if outcomes[goodKey].Err != nil ||
+		!outcomes[goodKey].Result.DomainChanged {
+		t.Fatalf("healthy batch outcome = %+v", outcomes[goodKey])
+	}
+	if outcomes[badKey].Err == nil {
+		t.Fatalf("poison batch outcome = %+v", outcomes[badKey])
+	}
+	if _, err := dbgen.New(pool).GetPullRequestByKey(
+		context.Background(),
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: goodRepo.FullName,
+			PrNumber:     42,
+		},
+	); err != nil {
+		t.Fatalf("healthy batch row missing: %v", err)
+	}
+}
+
+func TestCoordinatorReturnsPerKeyWriterErrors(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		50*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	for _, number := range []int{4812, 4815} {
+		request := queue.RefreshRequest{
+			Args: queue.NewResolveStackMembershipArgs(
+				fmt.Sprintf("pr:acme/monolith:%d", number),
+			).RefreshArgs,
+			Queue: queue.QueueEvent,
+		}
+		if err := handler.ResolveStackMembership(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture.PullRequests[1].Head.SHA = ""
+	fixture.PullRequests[1].Title = "poison should not apply"
+	fixture.PullRequests[2].Title = "healthy sibling applied"
+	fake.SetFixture(fixture)
+	baseline := fake.RequestCount(http.MethodPost, "/graphql")
+	type result struct {
+		number int
+		err    error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	for _, number := range []int{4812, 4815} {
+		number := number
+		go func() {
+			<-start
+			err := handler.RefreshPR(ctx, queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", number),
+				).RefreshArgs,
+				Queue: queue.QueueEvent,
+			})
+			results <- result{number: number, err: err}
+		}()
+	}
+	close(start)
+	outcomes := map[int]error{}
+	for range 2 {
+		outcome := <-results
+		outcomes[outcome.number] = outcome.err
+	}
+	if outcomes[4812] == nil {
+		t.Fatal("poison entity unexpectedly succeeded")
+	}
+	if outcomes[4815] != nil {
+		t.Fatalf("healthy sibling failed: %v", outcomes[4815])
+	}
+	if got := fake.RequestCount(
+		http.MethodPost,
+		"/graphql",
+	) - baseline; got != 1 {
+		t.Fatalf("coordinator GraphQL batches = %d, want 1", got)
+	}
+	healthy, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4815,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healthy.Title != "healthy sibling applied" {
+		t.Fatalf("healthy sibling row = %+v", healthy)
+	}
+}
+
+func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	_, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	repository := testRepository(
+		"acme/monolith",
+		1001,
+		fixture.Repository.UpdatedAt,
+	)
+	repository.NodeID = fixture.Repository.NodeID
+	repository.DefaultBranch = fixture.Repository.DefaultBranch
+	repository.DefaultHeadSHA = fixture.Repository.DefaultBranchSHA
+	repository.ETag = `"repo"`
+	repository.LastCheckedAt = time.Now()
+	if _, err := handler.writer.ApplyRepository(
+		context.Background(),
+		repository,
+		store.SyncSourceWebhook,
+		repository.ETag,
+		repository.LastCheckedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	pull := pullRecordFromREST(
+		repository,
+		toGHPullRequest(t, fixture.PullRequests[1]),
+		`"pull"`,
+		store.SyncSourceWebhook,
+		time.Now(),
+	)
+	apply := func() error {
+		observation, err := handler.writer.BeginObservation(
+			context.Background(),
+			store.PullRequestEntityKey(1, 1001, pull.Number),
+		)
+		if err != nil {
+			return err
+		}
+		defer observation.Close() //nolint:errcheck
+		_, err = handler.writer.ApplyPullRequestObserved(
+			context.Background(),
+			observation,
+			pull,
+			handler.pullRequestHook(
+				repository.FullName,
+				pull.Number,
+				queue.QueueEvent,
+			),
+		)
+		return err
+	}
+	if err := apply(); err == nil ||
+		!strings.Contains(err.Error(), "River client missing") {
+		t.Fatalf("missing River transaction error = %v", err)
+	}
+	var rolledBackRows int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM pull_requests
+	`).Scan(&rolledBackRows); err != nil {
+		t.Fatal(err)
+	}
+	if rolledBackRows != 0 {
+		t.Fatalf("cache row committed without followups: %d", rolledBackRows)
+	}
+	handler.SetRiverClient(riverClient)
+	if err := apply(); err != nil {
+		t.Fatal(err)
+	}
+	var generations, jobs int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM refresh_intent_generations
+		WHERE (kind = 'refresh_checks' AND refresh_key = 'checks:acme/monolith:8f31c2d')
+		   OR (kind = 'refresh_stack' AND refresh_key = 'stack:acme/monolith:142')
+	`).Scan(&generations); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM river_job
+		WHERE kind IN ('refresh_checks', 'refresh_stack')
+		  AND args->>'key' LIKE '%acme/monolith%'
+	`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if generations != 2 || jobs != 2 {
+		t.Fatalf("transactional followups generations=%d jobs=%d", generations, jobs)
+	}
+}
+
+func TestBatchObservationLockBlocksConcurrentWorkerAndCommitsFollowupGeneration(
+	t *testing.T,
+) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+		fakegithub.WithResponseDelay(200*time.Millisecond),
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	resolveRequest := queue.RefreshRequest{
+		Args: queue.NewResolveStackMembershipArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+	fake.ScriptNotFound(
+		http.MethodGet,
+		"/repos/acme/monolith/pulls/4812",
+		1,
+	)
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+	tombstoned, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tombstoned.TombstonedAt.Valid {
+		t.Fatal("pre-race authoritative 404 did not tombstone PR")
+	}
+	baselineREST := fake.RequestCount(
+		http.MethodGet,
+		"/repos/acme/monolith/pulls/4812",
+	)
+	refreshRequest := queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- handler.RefreshPR(ctx, refreshRequest)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for fake.RequestCount(http.MethodPost, "/graphql") == 0 &&
+		time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if fake.RequestCount(http.MethodPost, "/graphql") == 0 {
+		t.Fatal("GraphQL batch did not reach paused fake")
+	}
+	// The fake snapshots source truth after its configured delay, so this
+	// equal-updated_at/head change lands while the authoritative request is in
+	// flight and must resurrect the preceding tombstone.
+	fixture.PullRequests[1].Head.SHA = "equal-time-new-head"
+	fixture.PullRequests[1].Title = "equal timestamp concurrent truth"
+	fake.SetFixture(fixture)
+	resolveDone := make(chan error, 1)
+	go func() {
+		resolveDone <- handler.ResolveStackMembership(ctx, resolveRequest)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if got := fake.RequestCount(
+		http.MethodGet,
+		"/repos/acme/monolith/pulls/4812",
+	); got != baselineREST {
+		t.Fatalf(
+			"concurrent REST worker fetched while batch held lock: %d -> %d",
+			baselineREST,
+			got,
+		)
+	}
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-resolveDone; err != nil {
+		t.Fatal(err)
+	}
+	var generation int64
+	if err := pool.QueryRow(ctx, `
+		SELECT generation
+		FROM refresh_intent_generations
+		WHERE kind = 'refresh_checks'
+		  AND refresh_key = 'checks:acme/monolith:equal-time-new-head'
+	`).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	if generation < 1 {
+		t.Fatalf("new-head follow-up generation = %d", generation)
+	}
+	row, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.HeadSha != "equal-time-new-head" ||
+		row.Title != "equal timestamp concurrent truth" {
+		t.Fatalf("concurrent final PR = %+v", row)
+	}
+}
+
 func TestPR404CreatesTombstoneAndEvent(t *testing.T) {
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
@@ -110,7 +749,7 @@ func TestPR404CreatesTombstoneAndEvent(t *testing.T) {
 		SELECT count(*)
 		FROM change_events
 		WHERE kind = 'pull_request.tombstoned'
-		  AND entity_key = 'pr:acme/monolith:4812'
+		  AND entity_key = 'pr:1:1001:4812'
 	`).Scan(&events); err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +760,104 @@ func TestPR404CreatesTombstoneAndEvent(t *testing.T) {
 		t.Fatalf("PR fetches = %d, want initial + scripted 404", got)
 	}
 	server.Close()
+}
+
+func TestRepositoryRulesLockedCASDirtyEventAndConditionalRecheck(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	stackRequest := queue.RefreshRequest{
+		Args: queue.NewRefreshStackArgs(
+			"stack:acme/monolith:142",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.RefreshStack(ctx, stackRequest); err != nil {
+		t.Fatal(err)
+	}
+	rulesRequest := queue.RefreshRequest{
+		Args: queue.NewRefreshRepoRulesArgs(
+			"repo_rules:acme/monolith:rules",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.RefreshRepoRules(ctx, rulesRequest); err != nil {
+		t.Fatal(err)
+	}
+	var ruleCount, eventCount int
+	var firstChecked time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), max(last_checked_at)
+		FROM repo_rules
+	`).Scan(&ruleCount, &firstChecked); err != nil {
+		t.Fatal(err)
+	}
+	if ruleCount != 1 {
+		t.Fatalf("repository rules = %d, want 1", ruleCount)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM change_events
+		WHERE kind = 'repo_rules.changed'
+		  AND entity_key = 'repo_rules:1:1001'
+	`).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("repository rule events = %d, want 1", eventCount)
+	}
+	if err := handler.RefreshRepoRules(ctx, rulesRequest); err != nil {
+		t.Fatal(err)
+	}
+	var secondChecked time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT max(last_checked_at)
+		FROM repo_rules
+	`).Scan(&secondChecked); err != nil {
+		t.Fatal(err)
+	}
+	if secondChecked.Before(firstChecked) {
+		t.Fatalf(
+			"conditional recheck moved checked_at backwards: %s -> %s",
+			firstChecked,
+			secondChecked,
+		)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM change_events
+		WHERE kind = 'repo_rules.changed'
+	`).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("304 emitted repository rule event; count = %d", eventCount)
+	}
+	var dirty int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM derivation_dirty
+		WHERE scope_key = 'stack:1:1001:142'
+	`).Scan(&dirty); err != nil {
+		t.Fatal(err)
+	}
+	if dirty != 1 {
+		t.Fatalf("repository rule dirty scope count = %d, want 1", dirty)
+	}
+	if got := fake.RequestCount(
+		http.MethodGet,
+		"/repos/acme/monolith/rulesets",
+	); got != 2 {
+		t.Fatalf("repository rules fetches = %d, want 2", got)
+	}
 }
 
 func TestBackfillResumesFromDurableCursor(t *testing.T) {
@@ -135,33 +872,30 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 	)
 	defer server.Close()
 	handler.SetRiverClient(riverClient)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := riverClient.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	}()
 	cursor, err := StartBackfill(ctx, pool, riverClient, 1, "acme/monolith")
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := queue.NewBackfillRepoPageArgs(
-		1,
-		"acme/monolith",
-		cursor.Phase,
-		int(cursor.Page),
-	)
-	if err := handler.BackfillRepoPage(ctx, first); err != nil {
-		t.Fatal(err)
+	if cursor.Phase != "repository" {
+		t.Fatalf("initial cursor = %+v", cursor)
 	}
-	// A crashed/retried copy with the stale expected cursor is a no-op.
-	if err := handler.BackfillRepoPage(ctx, first); err != nil {
-		t.Fatal(err)
-	}
-	resumed, err := StartBackfill(ctx, pool, riverClient, 1, "acme/monolith")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resumed.Phase != "stacks" || resumed.Page != 1 {
-		t.Fatalf("resume cursor = %+v, want stacks page 1", resumed)
-	}
-	for {
-		current, err := dbgen.New(pool).GetBackfillCursor(
+	deadline := time.Now().Add(20 * time.Second)
+	var completed dbgen.BackfillCursor
+	for time.Now().Before(deadline) {
+		completed, err = dbgen.New(pool).GetBackfillCursor(
 			ctx,
 			dbgen.GetBackfillCursorParams{
 				InstallationID: 1,
@@ -171,20 +905,20 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if current.Phase == "done" {
+		if completed.Phase == "done" {
 			break
 		}
-		if err := handler.BackfillRepoPage(
-			ctx,
-			queue.NewBackfillRepoPageArgs(
-				1,
-				"acme/monolith",
-				current.Phase,
-				int(current.Page),
-			),
-		); err != nil {
-			t.Fatal(err)
-		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if completed.Phase != "done" || !completed.CompletedAt.Valid {
+		t.Fatalf("backfill did not complete after children: %+v", completed)
+	}
+	resumed, err := StartBackfill(ctx, pool, riverClient, 1, "acme/monolith")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Phase != "done" || !resumed.CompletedAt.Valid {
+		t.Fatalf("resume cursor = %+v, want completed", resumed)
 	}
 	if got := fake.RequestCount(
 		http.MethodGet,
@@ -201,25 +935,205 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 	if got := fake.RequestCount(
 		http.MethodGet,
 		"/repos/acme/monolith/pulls",
-	); got != 2 {
-		t.Fatalf("PR list fetches = %d, want two resumable pages", got)
+	); got != 5 {
+		t.Fatalf(
+			"PR list fetches = %d, want high-water plus two overlap passes",
+			got,
+		)
 	}
 	var refreshes int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*)
-		FROM river_job
-		WHERE kind IN ('refresh_pr', 'refresh_stack')
-		  AND args->>'key' LIKE '%:acme/monolith:%'
+		FROM (
+			SELECT DISTINCT kind, args->>'key'
+			FROM river_job
+			WHERE kind IN ('refresh_pr', 'refresh_stack')
+			  AND args->>'key' LIKE '%:acme/monolith:%'
+		) AS distinct_refreshes
 	`).Scan(&refreshes); err != nil {
 		t.Fatal(err)
 	}
 	if refreshes != 5 {
 		t.Fatalf("backfill refresh jobs = %d, want 1 stack + 4 open PRs", refreshes)
 	}
+	var pendingChildren int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM backfill_children
+		WHERE installation_id = 1
+		  AND repo_full_name = 'acme/monolith'
+		  AND completed_at IS NULL
+	`).Scan(&pendingChildren); err != nil {
+		t.Fatal(err)
+	}
+	if pendingChildren != 0 {
+		t.Fatalf("pending backfill children = %d, want 0", pendingChildren)
+	}
+}
+
+func TestInstallationBackfillEnumeratesAndWaitsForRepoChildren(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fakegithub.DefaultFixture(),
+		10*time.Millisecond,
+		2,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := riverClient.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	}()
+	if _, err := StartInstallationBackfill(ctx, pool, riverClient, 1); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	var cursor dbgen.InstallationBackfillCursor
+	var err error
+	for time.Now().Before(deadline) {
+		cursor, err = dbgen.New(pool).GetInstallationBackfillCursor(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cursor.Phase == "done" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if cursor.Phase != "done" || !cursor.CompletedAt.Valid {
+		t.Fatalf("installation backfill did not complete: %+v", cursor)
+	}
+	repoCursor, err := dbgen.New(pool).GetBackfillCursor(
+		ctx,
+		dbgen.GetBackfillCursorParams{
+			InstallationID: 1,
+			RepoFullName:   "acme/monolith",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoCursor.Phase != "done" || !repoCursor.CompletedAt.Valid {
+		t.Fatalf("repository child cursor = %+v", repoCursor)
+	}
+	if got := fake.RequestCount(
+		http.MethodGet,
+		"/installation/repositories",
+	); got != 1 {
+		t.Fatalf("installation repository pages = %d, want 1", got)
+	}
+}
+
+func TestBackfillStableCreatedSnapshotSurvivesMidScanUpdate(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	var mutated atomic.Bool
+	hook := fakegithub.WithRequestHook(func(
+		method string,
+		path string,
+		count int,
+		fixture *fakegithub.Fixture,
+	) {
+		if method != http.MethodGet ||
+			path != "/repos/acme/monolith/pulls" ||
+			count != 3 {
+			return
+		}
+		fixture.PullRequests[1].UpdatedAt =
+			fixture.PullRequests[1].UpdatedAt.Add(24 * time.Hour)
+		mutated.Store(true)
+	})
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fakegithub.DefaultFixture(),
+		10*time.Millisecond,
+		2,
+		hook,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := riverClient.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	}()
+	if _, err := StartBackfill(
+		ctx,
+		pool,
+		riverClient,
+		1,
+		"acme/monolith",
+	); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		cursor, err := dbgen.New(pool).GetBackfillCursor(
+			ctx,
+			dbgen.GetBackfillCursorParams{
+				InstallationID: 1,
+				RepoFullName:   "acme/monolith",
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cursor.Phase == "done" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !mutated.Load() {
+		t.Fatal("mid-scan fake mutation did not run")
+	}
+	var discovered int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM backfill_children
+		WHERE installation_id = 1
+		  AND repo_full_name = 'acme/monolith'
+		  AND kind = 'refresh_pr'
+	`).Scan(&discovered); err != nil {
+		t.Fatal(err)
+	}
+	if discovered != 4 {
+		t.Fatalf(
+			"stable snapshot discovered %d open PRs after mutation, want 4",
+			discovered,
+		)
+	}
+	if got := fake.RequestCount(
+		http.MethodGet,
+		"/repos/acme/monolith/pulls",
+	); got != 5 {
+		t.Fatalf(
+			"pull list calls = %d, want high-water plus two overlap passes",
+			got,
+		)
+	}
 }
 
 func TestOrderIndependenceFinalCacheState(t *testing.T) {
-	var want cacheSnapshot
+	want := expectedOrderCacheSnapshot()
 	for run := 0; run < 4; run++ {
 		repo := "acme/order"
 		harness := newPipelineHarness(t, repo)
@@ -270,10 +1184,6 @@ func TestOrderIndependenceFinalCacheState(t *testing.T) {
 		harness.waitIdle()
 		got := snapshotCache(t, harness.pool, repo)
 		harness.close()
-		if run == 0 {
-			want = got
-			continue
-		}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf(
 				"run %d final cache differs\n got: %+v\nwant: %+v",
@@ -282,6 +1192,22 @@ func TestOrderIndependenceFinalCacheState(t *testing.T) {
 				want,
 			)
 		}
+	}
+}
+
+func expectedOrderCacheSnapshot() cacheSnapshot {
+	// This golden is deliberately authored independently of fakegithub.Fixture
+	// and snapshotCache. It prevents an identically empty or consistently
+	// malformed implementation from satisfying C-I4 by self-comparison.
+	return cacheSnapshot{
+		Repos:        `[{"gh_id": 2001, "node_id": "R_acme_order", "archived": false, "head_sha": "", "full_name": "acme/order", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T12:00:00Z", "default_branch": "main"}]`,
+		RepoRules:    `[]`,
+		Stacks:       `[{"open": true, "gh_id": 9876543, "number": 142, "entries": [{"draft": false, "state": "closed", "number": 4810, "head_ref": "refactor/tokenizer", "head_sha": "bbbb001", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4812, "head_ref": "refactor/bm25f-ranker", "head_sha": "8f31c2d", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4815, "head_ref": "feat/relevance-debug", "head_sha": "bbbb003", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4816, "head_ref": "feat/results-rewire", "head_sha": "bbbb004", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4820, "head_ref": "feat/relevance-telemetry", "head_sha": "bbbb005", "updated_at": "2026-07-28T12:00:00Z"}], "node_id": "S_kwDOABCDEF4AAAAA", "base_ref": "main", "base_sha": "aaaa000", "head_sha": "bbbb005", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T12:00:00Z"}]`,
+		Pulls:        `[{"gh_id": 804810, "state": "closed", "title": "Tokenizer rewrite for query parser", "number": 4810, "node_id": "PR_kwDOABCDEF4810", "base_ref": "main", "base_sha": "aaaa000", "head_ref": "refactor/tokenizer", "head_sha": "bbbb001", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 1, "review_decision": "APPROVED"}, {"gh_id": 804812, "state": "open", "title": "BM25F ranker integration", "number": 4812, "node_id": "PR_kwDOABCDEF4812", "base_ref": "refactor/tokenizer", "base_sha": "bbbb001", "head_ref": "refactor/bm25f-ranker", "head_sha": "8f31c2d", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 2, "review_decision": "CHANGES_REQUESTED"}, {"gh_id": 804815, "state": "open", "title": "Relevance debug API endpoint", "number": 4815, "node_id": "PR_kwDOABCDEF4815", "base_ref": "refactor/bm25f-ranker", "base_sha": "8f31c2d", "head_ref": "feat/relevance-debug", "head_sha": "bbbb003", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 3, "review_decision": "REVIEW_REQUIRED"}, {"gh_id": 804816, "state": "open", "title": "Results page rewiring", "number": 4816, "node_id": "PR_kwDOABCDEF4816", "base_ref": "feat/relevance-debug", "base_sha": "bbbb003", "head_ref": "feat/results-rewire", "head_sha": "bbbb004", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 4, "review_decision": "REVIEW_REQUIRED"}, {"gh_id": 804820, "state": "open", "title": "Relevance telemetry dashboards", "number": 4820, "node_id": "PR_kwDOABCDEF4820", "base_ref": "feat/results-rewire", "base_sha": "bbbb004", "head_ref": "feat/relevance-telemetry", "head_sha": "bbbb005", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 5, "review_decision": "REVIEW_REQUIRED"}]`,
+		Threads:      `[]`,
+		Checks:       `[{"name": "unit", "gh_id": 99001, "status": "completed", "head_sha": "8f31c2d", "conclusion": "failure", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z"}, {"name": "lint", "gh_id": 99002, "status": "completed", "head_sha": "8f31c2d", "conclusion": "success", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z"}]`,
+		CheckHistory: `[{"name": "unit", "status": "completed", "head_sha": "8f31c2d", "conclusion": "failure", "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z", "check_run_gh_id": 99001}, {"name": "lint", "status": "completed", "head_sha": "8f31c2d", "conclusion": "success", "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z", "check_run_gh_id": 99002}]`,
+		Dirty:        `["pr:1:2001:4810", "pr:1:2001:4812", "pr:1:2001:4815", "pr:1:2001:4816", "pr:1:2001:4820", "stack:1:2001:142"]`,
 	}
 }
 
@@ -474,6 +1400,7 @@ func (h *pipelineHarness) close() {
 
 type cacheSnapshot struct {
 	Repos        string
+	RepoRules    string
 	Stacks       string
 	Pulls        string
 	Threads      string
@@ -493,9 +1420,24 @@ func snapshotCache(
 			SELECT COALESCE(jsonb_agg(to_jsonb(row_data)), '[]'::jsonb)
 			FROM (
 				SELECT gh_id, node_id, full_name, default_branch, archived,
-				       gh_updated_at, head_sha, sync_source,
+				       to_char(gh_updated_at AT TIME ZONE 'UTC',
+				               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS gh_updated_at,
+				       head_sha, sync_source,
 				       tombstoned_at IS NOT NULL AS tombstoned
 				FROM repos WHERE full_name = $1
+			) AS row_data
+		`, repo),
+		RepoRules: queryJSON(t, pool, `
+			SELECT COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY rule_key),
+			                '[]'::jsonb)
+			FROM (
+				SELECT repo_rules.rule_key, repo_rules.rule,
+				       to_char(repo_rules.gh_updated_at AT TIME ZONE 'UTC',
+				               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS gh_updated_at,
+				       repo_rules.head_sha, repo_rules.sync_source,
+				       repo_rules.tombstoned_at IS NOT NULL AS tombstoned
+				FROM repo_rules JOIN repos ON repos.id = repo_rules.repo_id
+				WHERE repos.full_name = $1
 			) AS row_data
 		`, repo),
 		Stacks: queryJSON(t, pool, `
@@ -503,7 +1445,10 @@ func snapshotCache(
 			FROM (
 				SELECT stacks.number, stacks.gh_id, stacks.node_id,
 				       stacks.base_ref, stacks.base_sha, stacks.open,
-				       stacks.entries, stacks.gh_updated_at, stacks.head_sha,
+				       stacks.entries,
+				       to_char(stacks.gh_updated_at AT TIME ZONE 'UTC',
+				               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS gh_updated_at,
+				       stacks.head_sha,
 				       stacks.sync_source,
 				       stacks.tombstoned_at IS NOT NULL AS tombstoned
 				FROM stacks JOIN repos ON repos.id = stacks.repo_id
@@ -519,7 +1464,9 @@ func snapshotCache(
 				       pull_requests.head_sha, pull_requests.base_ref,
 				       pull_requests.base_sha, pull_requests.review_decision,
 				       pull_requests.stack_number, pull_requests.stack_position,
-				       pull_requests.gh_updated_at, pull_requests.sync_source,
+				       to_char(pull_requests.gh_updated_at AT TIME ZONE 'UTC',
+				               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS gh_updated_at,
+				       pull_requests.sync_source,
 				       pull_requests.tombstoned_at IS NOT NULL AS tombstoned
 				FROM pull_requests JOIN repos ON repos.id = pull_requests.repo_id
 				WHERE repos.full_name = $1
@@ -531,7 +1478,9 @@ func snapshotCache(
 				SELECT review_threads.id, review_threads.pr_number,
 				       review_threads.is_resolved, review_threads.is_outdated,
 				       review_threads.path, review_threads.line,
-				       review_threads.comments, review_threads.gh_updated_at,
+				       review_threads.comments,
+				       to_char(review_threads.gh_updated_at AT TIME ZONE 'UTC',
+				               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS gh_updated_at,
 				       review_threads.head_sha, review_threads.sync_source,
 				       review_threads.tombstoned_at IS NOT NULL AS tombstoned
 				FROM review_threads JOIN repos ON repos.id = review_threads.repo_id
@@ -543,7 +1492,9 @@ func snapshotCache(
 			FROM (
 				SELECT check_runs.gh_id, check_runs.name, check_runs.status,
 				       check_runs.conclusion, check_runs.head_sha,
-				       check_runs.gh_updated_at, check_runs.sync_source,
+				       to_char(check_runs.gh_updated_at AT TIME ZONE 'UTC',
+				               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS gh_updated_at,
+				       check_runs.sync_source,
 				       check_runs.tombstoned_at IS NOT NULL AS tombstoned
 				FROM check_runs JOIN repos ON repos.id = check_runs.repo_id
 				WHERE repos.full_name = $1
@@ -555,7 +1506,9 @@ func snapshotCache(
 			FROM (
 				SELECT check_history.check_run_gh_id, check_history.name,
 				       check_history.status, check_history.conclusion,
-				       check_history.gh_updated_at, check_history.head_sha,
+				       to_char(check_history.gh_updated_at AT TIME ZONE 'UTC',
+				               'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS gh_updated_at,
+				       check_history.head_sha,
 				       check_history.sync_source
 				FROM check_history JOIN repos ON repos.id = check_history.repo_id
 				WHERE repos.full_name = $1
@@ -564,8 +1517,12 @@ func snapshotCache(
 		Dirty: queryJSON(t, pool, `
 			SELECT COALESCE(jsonb_agg(scope_key ORDER BY scope_key), '[]'::jsonb)
 			FROM derivation_dirty
-			WHERE scope_key LIKE $1
-		`, "%:"+repo+":%"),
+			WHERE scope_key LIKE (
+				SELECT '%:' || installation_id::text || ':' ||
+				       gh_id::text || ':%'
+				FROM repos WHERE full_name = $1
+			)
+		`, repo),
 	}
 }
 
@@ -589,6 +1546,7 @@ func newDirectHandler(
 	fixture fakegithub.Fixture,
 	batchWindow time.Duration,
 	pageSize int,
+	fakeOptions ...fakegithub.Option,
 ) (
 	*fakegithub.Server,
 	*httptest.Server,
@@ -596,7 +1554,7 @@ func newDirectHandler(
 	*river.Client[pgx.Tx],
 ) {
 	t.Helper()
-	fake := fakegithub.New(fixture, fetchTestSecret)
+	fake := fakegithub.New(fixture, fetchTestSecret, fakeOptions...)
 	server := httptest.NewServer(fake)
 	gate := budget.New(server.Client(), budget.Options{})
 	rest, err := gh.NewRESTClient(
@@ -627,7 +1585,10 @@ func newDirectHandler(
 	if err != nil {
 		t.Fatal(err)
 	}
-	riverClient, err := queue.NewClient(pool)
+	riverClient, err := queue.NewClient(
+		pool,
+		queue.WithRefreshHandler(handler),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -700,6 +1661,22 @@ func clonePayload(t *testing.T, payload map[string]any) map[string]any {
 		t.Fatal(err)
 	}
 	return cloned
+}
+
+func toGHPullRequest(
+	t *testing.T,
+	pull fakegithub.PullRequest,
+) *gh.PullRequest {
+	t.Helper()
+	encoded, err := json.Marshal(pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var converted gh.PullRequest
+	if err := json.Unmarshal(encoded, &converted); err != nil {
+		t.Fatal(err)
+	}
+	return &converted
 }
 
 func fetchTestDatabase(t *testing.T) *pgxpool.Pool {

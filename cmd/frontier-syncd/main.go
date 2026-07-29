@@ -4,7 +4,7 @@
 //
 //	frontier-syncd serve [--roles=all]   run the engine (default command)
 //	frontier-syncd migrate               apply River + schema migrations
-//	frontier-syncd backfill --repo=...   start/resume one repo backfill
+//	frontier-syncd backfill              start/resume installation backfill
 //	frontier-syncd requeue --guid=...    replay parked deliveries
 //	frontier-syncd version               print the build version
 package main
@@ -83,12 +83,11 @@ func run(args []string) error {
 
 func backfill(args []string) error {
 	fs := flag.NewFlagSet("backfill", flag.ContinueOnError)
-	repo := fs.String("repo", "", "repository in owner/name form")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 0 || *repo == "" {
-		return fmt.Errorf("backfill requires --repo=owner/name")
+	if fs.NArg() != 0 {
+		return fmt.Errorf("backfill does not accept positional arguments")
 	}
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -111,20 +110,19 @@ func backfill(args []string) error {
 	if err != nil {
 		return fmt.Errorf("River client: %w", err)
 	}
-	cursor, err := fetch.StartBackfill(
+	cursor, err := fetch.StartInstallationBackfill(
 		ctx,
 		pool,
 		riverClient,
 		cfg.GitHubInstallationID,
-		*repo,
 	)
 	if err != nil {
 		return err
 	}
 	slog.Info(
 		"backfill started or resumed",
-		"repo",
-		*repo,
+		"installation_id",
+		cfg.GitHubInstallationID,
 		"phase",
 		cursor.Phase,
 		"page",

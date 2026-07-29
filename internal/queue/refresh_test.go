@@ -13,6 +13,14 @@ func TestRefreshJobArgsArePointersOnly(t *testing.T) {
 		kind string
 	}{
 		{NewRefreshPRArgs("pr:acme/monolith:4812"), KindRefreshPR},
+		{
+			NewRefreshRepositoryArgs("repo:acme/monolith:metadata"),
+			KindRefreshRepository,
+		},
+		{
+			NewRefreshRepoRulesArgs("repo_rules:acme/monolith:rules"),
+			KindRefreshRepoRules,
+		},
 		{NewRefreshStackArgs("stack:acme/monolith:142"), KindRefreshStack},
 		{NewRefreshChecksArgs("checks:acme/monolith:abc"), KindRefreshChecks},
 		{NewRefreshBranchArgs("branch:acme/monolith:main"), KindRefreshBranch},
@@ -40,6 +48,27 @@ func TestRefreshJobArgsArePointersOnly(t *testing.T) {
 				t.Fatalf("River kind = %q, want %q", test.args.Kind(), test.kind)
 			}
 		})
+	}
+}
+
+func TestInstallationBackfillArgsCarryExpectedCursorOnly(t *testing.T) {
+	args := NewBackfillInstallationPageArgs(7, "repositories", 3)
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 3 ||
+		fields["installation_id"] != float64(7) ||
+		fields["phase"] != "repositories" ||
+		fields["page"] != float64(3) {
+		t.Fatalf("installation backfill args = %s", encoded)
+	}
+	if args.Kind() != KindBackfillInstallation {
+		t.Fatalf("kind = %q", args.Kind())
 	}
 }
 

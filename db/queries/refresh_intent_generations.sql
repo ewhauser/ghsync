@@ -30,3 +30,14 @@ SELECT generation
 FROM refresh_intent_generations
 WHERE kind = $1 AND refresh_key = $2
 FOR UPDATE;
+
+-- name: CompleteRefreshIntentGeneration :exec
+UPDATE refresh_intent_generations
+SET completed_generation = GREATEST(
+        completed_generation,
+        sqlc.arg(completed_generation)
+    ),
+    updated_at = now()
+WHERE kind = sqlc.arg(kind)
+  AND refresh_key = sqlc.arg(refresh_key)
+  AND generation >= sqlc.arg(completed_generation);

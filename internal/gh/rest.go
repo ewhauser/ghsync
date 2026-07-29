@@ -194,6 +194,33 @@ type ListPullsOptions struct {
 	Page      int
 }
 
+type ListRepositoriesOptions struct {
+	PerPage int
+	Page    int
+}
+
+// RepositoryRule preserves the complete ruleset payload while exposing the
+// immutable key and optional semantic timestamp used by the mirror CAS.
+type RepositoryRule struct {
+	ID        int64
+	UpdatedAt *time.Time
+	Raw       json.RawMessage
+}
+
+func (r *RepositoryRule) UnmarshalJSON(data []byte) error {
+	var metadata struct {
+		ID        int64      `json:"id"`
+		UpdatedAt *time.Time `json:"updated_at"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return err
+	}
+	r.ID = metadata.ID
+	r.UpdatedAt = metadata.UpdatedAt
+	r.Raw = append(r.Raw[:0], data...)
+	return nil
+}
+
 // RESTResponse is typed 304/pagination metadata. NotModified is a successful
 // conditional result, not an error (C-B4).
 type RESTResponse struct {
@@ -233,6 +260,45 @@ func (c *RESTClient) GetRepository(
 		return nil, response, err
 	}
 	return &repository, response, nil
+}
+
+func (c *RESTClient) ListInstallationRepositories(
+	ctx context.Context,
+	class budget.Class,
+	options ListRepositoriesOptions,
+	etag string,
+) ([]Repository, *RESTResponse, error) {
+	query := make(url.Values)
+	setPagination(query, options.PerPage, options.Page)
+	var payload struct {
+		Repositories []Repository `json:"repositories"`
+	}
+	response, err := c.getJSON(
+		ctx,
+		class,
+		"installation/repositories",
+		query,
+		etag,
+		&payload,
+	)
+	return payload.Repositories, response, err
+}
+
+func (c *RESTClient) ListRepositoryRules(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	etag string,
+) ([]RepositoryRule, *RESTResponse, error) {
+	path := fmt.Sprintf(
+		"repos/%s/%s/rulesets",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+	)
+	var rules []RepositoryRule
+	response, err := c.getJSON(ctx, class, path, nil, etag, &rules)
+	return rules, response, err
 }
 
 func (c *RESTClient) ListStacks(

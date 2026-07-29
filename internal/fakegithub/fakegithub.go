@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,7 @@ type PullRequest struct {
 	Head           PullRequestBranch `json:"head"`
 	Base           PullRequestBranch `json:"base"`
 	UpdatedAt      time.Time         `json:"updated_at"`
+	CreatedAt      time.Time         `json:"-"`
 	Stack          *StackRef         `json:"stack"`
 	ReviewThreads  []ReviewThread    `json:"-"`
 }
@@ -134,6 +136,15 @@ type CheckRun struct {
 	CompletedAt *time.Time `json:"completed_at"`
 }
 
+type RepositoryRule struct {
+	ID          int64            `json:"id"`
+	Name        string           `json:"name"`
+	Target      string           `json:"target"`
+	Enforcement string           `json:"enforcement"`
+	UpdatedAt   *time.Time       `json:"updated_at,omitempty"`
+	Rules       []map[string]any `json:"rules"`
+}
+
 func (c CheckRun) MarshalJSON() ([]byte, error) {
 	type wireCheckRun CheckRun
 	return json.Marshal(struct {
@@ -149,6 +160,8 @@ type Fixture struct {
 	Owner        string
 	Repo         string
 	Repository   Repository
+	Repositories []Repository
+	RepoRules    []RepositoryRule
 	Stacks       []Stack
 	PullRequests []PullRequest
 	CheckRuns    []CheckRun
@@ -183,6 +196,25 @@ type RateLimitStep struct {
 
 // Option customizes the fake server for a scenario.
 type Option func(*Server)
+
+func WithFixture(fixture Fixture) Option {
+	return func(s *Server) {
+		s.fixture = fixture
+	}
+}
+
+// WithRequestHook mutates fixture truth at a deterministic request boundary.
+// Tests use it to expose mutable-pagination races without timing sleeps.
+func WithRequestHook(
+	hook func(method string, path string, count int, fixture *Fixture),
+) Option {
+	if hook == nil {
+		panic("request hook is required")
+	}
+	return func(s *Server) {
+		s.requestHook = hook
+	}
+}
 
 // WithRateLimits sets independent REST-request and GraphQL-point limits.
 func WithRateLimits(rest, graphql int64) Option {
@@ -274,6 +306,7 @@ type Server struct {
 	client         *http.Client
 	requestCounts  map[string]int
 	notFound       map[string]int
+	requestHook    func(string, string, int, *Fixture)
 }
 
 func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
@@ -305,6 +338,8 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("GET /repos/{owner}/{repo}", s.getRepository)
+	mux.HandleFunc("GET /installation/repositories", s.listInstallationRepositories)
+	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets", s.listRepositoryRules)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks", s.listStacks)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks/{number}", s.getStack)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", s.listPulls)
@@ -323,6 +358,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestKey := r.Method + " " + r.URL.Path
 	s.mu.Lock()
 	s.requestCounts[requestKey]++
+	requestCount := s.requestCounts[requestKey]
+	if s.requestHook != nil {
+		s.requestHook(r.Method, r.URL.Path, requestCount, &s.fixture)
+	}
 	if s.notFound[requestKey] > 0 {
 		s.notFound[requestKey]--
 		s.mu.Unlock()
@@ -462,6 +501,38 @@ func (s *Server) getRepository(w http.ResponseWriter, r *http.Request) {
 	s.writeConditionalJSON(w, r, "core", fx.Repository)
 }
 
+func (s *Server) listInstallationRepositories(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	s.mu.Lock()
+	repositories := append([]Repository(nil), s.fixture.Repositories...)
+	if len(repositories) == 0 {
+		repositories = []Repository{s.fixture.Repository}
+	}
+	s.mu.Unlock()
+	sort.SliceStable(repositories, func(i, j int) bool {
+		return repositories[i].ID < repositories[j].ID
+	})
+	repositories = paginate(repositories, r, w)
+	s.writeConditionalJSON(w, r, "core", map[string]any{
+		"total_count":  len(repositories),
+		"repositories": repositories,
+	})
+}
+
+func (s *Server) listRepositoryRules(w http.ResponseWriter, r *http.Request) {
+	fx, ok := s.checkRepo(w, r)
+	if !ok {
+		return
+	}
+	rules := append([]RepositoryRule(nil), fx.RepoRules...)
+	sort.SliceStable(rules, func(i, j int) bool {
+		return rules[i].ID < rules[j].ID
+	})
+	s.writeConditionalJSON(w, r, "core", rules)
+}
+
 func (s *Server) listStacks(w http.ResponseWriter, r *http.Request) {
 	fx, ok := s.checkRepo(w, r)
 	if !ok {
@@ -519,16 +590,43 @@ func (s *Server) listPulls(w http.ResponseWriter, r *http.Request) {
 			pulls = append(pulls, pull)
 		}
 	}
+	sortBy := r.URL.Query().Get("sort")
+	if sortBy != "" {
+		if sortBy != "updated" && sortBy != "created" {
+			http.Error(w, "bad sort", http.StatusBadRequest)
+			return
+		}
+		sort.SliceStable(pulls, func(i, j int) bool {
+			if sortBy == "updated" {
+				if pulls[i].UpdatedAt.Equal(pulls[j].UpdatedAt) {
+					return pulls[i].Number < pulls[j].Number
+				}
+				return pulls[i].UpdatedAt.Before(pulls[j].UpdatedAt)
+			}
+			if pulls[i].CreatedAt.Equal(pulls[j].CreatedAt) {
+				return pulls[i].Number < pulls[j].Number
+			}
+			return pulls[i].CreatedAt.Before(pulls[j].CreatedAt)
+		})
+		direction := r.URL.Query().Get("direction")
+		if direction == "" {
+			direction = "desc"
+		}
+		if direction == "desc" {
+			slicesReverse(pulls)
+		} else if direction != "asc" {
+			http.Error(w, "bad direction", http.StatusBadRequest)
+			return
+		}
+	}
 	pulls = paginate(pulls, r, w)
 	s.writeConditionalJSON(w, r, "core", pulls)
 }
 
 func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Query     string `json:"query"`
-		Variables struct {
-			IDs []string `json:"ids"`
-		} `json:"variables"`
+		Query     string                     `json:"query"`
+		Variables map[string]json.RawMessage `json:"variables"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil &&
 		!errors.Is(err, io.EOF) {
@@ -545,12 +643,16 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 			"used":      budget.limit - budget.remaining,
 		},
 	}
-	if len(request.Variables.IDs) > 0 {
-		s.mu.Lock()
-		fx := s.fixture
-		s.mu.Unlock()
-		nodes := make([]any, 0, len(request.Variables.IDs))
-		for _, id := range request.Variables.IDs {
+	s.mu.Lock()
+	fx := s.fixture
+	s.mu.Unlock()
+	var ids []string
+	if raw := request.Variables["ids"]; len(raw) > 0 {
+		_ = json.Unmarshal(raw, &ids)
+	}
+	if len(ids) > 0 {
+		nodes := make([]any, 0, len(ids))
+		for _, id := range ids {
 			var node any
 			for _, pull := range fx.PullRequests {
 				if pull.NodeID == id {
@@ -561,6 +663,40 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 			nodes = append(nodes, node)
 		}
 		data["nodes"] = nodes
+	} else if strings.Contains(
+		request.Query,
+		"FrontierPullRequestReviewThreadsPage",
+	) {
+		id, after := graphQLCursorVariables(request.Variables)
+		for _, pull := range fx.PullRequests {
+			if pull.NodeID == id {
+				data["node"] = map[string]any{
+					"reviewThreads": graphQLReviewThreads(
+						pull.ReviewThreads,
+						after,
+					),
+				}
+				break
+			}
+		}
+	} else if strings.Contains(
+		request.Query,
+		"FrontierReviewThreadCommentsPage",
+	) {
+		id, after := graphQLCursorVariables(request.Variables)
+		for _, pull := range fx.PullRequests {
+			for _, thread := range pull.ReviewThreads {
+				if thread.ID == id {
+					data["node"] = map[string]any{
+						"comments": graphQLReviewComments(
+							thread.Comments,
+							after,
+						),
+					}
+					break
+				}
+			}
+		}
 	}
 	writeJSON(w, map[string]any{
 		"data": data,
@@ -606,26 +742,6 @@ func (s *Server) listCheckRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func graphQLPullRequest(repository Repository, pull PullRequest) map[string]any {
-	threads := make([]map[string]any, 0, len(pull.ReviewThreads))
-	for _, thread := range pull.ReviewThreads {
-		comments := make([]map[string]any, 0, len(thread.Comments))
-		for _, comment := range thread.Comments {
-			comments = append(comments, map[string]any{
-				"id":        comment.ID,
-				"body":      comment.Body,
-				"updatedAt": comment.UpdatedAt.Format(time.RFC3339Nano),
-				"author":    map[string]any{"login": comment.AuthorLogin},
-			})
-		}
-		threads = append(threads, map[string]any{
-			"id":         thread.ID,
-			"isResolved": thread.IsResolved,
-			"isOutdated": thread.IsOutdated,
-			"path":       thread.Path,
-			"line":       thread.Line,
-			"comments":   map[string]any{"nodes": comments},
-		})
-	}
 	return map[string]any{
 		"id":             pull.NodeID,
 		"databaseId":     pull.ID,
@@ -656,7 +772,80 @@ func graphQLPullRequest(repository Repository, pull PullRequest) map[string]any 
 				},
 			},
 		},
-		"reviewThreads": map[string]any{"nodes": threads},
+		"reviewThreads": graphQLReviewThreads(pull.ReviewThreads, 0),
+	}
+}
+
+const fakeGraphQLConnectionLimit = 100
+
+func graphQLReviewThreads(
+	threads []ReviewThread,
+	after int,
+) map[string]any {
+	start, end, pageInfo := graphQLPage(len(threads), after)
+	nodes := make([]map[string]any, 0, end-start)
+	for _, thread := range threads[start:end] {
+		nodes = append(nodes, map[string]any{
+			"id":         thread.ID,
+			"isResolved": thread.IsResolved,
+			"isOutdated": thread.IsOutdated,
+			"path":       thread.Path,
+			"line":       thread.Line,
+			"comments":   graphQLReviewComments(thread.Comments, 0),
+		})
+	}
+	return map[string]any{"nodes": nodes, "pageInfo": pageInfo}
+}
+
+func graphQLReviewComments(
+	comments []ReviewComment,
+	after int,
+) map[string]any {
+	start, end, pageInfo := graphQLPage(len(comments), after)
+	nodes := make([]map[string]any, 0, end-start)
+	for _, comment := range comments[start:end] {
+		author := any(nil)
+		if comment.AuthorLogin != "" {
+			author = map[string]any{"login": comment.AuthorLogin}
+		}
+		nodes = append(nodes, map[string]any{
+			"id":        comment.ID,
+			"body":      comment.Body,
+			"updatedAt": comment.UpdatedAt.Format(time.RFC3339Nano),
+			"author":    author,
+		})
+	}
+	return map[string]any{"nodes": nodes, "pageInfo": pageInfo}
+}
+
+func graphQLPage(length, after int) (int, int, map[string]any) {
+	start := min(max(after, 0), length)
+	end := min(start+fakeGraphQLConnectionLimit, length)
+	var endCursor any
+	if end > 0 {
+		endCursor = strconv.Itoa(end)
+	}
+	return start, end, map[string]any{
+		"hasNextPage": end < length,
+		"endCursor":   endCursor,
+	}
+}
+
+func graphQLCursorVariables(
+	variables map[string]json.RawMessage,
+) (string, int) {
+	var id string
+	_ = json.Unmarshal(variables["id"], &id)
+	var cursor string
+	_ = json.Unmarshal(variables["after"], &cursor)
+	after, _ := strconv.Atoi(cursor)
+	return id, after
+}
+
+func slicesReverse[T any](values []T) {
+	for left, right := 0, len(values)-1; left < right; left, right =
+		left+1, right-1 {
+		values[left], values[right] = values[right], values[left]
 	}
 }
 

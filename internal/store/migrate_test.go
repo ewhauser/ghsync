@@ -140,6 +140,23 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err != nil || riverTables != 1 {
 		t.Fatalf("river_job table missing (err=%v, count=%d)", err, riverTables)
 	}
+
+	var historyRetentionIndex string
+	err = pool.QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND tablename = 'check_history'
+		  AND indexname = 'check_history_synced_at_brin_idx'
+	`).Scan(&historyRetentionIndex)
+	if err != nil ||
+		!strings.Contains(historyRetentionIndex, "USING brin (synced_at)") {
+		t.Fatalf(
+			"global check-history retention index = %q (err=%v)",
+			historyRetentionIndex,
+			err,
+		)
+	}
 }
 
 func TestVerifyChecksum(t *testing.T) {

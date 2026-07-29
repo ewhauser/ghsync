@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -168,6 +169,54 @@ func TestPullsGoldenResponseDecodesThroughClientContract(t *testing.T) {
 	}
 	if got := pulls[1].Base.Ref; got != "refactor/tokenizer" {
 		t.Fatalf("base ref = %q", got)
+	}
+}
+
+func TestPullListHonorsSortDirectionAndPagination(t *testing.T) {
+	fixture := DefaultFixture()
+	for index := range fixture.PullRequests {
+		fixture.PullRequests[index].UpdatedAt = time.Date(
+			2026,
+			7,
+			28,
+			12,
+			index,
+			0,
+			0,
+			time.UTC,
+		)
+	}
+	fake := New(fixture, "secret")
+	readNumbers := func(target string) []int {
+		t.Helper()
+		resp := serve(fake, http.MethodGet, target, nil)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d", target, resp.StatusCode)
+		}
+		var pulls []PullRequest
+		if err := json.NewDecoder(resp.Body).Decode(&pulls); err != nil {
+			t.Fatal(err)
+		}
+		numbers := make([]int, 0, len(pulls))
+		for _, pull := range pulls {
+			numbers = append(numbers, pull.Number)
+		}
+		return numbers
+	}
+	ascending := readNumbers(
+		"http://fake.test/repos/acme/monolith/pulls" +
+			"?state=all&sort=updated&direction=asc&per_page=2&page=1",
+	)
+	descending := readNumbers(
+		"http://fake.test/repos/acme/monolith/pulls" +
+			"?state=all&sort=updated&direction=desc&per_page=2&page=1",
+	)
+	if !reflect.DeepEqual(ascending, []int{4810, 4812}) {
+		t.Fatalf("ascending first page = %v", ascending)
+	}
+	if !reflect.DeepEqual(descending, []int{4820, 4816}) {
+		t.Fatalf("descending first page = %v", descending)
 	}
 }
 

@@ -18,11 +18,14 @@ import (
 
 const (
 	KindRefreshPR              = "refresh_pr"
+	KindRefreshRepository      = "refresh_repository"
+	KindRefreshRepoRules       = "refresh_repo_rules"
 	KindRefreshStack           = "refresh_stack"
 	KindRefreshChecks          = "refresh_checks"
 	KindRefreshBranch          = "refresh_branch"
 	KindResolveStackMembership = "resolve_stack_membership"
 	KindBackfillRepoPage       = "backfill_repo_page"
+	KindBackfillInstallation   = "backfill_installation_page"
 )
 
 // RefreshArgs is the complete durable job pointer. It intentionally contains
@@ -33,6 +36,8 @@ type RefreshArgs struct {
 }
 
 type RefreshPRArgs struct{ RefreshArgs }
+type RefreshRepositoryArgs struct{ RefreshArgs }
+type RefreshRepoRulesArgs struct{ RefreshArgs }
 type RefreshStackArgs struct{ RefreshArgs }
 type RefreshChecksArgs struct{ RefreshArgs }
 type RefreshBranchArgs struct{ RefreshArgs }
@@ -45,8 +50,26 @@ type BackfillRepoPageArgs struct {
 	Page           int    `json:"page"`
 }
 
+type BackfillInstallationPageArgs struct {
+	InstallationID int64  `json:"installation_id"`
+	Phase          string `json:"phase"`
+	Page           int    `json:"page"`
+}
+
 func NewRefreshPRArgs(key string) RefreshPRArgs {
 	return RefreshPRArgs{RefreshArgs{PointerKind: KindRefreshPR, Key: key}}
+}
+
+func NewRefreshRepositoryArgs(key string) RefreshRepositoryArgs {
+	return RefreshRepositoryArgs{
+		RefreshArgs{PointerKind: KindRefreshRepository, Key: key},
+	}
+}
+
+func NewRefreshRepoRulesArgs(key string) RefreshRepoRulesArgs {
+	return RefreshRepoRulesArgs{
+		RefreshArgs{PointerKind: KindRefreshRepoRules, Key: key},
+	}
 }
 
 func NewRefreshStackArgs(key string) RefreshStackArgs {
@@ -68,11 +91,16 @@ func NewResolveStackMembershipArgs(key string) ResolveStackMembershipArgs {
 }
 
 func (RefreshPRArgs) Kind() string              { return KindRefreshPR }
+func (RefreshRepositoryArgs) Kind() string      { return KindRefreshRepository }
+func (RefreshRepoRulesArgs) Kind() string       { return KindRefreshRepoRules }
 func (RefreshStackArgs) Kind() string           { return KindRefreshStack }
 func (RefreshChecksArgs) Kind() string          { return KindRefreshChecks }
 func (RefreshBranchArgs) Kind() string          { return KindRefreshBranch }
 func (ResolveStackMembershipArgs) Kind() string { return KindResolveStackMembership }
 func (BackfillRepoPageArgs) Kind() string       { return KindBackfillRepoPage }
+func (BackfillInstallationPageArgs) Kind() string {
+	return KindBackfillInstallation
+}
 
 func NewBackfillRepoPageArgs(
 	installationID int64,
@@ -83,6 +111,18 @@ func NewBackfillRepoPageArgs(
 	return BackfillRepoPageArgs{
 		InstallationID: installationID,
 		RepoFullName:   repoFullName,
+		Phase:          phase,
+		Page:           page,
+	}
+}
+
+func NewBackfillInstallationPageArgs(
+	installationID int64,
+	phase string,
+	page int,
+) BackfillInstallationPageArgs {
+	return BackfillInstallationPageArgs{
+		InstallationID: installationID,
 		Phase:          phase,
 		Page:           page,
 	}
@@ -117,8 +157,12 @@ func NewRefreshInsertOptsForQueue(
 }
 
 func NewBackfillInsertOpts() *river.InsertOpts {
+	return NewBackfillInsertOptsForQueue(QueueInteractive)
+}
+
+func NewBackfillInsertOptsForQueue(queueName string) *river.InsertOpts {
 	return &river.InsertOpts{
-		Queue:    QueueInteractive,
+		Queue:    queueName,
 		Priority: 1,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
@@ -147,17 +191,37 @@ type RefreshSpec struct {
 // queue avoids coupling durable job definitions to GitHub/cache internals.
 type RefreshHandler interface {
 	RefreshPR(context.Context, RefreshRequest) error
+	RefreshRepository(context.Context, RefreshRequest) error
+	RefreshRepoRules(context.Context, RefreshRequest) error
 	RefreshStack(context.Context, RefreshRequest) error
 	RefreshChecks(context.Context, RefreshRequest) error
 	RefreshBranch(context.Context, RefreshRequest) error
 	ResolveStackMembership(context.Context, RefreshRequest) error
 	BackfillRepoPage(context.Context, BackfillRepoPageArgs) error
+	BackfillInstallationPage(
+		context.Context,
+		BackfillInstallationPageArgs,
+	) error
 }
 
 // Each durable M2 job kind delegates to the M3 fetch handler without changing
 // its pointer-only argument contract.
 type refreshPRWorker struct {
 	river.WorkerDefaults[RefreshPRArgs]
+	pool    *pgxpool.Pool
+	work    refreshWork
+	handler RefreshHandler
+}
+
+type refreshRepositoryWorker struct {
+	river.WorkerDefaults[RefreshRepositoryArgs]
+	pool    *pgxpool.Pool
+	work    refreshWork
+	handler RefreshHandler
+}
+
+type refreshRepoRulesWorker struct {
+	river.WorkerDefaults[RefreshRepoRulesArgs]
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
@@ -196,6 +260,11 @@ type backfillRepoPageWorker struct {
 	handler RefreshHandler
 }
 
+type backfillInstallationPageWorker struct {
+	river.WorkerDefaults[BackfillInstallationPageArgs]
+	handler RefreshHandler
+}
+
 type refreshWork func(context.Context, RefreshArgs) error
 
 func (w *refreshPRWorker) Work(
@@ -206,6 +275,38 @@ func (w *refreshPRWorker) Work(
 	if work == nil && w.handler != nil {
 		work = func(ctx context.Context, args RefreshArgs) error {
 			return w.handler.RefreshPR(
+				ctx,
+				RefreshRequest{Args: args, Queue: job.Queue},
+			)
+		}
+	}
+	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+}
+
+func (w *refreshRepositoryWorker) Work(
+	ctx context.Context,
+	job *river.Job[RefreshRepositoryArgs],
+) error {
+	work := w.work
+	if work == nil && w.handler != nil {
+		work = func(ctx context.Context, args RefreshArgs) error {
+			return w.handler.RefreshRepository(
+				ctx,
+				RefreshRequest{Args: args, Queue: job.Queue},
+			)
+		}
+	}
+	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+}
+
+func (w *refreshRepoRulesWorker) Work(
+	ctx context.Context,
+	job *river.Job[RefreshRepoRulesArgs],
+) error {
+	work := w.work
+	if work == nil && w.handler != nil {
+		work = func(ctx context.Context, args RefreshArgs) error {
+			return w.handler.RefreshRepoRules(
 				ctx,
 				RefreshRequest{Args: args, Queue: job.Queue},
 			)
@@ -291,12 +392,30 @@ func (w *backfillRepoPageWorker) Work(
 	return w.handler.BackfillRepoPage(ctx, job.Args)
 }
 
+func (w *backfillInstallationPageWorker) Work(
+	ctx context.Context,
+	job *river.Job[BackfillInstallationPageArgs],
+) error {
+	if w.handler == nil {
+		return fmt.Errorf("installation backfill worker is not configured")
+	}
+	return w.handler.BackfillInstallationPage(ctx, job.Args)
+}
+
 func registerRefreshWorkers(
 	workers *river.Workers,
 	pool *pgxpool.Pool,
 	handler RefreshHandler,
 ) {
 	river.AddWorker(workers, &refreshPRWorker{pool: pool, handler: handler})
+	river.AddWorker(
+		workers,
+		&refreshRepositoryWorker{pool: pool, handler: handler},
+	)
+	river.AddWorker(
+		workers,
+		&refreshRepoRulesWorker{pool: pool, handler: handler},
+	)
 	river.AddWorker(workers, &refreshStackWorker{pool: pool, handler: handler})
 	river.AddWorker(workers, &refreshChecksWorker{pool: pool, handler: handler})
 	river.AddWorker(workers, &refreshBranchWorker{pool: pool, handler: handler})
@@ -305,6 +424,10 @@ func registerRefreshWorkers(
 		&resolveStackMembershipWorker{pool: pool, handler: handler},
 	)
 	river.AddWorker(workers, &backfillRepoPageWorker{handler: handler})
+	river.AddWorker(
+		workers,
+		&backfillInstallationPageWorker{handler: handler},
+	)
 }
 
 func runRefresh[T river.JobArgs](
@@ -339,6 +462,11 @@ func runRefresh[T river.JobArgs](
 // InsertRefreshesTx atomically advances M2's durable generations and inserts
 // follow-up pointers. Stack diffs, branch fan-out, and backfill all use this
 // path so running-state coalescing keeps the same meaning everywhere.
+type RefreshGeneration struct {
+	Spec       RefreshSpec
+	Generation int64
+}
+
 func InsertRefreshesTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -346,11 +474,24 @@ func InsertRefreshesTx(
 	specs []RefreshSpec,
 	queueName string,
 ) error {
+	_, err := InsertRefreshesTxReturning(
+		ctx, tx, client, specs, queueName,
+	)
+	return err
+}
+
+func InsertRefreshesTxReturning(
+	ctx context.Context,
+	tx pgx.Tx,
+	client *river.Client[pgx.Tx],
+	specs []RefreshSpec,
+	queueName string,
+) ([]RefreshGeneration, error) {
 	if len(specs) == 0 {
-		return nil
+		return nil, nil
 	}
 	if client == nil {
-		return fmt.Errorf("River client is required")
+		return nil, fmt.Errorf("River client is required")
 	}
 	type generationPointer struct {
 		Kind       string `json:"kind"`
@@ -361,7 +502,7 @@ func InsertRefreshesTx(
 	pointers := make([]generationPointer, 0, len(specs))
 	for _, spec := range specs {
 		if spec.Key == "" {
-			return fmt.Errorf("refresh key is required")
+			return nil, fmt.Errorf("refresh key is required")
 		}
 		if _, duplicate := seen[spec]; duplicate {
 			continue
@@ -375,14 +516,14 @@ func InsertRefreshesTx(
 	}
 	encoded, err := json.Marshal(pointers)
 	if err != nil {
-		return fmt.Errorf("encode refresh generations: %w", err)
+		return nil, fmt.Errorf("encode refresh generations: %w", err)
 	}
 	generations, err := dbgen.New(tx).BumpRefreshIntentGenerations(ctx, encoded)
 	if err != nil {
-		return fmt.Errorf("bump refresh generations: %w", err)
+		return nil, fmt.Errorf("bump refresh generations: %w", err)
 	}
 	if len(generations) != len(deduped) {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"bumped %d refresh generations for %d specs",
 			len(generations),
 			len(deduped),
@@ -392,7 +533,7 @@ func InsertRefreshesTx(
 	for _, spec := range deduped {
 		args, err := argsForSpec(spec)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		params = append(params, river.InsertManyParams{
 			Args:       args,
@@ -400,15 +541,33 @@ func InsertRefreshesTx(
 		})
 	}
 	if _, err := client.InsertManyTx(ctx, tx, params); err != nil {
-		return fmt.Errorf("insert refresh jobs: %w", err)
+		return nil, fmt.Errorf("insert refresh jobs: %w", err)
 	}
-	return nil
+	bySpec := make(map[RefreshSpec]int64, len(generations))
+	for _, generation := range generations {
+		bySpec[RefreshSpec{
+			Kind: generation.Kind,
+			Key:  generation.RefreshKey,
+		}] = generation.Generation
+	}
+	result := make([]RefreshGeneration, 0, len(deduped))
+	for _, spec := range deduped {
+		result = append(result, RefreshGeneration{
+			Spec:       spec,
+			Generation: bySpec[spec],
+		})
+	}
+	return result, nil
 }
 
 func argsForSpec(spec RefreshSpec) (rivertype.JobArgs, error) {
 	switch spec.Kind {
 	case KindRefreshPR:
 		return NewRefreshPRArgs(spec.Key), nil
+	case KindRefreshRepository:
+		return NewRefreshRepositoryArgs(spec.Key), nil
+	case KindRefreshRepoRules:
+		return NewRefreshRepoRulesArgs(spec.Key), nil
 	case KindRefreshStack:
 		return NewRefreshStackArgs(spec.Key), nil
 	case KindRefreshChecks:
@@ -448,6 +607,18 @@ func completeRefresh[T river.JobArgs](
 
 	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
 		return fmt.Errorf("complete refresh job: %w", err)
+	}
+	if startedGeneration > 0 {
+		if err := dbgen.New(tx).CompleteRefreshIntentGeneration(
+			ctx,
+			dbgen.CompleteRefreshIntentGenerationParams{
+				CompletedGeneration: startedGeneration,
+				Kind:                args.PointerKind,
+				RefreshKey:          args.Key,
+			},
+		); err != nil {
+			return fmt.Errorf("complete refresh generation: %w", err)
+		}
 	}
 
 	if generation > startedGeneration {

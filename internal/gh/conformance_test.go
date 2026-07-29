@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -318,6 +319,53 @@ func TestPullsPreservePreviewStackExtension(t *testing.T) {
 		pulls[1].Stack.ID != 9876543 ||
 		pulls[1].Stack.Position != 2 {
 		t.Fatalf("preview stack extension = %+v", pulls[1].Stack)
+	}
+}
+
+func TestGraphQLPaginatesReviewThreadsAndNestedComments(t *testing.T) {
+	fixture := fakegithub.DefaultFixture()
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	threads := make([]fakegithub.ReviewThread, 101)
+	for index := range threads {
+		comments := []fakegithub.ReviewComment{{
+			ID:   fmt.Sprintf("comment-%03d-000", index),
+			Body: "body", UpdatedAt: now, AuthorLogin: "reviewer",
+		}}
+		if index == 0 {
+			comments = make([]fakegithub.ReviewComment, 101)
+			for commentIndex := range comments {
+				comments[commentIndex] = fakegithub.ReviewComment{
+					ID:   fmt.Sprintf("comment-000-%03d", commentIndex),
+					Body: "body", UpdatedAt: now, AuthorLogin: "reviewer",
+				}
+			}
+		}
+		threads[index] = fakegithub.ReviewThread{
+			ID:       fmt.Sprintf("thread-%03d", index),
+			Path:     "file.go",
+			Comments: comments,
+		}
+	}
+	fixture.PullRequests[1].ReviewThreads = threads
+	server, baseURL := startFake(t, fakegithub.WithFixture(fixture))
+	gate := budget.New(server.Client(), budget.Options{})
+	client := newGraphQLClient(t, baseURL, gate)
+	nodes, _, err := client.BatchPullRequests(
+		context.Background(),
+		budget.Event,
+		[]string{fixture.PullRequests[1].NodeID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || len(nodes[0].ReviewThreads.Nodes) != 101 {
+		t.Fatalf("review threads = %#v", nodes)
+	}
+	if got := len(nodes[0].ReviewThreads.Nodes[0].Comments.Nodes); got != 101 {
+		t.Fatalf("first thread comments = %d, want 101", got)
+	}
+	if got := server.handler.RequestCount(http.MethodPost, "/graphql"); got != 3 {
+		t.Fatalf("GraphQL requests = %d, want initial + two page calls", got)
 	}
 }
 

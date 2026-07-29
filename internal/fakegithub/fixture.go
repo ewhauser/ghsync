@@ -64,6 +64,11 @@ func DefaultFixture() Fixture {
 			UpdatedAt:      now, Stack: stackRef(5),
 		},
 	}
+	for index := range pulls {
+		pulls[index].CreatedAt = now.Add(
+			-time.Duration(len(pulls)-index) * 24 * time.Hour,
+		)
+	}
 	stackPulls := make([]StackPullRequest, 0, len(pulls))
 	for _, pull := range pulls {
 		stackPulls = append(stackPulls, StackPullRequest{
@@ -84,6 +89,26 @@ func DefaultFixture() Fixture {
 			FullName: "acme/monolith", DefaultBranch: "main",
 			DefaultBranchSHA: base.SHA, UpdatedAt: now, PushedAt: now,
 		},
+		Repositories: []Repository{{
+			ID: 1001, NodeID: "R_kwDOABCDEF", Owner: "acme", Name: "monolith",
+			FullName: "acme/monolith", DefaultBranch: "main",
+			DefaultBranchSHA: base.SHA, UpdatedAt: now, PushedAt: now,
+		}},
+		RepoRules: []RepositoryRule{{
+			ID:          7001,
+			Name:        "protect-main",
+			Target:      "branch",
+			Enforcement: "active",
+			UpdatedAt:   &now,
+			Rules: []map[string]any{{
+				"type": "required_status_checks",
+				"parameters": map[string]any{
+					"required_status_checks": []map[string]any{
+						{"context": "unit"},
+					},
+				},
+			}},
+		}},
 		Stacks: []Stack{
 			{
 				ID:           9876543,

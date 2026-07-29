@@ -88,8 +88,14 @@ type PullRequestNode struct {
 	} `json:"author"`
 	Repository    RepositoryNode `json:"repository"`
 	ReviewThreads struct {
-		Nodes []ReviewThreadNode `json:"nodes"`
+		Nodes    []ReviewThreadNode `json:"nodes"`
+		PageInfo PageInfo           `json:"pageInfo"`
 	} `json:"reviewThreads"`
+}
+
+type PageInfo struct {
+	HasNextPage bool    `json:"hasNextPage"`
+	EndCursor   *string `json:"endCursor"`
 }
 
 type RepositoryNode struct {
@@ -117,7 +123,8 @@ type ReviewThreadNode struct {
 	Path       string `json:"path"`
 	Line       *int   `json:"line"`
 	Comments   struct {
-		Nodes []ReviewCommentNode `json:"nodes"`
+		Nodes    []ReviewCommentNode `json:"nodes"`
+		PageInfo PageInfo            `json:"pageInfo"`
 	} `json:"comments"`
 }
 
@@ -158,6 +165,7 @@ const pullRequestNodesQuery = `query FrontierPullRequestNodes($ids: [ID!]!) {
         defaultBranchRef { name target { oid } }
       }
       reviewThreads(first: 100) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           isResolved
@@ -165,9 +173,50 @@ const pullRequestNodesQuery = `query FrontierPullRequestNodes($ids: [ID!]!) {
           path
           line
           comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
             nodes { id body updatedAt author { login } }
           }
         }
+      }
+    }
+  }
+  rateLimit { cost limit remaining resetAt }
+}`
+
+const pullRequestReviewThreadsPageQuery = `query FrontierPullRequestReviewThreadsPage(
+  $id: ID!,
+  $after: String
+) {
+  node(id: $id) {
+    ... on PullRequest {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { id body updatedAt author { login } }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { cost limit remaining resetAt }
+}`
+
+const reviewThreadCommentsPageQuery = `query FrontierReviewThreadCommentsPage(
+  $id: ID!,
+  $after: String
+) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id body updatedAt author { login } }
       }
     }
   }
@@ -211,7 +260,134 @@ func (c *GraphQLClient) BatchPullRequests(
 			len(nodeIDs),
 		)
 	}
+	for _, node := range data.Nodes {
+		if node == nil {
+			continue
+		}
+		if err := c.completePullRequestReviewConnections(
+			ctx,
+			class,
+			node,
+		); err != nil {
+			return nil, response, err
+		}
+	}
 	return data.Nodes, response, nil
+}
+
+func (c *GraphQLClient) completePullRequestReviewConnections(
+	ctx context.Context,
+	class budget.Class,
+	pull *PullRequestNode,
+) error {
+	for index := range pull.ReviewThreads.Nodes {
+		if err := c.completeReviewThreadComments(
+			ctx,
+			class,
+			&pull.ReviewThreads.Nodes[index],
+		); err != nil {
+			return err
+		}
+	}
+	for pull.ReviewThreads.PageInfo.HasNextPage {
+		if pull.ReviewThreads.PageInfo.EndCursor == nil {
+			return fmt.Errorf("reviewThreads hasNextPage without endCursor")
+		}
+		var data struct {
+			Node *struct {
+				ReviewThreads struct {
+					Nodes    []ReviewThreadNode `json:"nodes"`
+					PageInfo PageInfo           `json:"pageInfo"`
+				} `json:"reviewThreads"`
+			} `json:"node"`
+		}
+		_, err := c.Call(
+			ctx,
+			class,
+			pullRequestReviewThreadsPageQuery,
+			map[string]any{
+				"id":    pull.ID,
+				"after": *pull.ReviewThreads.PageInfo.EndCursor,
+			},
+			&data,
+		)
+		if err != nil {
+			return fmt.Errorf("paginate reviewThreads for %s: %w", pull.ID, err)
+		}
+		if data.Node == nil {
+			return fmt.Errorf(
+				"paginate reviewThreads for %s: node disappeared",
+				pull.ID,
+			)
+		}
+		for index := range data.Node.ReviewThreads.Nodes {
+			if err := c.completeReviewThreadComments(
+				ctx,
+				class,
+				&data.Node.ReviewThreads.Nodes[index],
+			); err != nil {
+				return err
+			}
+		}
+		pull.ReviewThreads.Nodes = append(
+			pull.ReviewThreads.Nodes,
+			data.Node.ReviewThreads.Nodes...,
+		)
+		pull.ReviewThreads.PageInfo = data.Node.ReviewThreads.PageInfo
+	}
+	return nil
+}
+
+func (c *GraphQLClient) completeReviewThreadComments(
+	ctx context.Context,
+	class budget.Class,
+	thread *ReviewThreadNode,
+) error {
+	for thread.Comments.PageInfo.HasNextPage {
+		if thread.Comments.PageInfo.EndCursor == nil {
+			return fmt.Errorf(
+				"review thread %s comments hasNextPage without endCursor",
+				thread.ID,
+			)
+		}
+		var data struct {
+			Node *struct {
+				Comments struct {
+					Nodes    []ReviewCommentNode `json:"nodes"`
+					PageInfo PageInfo            `json:"pageInfo"`
+				} `json:"comments"`
+			} `json:"node"`
+		}
+		_, err := c.Call(
+			ctx,
+			class,
+			reviewThreadCommentsPageQuery,
+			map[string]any{
+				"id":    thread.ID,
+				"after": *thread.Comments.PageInfo.EndCursor,
+			},
+			&data,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"paginate review thread %s comments: %w",
+				thread.ID,
+				err,
+			)
+		}
+		if data.Node == nil {
+			return fmt.Errorf(
+				"paginate review thread %s comments: node disappeared",
+				thread.ID,
+			)
+		}
+		thread.Comments.Nodes = append(
+			thread.Comments.Nodes,
+			data.Node.Comments.Nodes...,
+		)
+		thread.Comments.PageInfo = data.Node.Comments.PageInfo
+	}
+	return nil
 }
 
 // Call executes a query that includes a top-level data.rateLimit block.

@@ -20,13 +20,6 @@ const (
 	defaultBatchSize   = gh.MaxPullRequestBatch
 )
 
-type pullBatchWriter interface {
-	ApplyPullRequestBatch(
-		context.Context,
-		[]store.PullRequestRecord,
-	) (map[string]store.ApplyPullRequestResult, error)
-}
-
 type pullBatchItem struct {
 	ctx       context.Context
 	key       entityKey
@@ -35,6 +28,7 @@ type pullBatchItem struct {
 	source    store.SyncSource
 	class     budget.Class
 	startedAt time.Time
+	hook      func(string) store.PullRequestHook
 	result    chan pullBatchResult
 }
 
@@ -54,24 +48,22 @@ type pendingPullBatch struct {
 	closed bool
 }
 
-// prCoordinator implements C-P4 as a shared worker coordinator. River claims
-// individual jobs; calls arriving in a short window gang into nodes(ids:).
-// This avoids teaching River about multi-job acknowledgement while retaining
-// one generation recheck per durable job.
+// prCoordinator gangs GraphQL transport while preserving one independently
+// locked transaction and one result per entity.
 type prCoordinator struct {
 	mu             sync.Mutex
 	batches        map[pullBatchKey]*pendingPullBatch
 	window         time.Duration
 	max            int
 	graphQL        *gh.GraphQLClient
-	writer         pullBatchWriter
+	writer         *store.EntityWriter
 	installationID int64
 	orgID          int64
 }
 
 func newPRCoordinator(
 	graphQL *gh.GraphQLClient,
-	writer pullBatchWriter,
+	writer *store.EntityWriter,
 	installationID int64,
 	orgID int64,
 	window time.Duration,
@@ -97,6 +89,7 @@ func (c *prCoordinator) submit(
 	metadata store.FetchMetadata,
 	class budget.Class,
 	source store.SyncSource,
+	hook func(string) store.PullRequestHook,
 ) (store.ApplyPullRequestResult, error) {
 	item := &pullBatchItem{
 		ctx:       ctx,
@@ -106,6 +99,7 @@ func (c *prCoordinator) submit(
 		class:     class,
 		source:    source,
 		startedAt: time.Now(),
+		hook:      hook,
 		result:    make(chan pullBatchResult, 1),
 	}
 	batchKey := pullBatchKey{class: class, source: source}
@@ -149,18 +143,84 @@ func (c *prCoordinator) flush(key pullBatchKey, batch *pendingPullBatch) {
 
 func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	sort.Slice(batch.items, func(i, j int) bool {
-		return batch.items[i].key.Repo+":"+batch.items[i].key.Value <
-			batch.items[j].key.Repo+":"+batch.items[j].key.Value
+		return immutablePRKey(batch.items[i]) < immutablePRKey(batch.items[j])
 	})
-	ids := make([]string, 0, len(batch.items))
-	for _, item := range batch.items {
-		ids = append(ids, item.nodeID)
-	}
 	callCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(batch.items[0].ctx),
 		30*time.Second,
 	)
 	defer cancel()
+
+	repoObservations := make(map[int64]*store.Observation)
+	var observations []*store.Observation
+	closeObservations := func() {
+		for index := len(observations) - 1; index >= 0; index-- {
+			_ = observations[index].Close()
+		}
+	}
+	defer closeObservations()
+
+	repoIDs := make([]int64, 0)
+	for _, item := range batch.items {
+		if _, exists := repoObservations[item.metadata.RepoGitHubID]; !exists {
+			repoIDs = append(repoIDs, item.metadata.RepoGitHubID)
+			repoObservations[item.metadata.RepoGitHubID] = nil
+		}
+	}
+	sort.Slice(repoIDs, func(i, j int) bool { return repoIDs[i] < repoIDs[j] })
+	for _, repoID := range repoIDs {
+		observation, err := c.writer.BeginObservation(
+			callCtx,
+			store.RepositoryEntityKey(c.installationID, repoID),
+		)
+		if err != nil {
+			c.finishAll(batch, nil, err)
+			return
+		}
+		repoObservations[repoID] = observation
+		observations = append(observations, observation)
+	}
+
+	itemObservations := make(map[*pullBatchItem]*store.Observation, len(batch.items))
+	active := make([]*pullBatchItem, 0, len(batch.items))
+	results := make(map[*pullBatchItem]pullBatchResult, len(batch.items))
+	for _, item := range batch.items {
+		observation, err := c.writer.BeginObservation(
+			callCtx,
+			store.PullRequestEntityKey(
+				item.metadata.InstallationID,
+				item.metadata.RepoGitHubID,
+				item.key.Number,
+			),
+		)
+		if err != nil {
+			results[item] = pullBatchResult{err: err}
+			continue
+		}
+		itemObservations[item] = observation
+		observations = append(observations, observation)
+		metadata, err := c.writer.PullRequestMetadata(
+			callCtx,
+			item.key.Repo,
+			item.key.Number,
+		)
+		if err != nil {
+			results[item] = pullBatchResult{err: err}
+			continue
+		}
+		item.metadata = metadata
+		item.nodeID = metadata.NodeID
+		active = append(active, item)
+	}
+	if len(active) == 0 {
+		c.finishAll(batch, results, nil)
+		return
+	}
+
+	ids := make([]string, 0, len(active))
+	for _, item := range active {
+		ids = append(ids, item.nodeID)
+	}
 	nodes, _, err := c.graphQL.BatchPullRequests(
 		callCtx,
 		batch.items[0].class,
@@ -170,58 +230,110 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		c.finishAll(batch, nil, err)
 		return
 	}
-	pulls := make([]store.PullRequestRecord, 0, len(nodes))
+
+	repositoryFailures := make(map[int64]error)
+	applies := make([]store.PullRequestApply, 0, len(active))
+	applyItems := make(map[string]*pullBatchItem, len(active))
+	repositoryApplied := make(map[int64]bool)
 	for index, node := range nodes {
+		item := active[index]
 		if node == nil {
-			c.finishAll(
-				batch,
-				nil,
-				fmt.Errorf("%w: %q", errGraphQLNodeNotFound, ids[index]),
-			)
-			return
+			results[item] = pullBatchResult{
+				err: fmt.Errorf(
+					"%w: %q",
+					errGraphQLNodeNotFound,
+					ids[index],
+				),
+			}
+			continue
 		}
-		pulls = append(
-			pulls,
-			pullRecordFromNode(
-				node,
-				batch.items[index],
-				c.installationID,
-				c.orgID,
-			),
+		record := pullRecordFromNode(
+			node,
+			item,
+			c.installationID,
+			c.orgID,
 		)
+		repoID := record.Repository.GitHubID
+		if repoErr := repositoryFailures[repoID]; repoErr != nil {
+			results[item] = pullBatchResult{err: repoErr}
+			continue
+		}
+		if !repositoryApplied[repoID] {
+			_, repoErr := c.writer.ApplyRepositoryObserved(
+				callCtx,
+				repoObservations[repoID],
+				record.Repository,
+				item.source,
+				"",
+				item.startedAt,
+			)
+			if repoErr != nil {
+				repositoryFailures[repoID] = repoErr
+				results[item] = pullBatchResult{err: repoErr}
+				continue
+			}
+			repositoryApplied[repoID] = true
+		}
+		key := store.PullRequestEntityKey(
+			record.Repository.InstallationID,
+			record.Repository.GitHubID,
+			record.Number,
+		)
+		applies = append(applies, store.PullRequestApply{
+			Record:      record,
+			Observation: itemObservations[item],
+			Hook:        item.hook(record.Repository.FullName),
+		})
+		applyItems[key] = item
 	}
-	results, err := c.writer.ApplyPullRequestBatch(callCtx, pulls)
-	c.finishAll(batch, results, err)
+	outcomes := c.writer.ApplyPullRequestBatch(callCtx, applies)
+	for key, outcome := range outcomes {
+		item := applyItems[key]
+		results[item] = pullBatchResult{
+			applied: outcome.Result,
+			err:     outcome.Err,
+		}
+	}
+	c.finishAll(batch, results, nil)
 }
 
 func (c *prCoordinator) finishAll(
 	batch *pendingPullBatch,
-	results map[string]store.ApplyPullRequestResult,
-	err error,
+	results map[*pullBatchItem]pullBatchResult,
+	batchErr error,
 ) {
 	for _, item := range batch.items {
-		result := pullBatchResult{err: err}
-		if err == nil {
-			entityKey := fmt.Sprintf(
-				"pr:%s:%d",
-				item.key.Repo,
-				item.key.Number,
-			)
-			result.applied = results[entityKey]
+		result, ok := results[item]
+		if batchErr != nil {
+			result = pullBatchResult{err: batchErr}
+		} else if !ok {
+			result = pullBatchResult{
+				err: fmt.Errorf(
+					"PR batch omitted result for %s",
+					requestKey(item.key),
+				),
+			}
 		}
 		item.result <- result
 	}
 }
 
-// SortedPullRequestKeys documents and unit-tests the lock acquisition order
-// independently of Postgres (C-P4).
+func immutablePRKey(item *pullBatchItem) string {
+	return store.PullRequestEntityKey(
+		item.metadata.InstallationID,
+		item.metadata.RepoGitHubID,
+		item.key.Number,
+	)
+}
+
 func SortedPullRequestKeys(records []store.PullRequestRecord) []string {
 	keys := make([]string, 0, len(records))
 	for _, record := range records {
-		keys = append(
-			keys,
-			fmt.Sprintf("pr:%s:%d", record.Repository.FullName, record.Number),
-		)
+		keys = append(keys, store.PullRequestEntityKey(
+			record.Repository.InstallationID,
+			record.Repository.GitHubID,
+			record.Number,
+		))
 	}
 	sort.Strings(keys)
 	return keys
