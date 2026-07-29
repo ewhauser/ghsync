@@ -28,8 +28,10 @@ const (
 	defaultGapMaxPages             = 10
 	defaultDriftPeriod             = time.Hour
 	defaultDriftSampleSize         = 10
+	defaultDriftResolvedRetention  = 30 * 24 * time.Hour
 	defaultRetentionPeriod         = 24 * time.Hour
 	defaultRetentionAge            = 90 * 24 * time.Hour
+	defaultRetentionBatchSize      = 1000
 )
 
 type Config struct {
@@ -88,11 +90,13 @@ type Config struct {
 	GapPageSize   int
 	GapMaxPages   int
 
-	DriftPeriod     time.Duration
-	DriftSampleSize int
+	DriftPeriod            time.Duration
+	DriftSampleSize        int
+	DriftResolvedRetention time.Duration
 
-	RetentionPeriod time.Duration
-	RetentionAge    time.Duration
+	RetentionPeriod    time.Duration
+	RetentionAge       time.Duration
+	RetentionBatchSize int
 }
 
 func FromEnv() (Config, error) {
@@ -121,8 +125,10 @@ func FromEnv() (Config, error) {
 		GapMaxPages:                defaultGapMaxPages,
 		DriftPeriod:                defaultDriftPeriod,
 		DriftSampleSize:            defaultDriftSampleSize,
+		DriftResolvedRetention:     defaultDriftResolvedRetention,
 		RetentionPeriod:            defaultRetentionPeriod,
 		RetentionAge:               defaultRetentionAge,
+		RetentionBatchSize:         defaultRetentionBatchSize,
 	}
 	if raw := os.Getenv("GITHUB_APP_ID"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
@@ -198,8 +204,8 @@ func FromEnv() (Config, error) {
 		{"GAP_HEAL_PERIOD", &cfg.GapHealPeriod},
 		{"GAP_COMPARISON_WINDOW", &cfg.GapWindow},
 		{"DRIFT_PERIOD", &cfg.DriftPeriod},
+		{"DRIFT_RESOLVED_RETENTION", &cfg.DriftResolvedRetention},
 		{"RETENTION_PERIOD", &cfg.RetentionPeriod},
-		{"RETENTION_AGE", &cfg.RetentionAge},
 	}
 	for _, item := range durationValues {
 		if raw := os.Getenv(item.key); raw != "" {
@@ -218,6 +224,7 @@ func FromEnv() (Config, error) {
 		{"GAP_PAGE_SIZE", &cfg.GapPageSize},
 		{"GAP_MAX_PAGES", &cfg.GapMaxPages},
 		{"DRIFT_SAMPLE_SIZE", &cfg.DriftSampleSize},
+		{"RETENTION_BATCH_SIZE", &cfg.RetentionBatchSize},
 	}
 	for _, item := range intValues {
 		if raw := os.Getenv(item.key); raw != "" {
@@ -227,6 +234,19 @@ func FromEnv() (Config, error) {
 			}
 			*item.target = value
 		}
+	}
+	if raw := os.Getenv("RETENTION_AGE"); raw != "" {
+		value, err := parsePositiveDuration("RETENTION_AGE", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		if value < defaultRetentionAge {
+			return Config{}, fmt.Errorf(
+				"RETENTION_AGE must be at least the locked 90-day policy (%s)",
+				defaultRetentionAge,
+			)
+		}
+		cfg.RetentionAge = value
 	}
 	if cfg.SweepPageSize > 100 || cfg.GapPageSize > 100 {
 		return Config{}, fmt.Errorf(

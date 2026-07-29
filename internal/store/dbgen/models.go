@@ -80,6 +80,15 @@ type DerivationDirty struct {
 	MarkedAt pgtype.Timestamptz
 }
 
+type DriftEntity struct {
+	InstallationID int64
+	EntityKind     string
+	SourceID       int64
+	EntityKey      string
+	LockKey        string
+	CacheSnapshot  []byte
+}
+
 type DriftFinding struct {
 	ID                int64
 	InstallationID    int64
@@ -90,6 +99,29 @@ type DriftFinding struct {
 	UpstreamSnapshot  []byte
 	Diff              []byte
 	RefreshEnqueuedAt pgtype.Timestamptz
+	DiffHash          string
+	FirstSeenAt       pgtype.Timestamptz
+	LastSeenAt        pgtype.Timestamptz
+	OccurrenceCount   int64
+	HealGeneration    int64
+	EscalatedAt       pgtype.Timestamptz
+	ResolvedAt        pgtype.Timestamptz
+}
+
+type DriftSampleCursor struct {
+	InstallationID int64
+	EntityKind     string
+	SourceID       int64
+	UpdatedAt      pgtype.Timestamptz
+}
+
+type GapHealCursor struct {
+	InstallationID int64
+	Cursor         string
+	Cutoff         pgtype.Timestamptz
+	StartedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	CompletedAt    pgtype.Timestamptz
 }
 
 type InstallationBackfillCursor struct {
@@ -145,6 +177,7 @@ type RefreshIntentGeneration struct {
 	Generation          int64
 	UpdatedAt           pgtype.Timestamptz
 	CompletedGeneration int64
+	DeadlineAt          pgtype.Timestamptz
 }
 
 type Repo struct {
@@ -239,6 +272,7 @@ type SweepCursor struct {
 	StartedAt      pgtype.Timestamptz
 	UpdatedAt      pgtype.Timestamptz
 	CompletedAt    pgtype.Timestamptz
+	PassNewCount   int32
 }
 
 type SweepPage struct {
@@ -249,7 +283,7 @@ type SweepPage struct {
 	Etag           string
 	NextCursor     string
 	EntityKeys     []byte
-	LastCheckedAt  pgtype.Timestamptz
+	ListSeenAt     pgtype.Timestamptz
 }
 
 type WebhookDelivery struct {

@@ -114,6 +114,7 @@ func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
 		"GAP_MAX_PAGES":               "0",
 		"DRIFT_SAMPLE_SIZE":           "none",
 		"RETENTION_AGE":               "-1h",
+		"RETENTION_BATCH_SIZE":        "0",
 	} {
 		t.Run(key, func(t *testing.T) {
 			clearConfigEnv(t)
@@ -122,6 +123,24 @@ func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
 				t.Fatalf("%s=%q accepted", key, value)
 			}
 		})
+	}
+}
+
+func TestRetentionAgeCannotShortenLockedPolicy(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("RETENTION_AGE", "90h")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("RETENTION_AGE=90h shortened the locked 90-day policy")
+	}
+
+	clearConfigEnv(t)
+	t.Setenv("RETENTION_AGE", "2400h")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("explicit longer retention rejected: %v", err)
+	}
+	if cfg.RetentionAge != 2400*time.Hour {
+		t.Fatalf("retention age = %s, want 2400h", cfg.RetentionAge)
 	}
 }
 
@@ -187,8 +206,10 @@ func clearConfigEnv(t *testing.T) {
 		"GAP_MAX_PAGES",
 		"DRIFT_PERIOD",
 		"DRIFT_SAMPLE_SIZE",
+		"DRIFT_RESOLVED_RETENTION",
 		"RETENTION_PERIOD",
 		"RETENTION_AGE",
+		"RETENTION_BATCH_SIZE",
 	} {
 		t.Setenv(key, "")
 	}

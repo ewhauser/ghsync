@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -764,7 +765,18 @@ func (s *Server) getPull(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, pull := range fx.PullRequests {
 		if pull.Number == number {
-			s.writeConditionalJSON(w, r, "core", pull)
+			// GitHub's REST pull shape carries the author under user.login.
+			// Keep AuthorLogin out of the fixture's serialized list golden,
+			// but include the real field on authoritative detail fetches.
+			s.writeConditionalJSON(w, r, "core", struct {
+				PullRequest
+				User map[string]string `json:"user"`
+			}{
+				PullRequest: pull,
+				User: map[string]string{
+					"login": pull.AuthorLogin,
+				},
+			})
 			return
 		}
 	}
@@ -997,25 +1009,34 @@ func (s *Server) listAppHookDeliveries(
 		}
 		perPage = value
 	}
-	offset := 0
+	var beforeID int64
 	if raw := r.URL.Query().Get("cursor"); raw != "" {
-		value, err := strconv.Atoi(raw)
-		if err != nil || value < 0 {
+		value, err := decodeDeliveryCursor(raw)
+		if err != nil {
 			http.Error(w, "bad cursor", http.StatusUnprocessableEntity)
 			return
 		}
-		offset = value
+		beforeID = value
 	}
 	deliveries := s.Deliveries()
-	if offset > len(deliveries) {
-		offset = len(deliveries)
+	if beforeID > 0 {
+		filtered := deliveries[:0]
+		for _, delivery := range deliveries {
+			if delivery.ID < beforeID {
+				filtered = append(filtered, delivery)
+			}
+		}
+		deliveries = filtered
 	}
-	end := min(offset+perPage, len(deliveries))
-	page := deliveries[offset:end]
+	end := min(perPage, len(deliveries))
+	page := deliveries[:end]
 	if end < len(deliveries) {
 		nextURL := *r.URL
 		query := nextURL.Query()
-		query.Set("cursor", strconv.Itoa(end))
+		query.Set(
+			"cursor",
+			encodeDeliveryCursor(page[len(page)-1].ID),
+		)
 		nextURL.RawQuery = query.Encode()
 		w.Header().Set(
 			"Link",
@@ -1051,26 +1072,51 @@ func (s *Server) redeliverAppHookDelivery(
 		http.Error(w, "delivery not found", http.StatusUnprocessableEntity)
 		return
 	}
-	statusCode, deliveryErr := s.sendWebhook(
-		r.Context(),
-		original.targetURL,
-		original.Event,
-		original.GUID,
-		original.body,
-	)
-	s.recordHookDelivery(
-		original.targetURL,
-		original.Event,
-		original.GUID,
-		original.body,
-		true,
-		statusCode,
-	)
-	if deliveryErr != nil {
-		http.Error(w, deliveryErr.Error(), http.StatusUnprocessableEntity)
-		return
-	}
+	// GitHub acknowledges a redelivery request before attempting the webhook.
+	// Use a background context because the request context is cancelled as
+	// soon as this 202 response completes.
 	w.WriteHeader(http.StatusAccepted)
+	go func(delivery storedHookDelivery) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		statusCode, _ := s.sendWebhook(
+			ctx,
+			delivery.targetURL,
+			delivery.Event,
+			delivery.GUID,
+			delivery.body,
+		)
+		s.recordHookDelivery(
+			delivery.targetURL,
+			delivery.Event,
+			delivery.GUID,
+			delivery.body,
+			true,
+			statusCode,
+		)
+	}(*original)
+}
+
+func encodeDeliveryCursor(beforeID int64) string {
+	return base64.RawURLEncoding.EncodeToString(
+		[]byte(fmt.Sprintf("before:%d", beforeID)),
+	)
+}
+
+func decodeDeliveryCursor(cursor string) (int64, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return 0, err
+	}
+	raw := strings.TrimPrefix(string(decoded), "before:")
+	if raw == string(decoded) {
+		return 0, fmt.Errorf("cursor prefix is invalid")
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("cursor boundary is invalid")
+	}
+	return value, nil
 }
 
 type fakeAppClaims struct {

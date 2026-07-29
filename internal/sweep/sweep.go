@@ -55,8 +55,9 @@ type Config struct {
 	GapPageSize   int
 	GapMaxPages   int
 
-	RetentionPeriod time.Duration
-	RetentionAge    time.Duration
+	RetentionPeriod    time.Duration
+	RetentionAge       time.Duration
+	RetentionBatchSize int
 
 	Now      func() time.Time
 	Observer Observer
@@ -80,10 +81,47 @@ func (c Config) validate() error {
 	}
 	if c.PageSize <= 0 || c.PageSize > 100 ||
 		c.GapPageSize <= 0 || c.GapPageSize > 100 ||
-		c.GapMaxPages <= 0 {
+		c.GapMaxPages <= 0 || c.RetentionBatchSize <= 0 {
 		return fmt.Errorf("sweep page sizes/max pages are invalid")
 	}
+	for _, bound := range []time.Duration{
+		c.OpenStackMaxStaleness,
+		c.OpenPRMaxStaleness,
+		c.RepoRulesMaxStaleness,
+		c.ClosedMaxStaleness,
+		c.RepositoryListPeriod,
+	} {
+		plan := scheduleForBound(bound)
+		if plan.Cadence <= 0 || plan.CompletionHeadroom <= 0 ||
+			plan.Cadence+plan.CompletionHeadroom >= bound {
+			return fmt.Errorf(
+				"staleness bound %s is too small for schedule headroom",
+				bound,
+			)
+		}
+	}
 	return nil
+}
+
+type SchedulePlan struct {
+	Bound              time.Duration
+	Cadence            time.Duration
+	CompletionHeadroom time.Duration
+}
+
+// scheduleForBound reserves 20% of C-R1 for queueing plus the authoritative
+// fetch and leaves a further 5% safety margin. The scheduler therefore runs
+// strictly before the public staleness bound.
+func scheduleForBound(bound time.Duration) SchedulePlan {
+	return SchedulePlan{
+		Bound:              bound,
+		Cadence:            bound * 3 / 4,
+		CompletionHeadroom: bound / 5,
+	}
+}
+
+func (p SchedulePlan) dueBefore(now time.Time) time.Time {
+	return now.Add(p.Cadence + p.CompletionHeadroom - p.Bound)
 }
 
 type Observer interface {
@@ -94,6 +132,7 @@ type Observer interface {
 		time.Duration,
 	)
 	GapRedelivery(context.Context, int64, string)
+	GapWindowIncomplete(context.Context, string, int)
 }
 
 type LogObserver struct{}
@@ -124,6 +163,18 @@ func (LogObserver) GapRedelivery(
 	)
 }
 
+func (LogObserver) GapWindowIncomplete(
+	_ context.Context,
+	cursor string,
+	pages int,
+) {
+	slog.Error(
+		"C-R4 webhook delivery gap window hit its page cap; continuation scheduled",
+		"cursor", cursor,
+		"pages", pages,
+	)
+}
+
 type noopObserver struct{}
 
 func (noopObserver) SweepOverrun(
@@ -133,7 +184,8 @@ func (noopObserver) SweepOverrun(
 	time.Duration,
 ) {
 }
-func (noopObserver) GapRedelivery(context.Context, int64, string) {}
+func (noopObserver) GapRedelivery(context.Context, int64, string)     {}
+func (noopObserver) GapWindowIncomplete(context.Context, string, int) {}
 
 type Options struct {
 	Pool       *pgxpool.Pool
@@ -202,7 +254,8 @@ type ListPageArgs struct {
 func (ListPageArgs) Kind() string { return jobKindPage }
 
 type GapHealArgs struct {
-	Installation int64 `json:"installation_id"`
+	Installation int64  `json:"installation_id"`
+	Cursor       string `json:"cursor,omitempty"`
 }
 
 func (GapHealArgs) Kind() string { return jobKindGapHeal }
@@ -285,7 +338,7 @@ func (s *Service) ReconciliationPeriodicJobs() []*river.PeriodicJob {
 				return GapHealArgs{
 						Installation: s.config.InstallationID,
 					},
-					periodicInsertOpts()
+					periodicInsertOpts(queue.QueueReconcile)
 			},
 			&river.PeriodicJobOpts{
 				ID:         "frontier_gap_heal",
@@ -295,12 +348,16 @@ func (s *Service) ReconciliationPeriodicJobs() []*river.PeriodicJob {
 	}
 }
 
+func ReconciliationPeriodicJobs(config Config) []*river.PeriodicJob {
+	return (&Service{config: config}).ReconciliationPeriodicJobs()
+}
+
 func (s *Service) PrunerPeriodicJobs() []*river.PeriodicJob {
 	return []*river.PeriodicJob{
 		river.NewPeriodicJob(
 			river.PeriodicInterval(s.config.RetentionPeriod),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return PruneArgs{}, periodicInsertOpts()
+				return PruneArgs{}, periodicInsertOpts(queue.QueuePruner)
 			},
 			&river.PeriodicJobOpts{
 				ID:         "frontier_retention_prune",
@@ -310,18 +367,23 @@ func (s *Service) PrunerPeriodicJobs() []*river.PeriodicJob {
 	}
 }
 
+func PrunerPeriodicJobs(config Config) []*river.PeriodicJob {
+	return (&Service{config: config}).PrunerPeriodicJobs()
+}
+
 func (s *Service) kickoffPeriodic(
 	kind string,
-	period time.Duration,
+	bound time.Duration,
 ) *river.PeriodicJob {
+	plan := scheduleForBound(bound)
 	return river.NewPeriodicJob(
-		river.PeriodicInterval(period),
+		river.PeriodicInterval(plan.Cadence),
 		func() (river.JobArgs, *river.InsertOpts) {
 			return KickoffArgs{
 					SweepKind:    kind,
 					Installation: s.config.InstallationID,
 				},
-				periodicInsertOpts()
+				periodicInsertOpts(queue.QueueReconcile)
 		},
 		&river.PeriodicJobOpts{
 			ID:         "frontier_sweep_" + kind,
@@ -330,16 +392,16 @@ func (s *Service) kickoffPeriodic(
 	)
 }
 
-func periodicInsertOpts() *river.InsertOpts {
+func periodicInsertOpts(queueName string) *river.InsertOpts {
 	return &river.InsertOpts{
-		Queue:    queue.QueueSweep,
+		Queue:    queueName,
 		Priority: 1,
 	}
 }
 
 func listPageInsertOpts() *river.InsertOpts {
 	return &river.InsertOpts{
-		Queue:    queue.QueueSweep,
+		Queue:    queue.QueueReconcile,
 		Priority: 1,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
@@ -372,7 +434,9 @@ func (s *Service) Kickoff(
 		return s.kickoffRepositoryScopes(
 			ctx,
 			KindStacks,
-			s.config.OpenStackMaxStaleness,
+			scheduleForBound(
+				s.config.OpenStackMaxStaleness,
+			).Cadence,
 		)
 	case KindPullRequests:
 		if err := s.enqueueStalePullRequests(ctx); err != nil {
@@ -381,7 +445,9 @@ func (s *Service) Kickoff(
 		return s.kickoffRepositoryScopes(
 			ctx,
 			KindPullRequests,
-			s.config.OpenPRMaxStaleness,
+			scheduleForBound(
+				s.config.OpenPRMaxStaleness,
+			).Cadence,
 		)
 	case KindRepoRules:
 		return s.enqueueStaleRepoRules(ctx)
@@ -393,7 +459,9 @@ func (s *Service) Kickoff(
 			KindRepositories,
 			"",
 			"1",
-			s.config.RepositoryListPeriod,
+			scheduleForBound(
+				s.config.RepositoryListPeriod,
+			).Cadence,
 		)
 	default:
 		return fmt.Errorf("unsupported sweep kind %q", args.SweepKind)
@@ -558,7 +626,7 @@ func (s *Service) ReconcilePage(
 		page.nextCursor = cachedPage.NextCursor
 		page.etag = cachedPage.Etag
 	}
-	return s.persistPage(ctx, args, cursor, page)
+	return s.persistPage(ctx, args, page)
 }
 
 func (s *Service) fetchPage(
@@ -601,6 +669,11 @@ func (s *Service) fetchPage(
 				queue.RefreshSpec{
 					Kind: queue.KindRefreshRepository,
 					Key:  key,
+					Deadline: s.config.Now().Add(
+						scheduleForBound(
+							s.config.RepositoryListPeriod,
+						).CompletionHeadroom,
+					),
 				},
 			)
 		}
@@ -650,6 +723,11 @@ func (s *Service) fetchPage(
 				queue.RefreshSpec{
 					Kind: queue.KindRefreshStack,
 					Key:  key,
+					Deadline: s.config.Now().Add(
+						scheduleForBound(
+							s.config.OpenStackMaxStaleness,
+						).CompletionHeadroom,
+					),
 				},
 			)
 		}
@@ -670,8 +748,8 @@ func (s *Service) fetchPage(
 			repo,
 			gh.ListPullsOptions{
 				State:     "open",
-				Sort:      "updated",
-				Direction: "desc",
+				Sort:      "created",
+				Direction: "asc",
 				PerPage:   s.config.PageSize,
 				Page:      page,
 			},
@@ -702,6 +780,11 @@ func (s *Service) fetchPage(
 				queue.RefreshSpec{
 					Kind: queue.KindRefreshPR,
 					Key:  key,
+					Deadline: s.config.Now().Add(
+						scheduleForBound(
+							s.config.OpenPRMaxStaleness,
+						).CompletionHeadroom,
+					),
 				},
 			)
 		}
@@ -717,24 +800,15 @@ func (s *Service) fetchPage(
 func (s *Service) persistPage(
 	ctx context.Context,
 	args ListPageArgs,
-	prior dbgen.SweepCursor,
 	page fetchedPage,
 ) error {
 	client := s.riverClient()
 	if client == nil {
 		return fmt.Errorf("sweep River client is not configured")
 	}
-	seen, err := mergeKeys(prior.SeenKeys, page.keys)
-	if err != nil {
-		return err
-	}
 	encodedPageKeys, err := json.Marshal(sortedUnique(page.keys))
 	if err != nil {
 		return fmt.Errorf("encode sweep page keys: %w", err)
-	}
-	encodedSeen, err := json.Marshal(seen)
-	if err != nil {
-		return fmt.Errorf("encode sweep seen keys: %w", err)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -756,6 +830,19 @@ func (s *Service) persistPage(
 	if current.CompletedAt.Valid || current.Cursor != args.Cursor {
 		return tx.Commit(ctx)
 	}
+	seen, err := mergeKeys(current.SeenKeys, page.keys)
+	if err != nil {
+		return err
+	}
+	newKeys, err := countNewKeys(current.SeenKeys, page.keys)
+	if err != nil {
+		return err
+	}
+	passNewCount := int(current.PassNewCount) + newKeys
+	encodedSeen, err := json.Marshal(seen)
+	if err != nil {
+		return fmt.Errorf("encode sweep seen keys: %w", err)
+	}
 	now := s.config.Now().UTC()
 	if err := queries.UpsertSweepPage(
 		ctx,
@@ -767,46 +854,70 @@ func (s *Service) persistPage(
 			Etag:           page.etag,
 			NextCursor:     page.nextCursor,
 			EntityKeys:     encodedPageKeys,
-			LastCheckedAt:  timestamptz(now),
+			ListSeenAt:     timestamptz(now),
 		},
 	); err != nil {
 		return fmt.Errorf("persist sweep page validator: %w", err)
 	}
-	if page.notModified {
-		if err := s.touchValidatedPage(
-			ctx,
-			queries,
-			args,
-			page.keys,
-			now,
-		); err != nil {
-			return err
-		}
-	}
 	specs := append([]queue.RefreshSpec(nil), page.refreshSpecs...)
 	if page.nextCursor == "" {
-		missing, err := s.missingVerificationSpecs(
-			ctx,
-			queries,
-			args,
-			seen,
-		)
-		if err != nil {
-			return err
-		}
-		specs = append(specs, missing...)
-		if _, err := queries.CompleteSweepCursor(
-			ctx,
-			dbgen.CompleteSweepCursorParams{
-				SeenKeys:       encodedSeen,
-				CompletedAt:    timestamptz(now),
-				InstallationID: args.Installation,
-				SweepKind:      args.SweepKind,
-				ScopeKey:       args.ScopeKey,
-				ExpectedCursor: args.Cursor,
-			},
-		); err != nil {
-			return fmt.Errorf("complete sweep cursor: %w", err)
+		// PR listings can shrink between numbered pages. Restart from the
+		// leading page until a complete overlap pass adds no identifiers.
+		if args.SweepKind == KindPullRequests && passNewCount > 0 {
+			if _, err := queries.RestartSweepCursorPass(
+				ctx,
+				dbgen.RestartSweepCursorPassParams{
+					FirstCursor:    "1",
+					SeenKeys:       encodedSeen,
+					UpdatedAt:      timestamptz(now),
+					InstallationID: args.Installation,
+					SweepKind:      args.SweepKind,
+					ScopeKey:       args.ScopeKey,
+					ExpectedCursor: args.Cursor,
+				},
+			); err != nil {
+				return fmt.Errorf("restart overlapping PR sweep: %w", err)
+			}
+			if _, err := client.InsertTx(
+				ctx,
+				tx,
+				ListPageArgs{
+					SweepKind:    args.SweepKind,
+					Installation: args.Installation,
+					ScopeKey:     args.ScopeKey,
+					Cursor:       "1",
+				},
+				listPageInsertOpts(),
+			); err != nil {
+				return fmt.Errorf(
+					"insert overlapping PR sweep pass: %w",
+					err,
+				)
+			}
+		} else {
+			missing, err := s.missingVerificationSpecs(
+				ctx,
+				queries,
+				args,
+				seen,
+			)
+			if err != nil {
+				return err
+			}
+			specs = append(specs, missing...)
+			if _, err := queries.CompleteSweepCursor(
+				ctx,
+				dbgen.CompleteSweepCursorParams{
+					SeenKeys:       encodedSeen,
+					CompletedAt:    timestamptz(now),
+					InstallationID: args.Installation,
+					SweepKind:      args.SweepKind,
+					ScopeKey:       args.ScopeKey,
+					ExpectedCursor: args.Cursor,
+				},
+			); err != nil {
+				return fmt.Errorf("complete sweep cursor: %w", err)
+			}
 		}
 	} else {
 		if _, err := queries.AdvanceSweepCursor(
@@ -814,6 +925,7 @@ func (s *Service) persistPage(
 			dbgen.AdvanceSweepCursorParams{
 				NextCursor:     page.nextCursor,
 				SeenKeys:       encodedSeen,
+				PassNewCount:   int32(passNewCount),
 				UpdatedAt:      timestamptz(now),
 				InstallationID: args.Installation,
 				SweepKind:      args.SweepKind,
@@ -864,6 +976,7 @@ func (s *Service) missingVerificationSpecs(
 	}
 	var cached []string
 	var kind string
+	var bound time.Duration
 	switch args.SweepKind {
 	case KindRepositories:
 		names, err := queries.ListLiveRepositoryNames(
@@ -877,6 +990,7 @@ func (s *Service) missingVerificationSpecs(
 			cached = append(cached, "repo:"+name+":metadata")
 		}
 		kind = queue.KindRefreshRepository
+		bound = s.config.RepositoryListPeriod
 	case KindStacks:
 		numbers, err := queries.ListLiveStackNumbers(
 			ctx,
@@ -895,6 +1009,7 @@ func (s *Service) missingVerificationSpecs(
 			)
 		}
 		kind = queue.KindRefreshStack
+		bound = s.config.OpenStackMaxStaleness
 	case KindPullRequests:
 		numbers, err := queries.ListLiveOpenPullRequestNumbers(
 			ctx,
@@ -913,6 +1028,7 @@ func (s *Service) missingVerificationSpecs(
 			)
 		}
 		kind = queue.KindRefreshPR
+		bound = s.config.OpenPRMaxStaleness
 	default:
 		return nil, fmt.Errorf(
 			"unsupported disappearance sweep %q",
@@ -920,100 +1036,30 @@ func (s *Service) missingVerificationSpecs(
 		)
 	}
 	var specs []queue.RefreshSpec
+	deadline := s.config.Now().Add(
+		scheduleForBound(bound).CompletionHeadroom,
+	)
 	for _, key := range cached {
 		if _, present := seenSet[key]; present {
 			continue
 		}
 		// C-R3: listing absence is only a hint. The ordinary entity worker
 		// performs the verification fetch, and only a 404 writes a tombstone.
-		specs = append(specs, queue.RefreshSpec{Kind: kind, Key: key})
+		specs = append(specs, queue.RefreshSpec{
+			Kind: kind, Key: key, Deadline: deadline,
+		})
 	}
 	return specs, nil
 }
 
-func (s *Service) touchValidatedPage(
-	ctx context.Context,
-	queries *dbgen.Queries,
-	args ListPageArgs,
-	keys []string,
-	checkedAt time.Time,
-) error {
-	switch args.SweepKind {
-	case KindStacks:
-		numbers, err := pageNumbers(keys, "stack:", args.ScopeKey)
-		if err != nil {
-			return err
-		}
-		if len(numbers) == 0 {
-			return nil
-		}
-		if _, err := queries.TouchListedStacksCheckedAt(
-			ctx,
-			dbgen.TouchListedStacksCheckedAtParams{
-				CheckedAt:      timestamptz(checkedAt),
-				InstallationID: args.Installation,
-				RepoFullName:   args.ScopeKey,
-				StackNumbers:   numbers,
-			},
-		); err != nil {
-			return fmt.Errorf("touch stack-list validations: %w", err)
-		}
-	case KindPullRequests:
-		numbers, err := pageNumbers(keys, "pr:", args.ScopeKey)
-		if err != nil {
-			return err
-		}
-		if len(numbers) == 0 {
-			return nil
-		}
-		if _, err := queries.TouchListedPullRequestsCheckedAt(
-			ctx,
-			dbgen.TouchListedPullRequestsCheckedAtParams{
-				CheckedAt:      timestamptz(checkedAt),
-				InstallationID: args.Installation,
-				RepoFullName:   args.ScopeKey,
-				PrNumbers:      numbers,
-			},
-		); err != nil {
-			return fmt.Errorf("touch PR-list validations: %w", err)
-		}
-	}
-	return nil
-}
-
-func pageNumbers(
-	keys []string,
-	prefix string,
-	repo string,
-) ([]int32, error) {
-	fullPrefix := prefix + repo + ":"
-	numbers := make([]int32, 0, len(keys))
-	for _, key := range keys {
-		if !strings.HasPrefix(key, fullPrefix) {
-			return nil, fmt.Errorf("unexpected sweep page key %q", key)
-		}
-		number, err := strconv.ParseInt(
-			strings.TrimPrefix(key, fullPrefix),
-			10,
-			32,
-		)
-		if err != nil || number <= 0 {
-			return nil, fmt.Errorf("invalid sweep page key %q", key)
-		}
-		numbers = append(numbers, int32(number))
-	}
-	return numbers, nil
-}
-
 func (s *Service) enqueueStaleStacks(ctx context.Context) error {
 	queries := dbgen.New(s.pool)
+	plan := scheduleForBound(s.config.OpenStackMaxStaleness)
 	open, err := queries.ListStaleOpenStacks(
 		ctx,
 		dbgen.ListStaleOpenStacksParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore: timestamptz(
-				s.config.Now().Add(-s.config.OpenStackMaxStaleness),
-			),
+			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1028,6 +1074,7 @@ func (s *Service) enqueueStaleStacks(ctx context.Context) error {
 				row.RepoFullName,
 				row.Number,
 			),
+			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
 	return s.enqueueRefreshes(ctx, specs)
@@ -1035,13 +1082,12 @@ func (s *Service) enqueueStaleStacks(ctx context.Context) error {
 
 func (s *Service) enqueueStalePullRequests(ctx context.Context) error {
 	queries := dbgen.New(s.pool)
+	plan := scheduleForBound(s.config.OpenPRMaxStaleness)
 	open, err := queries.ListStaleOpenPullRequests(
 		ctx,
 		dbgen.ListStaleOpenPullRequestsParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore: timestamptz(
-				s.config.Now().Add(-s.config.OpenPRMaxStaleness),
-			),
+			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1050,32 +1096,32 @@ func (s *Service) enqueueStalePullRequests(ctx context.Context) error {
 	specs := make([]queue.RefreshSpec, 0, len(open))
 	for _, row := range open {
 		specs = append(specs, queue.RefreshSpec{
-			Kind: queue.KindRefreshPR,
-			Key:  fmt.Sprintf("pr:%s:%d", row.RepoFullName, row.Number),
+			Kind:     queue.KindRefreshPR,
+			Key:      fmt.Sprintf("pr:%s:%d", row.RepoFullName, row.Number),
+			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
 	return s.enqueueRefreshes(ctx, specs)
 }
 
 func (s *Service) enqueueStaleRepoRules(ctx context.Context) error {
+	plan := scheduleForBound(s.config.RepoRulesMaxStaleness)
 	names, err := dbgen.New(s.pool).ListStaleRepoRules(
 		ctx,
 		dbgen.ListStaleRepoRulesParams{
 			InstallationID: s.config.InstallationID,
-			// C-R1: the hourly periodic job conditionally validates every
-			// repository rules collection, so a run cannot miss a row that
-			// became due just after the previous scheduler tick.
-			StaleBefore: timestamptz(s.config.Now()),
+			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("list stale repository rules: %w", err)
 	}
 	specs := make([]queue.RefreshSpec, 0, len(names))
-	for _, name := range names {
+	for _, row := range names {
 		specs = append(specs, queue.RefreshSpec{
-			Kind: queue.KindRefreshRepoRules,
-			Key:  "repo_rules:" + name + ":rules",
+			Kind:     queue.KindRefreshRepoRules,
+			Key:      "repo_rules:" + row.FullName + ":rules",
+			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
 	return s.enqueueRefreshes(ctx, specs)
@@ -1083,11 +1129,12 @@ func (s *Service) enqueueStaleRepoRules(ctx context.Context) error {
 
 func (s *Service) enqueueClosedTracked(ctx context.Context) error {
 	queries := dbgen.New(s.pool)
+	plan := scheduleForBound(s.config.ClosedMaxStaleness)
 	stacks, err := queries.ListStaleClosedStacks(
 		ctx,
 		dbgen.ListStaleClosedStacksParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore:    timestamptz(s.config.Now()),
+			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1097,7 +1144,7 @@ func (s *Service) enqueueClosedTracked(ctx context.Context) error {
 		ctx,
 		dbgen.ListStaleClosedPullRequestsParams{
 			InstallationID: s.config.InstallationID,
-			StaleBefore:    timestamptz(s.config.Now()),
+			StaleBefore:    timestamptz(plan.dueBefore(s.config.Now())),
 		},
 	)
 	if err != nil {
@@ -1112,12 +1159,14 @@ func (s *Service) enqueueClosedTracked(ctx context.Context) error {
 				row.RepoFullName,
 				row.Number,
 			),
+			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
 	for _, row := range pulls {
 		specs = append(specs, queue.RefreshSpec{
-			Kind: queue.KindRefreshPR,
-			Key:  fmt.Sprintf("pr:%s:%d", row.RepoFullName, row.Number),
+			Kind:     queue.KindRefreshPR,
+			Key:      fmt.Sprintf("pr:%s:%d", row.RepoFullName, row.Number),
+			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
 	return s.enqueueRefreshes(ctx, specs)
@@ -1162,6 +1211,31 @@ func mergeKeys(existing []byte, added []string) ([]string, error) {
 		}
 	}
 	return sortedUnique(append(keys, added...)), nil
+}
+
+func countNewKeys(existing []byte, added []string) (int, error) {
+	var keys []string
+	if len(existing) > 0 {
+		if err := json.Unmarshal(existing, &keys); err != nil {
+			return 0, fmt.Errorf("decode sweep seen keys: %w", err)
+		}
+	}
+	seen := make(map[string]struct{}, len(keys)+len(added))
+	for _, key := range keys {
+		seen[key] = struct{}{}
+	}
+	count := 0
+	for _, key := range added {
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		count++
+	}
+	return count, nil
 }
 
 func sortedUnique(keys []string) []string {

@@ -27,6 +27,7 @@ FOR UPDATE;
 UPDATE sweep_cursors
 SET cursor = sqlc.arg(first_cursor),
     seen_keys = '[]'::jsonb,
+    pass_new_count = 0,
     started_at = sqlc.arg(started_at),
     updated_at = sqlc.arg(started_at),
     completed_at = NULL
@@ -39,6 +40,20 @@ RETURNING *;
 UPDATE sweep_cursors
 SET cursor = sqlc.arg(next_cursor),
     seen_keys = sqlc.arg(seen_keys),
+    pass_new_count = sqlc.arg(pass_new_count),
+    updated_at = sqlc.arg(updated_at)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND sweep_kind = sqlc.arg(sweep_kind)
+  AND scope_key = sqlc.arg(scope_key)
+  AND cursor = sqlc.arg(expected_cursor)
+  AND completed_at IS NULL
+RETURNING *;
+
+-- name: RestartSweepCursorPass :one
+UPDATE sweep_cursors
+SET cursor = sqlc.arg(first_cursor),
+    seen_keys = sqlc.arg(seen_keys),
+    pass_new_count = 0,
     updated_at = sqlc.arg(updated_at)
 WHERE installation_id = sqlc.arg(installation_id)
   AND sweep_kind = sqlc.arg(sweep_kind)
@@ -51,6 +66,7 @@ RETURNING *;
 UPDATE sweep_cursors
 SET cursor = '',
     seen_keys = sqlc.arg(seen_keys),
+    pass_new_count = 0,
     updated_at = sqlc.arg(completed_at),
     completed_at = sqlc.arg(completed_at)
 WHERE installation_id = sqlc.arg(installation_id)
@@ -71,17 +87,17 @@ WHERE installation_id = sqlc.arg(installation_id)
 -- name: UpsertSweepPage :exec
 INSERT INTO sweep_pages (
     installation_id, sweep_kind, scope_key, cursor, etag, next_cursor,
-    entity_keys, last_checked_at
+    entity_keys, list_seen_at
 ) VALUES (
     sqlc.arg(installation_id), sqlc.arg(sweep_kind), sqlc.arg(scope_key),
     sqlc.arg(cursor), sqlc.arg(etag), sqlc.arg(next_cursor),
-    sqlc.arg(entity_keys), sqlc.arg(last_checked_at)
+    sqlc.arg(entity_keys), sqlc.arg(list_seen_at)
 )
 ON CONFLICT (installation_id, sweep_kind, scope_key, cursor) DO UPDATE
 SET etag = EXCLUDED.etag,
     next_cursor = EXCLUDED.next_cursor,
     entity_keys = EXCLUDED.entity_keys,
-    last_checked_at = EXCLUDED.last_checked_at;
+    list_seen_at = EXCLUDED.list_seen_at;
 
 -- name: ListSweepRepositories :many
 SELECT id, gh_id, full_name
@@ -119,7 +135,8 @@ WHERE repos.installation_id = sqlc.arg(installation_id)
 ORDER BY pull_requests.number;
 
 -- name: ListStaleOpenStacks :many
-SELECT repos.full_name AS repo_full_name, stacks.number
+SELECT repos.full_name AS repo_full_name, stacks.number,
+       stacks.last_checked_at
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
 WHERE repos.installation_id = sqlc.arg(installation_id)
@@ -130,7 +147,8 @@ WHERE repos.installation_id = sqlc.arg(installation_id)
 ORDER BY stacks.last_checked_at, repos.full_name, stacks.number;
 
 -- name: ListStaleClosedStacks :many
-SELECT repos.full_name AS repo_full_name, stacks.number
+SELECT repos.full_name AS repo_full_name, stacks.number,
+       stacks.last_checked_at
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
 WHERE repos.installation_id = sqlc.arg(installation_id)
@@ -141,7 +159,8 @@ WHERE repos.installation_id = sqlc.arg(installation_id)
 ORDER BY stacks.last_checked_at, repos.full_name, stacks.number;
 
 -- name: ListStaleOpenPullRequests :many
-SELECT repos.full_name AS repo_full_name, pull_requests.number
+SELECT repos.full_name AS repo_full_name, pull_requests.number,
+       pull_requests.last_checked_at
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
 WHERE repos.installation_id = sqlc.arg(installation_id)
@@ -152,7 +171,8 @@ WHERE repos.installation_id = sqlc.arg(installation_id)
 ORDER BY pull_requests.last_checked_at, repos.full_name, pull_requests.number;
 
 -- name: ListStaleClosedPullRequests :many
-SELECT repos.full_name AS repo_full_name, pull_requests.number
+SELECT repos.full_name AS repo_full_name, pull_requests.number,
+       pull_requests.last_checked_at
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
 WHERE repos.installation_id = sqlc.arg(installation_id)
@@ -163,7 +183,11 @@ WHERE repos.installation_id = sqlc.arg(installation_id)
 ORDER BY pull_requests.last_checked_at, repos.full_name, pull_requests.number;
 
 -- name: ListStaleRepoRules :many
-SELECT repos.full_name
+SELECT repos.full_name,
+       COALESCE(
+           repo_rule_sync_state.last_checked_at,
+           repos.last_checked_at
+       ) AS last_checked_at
 FROM repos
 LEFT JOIN repo_rule_sync_state ON repo_rule_sync_state.repo_id = repos.id
 WHERE repos.installation_id = sqlc.arg(installation_id)
@@ -177,53 +201,77 @@ ORDER BY COALESCE(
     repos.last_checked_at
 ), repos.full_name;
 
--- name: TouchListedStacksCheckedAt :execrows
--- A 304 on the authoritative stack-list page validates the open stack
--- summaries on that page without downloading one response per stack.
-UPDATE stacks
-SET last_checked_at = GREATEST(
-    last_checked_at,
-    sqlc.arg(checked_at)
-)
-FROM repos
-WHERE repos.id = stacks.repo_id
-  AND repos.installation_id = sqlc.arg(installation_id)
-  AND repos.full_name = sqlc.arg(repo_full_name)
-  AND repos.tombstoned_at IS NULL
-  AND stacks.tombstoned_at IS NULL
-  AND stacks.open
-  AND stacks.number = ANY(sqlc.arg(stack_numbers)::int[]);
-
--- name: TouchListedPullRequestsCheckedAt :execrows
--- C-R1/C-B4: the unchanged authoritative open-PR page is a successful
--- validation for every live PR summary it contains.
-UPDATE pull_requests
-SET last_checked_at = GREATEST(
-    last_checked_at,
-    sqlc.arg(checked_at)
-)
-FROM repos
-WHERE repos.id = pull_requests.repo_id
-  AND repos.installation_id = sqlc.arg(installation_id)
-  AND repos.full_name = sqlc.arg(repo_full_name)
-  AND repos.tombstoned_at IS NULL
-  AND pull_requests.tombstoned_at IS NULL
-  AND pull_requests.state = 'open'
-  AND pull_requests.number = ANY(sqlc.arg(pr_numbers)::int[]);
-
 -- name: ListExistingWebhookDeliveryGUIDs :many
 SELECT delivery_guid
 FROM webhook_deliveries
 WHERE delivery_guid = ANY(sqlc.arg(delivery_guids)::text[]);
 
--- name: PruneWebhookDeliveryPayloads :execrows
-UPDATE webhook_deliveries
+-- name: EnsureGapHealCursor :one
+INSERT INTO gap_heal_cursors (installation_id)
+VALUES (sqlc.arg(installation_id))
+ON CONFLICT (installation_id) DO UPDATE
+SET installation_id = EXCLUDED.installation_id
+RETURNING *;
+
+-- name: GetGapHealCursorForUpdate :one
+SELECT *
+FROM gap_heal_cursors
+WHERE installation_id = sqlc.arg(installation_id)
+FOR UPDATE;
+
+-- name: StartGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = '',
+    cutoff = sqlc.arg(cutoff),
+    started_at = sqlc.arg(started_at),
+    updated_at = sqlc.arg(started_at),
+    completed_at = NULL
+WHERE installation_id = sqlc.arg(installation_id)
+RETURNING *;
+
+-- name: AdvanceGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = sqlc.arg(next_cursor),
+    updated_at = sqlc.arg(updated_at)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND cursor = sqlc.arg(expected_cursor)
+  AND completed_at IS NULL
+RETURNING *;
+
+-- name: CompleteGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = '',
+    updated_at = sqlc.arg(completed_at),
+    completed_at = sqlc.arg(completed_at)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND cursor = sqlc.arg(expected_cursor)
+  AND completed_at IS NULL
+RETURNING *;
+
+-- name: PruneWebhookDeliveryPayloadBatch :execrows
+WITH batch AS (
+    SELECT candidate.delivery_guid
+    FROM webhook_deliveries AS candidate
+    WHERE candidate.received_at < sqlc.arg(cutoff)
+      AND candidate.raw_body IS NOT NULL
+    ORDER BY candidate.received_at, candidate.delivery_guid
+    LIMIT sqlc.arg(batch_size)
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE webhook_deliveries AS delivery
 SET raw_body = NULL,
     headers = '{}'::jsonb,
     payload_pruned_at = sqlc.arg(pruned_at)
-WHERE received_at < sqlc.arg(cutoff)
-  AND raw_body IS NOT NULL;
+FROM batch
+WHERE delivery.delivery_guid = batch.delivery_guid;
 
--- name: DeleteCheckHistoryBefore :execrows
-DELETE FROM check_history
-WHERE synced_at < sqlc.arg(cutoff);
+-- name: DeleteCheckHistoryBatch :execrows
+DELETE FROM check_history AS history
+WHERE history.id IN (
+    SELECT candidate.id
+    FROM check_history AS candidate
+    WHERE candidate.synced_at < sqlc.arg(cutoff)
+    ORDER BY candidate.synced_at, candidate.id
+    LIMIT sqlc.arg(batch_size)
+    FOR UPDATE SKIP LOCKED
+);

@@ -110,8 +110,8 @@ func TestMigrateIdempotent(t *testing.T) {
 		WHERE schemaname = current_schema()
 		  AND tablename = 'webhook_deliveries'
 	`).Scan(&indexCount)
-	if err != nil || indexCount != 2 {
-		t.Fatalf("webhook_deliveries index count = %d (err=%v), want 2", indexCount, err)
+	if err != nil || indexCount != 3 {
+		t.Fatalf("webhook_deliveries index count = %d (err=%v), want 3", indexCount, err)
 	}
 	var partialIndexDefinition string
 	err = pool.QueryRow(ctx, `
@@ -154,6 +154,22 @@ func TestMigrateIdempotent(t *testing.T) {
 		t.Fatalf(
 			"global check-history retention index = %q (err=%v)",
 			historyRetentionIndex,
+			err,
+		)
+	}
+	var deliveryRetentionIndex string
+	err = pool.QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND tablename = 'webhook_deliveries'
+		  AND indexname = 'webhook_deliveries_received_at_brin_idx'
+	`).Scan(&deliveryRetentionIndex)
+	if err != nil ||
+		!strings.Contains(deliveryRetentionIndex, "USING brin (received_at)") {
+		t.Fatalf(
+			"delivery retention index = %q (err=%v)",
+			deliveryRetentionIndex,
 			err,
 		)
 	}

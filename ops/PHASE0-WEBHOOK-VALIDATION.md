@@ -6,6 +6,61 @@ GitHub private-preview behavior that is not documented.
 
 ## Safety and setup
 
+Export the non-secret coordinates for the test installation:
+
+```bash
+export GITHUB_APP_ID=123456
+export GITHUB_INSTALLATION_ID=789012
+export GITHUB_PRIVATE_KEY_PATH=/absolute/path/to/test-app.private-key.pem
+export OWNER_REPO=acme/frontier-phase0
+export CAPTURE_DIR=/absolute/path/to/frontier-phase0-20260728
+mkdir -p "$CAPTURE_DIR"
+```
+
+Create a short-lived App JWT locally. Never paste the JWT, installation token,
+or private key into the experiment artifacts:
+
+```bash
+export APP_JWT="$(
+  ruby -ropenssl -rjson -rbase64 -e '
+    key = OpenSSL::PKey::RSA.new(File.read(ARGV.fetch(1)))
+    now = Time.now.to_i
+    encode = ->(value) {
+      Base64.urlsafe_encode64(
+        JSON.generate(value),
+        padding: false
+      )
+    }
+    body = [
+      encode.call({ alg: "RS256", typ: "JWT" }),
+      encode.call({
+        iat: now - 60,
+        exp: now + 540,
+        iss: ARGV.fetch(0)
+      })
+    ].join(".")
+    puts "#{body}.#{Base64.urlsafe_encode64(
+      key.sign(OpenSSL::Digest.new("SHA256"), body),
+      padding: false
+    )}"
+  ' "$GITHUB_APP_ID" "$GITHUB_PRIVATE_KEY_PATH"
+)"
+```
+
+Mint an installation token for authoritative resource fetches:
+
+```bash
+export INSTALLATION_TOKEN="$(
+  curl --fail-with-body --silent --show-error \
+    --request POST \
+    --header "Accept: application/vnd.github+json" \
+    --header "Authorization: Bearer $APP_JWT" \
+    --header "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/app/installations/$GITHUB_INSTALLATION_ID/access_tokens" |
+    jq --exit-status --raw-output .token
+)"
+```
+
 1. Use the enrolled non-production repository designated for Frontier tests.
    Do not use a repository with unrelated active contributors or protected
    production branches.
@@ -31,10 +86,128 @@ GitHub private-preview behavior that is not documented.
    action. If unrelated activity occurs during an observation window, mark the
    run contaminated and repeat it.
 
+### Capture every delivery page
+
+Capture GitHub's complete App delivery window as JSON Lines. Pagination follows
+GitHub's opaque `Link` cursor and terminates only when no `rel="next"` link is
+returned; it never infers a page number or stops because a page appears old:
+
+```bash
+next_url='https://api.github.com/app/hook/deliveries?per_page=100'
+: >"$CAPTURE_DIR/github-deliveries.jsonl"
+while [ -n "$next_url" ]; do
+  headers_file="$(mktemp)"
+  body_file="$(mktemp)"
+  curl --fail-with-body --silent --show-error \
+    --dump-header "$headers_file" \
+    --output "$body_file" \
+    --header "Accept: application/vnd.github+json" \
+    --header "Authorization: Bearer $APP_JWT" \
+    --header "X-GitHub-Api-Version: 2022-11-28" \
+    "$next_url"
+  jq --compact-output '.[]' "$body_file" \
+    >>"$CAPTURE_DIR/github-deliveries.jsonl"
+  next_url="$(
+    awk 'BEGIN { IGNORECASE=1 }
+      /^link:/ {
+        count = split($0, links, ",")
+        for (i = 1; i <= count; i++) {
+          if (links[i] ~ /rel="next"/ &&
+              match(links[i], /<[^>]+>/)) {
+            print substr(links[i], RSTART + 1, RLENGTH - 2)
+          }
+        }
+      }' "$headers_file"
+  )"
+  rm -f "$headers_file" "$body_file"
+done
+```
+
+Transform delivery metadata and the ingress capture into
+`$CAPTURE_DIR/phase0-records.jsonl`. Every line must validate against
+[`phase0-delivery-record.schema.json`](phase0-delivery-record.schema.json).
+The schema intentionally excludes payload bodies, credentials, signatures,
+and author identity. A capture is incomplete if the GitHub list hit an
+operator-imposed time/page limit; record the failure and resume from the
+returned opaque next cursor instead of publishing a partial result.
+
+Validate the artifact before analysis:
+
+```bash
+record_file="$(mktemp)"
+validation_failed=0
+while IFS= read -r record; do
+  printf '%s\n' "$record" >"$record_file"
+  npx --yes ajv-cli@5.0.0 validate \
+    --spec=draft2019 \
+    --strict=true \
+    --validate-formats=false \
+    -s ops/phase0-delivery-record.schema.json \
+    -d "$record_file" ||
+    validation_failed=1
+done <"$CAPTURE_DIR/phase0-records.jsonl"
+rm -f "$record_file"
+test "$validation_failed" -eq 0
+```
+
 For every action below, retain observations for 120 seconds after the GitHub
 operation reports success. Record both arrival time at GitHub
 (`delivered_at`) and arrival time at Frontier ingress so event-to-ingress delay
 is distinguishable from a missing event.
+
+### Authoritative post-action fetches
+
+Fetch the PR collection, each affected PR, and its stack resource after every
+experiment. Keep the response ETag and fetched-at time alongside the sanitized
+projection used in the result table:
+
+```bash
+owner="${OWNER_REPO%%/*}"
+repo="${OWNER_REPO#*/}"
+curl --fail-with-body --silent --show-error \
+  --header "Accept: application/vnd.github+json" \
+  --header "Authorization: Bearer $INSTALLATION_TOKEN" \
+  --header "X-GitHub-Api-Version: 2022-11-28" \
+  "https://api.github.com/repos/$OWNER_REPO/pulls?state=all&per_page=100" |
+  jq '[.[] | {
+    number, state, merged_at, updated_at,
+    base: {ref: .base.ref, sha: .base.sha},
+    head: {ref: .head.ref, sha: .head.sha}
+  }]' >"$CAPTURE_DIR/authoritative-pulls.json"
+
+export PR_NUMBER=123
+curl --fail-with-body --silent --show-error \
+  --header "Accept: application/vnd.github+json" \
+  --header "Authorization: Bearer $INSTALLATION_TOKEN" \
+  --header "X-GitHub-Api-Version: 2022-11-28" \
+  "https://api.github.com/repos/$OWNER_REPO/pulls/$PR_NUMBER" |
+  jq '{
+    number, state, merged_at, updated_at,
+    base: {ref: .base.ref, sha: .base.sha},
+    head: {ref: .head.ref, sha: .head.sha}
+  }' >"$CAPTURE_DIR/pr-$PR_NUMBER.json"
+
+export STACK_NUMBER=123
+curl --fail-with-body --silent --show-error \
+  --header "Accept: application/vnd.github+json" \
+  --header "Authorization: Bearer $INSTALLATION_TOKEN" \
+  --header "X-GitHub-Api-Version: 2022-11-28" \
+  "https://api.github.com/repos/$OWNER_REPO/stacks/$STACK_NUMBER" |
+  jq '{
+    id, number, state, updated_at,
+    pull_requests: [
+      .pull_requests[] | {
+        number, position,
+        base: {ref: .base.ref, sha: .base.sha},
+        head: {ref: .head.ref, sha: .head.sha}
+      }
+    ]
+  }' >"$CAPTURE_DIR/stack-$STACK_NUMBER.json"
+```
+
+If the installed private-preview version uses a different stack URL or media
+type, replace only those two values and record them in the run metadata. A
+404/410 is data and must be retained for dissolve tests.
 
 ## Experiment A: server-side Rebase Stack
 
@@ -122,8 +295,12 @@ Also record a concise result for each hypothesis:
    that path.
 2. Change only rules supported by the recorded evidence:
    - add an observed event/action pair when it identifies a refresh target;
-   - narrow `action: "*"` only if every unneeded action was explicitly
-     observed and shown safe to ignore;
+   - treat observations as additive evidence only: an unseen action is not
+     evidence that GitHub never emits it;
+   - narrow `action: "*"` only after the complete API action domain for that
+     event is documented, every excluded action has an authoritative semantic
+     analysis and a golden negative replay, and the narrowing has explicit
+     design approval;
    - use `stacked_target: stack` when a PR/ref signal proves stack-wide state
      may have changed;
    - retain the `resolve_stack_membership` rule for PR events even when stack

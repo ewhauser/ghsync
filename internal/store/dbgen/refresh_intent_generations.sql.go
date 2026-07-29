@@ -7,28 +7,44 @@ package dbgen
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const bumpRefreshIntentGenerations = `-- name: BumpRefreshIntentGenerations :many
 WITH intents AS (
     SELECT DISTINCT
         element->>'kind' AS kind,
-        element->>'refresh_key' AS refresh_key
+        element->>'refresh_key' AS refresh_key,
+        NULLIF(element->>'deadline_at', '')::timestamptz AS deadline_at
     FROM jsonb_array_elements($1::jsonb) AS element
 )
-INSERT INTO refresh_intent_generations (kind, refresh_key, generation)
-SELECT kind, refresh_key, 1
+INSERT INTO refresh_intent_generations (
+    kind, refresh_key, generation, deadline_at
+)
+SELECT kind, refresh_key, 1, deadline_at
 FROM intents
 ON CONFLICT (kind, refresh_key) DO UPDATE
 SET generation = refresh_intent_generations.generation + 1,
+    deadline_at = CASE
+        WHEN EXCLUDED.deadline_at IS NULL
+        THEN refresh_intent_generations.deadline_at
+        WHEN refresh_intent_generations.deadline_at IS NULL
+        THEN EXCLUDED.deadline_at
+        ELSE LEAST(
+            refresh_intent_generations.deadline_at,
+            EXCLUDED.deadline_at
+        )
+    END,
     updated_at = now()
-RETURNING kind, refresh_key, generation
+RETURNING kind, refresh_key, generation, deadline_at
 `
 
 type BumpRefreshIntentGenerationsRow struct {
 	Kind       string
 	RefreshKey string
 	Generation int64
+	DeadlineAt pgtype.Timestamptz
 }
 
 // Bump each coalesced key once in the same transaction that inserts its River
@@ -42,7 +58,12 @@ func (q *Queries) BumpRefreshIntentGenerations(ctx context.Context, intents []by
 	var items []BumpRefreshIntentGenerationsRow
 	for rows.Next() {
 		var i BumpRefreshIntentGenerationsRow
-		if err := rows.Scan(&i.Kind, &i.RefreshKey, &i.Generation); err != nil {
+		if err := rows.Scan(
+			&i.Kind,
+			&i.RefreshKey,
+			&i.Generation,
+			&i.DeadlineAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -59,6 +80,11 @@ SET completed_generation = GREATEST(
         completed_generation,
         $1
     ),
+    deadline_at = CASE
+        WHEN generation = $1
+        THEN NULL
+        ELSE deadline_at
+    END,
     updated_at = now()
 WHERE kind = $2
   AND refresh_key = $3
@@ -116,4 +142,28 @@ func (q *Queries) GetRefreshIntentGenerationForUpdate(ctx context.Context, arg G
 	var generation int64
 	err := row.Scan(&generation)
 	return generation, err
+}
+
+const getRefreshIntentState = `-- name: GetRefreshIntentState :one
+SELECT generation, completed_generation, deadline_at
+FROM refresh_intent_generations
+WHERE kind = $1 AND refresh_key = $2
+`
+
+type GetRefreshIntentStateParams struct {
+	Kind       string
+	RefreshKey string
+}
+
+type GetRefreshIntentStateRow struct {
+	Generation          int64
+	CompletedGeneration int64
+	DeadlineAt          pgtype.Timestamptz
+}
+
+func (q *Queries) GetRefreshIntentState(ctx context.Context, arg GetRefreshIntentStateParams) (GetRefreshIntentStateRow, error) {
+	row := q.db.QueryRow(ctx, getRefreshIntentState, arg.Kind, arg.RefreshKey)
+	var i GetRefreshIntentStateRow
+	err := row.Scan(&i.Generation, &i.CompletedGeneration, &i.DeadlineAt)
+	return i, err
 }

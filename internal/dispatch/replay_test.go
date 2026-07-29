@@ -51,30 +51,64 @@ func loadGoldenJobs(t *testing.T) []Intent {
 
 func TestRecordedReplayDecisionsAreOrderIndependent(t *testing.T) {
 	deliveries := loadRecordedDeliveries(t)
-	classifier := DefaultClassifier()
 	golden := loadGoldenJobs(t)
-	baseline := classifyDecisions(t, classifier, deliveries)
-	if !reflect.DeepEqual(baseline, golden) {
-		t.Fatalf("baseline differs from hand-authored golden\n got: %#v\nwant: %#v", baseline, golden)
+	fileRules, err := LoadRulesFile("../../config/dispatcher-rules.yaml")
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for seed := int64(0); seed < 50; seed++ {
-		random := rand.New(rand.NewSource(seed)) //nolint:gosec // property permutation
-		permuted := append([]recordedDelivery(nil), deliveries...)
-		random.Shuffle(len(permuted), func(i, j int) {
-			permuted[i], permuted[j] = permuted[j], permuted[i]
-		})
-		withDuplicates := make([]recordedDelivery, 0, len(permuted)*2)
-		for _, delivery := range permuted {
-			withDuplicates = append(withDuplicates, delivery)
-			if random.Intn(3) == 0 {
-				withDuplicates = append(withDuplicates, delivery)
+	for name, classifier := range map[string]Classifier{
+		"compiled defaults": DefaultClassifier(),
+		"deployed file":     NewClassifier(fileRules),
+	} {
+		t.Run(name, func(t *testing.T) {
+			baseline := classifyDecisions(t, classifier, deliveries)
+			if !reflect.DeepEqual(baseline, golden) {
+				t.Fatalf(
+					"baseline differs from hand-authored golden\n got: %#v\nwant: %#v",
+					baseline,
+					golden,
+				)
 			}
-		}
-		got := classifyDecisions(t, classifier, withDuplicates)
-		if !reflect.DeepEqual(got, golden) {
-			t.Fatalf("seed %d decisions differ\n got: %#v\nwant: %#v", seed, got, golden)
-		}
+			for seed := int64(0); seed < 50; seed++ {
+				random := rand.New(
+					rand.NewSource(seed), //nolint:gosec
+				)
+				permuted := append(
+					[]recordedDelivery(nil),
+					deliveries...,
+				)
+				random.Shuffle(len(permuted), func(i, j int) {
+					permuted[i], permuted[j] = permuted[j], permuted[i]
+				})
+				withDuplicates := make(
+					[]recordedDelivery,
+					0,
+					len(permuted)*2,
+				)
+				for _, delivery := range permuted {
+					withDuplicates = append(withDuplicates, delivery)
+					if random.Intn(3) == 0 {
+						withDuplicates = append(
+							withDuplicates,
+							delivery,
+						)
+					}
+				}
+				got := classifyDecisions(
+					t,
+					classifier,
+					withDuplicates,
+				)
+				if !reflect.DeepEqual(got, golden) {
+					t.Fatalf(
+						"seed %d decisions differ\n got: %#v\nwant: %#v",
+						seed,
+						got,
+						golden,
+					)
+				}
+			}
+		})
 	}
 }
 

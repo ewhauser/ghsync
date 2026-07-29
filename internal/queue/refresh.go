@@ -183,8 +183,9 @@ type RefreshRequest struct {
 }
 
 type RefreshSpec struct {
-	Kind string
-	Key  string
+	Kind     string
+	Key      string
+	Deadline time.Time
 }
 
 // RefreshHandler is implemented by internal/fetch. Keeping this interface in
@@ -211,6 +212,7 @@ type refreshPRWorker struct {
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type refreshRepositoryWorker struct {
@@ -218,6 +220,7 @@ type refreshRepositoryWorker struct {
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type refreshRepoRulesWorker struct {
@@ -225,6 +228,7 @@ type refreshRepoRulesWorker struct {
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type refreshStackWorker struct {
@@ -232,6 +236,7 @@ type refreshStackWorker struct {
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type refreshChecksWorker struct {
@@ -239,6 +244,7 @@ type refreshChecksWorker struct {
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type refreshBranchWorker struct {
@@ -246,6 +252,7 @@ type refreshBranchWorker struct {
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type resolveStackMembershipWorker struct {
@@ -253,6 +260,7 @@ type resolveStackMembershipWorker struct {
 	pool    *pgxpool.Pool
 	work    refreshWork
 	handler RefreshHandler
+	monitor refreshDeadlineMonitor
 }
 
 type backfillRepoPageWorker struct {
@@ -267,6 +275,11 @@ type backfillInstallationPageWorker struct {
 
 type refreshWork func(context.Context, RefreshArgs) error
 
+type refreshDeadlineMonitor struct {
+	observer DeadlineObserver
+	now      func() time.Time
+}
+
 func (w *refreshPRWorker) Work(
 	ctx context.Context,
 	job *river.Job[RefreshPRArgs],
@@ -280,7 +293,9 @@ func (w *refreshPRWorker) Work(
 			)
 		}
 	}
-	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+	return runRefresh(
+		ctx, w.pool, work, job, job.Args.RefreshArgs, w.monitor,
+	)
 }
 
 func (w *refreshRepositoryWorker) Work(
@@ -296,7 +311,9 @@ func (w *refreshRepositoryWorker) Work(
 			)
 		}
 	}
-	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+	return runRefresh(
+		ctx, w.pool, work, job, job.Args.RefreshArgs, w.monitor,
+	)
 }
 
 func (w *refreshRepoRulesWorker) Work(
@@ -312,7 +329,9 @@ func (w *refreshRepoRulesWorker) Work(
 			)
 		}
 	}
-	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+	return runRefresh(
+		ctx, w.pool, work, job, job.Args.RefreshArgs, w.monitor,
+	)
 }
 
 func (w *refreshStackWorker) Work(
@@ -328,7 +347,9 @@ func (w *refreshStackWorker) Work(
 			)
 		}
 	}
-	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+	return runRefresh(
+		ctx, w.pool, work, job, job.Args.RefreshArgs, w.monitor,
+	)
 }
 
 func (w *refreshChecksWorker) Work(
@@ -344,7 +365,9 @@ func (w *refreshChecksWorker) Work(
 			)
 		}
 	}
-	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+	return runRefresh(
+		ctx, w.pool, work, job, job.Args.RefreshArgs, w.monitor,
+	)
 }
 
 func (w *refreshBranchWorker) Work(
@@ -360,7 +383,9 @@ func (w *refreshBranchWorker) Work(
 			)
 		}
 	}
-	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+	return runRefresh(
+		ctx, w.pool, work, job, job.Args.RefreshArgs, w.monitor,
+	)
 }
 
 func (w *resolveStackMembershipWorker) Work(
@@ -379,7 +404,9 @@ func (w *resolveStackMembershipWorker) Work(
 			)
 		}
 	}
-	return runRefresh(ctx, w.pool, work, job, job.Args.RefreshArgs)
+	return runRefresh(
+		ctx, w.pool, work, job, job.Args.RefreshArgs, w.monitor,
+	)
 }
 
 func (w *backfillRepoPageWorker) Work(
@@ -406,22 +433,42 @@ func registerRefreshWorkers(
 	workers *river.Workers,
 	pool *pgxpool.Pool,
 	handler RefreshHandler,
+	observer DeadlineObserver,
+	now func() time.Time,
 ) {
-	river.AddWorker(workers, &refreshPRWorker{pool: pool, handler: handler})
+	if now == nil {
+		now = time.Now
+	}
+	monitor := refreshDeadlineMonitor{observer: observer, now: now}
+	river.AddWorker(workers, &refreshPRWorker{
+		pool: pool, handler: handler, monitor: monitor,
+	})
 	river.AddWorker(
 		workers,
-		&refreshRepositoryWorker{pool: pool, handler: handler},
+		&refreshRepositoryWorker{
+			pool: pool, handler: handler, monitor: monitor,
+		},
 	)
 	river.AddWorker(
 		workers,
-		&refreshRepoRulesWorker{pool: pool, handler: handler},
+		&refreshRepoRulesWorker{
+			pool: pool, handler: handler, monitor: monitor,
+		},
 	)
-	river.AddWorker(workers, &refreshStackWorker{pool: pool, handler: handler})
-	river.AddWorker(workers, &refreshChecksWorker{pool: pool, handler: handler})
-	river.AddWorker(workers, &refreshBranchWorker{pool: pool, handler: handler})
+	river.AddWorker(workers, &refreshStackWorker{
+		pool: pool, handler: handler, monitor: monitor,
+	})
+	river.AddWorker(workers, &refreshChecksWorker{
+		pool: pool, handler: handler, monitor: monitor,
+	})
+	river.AddWorker(workers, &refreshBranchWorker{
+		pool: pool, handler: handler, monitor: monitor,
+	})
 	river.AddWorker(
 		workers,
-		&resolveStackMembershipWorker{pool: pool, handler: handler},
+		&resolveStackMembershipWorker{
+			pool: pool, handler: handler, monitor: monitor,
+		},
 	)
 	river.AddWorker(workers, &backfillRepoPageWorker{handler: handler})
 	river.AddWorker(
@@ -436,10 +483,11 @@ func runRefresh[T river.JobArgs](
 	work refreshWork,
 	job *river.Job[T],
 	args RefreshArgs,
+	monitor refreshDeadlineMonitor,
 ) error {
-	startedGeneration, err := dbgen.New(pool).GetRefreshIntentGeneration(
+	started, err := dbgen.New(pool).GetRefreshIntentState(
 		ctx,
-		dbgen.GetRefreshIntentGenerationParams{
+		dbgen.GetRefreshIntentStateParams{
 			Kind:       args.PointerKind,
 			RefreshKey: args.Key,
 		},
@@ -456,7 +504,22 @@ func runRefresh[T river.JobArgs](
 	} else if err := work(ctx, args); err != nil {
 		return err
 	}
-	return completeRefresh(ctx, pool, job, args, startedGeneration)
+	now := monitor.now
+	if now == nil {
+		now = time.Now
+	}
+	completedAt := now()
+	if monitor.observer != nil && started.DeadlineAt.Valid &&
+		completedAt.After(started.DeadlineAt.Time) {
+		monitor.observer.RefreshDeadlineMissed(
+			ctx,
+			args.PointerKind,
+			args.Key,
+			started.DeadlineAt.Time,
+			completedAt,
+		)
+	}
+	return completeRefresh(ctx, pool, job, args, started.Generation)
 }
 
 // InsertRefreshesTx atomically advances M2's durable generations and inserts
@@ -496,23 +559,41 @@ func InsertRefreshesTxReturning(
 	type generationPointer struct {
 		Kind       string `json:"kind"`
 		RefreshKey string `json:"refresh_key"`
+		DeadlineAt string `json:"deadline_at,omitempty"`
 	}
-	seen := make(map[RefreshSpec]struct{}, len(specs))
+	type refreshKey struct {
+		Kind string
+		Key  string
+	}
+	seen := make(map[refreshKey]int, len(specs))
 	deduped := make([]RefreshSpec, 0, len(specs))
 	pointers := make([]generationPointer, 0, len(specs))
 	for _, spec := range specs {
 		if spec.Key == "" {
 			return nil, fmt.Errorf("refresh key is required")
 		}
-		if _, duplicate := seen[spec]; duplicate {
+		key := refreshKey{Kind: spec.Kind, Key: spec.Key}
+		if index, duplicate := seen[key]; duplicate {
+			if !spec.Deadline.IsZero() &&
+				(deduped[index].Deadline.IsZero() ||
+					spec.Deadline.Before(deduped[index].Deadline)) {
+				deduped[index].Deadline = spec.Deadline
+				pointers[index].DeadlineAt = spec.Deadline.
+					UTC().Format(time.RFC3339Nano)
+			}
 			continue
 		}
-		seen[spec] = struct{}{}
+		seen[key] = len(deduped)
 		deduped = append(deduped, spec)
-		pointers = append(pointers, generationPointer{
+		pointer := generationPointer{
 			Kind:       spec.Kind,
 			RefreshKey: spec.Key,
-		})
+		}
+		if !spec.Deadline.IsZero() {
+			pointer.DeadlineAt = spec.Deadline.
+				UTC().Format(time.RFC3339Nano)
+		}
+		pointers = append(pointers, pointer)
 	}
 	encoded, err := json.Marshal(pointers)
 	if err != nil {
@@ -543,9 +624,9 @@ func InsertRefreshesTxReturning(
 	if _, err := client.InsertManyTx(ctx, tx, params); err != nil {
 		return nil, fmt.Errorf("insert refresh jobs: %w", err)
 	}
-	bySpec := make(map[RefreshSpec]int64, len(generations))
+	bySpec := make(map[refreshKey]int64, len(generations))
 	for _, generation := range generations {
-		bySpec[RefreshSpec{
+		bySpec[refreshKey{
 			Kind: generation.Kind,
 			Key:  generation.RefreshKey,
 		}] = generation.Generation
@@ -553,8 +634,11 @@ func InsertRefreshesTxReturning(
 	result := make([]RefreshGeneration, 0, len(deduped))
 	for _, spec := range deduped {
 		result = append(result, RefreshGeneration{
-			Spec:       spec,
-			Generation: bySpec[spec],
+			Spec: spec,
+			Generation: bySpec[refreshKey{
+				Kind: spec.Kind,
+				Key:  spec.Key,
+			}],
 		})
 	}
 	return result, nil

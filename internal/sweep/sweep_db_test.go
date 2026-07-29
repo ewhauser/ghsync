@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +34,94 @@ type observerRecorder struct {
 	mu         sync.Mutex
 	overruns   int
 	redelivery int
+	incomplete int
+}
+
+type simulatedClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *simulatedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *simulatedClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	c.mu.Unlock()
+}
+
+type deadlineObserverRecorder struct {
+	mu     sync.Mutex
+	misses int
+}
+
+func (o *deadlineObserverRecorder) RefreshDeadlineMissed(
+	context.Context,
+	string,
+	string,
+	time.Time,
+	time.Time,
+) {
+	o.mu.Lock()
+	o.misses++
+	o.mu.Unlock()
+}
+
+type blockSweepArgs struct {
+	ID string `json:"id"`
+}
+
+func (blockSweepArgs) Kind() string { return "test_block_sweep_queue" }
+
+type blockSweepWorker struct {
+	river.WorkerDefaults[blockSweepArgs]
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (w *blockSweepWorker) Work(
+	ctx context.Context,
+	_ *river.Job[blockSweepArgs],
+) error {
+	w.started <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.release:
+		return nil
+	}
+}
+
+type simulatedPRFetch struct {
+	queue.RefreshHandler
+	pool      *pgxpool.Pool
+	clock     *simulatedClock
+	duration  time.Duration
+	completed chan<- time.Time
+}
+
+func (h *simulatedPRFetch) RefreshPR(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
+	h.clock.Advance(h.duration)
+	if err := h.RefreshHandler.RefreshPR(ctx, request); err != nil {
+		return err
+	}
+	completedAt := h.clock.Now()
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE pull_requests
+		SET last_checked_at = $1
+		WHERE number = 4812
+	`, completedAt); err != nil {
+		return err
+	}
+	h.completed <- completedAt
+	return nil
 }
 
 func (o *observerRecorder) SweepOverrun(
@@ -53,6 +142,16 @@ func (o *observerRecorder) GapRedelivery(
 ) {
 	o.mu.Lock()
 	o.redelivery++
+	o.mu.Unlock()
+}
+
+func (o *observerRecorder) GapWindowIncomplete(
+	context.Context,
+	string,
+	int,
+) {
+	o.mu.Lock()
+	o.incomplete++
 	o.mu.Unlock()
 }
 
@@ -140,6 +239,7 @@ func newSweepHarness(
 			GapMaxPages:           10,
 			RetentionPeriod:       24 * time.Hour,
 			RetentionAge:          90 * 24 * time.Hour,
+			RetentionBatchSize:    100,
 			Now:                   func() time.Time { return now },
 			Observer:              observer,
 		},
@@ -149,6 +249,13 @@ func newSweepHarness(
 	}
 	riverClient, err := queue.NewClient(
 		pool,
+		queue.WithQueues(
+			queue.QueueInteractive,
+			queue.QueueEvent,
+			queue.QueueSweep,
+			queue.QueueReconcile,
+			queue.QueuePruner,
+		),
 		queue.WithRefreshHandler(handler),
 		queue.WithWorkerRegistrar(service.RegisterReconciliationWorkers),
 		queue.WithWorkerRegistrar(service.RegisterPrunerWorker),
@@ -189,6 +296,291 @@ func (h *sweepHarness) start(t *testing.T) {
 		defer stopCancel()
 		_ = h.river.StopAndCancel(stopCtx)
 	})
+}
+
+func TestC_R1EndToEndBoundIncludesCadenceQueueAndFetch(
+	t *testing.T,
+) {
+	h := newSweepHarness(t, 100)
+	h.seedCache(t, []int{4812}, false, false)
+	ctx := context.Background()
+	plan := scheduleForBound(10 * time.Minute)
+	if plan.Cadence >= plan.Bound ||
+		plan.Cadence+plan.CompletionHeadroom >= plan.Bound {
+		t.Fatalf("invalid C-R1 schedule plan: %+v", plan)
+	}
+
+	clock := &simulatedClock{now: h.now}
+	h.service.config.Now = clock.Now
+	lastChecked := h.now.Add(time.Microsecond)
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE pull_requests
+		SET last_checked_at = $1, synced_at = $1
+		WHERE number = 4812
+	`, lastChecked); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := make(chan struct{}, 1)
+	release := make(chan struct{})
+	completed := make(chan time.Time, 1)
+	deadlines := &deadlineObserverRecorder{}
+	handler := &simulatedPRFetch{
+		RefreshHandler: h.handler,
+		pool:           h.pool,
+		clock:          clock,
+		duration:       30 * time.Second,
+		completed:      completed,
+	}
+	riverClient, err := queue.NewClient(
+		h.pool,
+		queue.WithQueues(queue.QueueSweep),
+		queue.WithQueueMaxWorkers(queue.QueueSweep, 1),
+		queue.WithRefreshHandler(handler),
+		queue.WithDeadlineObserver(deadlines),
+		queue.WithNow(clock.Now),
+		queue.WithWorkerRegistrar(
+			h.service.RegisterReconciliationWorkers,
+		),
+		queue.WithWorkerRegistrar(func(workers *river.Workers) {
+			river.AddWorker(workers, &blockSweepWorker{
+				started: blocked,
+				release: release,
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handler.SetRiverClient(riverClient)
+	h.service.SetRiverClient(riverClient)
+	if _, err := riverClient.Insert(
+		ctx,
+		blockSweepArgs{ID: "saturated"},
+		&river.InsertOpts{Queue: queue.QueueSweep},
+	); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := riverClient.Start(runCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep queue did not saturate")
+	}
+
+	// The just-after-tick entity is not due at the prior tick.
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var early int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM refresh_intent_generations
+		WHERE kind = 'refresh_pr'
+		  AND refresh_key = 'pr:acme/monolith:4812'
+	`).Scan(&early); err != nil {
+		t.Fatal(err)
+	}
+	if early != 0 {
+		t.Fatalf("just-after-tick entity was enqueued early: %d", early)
+	}
+
+	// At the next cadence, its deadline falls inside cadence + reserved
+	// completion headroom and the scheduler must insert it.
+	clock.Advance(plan.Cadence)
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := dbgen.New(h.pool).GetRefreshIntentState(
+		ctx,
+		dbgen.GetRefreshIntentStateParams{
+			Kind:       queue.KindRefreshPR,
+			RefreshKey: "pr:acme/monolith:4812",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := lastChecked.Add(plan.Bound)
+	if !state.DeadlineAt.Valid ||
+		!state.DeadlineAt.Time.Equal(wantDeadline) {
+		t.Fatalf(
+			"refresh deadline = %v, want %s",
+			state.DeadlineAt,
+			wantDeadline,
+		)
+	}
+
+	// Simulate a saturated queue consuming half the reserved headroom, then
+	// an authoritative GraphQL fetch consuming another 30 seconds.
+	clock.Advance(time.Minute)
+	close(release)
+	var completedAt time.Time
+	select {
+	case completedAt = <-completed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("scheduled PR reconciliation did not complete")
+	}
+	if completedAt.After(wantDeadline) {
+		t.Fatalf(
+			"end-to-end freshness completed at %s after deadline %s",
+			completedAt,
+			wantDeadline,
+		)
+	}
+	deadlines.mu.Lock()
+	misses := deadlines.misses
+	deadlines.mu.Unlock()
+	if misses != 0 {
+		t.Fatalf("deadline misses = %d, want 0", misses)
+	}
+}
+
+func TestList304AdvancesOnlyListMembershipFreshness(t *testing.T) {
+	h := newSweepHarness(t, 100)
+	h.seedCache(t, []int{4812}, false, false)
+	ctx := context.Background()
+	runListing := func() {
+		t.Helper()
+		if err := h.service.Kickoff(ctx, KickoffArgs{
+			SweepKind:    KindPullRequests,
+			Installation: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Mutable PR discovery requires one overlap pass with no new IDs.
+		for range 2 {
+			if err := h.service.ReconcilePage(ctx, ListPageArgs{
+				SweepKind:    KindPullRequests,
+				Installation: 1,
+				ScopeKey:     "acme/monolith",
+				Cursor:       "1",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	runListing()
+
+	memberChecked := h.now.Add(-11 * time.Minute)
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE pull_requests
+		SET last_checked_at = $1
+		WHERE number = 4812
+	`, memberChecked); err != nil {
+		t.Fatal(err)
+	}
+	validatedAt := h.now.Add(time.Minute)
+	h.service.config.Now = func() time.Time { return validatedAt }
+	runListing()
+
+	var afterMember, listSeen time.Time
+	if err := h.pool.QueryRow(ctx, `
+		SELECT last_checked_at
+		FROM pull_requests
+		WHERE number = 4812
+	`).Scan(&afterMember); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.pool.QueryRow(ctx, `
+		SELECT list_seen_at
+		FROM sweep_pages
+		WHERE installation_id = 1
+		  AND sweep_kind = 'pull_requests'
+		  AND scope_key = 'acme/monolith'
+		  AND cursor = '1'
+	`).Scan(&listSeen); err != nil {
+		t.Fatal(err)
+	}
+	if !afterMember.Equal(memberChecked) {
+		t.Fatalf(
+			"list 304 advanced member freshness: %s -> %s",
+			memberChecked,
+			afterMember,
+		)
+	}
+	if !listSeen.Equal(validatedAt) {
+		t.Fatalf(
+			"list membership freshness = %s, want %s",
+			listSeen,
+			validatedAt,
+		)
+	}
+}
+
+func TestPullListingOverlapPassRecoversConcurrentPageShift(t *testing.T) {
+	h := newSweepHarness(t, 2)
+	h.seedCache(t, nil, false, false)
+	ctx := context.Background()
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcilePage(ctx, ListPageArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+		ScopeKey:     "acme/monolith",
+		Cursor:       "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Removing a page-one entity shifts PR 4816 from page two into an already
+	// scanned page. A single mutable page-number pass would skip it.
+	fixture := h.fixture
+	fixture.PullRequests[1].State = "closed"
+	h.fake.SetFixture(fixture)
+	for _, cursor := range []string{"2", "1", "2", "1", "2"} {
+		if err := h.service.ReconcilePage(ctx, ListPageArgs{
+			SweepKind:    KindPullRequests,
+			Installation: 1,
+			ScopeKey:     "acme/monolith",
+			Cursor:       cursor,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := dbgen.New(h.pool).GetSweepCursor(
+		ctx,
+		dbgen.GetSweepCursorParams{
+			InstallationID: 1,
+			SweepKind:      KindPullRequests,
+			ScopeKey:       "acme/monolith",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.CompletedAt.Valid {
+		t.Fatalf("overlap sweep did not stabilize: %+v", state)
+	}
+	var seen []string
+	if err := json.Unmarshal(state.SeenKeys, &seen); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(seen, "pr:acme/monolith:4816") {
+		t.Fatalf("concurrent page shift skipped PR 4816: %v", seen)
+	}
 }
 
 func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
@@ -239,6 +631,9 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 	`).Scan(&closedChecked); err != nil {
 		t.Fatal(err)
 	}
+	fixture := h.fixture
+	fixture.PullRequests[1].ReviewThreads[0].IsResolved = true
+	h.fake.SetFixture(fixture)
 	h.start(t)
 	for _, kind := range []string{
 		KindStacks,
@@ -308,11 +703,8 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 		`).Scan(&value)
 		return err == nil && value.After(staleClosed)
 	})
-	if got := h.fake.RequestCount(
-		http.MethodGet,
-		"/repos/acme/monolith/pulls/4812",
-	); got < 2 {
-		t.Fatalf("PR conditional validation requests = %d, want seed + sweep", got)
+	if got := h.fake.RequestCount(http.MethodPost, "/graphql"); got < 1 {
+		t.Fatalf("PR GraphQL reconciliation requests = %d, want at least 1", got)
 	}
 	var synced, checked time.Time
 	if err := h.pool.QueryRow(ctx, `
@@ -321,8 +713,19 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 	`).Scan(&synced, &checked); err != nil {
 		t.Fatal(err)
 	}
-	if !synced.Equal(oldOpenPR) || !checked.After(synced) {
-		t.Fatalf("304 provenance synced=%s checked=%s", synced, checked)
+	if checked.Before(synced) || !checked.After(oldOpenPR) {
+		t.Fatalf("GraphQL provenance synced=%s checked=%s", synced, checked)
+	}
+	var resolved bool
+	if err := h.pool.QueryRow(ctx, `
+		SELECT is_resolved
+		FROM review_threads
+		WHERE pr_number = 4812
+	`).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if !resolved {
+		t.Fatal("periodic GraphQL PR reconciliation missed review-thread state")
 	}
 }
 
@@ -381,7 +784,7 @@ func TestSweepCursorResumesAfterMidSweepCrashAndSignalsOverrun(
 	if overruns != 1 {
 		t.Fatalf("overrun signals = %d, want 1", overruns)
 	}
-	for page := 2; page <= 3; page++ {
+	for _, page := range []int{2, 1, 2} {
 		if err := h.service.ReconcilePage(ctx, ListPageArgs{
 			SweepKind:    KindPullRequests,
 			Installation: 1,
@@ -523,6 +926,13 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	if requests := h.fake.RedeliveryRequests(); len(requests) != 1 {
 		t.Fatalf("redelivery requests = %v, want one", requests)
 	}
+	waitFor(t, 10*time.Second, func() bool {
+		_, err := dbgen.New(h.pool).GetWebhookDelivery(
+			context.Background(),
+			guid,
+		)
+		return err == nil
+	})
 	delivery, err := dbgen.New(h.pool).GetWebhookDelivery(
 		context.Background(),
 		guid,
@@ -546,6 +956,72 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 		)
 		return err == nil && row.Title == "truth changed during outage"
 	})
+}
+
+func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
+	t *testing.T,
+) {
+	h := newSweepHarness(t, 1)
+	h.service.config.GapMaxPages = 1
+	ingressServer := httptest.NewServer(
+		ingress.NewHandler(
+			dbgen.New(h.pool),
+			sweepTestSecret,
+			1<<20,
+			time.Second,
+		).Mux(),
+	)
+	defer ingressServer.Close()
+	for index := range 3 {
+		if _, err := h.fake.DropWebhook(
+			ingressServer.URL+ingress.WebhookPath,
+			"push",
+			map[string]any{
+				"ref": fmt.Sprintf("refs/heads/gap-%d", index),
+				"repository": map[string]any{
+					"full_name": "acme/monolith",
+				},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 3 {
+		if err := h.service.HealDeliveryGaps(
+			context.Background(),
+			GapHealArgs{Installation: 1},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests := h.fake.RedeliveryRequests(); len(requests) != 3 {
+		t.Fatalf(
+			"redelivery requests = %v, want every capped page",
+			requests,
+		)
+	}
+	var cursor string
+	var completed bool
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT cursor, completed_at IS NOT NULL
+		FROM gap_heal_cursors
+		WHERE installation_id = 1
+	`).Scan(&cursor, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != "" || !completed {
+		t.Fatalf(
+			"gap cursor cursor=%q completed=%v, want terminal",
+			cursor,
+			completed,
+		)
+	}
+	h.observer.mu.Lock()
+	incomplete := h.observer.incomplete
+	h.observer.mu.Unlock()
+	if incomplete != 2 {
+		t.Fatalf("incomplete-window signals = %d, want 2", incomplete)
+	}
 }
 
 func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
@@ -629,6 +1105,100 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 			"history rows/change events = %d/%d, want 2/1",
 			historyRows,
 			changeEvents,
+		)
+	}
+}
+
+func TestPrunerCommitsBoundedBatchesUntilBacklogIsEmpty(t *testing.T) {
+	h := newSweepHarness(t, 100)
+	h.service.config.RetentionBatchSize = 2
+	h.seedCache(t, nil, false, false)
+	ctx := context.Background()
+	cutoff := h.now.Add(-h.service.config.RetentionAge)
+	var repoID int64
+	if err := h.pool.QueryRow(ctx, `
+		SELECT id FROM repos WHERE gh_id = 1001
+	`).Scan(&repoID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `
+		INSERT INTO check_runs (
+		    gh_id, repo_id, node_id, name, status, conclusion,
+		    details_url, app_slug, head_sha, synced_at,
+		    last_checked_at, etag, sync_source
+		) VALUES (
+		    9901, $1, 'node-batch', 'batch', 'completed', 'success',
+		    '', 'github-actions', 'batch-head', $2, $2, '', 'reconcile'
+		)
+	`, repoID, h.now); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 5 {
+		at := cutoff.Add(-time.Duration(index+1) * time.Second)
+		if _, err := h.pool.Exec(ctx, `
+			INSERT INTO webhook_deliveries (
+			    delivery_guid, event, raw_body, headers, received_at,
+			    status
+			) VALUES ($1, 'push', 'body', '{"x":"y"}', $2, 'processed')
+		`, fmt.Sprintf("batch-%d", index), at); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `
+			INSERT INTO check_history (
+			    check_run_gh_id, repo_id, name, status, conclusion,
+			    observed, head_sha, synced_at, etag, sync_source
+			) VALUES (
+			    9901, $1, 'batch', $2, 'success', '{}', 'batch-head',
+			    $3, '', 'reconcile'
+			)
+		`, repoID, fmt.Sprintf("batch-%d", index), at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	payloads, history, err := h.service.pruneBatch(ctx, h.now, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payloads != 2 || history != 2 {
+		t.Fatalf(
+			"first bounded batch pruned %d/%d, want 2/2",
+			payloads,
+			history,
+		)
+	}
+	var remainingPayloads, remainingHistory int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM webhook_deliveries
+		WHERE delivery_guid LIKE 'batch-%'
+		  AND raw_body IS NOT NULL
+	`).Scan(&remainingPayloads); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM check_history
+		WHERE name = 'batch'
+	`).Scan(&remainingHistory); err != nil {
+		t.Fatal(err)
+	}
+	if remainingPayloads != 3 || remainingHistory != 3 {
+		t.Fatalf(
+			"remaining after one batch = %d/%d, want 3/3",
+			remainingPayloads,
+			remainingHistory,
+		)
+	}
+	payloads, history, err = h.service.Prune(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payloads != 3 || history != 3 {
+		t.Fatalf(
+			"looped prune removed %d/%d, want 3/3",
+			payloads,
+			history,
 		)
 	}
 }

@@ -52,19 +52,24 @@ and marks cursors complete only after durable child generations complete.
 
 ### M4 reconciliation and validation
 
-River periodic jobs enqueue configured C-R1 schedules on the `sweep` queue.
+Every leader-eligible River process registers the same configured C-R1
+schedule table. Component jobs use isolated `reconcile`, `drift`, and `pruner`
+queues, while only fetch processes poll the three fetch priority queues.
 Authoritative repository, stack, and open-PR listings persist cursors, per-page
-ETags, and page membership; a restarted worker resumes the recorded page.
-Unchanged pages validate cached entity freshness, while changed pages enqueue
-ordinary conditional entity refreshes. Listing disappearance always takes the
+ETags, and list-membership freshness; a restarted worker resumes the recorded
+page. A list 304 never advances member-entity freshness. PR discovery uses a
+stable creation order plus repeated overlap passes, and members receive
+ordinary per-entity reconciliation. Listing disappearance always takes the
 verify-then-404 path before a retained tombstone is written.
 
-Startup and scheduled gap healing compare a bounded App-deliveries cursor
-window against retained `webhook_deliveries` GUID skeletons and request
-redelivery for missing GUIDs. The drift job full-fetches a random semantic
-sample, records attached diffs in `drift_findings`, and enqueues self-healing
-refreshes. The pruner removes webhook bodies/headers and `check_history` older
-than the configured 90-day boundary; it does not prune `change_events`.
+Startup and scheduled gap healing compare a fixed-time App-deliveries window
+against retained `webhook_deliveries` GUID skeletons and request redelivery for
+missing GUIDs. Capped scans emit a signal and durably continue from GitHub's
+opaque cursor. The drift job rotates a quota through every semantic entity
+class, deduplicates attached diffs, and permits one self-healing generation
+before persistent divergence is escalated. The pruner removes webhook
+bodies/headers and `check_history` older than the locked minimum 90-day
+boundary in bounded transactions; it does not prune `change_events`.
 
 The C-R1 durations, gap window, drift sample, and retention settings are
 environment configuration. Dispatcher rules can be loaded from

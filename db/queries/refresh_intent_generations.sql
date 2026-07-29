@@ -4,21 +4,39 @@
 WITH intents AS (
     SELECT DISTINCT
         element->>'kind' AS kind,
-        element->>'refresh_key' AS refresh_key
+        element->>'refresh_key' AS refresh_key,
+        NULLIF(element->>'deadline_at', '')::timestamptz AS deadline_at
     FROM jsonb_array_elements(sqlc.arg(intents)::jsonb) AS element
 )
-INSERT INTO refresh_intent_generations (kind, refresh_key, generation)
-SELECT kind, refresh_key, 1
+INSERT INTO refresh_intent_generations (
+    kind, refresh_key, generation, deadline_at
+)
+SELECT kind, refresh_key, 1, deadline_at
 FROM intents
 ON CONFLICT (kind, refresh_key) DO UPDATE
 SET generation = refresh_intent_generations.generation + 1,
+    deadline_at = CASE
+        WHEN EXCLUDED.deadline_at IS NULL
+        THEN refresh_intent_generations.deadline_at
+        WHEN refresh_intent_generations.deadline_at IS NULL
+        THEN EXCLUDED.deadline_at
+        ELSE LEAST(
+            refresh_intent_generations.deadline_at,
+            EXCLUDED.deadline_at
+        )
+    END,
     updated_at = now()
-RETURNING kind, refresh_key, generation;
+RETURNING kind, refresh_key, generation, deadline_at;
 
 -- name: GetRefreshIntentGeneration :one
 -- A running worker snapshots the generation before fetching authoritative
 -- state. Signals coalesced before the fetch are thereby covered by that fetch.
 SELECT generation
+FROM refresh_intent_generations
+WHERE kind = $1 AND refresh_key = $2;
+
+-- name: GetRefreshIntentState :one
+SELECT generation, completed_generation, deadline_at
 FROM refresh_intent_generations
 WHERE kind = $1 AND refresh_key = $2;
 
@@ -37,6 +55,11 @@ SET completed_generation = GREATEST(
         completed_generation,
         sqlc.arg(completed_generation)
     ),
+    deadline_at = CASE
+        WHEN generation = sqlc.arg(completed_generation)
+        THEN NULL
+        ELSE deadline_at
+    END,
     updated_at = now()
 WHERE kind = sqlc.arg(kind)
   AND refresh_key = sqlc.arg(refresh_key)

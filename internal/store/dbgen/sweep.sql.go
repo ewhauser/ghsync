@@ -11,22 +11,60 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const advanceGapHealCursor = `-- name: AdvanceGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = $1,
+    updated_at = $2
+WHERE installation_id = $3
+  AND cursor = $4
+  AND completed_at IS NULL
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+`
+
+type AdvanceGapHealCursorParams struct {
+	NextCursor     string
+	UpdatedAt      pgtype.Timestamptz
+	InstallationID int64
+	ExpectedCursor string
+}
+
+func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCursorParams) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, advanceGapHealCursor,
+		arg.NextCursor,
+		arg.UpdatedAt,
+		arg.InstallationID,
+		arg.ExpectedCursor,
+	)
+	var i GapHealCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Cursor,
+		&i.Cutoff,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
 const advanceSweepCursor = `-- name: AdvanceSweepCursor :one
 UPDATE sweep_cursors
 SET cursor = $1,
     seen_keys = $2,
-    updated_at = $3
-WHERE installation_id = $4
-  AND sweep_kind = $5
-  AND scope_key = $6
-  AND cursor = $7
+    pass_new_count = $3,
+    updated_at = $4
+WHERE installation_id = $5
+  AND sweep_kind = $6
+  AND scope_key = $7
+  AND cursor = $8
   AND completed_at IS NULL
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at
+RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
 `
 
 type AdvanceSweepCursorParams struct {
 	NextCursor     string
 	SeenKeys       []byte
+	PassNewCount   int32
 	UpdatedAt      pgtype.Timestamptz
 	InstallationID int64
 	SweepKind      string
@@ -38,6 +76,7 @@ func (q *Queries) AdvanceSweepCursor(ctx context.Context, arg AdvanceSweepCursor
 	row := q.db.QueryRow(ctx, advanceSweepCursor,
 		arg.NextCursor,
 		arg.SeenKeys,
+		arg.PassNewCount,
 		arg.UpdatedAt,
 		arg.InstallationID,
 		arg.SweepKind,
@@ -54,6 +93,38 @@ func (q *Queries) AdvanceSweepCursor(ctx context.Context, arg AdvanceSweepCursor
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.PassNewCount,
+	)
+	return i, err
+}
+
+const completeGapHealCursor = `-- name: CompleteGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = '',
+    updated_at = $1,
+    completed_at = $1
+WHERE installation_id = $2
+  AND cursor = $3
+  AND completed_at IS NULL
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+`
+
+type CompleteGapHealCursorParams struct {
+	CompletedAt    pgtype.Timestamptz
+	InstallationID int64
+	ExpectedCursor string
+}
+
+func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHealCursorParams) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, completeGapHealCursor, arg.CompletedAt, arg.InstallationID, arg.ExpectedCursor)
+	var i GapHealCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Cursor,
+		&i.Cutoff,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
 	)
 	return i, err
 }
@@ -62,6 +133,7 @@ const completeSweepCursor = `-- name: CompleteSweepCursor :one
 UPDATE sweep_cursors
 SET cursor = '',
     seen_keys = $1,
+    pass_new_count = 0,
     updated_at = $2,
     completed_at = $2
 WHERE installation_id = $3
@@ -69,7 +141,7 @@ WHERE installation_id = $3
   AND scope_key = $5
   AND cursor = $6
   AND completed_at IS NULL
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at
+RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
 `
 
 type CompleteSweepCursorParams struct {
@@ -100,21 +172,56 @@ func (q *Queries) CompleteSweepCursor(ctx context.Context, arg CompleteSweepCurs
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.PassNewCount,
 	)
 	return i, err
 }
 
-const deleteCheckHistoryBefore = `-- name: DeleteCheckHistoryBefore :execrows
-DELETE FROM check_history
-WHERE synced_at < $1
+const deleteCheckHistoryBatch = `-- name: DeleteCheckHistoryBatch :execrows
+DELETE FROM check_history AS history
+WHERE history.id IN (
+    SELECT candidate.id
+    FROM check_history AS candidate
+    WHERE candidate.synced_at < $1
+    ORDER BY candidate.synced_at, candidate.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
 `
 
-func (q *Queries) DeleteCheckHistoryBefore(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteCheckHistoryBefore, cutoff)
+type DeleteCheckHistoryBatchParams struct {
+	Cutoff    pgtype.Timestamptz
+	BatchSize int32
+}
+
+func (q *Queries) DeleteCheckHistoryBatch(ctx context.Context, arg DeleteCheckHistoryBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteCheckHistoryBatch, arg.Cutoff, arg.BatchSize)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const ensureGapHealCursor = `-- name: EnsureGapHealCursor :one
+INSERT INTO gap_heal_cursors (installation_id)
+VALUES ($1)
+ON CONFLICT (installation_id) DO UPDATE
+SET installation_id = EXCLUDED.installation_id
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+`
+
+func (q *Queries) EnsureGapHealCursor(ctx context.Context, installationID int64) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, ensureGapHealCursor, installationID)
+	var i GapHealCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Cursor,
+		&i.Cutoff,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
 }
 
 const ensureSweepCursor = `-- name: EnsureSweepCursor :one
@@ -125,7 +232,7 @@ INSERT INTO sweep_cursors (
 )
 ON CONFLICT (installation_id, sweep_kind, scope_key) DO UPDATE
 SET sweep_kind = EXCLUDED.sweep_kind
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at
+RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
 `
 
 type EnsureSweepCursorParams struct {
@@ -146,12 +253,34 @@ func (q *Queries) EnsureSweepCursor(ctx context.Context, arg EnsureSweepCursorPa
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.PassNewCount,
+	)
+	return i, err
+}
+
+const getGapHealCursorForUpdate = `-- name: GetGapHealCursorForUpdate :one
+SELECT installation_id, cursor, cutoff, started_at, updated_at, completed_at
+FROM gap_heal_cursors
+WHERE installation_id = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetGapHealCursorForUpdate(ctx context.Context, installationID int64) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, getGapHealCursorForUpdate, installationID)
+	var i GapHealCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Cursor,
+		&i.Cutoff,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
 	)
 	return i, err
 }
 
 const getSweepCursor = `-- name: GetSweepCursor :one
-SELECT installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at
+SELECT installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
 FROM sweep_cursors
 WHERE installation_id = $1
   AND sweep_kind = $2
@@ -176,12 +305,13 @@ func (q *Queries) GetSweepCursor(ctx context.Context, arg GetSweepCursorParams) 
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.PassNewCount,
 	)
 	return i, err
 }
 
 const getSweepCursorForUpdate = `-- name: GetSweepCursorForUpdate :one
-SELECT installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at
+SELECT installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
 FROM sweep_cursors
 WHERE installation_id = $1
   AND sweep_kind = $2
@@ -207,12 +337,13 @@ func (q *Queries) GetSweepCursorForUpdate(ctx context.Context, arg GetSweepCurso
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.PassNewCount,
 	)
 	return i, err
 }
 
 const getSweepPage = `-- name: GetSweepPage :one
-SELECT installation_id, sweep_kind, scope_key, cursor, etag, next_cursor, entity_keys, last_checked_at
+SELECT installation_id, sweep_kind, scope_key, cursor, etag, next_cursor, entity_keys, list_seen_at
 FROM sweep_pages
 WHERE installation_id = $1
   AND sweep_kind = $2
@@ -243,7 +374,7 @@ func (q *Queries) GetSweepPage(ctx context.Context, arg GetSweepPageParams) (Swe
 		&i.Etag,
 		&i.NextCursor,
 		&i.EntityKeys,
-		&i.LastCheckedAt,
+		&i.ListSeenAt,
 	)
 	return i, err
 }
@@ -376,7 +507,8 @@ func (q *Queries) ListLiveStackNumbers(ctx context.Context, arg ListLiveStackNum
 }
 
 const listStaleClosedPullRequests = `-- name: ListStaleClosedPullRequests :many
-SELECT repos.full_name AS repo_full_name, pull_requests.number
+SELECT repos.full_name AS repo_full_name, pull_requests.number,
+       pull_requests.last_checked_at
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
 WHERE repos.installation_id = $1
@@ -393,8 +525,9 @@ type ListStaleClosedPullRequestsParams struct {
 }
 
 type ListStaleClosedPullRequestsRow struct {
-	RepoFullName string
-	Number       int32
+	RepoFullName  string
+	Number        int32
+	LastCheckedAt pgtype.Timestamptz
 }
 
 func (q *Queries) ListStaleClosedPullRequests(ctx context.Context, arg ListStaleClosedPullRequestsParams) ([]ListStaleClosedPullRequestsRow, error) {
@@ -406,7 +539,7 @@ func (q *Queries) ListStaleClosedPullRequests(ctx context.Context, arg ListStale
 	var items []ListStaleClosedPullRequestsRow
 	for rows.Next() {
 		var i ListStaleClosedPullRequestsRow
-		if err := rows.Scan(&i.RepoFullName, &i.Number); err != nil {
+		if err := rows.Scan(&i.RepoFullName, &i.Number, &i.LastCheckedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -418,7 +551,8 @@ func (q *Queries) ListStaleClosedPullRequests(ctx context.Context, arg ListStale
 }
 
 const listStaleClosedStacks = `-- name: ListStaleClosedStacks :many
-SELECT repos.full_name AS repo_full_name, stacks.number
+SELECT repos.full_name AS repo_full_name, stacks.number,
+       stacks.last_checked_at
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
 WHERE repos.installation_id = $1
@@ -435,8 +569,9 @@ type ListStaleClosedStacksParams struct {
 }
 
 type ListStaleClosedStacksRow struct {
-	RepoFullName string
-	Number       int32
+	RepoFullName  string
+	Number        int32
+	LastCheckedAt pgtype.Timestamptz
 }
 
 func (q *Queries) ListStaleClosedStacks(ctx context.Context, arg ListStaleClosedStacksParams) ([]ListStaleClosedStacksRow, error) {
@@ -448,7 +583,7 @@ func (q *Queries) ListStaleClosedStacks(ctx context.Context, arg ListStaleClosed
 	var items []ListStaleClosedStacksRow
 	for rows.Next() {
 		var i ListStaleClosedStacksRow
-		if err := rows.Scan(&i.RepoFullName, &i.Number); err != nil {
+		if err := rows.Scan(&i.RepoFullName, &i.Number, &i.LastCheckedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -460,7 +595,8 @@ func (q *Queries) ListStaleClosedStacks(ctx context.Context, arg ListStaleClosed
 }
 
 const listStaleOpenPullRequests = `-- name: ListStaleOpenPullRequests :many
-SELECT repos.full_name AS repo_full_name, pull_requests.number
+SELECT repos.full_name AS repo_full_name, pull_requests.number,
+       pull_requests.last_checked_at
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
 WHERE repos.installation_id = $1
@@ -477,8 +613,9 @@ type ListStaleOpenPullRequestsParams struct {
 }
 
 type ListStaleOpenPullRequestsRow struct {
-	RepoFullName string
-	Number       int32
+	RepoFullName  string
+	Number        int32
+	LastCheckedAt pgtype.Timestamptz
 }
 
 func (q *Queries) ListStaleOpenPullRequests(ctx context.Context, arg ListStaleOpenPullRequestsParams) ([]ListStaleOpenPullRequestsRow, error) {
@@ -490,7 +627,7 @@ func (q *Queries) ListStaleOpenPullRequests(ctx context.Context, arg ListStaleOp
 	var items []ListStaleOpenPullRequestsRow
 	for rows.Next() {
 		var i ListStaleOpenPullRequestsRow
-		if err := rows.Scan(&i.RepoFullName, &i.Number); err != nil {
+		if err := rows.Scan(&i.RepoFullName, &i.Number, &i.LastCheckedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -502,7 +639,8 @@ func (q *Queries) ListStaleOpenPullRequests(ctx context.Context, arg ListStaleOp
 }
 
 const listStaleOpenStacks = `-- name: ListStaleOpenStacks :many
-SELECT repos.full_name AS repo_full_name, stacks.number
+SELECT repos.full_name AS repo_full_name, stacks.number,
+       stacks.last_checked_at
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
 WHERE repos.installation_id = $1
@@ -519,8 +657,9 @@ type ListStaleOpenStacksParams struct {
 }
 
 type ListStaleOpenStacksRow struct {
-	RepoFullName string
-	Number       int32
+	RepoFullName  string
+	Number        int32
+	LastCheckedAt pgtype.Timestamptz
 }
 
 func (q *Queries) ListStaleOpenStacks(ctx context.Context, arg ListStaleOpenStacksParams) ([]ListStaleOpenStacksRow, error) {
@@ -532,7 +671,7 @@ func (q *Queries) ListStaleOpenStacks(ctx context.Context, arg ListStaleOpenStac
 	var items []ListStaleOpenStacksRow
 	for rows.Next() {
 		var i ListStaleOpenStacksRow
-		if err := rows.Scan(&i.RepoFullName, &i.Number); err != nil {
+		if err := rows.Scan(&i.RepoFullName, &i.Number, &i.LastCheckedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -544,7 +683,11 @@ func (q *Queries) ListStaleOpenStacks(ctx context.Context, arg ListStaleOpenStac
 }
 
 const listStaleRepoRules = `-- name: ListStaleRepoRules :many
-SELECT repos.full_name
+SELECT repos.full_name,
+       COALESCE(
+           repo_rule_sync_state.last_checked_at,
+           repos.last_checked_at
+       ) AS last_checked_at
 FROM repos
 LEFT JOIN repo_rule_sync_state ON repo_rule_sync_state.repo_id = repos.id
 WHERE repos.installation_id = $1
@@ -564,19 +707,24 @@ type ListStaleRepoRulesParams struct {
 	StaleBefore    pgtype.Timestamptz
 }
 
-func (q *Queries) ListStaleRepoRules(ctx context.Context, arg ListStaleRepoRulesParams) ([]string, error) {
+type ListStaleRepoRulesRow struct {
+	FullName      string
+	LastCheckedAt pgtype.Timestamptz
+}
+
+func (q *Queries) ListStaleRepoRules(ctx context.Context, arg ListStaleRepoRulesParams) ([]ListStaleRepoRulesRow, error) {
 	rows, err := q.db.Query(ctx, listStaleRepoRules, arg.InstallationID, arg.StaleBefore)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []string
+	var items []ListStaleRepoRulesRow
 	for rows.Next() {
-		var full_name string
-		if err := rows.Scan(&full_name); err != nil {
+		var i ListStaleRepoRulesRow
+		if err := rows.Scan(&i.FullName, &i.LastCheckedAt); err != nil {
 			return nil, err
 		}
-		items = append(items, full_name)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -618,39 +766,130 @@ func (q *Queries) ListSweepRepositories(ctx context.Context, installationID int6
 	return items, nil
 }
 
-const pruneWebhookDeliveryPayloads = `-- name: PruneWebhookDeliveryPayloads :execrows
-UPDATE webhook_deliveries
+const pruneWebhookDeliveryPayloadBatch = `-- name: PruneWebhookDeliveryPayloadBatch :execrows
+WITH batch AS (
+    SELECT candidate.delivery_guid
+    FROM webhook_deliveries AS candidate
+    WHERE candidate.received_at < $2
+      AND candidate.raw_body IS NOT NULL
+    ORDER BY candidate.received_at, candidate.delivery_guid
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE webhook_deliveries AS delivery
 SET raw_body = NULL,
     headers = '{}'::jsonb,
     payload_pruned_at = $1
-WHERE received_at < $2
-  AND raw_body IS NOT NULL
+FROM batch
+WHERE delivery.delivery_guid = batch.delivery_guid
 `
 
-type PruneWebhookDeliveryPayloadsParams struct {
-	PrunedAt pgtype.Timestamptz
-	Cutoff   pgtype.Timestamptz
+type PruneWebhookDeliveryPayloadBatchParams struct {
+	PrunedAt  pgtype.Timestamptz
+	Cutoff    pgtype.Timestamptz
+	BatchSize int32
 }
 
-func (q *Queries) PruneWebhookDeliveryPayloads(ctx context.Context, arg PruneWebhookDeliveryPayloadsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, pruneWebhookDeliveryPayloads, arg.PrunedAt, arg.Cutoff)
+func (q *Queries) PruneWebhookDeliveryPayloadBatch(ctx context.Context, arg PruneWebhookDeliveryPayloadBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneWebhookDeliveryPayloadBatch, arg.PrunedAt, arg.Cutoff, arg.BatchSize)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
 }
 
+const restartSweepCursorPass = `-- name: RestartSweepCursorPass :one
+UPDATE sweep_cursors
+SET cursor = $1,
+    seen_keys = $2,
+    pass_new_count = 0,
+    updated_at = $3
+WHERE installation_id = $4
+  AND sweep_kind = $5
+  AND scope_key = $6
+  AND cursor = $7
+  AND completed_at IS NULL
+RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+`
+
+type RestartSweepCursorPassParams struct {
+	FirstCursor    string
+	SeenKeys       []byte
+	UpdatedAt      pgtype.Timestamptz
+	InstallationID int64
+	SweepKind      string
+	ScopeKey       string
+	ExpectedCursor string
+}
+
+func (q *Queries) RestartSweepCursorPass(ctx context.Context, arg RestartSweepCursorPassParams) (SweepCursor, error) {
+	row := q.db.QueryRow(ctx, restartSweepCursorPass,
+		arg.FirstCursor,
+		arg.SeenKeys,
+		arg.UpdatedAt,
+		arg.InstallationID,
+		arg.SweepKind,
+		arg.ScopeKey,
+		arg.ExpectedCursor,
+	)
+	var i SweepCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.SweepKind,
+		&i.ScopeKey,
+		&i.Cursor,
+		&i.SeenKeys,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+		&i.PassNewCount,
+	)
+	return i, err
+}
+
+const startGapHealCursor = `-- name: StartGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = '',
+    cutoff = $1,
+    started_at = $2,
+    updated_at = $2,
+    completed_at = NULL
+WHERE installation_id = $3
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+`
+
+type StartGapHealCursorParams struct {
+	Cutoff         pgtype.Timestamptz
+	StartedAt      pgtype.Timestamptz
+	InstallationID int64
+}
+
+func (q *Queries) StartGapHealCursor(ctx context.Context, arg StartGapHealCursorParams) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, startGapHealCursor, arg.Cutoff, arg.StartedAt, arg.InstallationID)
+	var i GapHealCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Cursor,
+		&i.Cutoff,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
 const startSweepCursor = `-- name: StartSweepCursor :one
 UPDATE sweep_cursors
 SET cursor = $1,
     seen_keys = '[]'::jsonb,
+    pass_new_count = 0,
     started_at = $2,
     updated_at = $2,
     completed_at = NULL
 WHERE installation_id = $3
   AND sweep_kind = $4
   AND scope_key = $5
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at
+RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
 `
 
 type StartSweepCursorParams struct {
@@ -679,90 +918,15 @@ func (q *Queries) StartSweepCursor(ctx context.Context, arg StartSweepCursorPara
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.PassNewCount,
 	)
 	return i, err
-}
-
-const touchListedPullRequestsCheckedAt = `-- name: TouchListedPullRequestsCheckedAt :execrows
-UPDATE pull_requests
-SET last_checked_at = GREATEST(
-    last_checked_at,
-    $1
-)
-FROM repos
-WHERE repos.id = pull_requests.repo_id
-  AND repos.installation_id = $2
-  AND repos.full_name = $3
-  AND repos.tombstoned_at IS NULL
-  AND pull_requests.tombstoned_at IS NULL
-  AND pull_requests.state = 'open'
-  AND pull_requests.number = ANY($4::int[])
-`
-
-type TouchListedPullRequestsCheckedAtParams struct {
-	CheckedAt      pgtype.Timestamptz
-	InstallationID int64
-	RepoFullName   string
-	PrNumbers      []int32
-}
-
-// C-R1/C-B4: the unchanged authoritative open-PR page is a successful
-// validation for every live PR summary it contains.
-func (q *Queries) TouchListedPullRequestsCheckedAt(ctx context.Context, arg TouchListedPullRequestsCheckedAtParams) (int64, error) {
-	result, err := q.db.Exec(ctx, touchListedPullRequestsCheckedAt,
-		arg.CheckedAt,
-		arg.InstallationID,
-		arg.RepoFullName,
-		arg.PrNumbers,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const touchListedStacksCheckedAt = `-- name: TouchListedStacksCheckedAt :execrows
-UPDATE stacks
-SET last_checked_at = GREATEST(
-    last_checked_at,
-    $1
-)
-FROM repos
-WHERE repos.id = stacks.repo_id
-  AND repos.installation_id = $2
-  AND repos.full_name = $3
-  AND repos.tombstoned_at IS NULL
-  AND stacks.tombstoned_at IS NULL
-  AND stacks.open
-  AND stacks.number = ANY($4::int[])
-`
-
-type TouchListedStacksCheckedAtParams struct {
-	CheckedAt      pgtype.Timestamptz
-	InstallationID int64
-	RepoFullName   string
-	StackNumbers   []int32
-}
-
-// A 304 on the authoritative stack-list page validates the open stack
-// summaries on that page without downloading one response per stack.
-func (q *Queries) TouchListedStacksCheckedAt(ctx context.Context, arg TouchListedStacksCheckedAtParams) (int64, error) {
-	result, err := q.db.Exec(ctx, touchListedStacksCheckedAt,
-		arg.CheckedAt,
-		arg.InstallationID,
-		arg.RepoFullName,
-		arg.StackNumbers,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
 }
 
 const upsertSweepPage = `-- name: UpsertSweepPage :exec
 INSERT INTO sweep_pages (
     installation_id, sweep_kind, scope_key, cursor, etag, next_cursor,
-    entity_keys, last_checked_at
+    entity_keys, list_seen_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
@@ -772,7 +936,7 @@ ON CONFLICT (installation_id, sweep_kind, scope_key, cursor) DO UPDATE
 SET etag = EXCLUDED.etag,
     next_cursor = EXCLUDED.next_cursor,
     entity_keys = EXCLUDED.entity_keys,
-    last_checked_at = EXCLUDED.last_checked_at
+    list_seen_at = EXCLUDED.list_seen_at
 `
 
 type UpsertSweepPageParams struct {
@@ -783,7 +947,7 @@ type UpsertSweepPageParams struct {
 	Etag           string
 	NextCursor     string
 	EntityKeys     []byte
-	LastCheckedAt  pgtype.Timestamptz
+	ListSeenAt     pgtype.Timestamptz
 }
 
 func (q *Queries) UpsertSweepPage(ctx context.Context, arg UpsertSweepPageParams) error {
@@ -795,7 +959,7 @@ func (q *Queries) UpsertSweepPage(ctx context.Context, arg UpsertSweepPageParams
 		arg.Etag,
 		arg.NextCursor,
 		arg.EntityKeys,
-		arg.LastCheckedAt,
+		arg.ListSeenAt,
 	)
 	return err
 }

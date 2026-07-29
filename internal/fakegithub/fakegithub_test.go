@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -506,10 +507,14 @@ func TestEmitWebhookFailsOnNon2xx(t *testing.T) {
 }
 
 func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
-	var received int
+	var received atomic.Int32
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
 	target := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			received++
+			received.Add(1)
+			started <- struct{}{}
+			<-release
 			w.WriteHeader(http.StatusNoContent)
 		},
 	))
@@ -534,8 +539,9 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		nil,
 	)
 	defer first.Body.Close()
+	link := first.Header.Get("Link")
 	if first.StatusCode != http.StatusOK ||
-		!strings.Contains(first.Header.Get("Link"), "cursor=2") {
+		!strings.Contains(link, "cursor=") {
 		t.Fatalf(
 			"first page status/link = %d/%q",
 			first.StatusCode,
@@ -549,10 +555,23 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 	if len(deliveries) != 2 || deliveries[0].ID <= deliveries[1].ID {
 		t.Fatalf("first page deliveries = %+v", deliveries)
 	}
+	// A concurrent new delivery sorts ahead of page one. The opaque boundary
+	// cursor must still resume after the last ID actually returned.
+	if _, err := fake.DropWebhook(
+		target.URL,
+		"push",
+		map[string]any{"action": "concurrent"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	nextURL := strings.TrimSuffix(
+		strings.TrimPrefix(strings.Split(link, ";")[0], "<"),
+		">",
+	)
 	second := serve(
 		fake,
 		http.MethodGet,
-		"http://fake.test/app/hook/deliveries?per_page=2&cursor=2",
+		nextURL,
 		nil,
 	)
 	defer second.Body.Close()
@@ -576,16 +595,28 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 	if redelivery.StatusCode != http.StatusAccepted {
 		t.Fatalf("redelivery status = %d", redelivery.StatusCode)
 	}
-	if received != 1 ||
-		len(fake.RedeliveryRequests()) != 1 ||
-		!fake.Deliveries()[0].Redelivery {
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("asynchronous redelivery did not start")
+	}
+	if received.Load() != 1 || len(fake.RedeliveryRequests()) != 1 {
 		t.Fatalf(
 			"received=%d requests=%v deliveries=%+v",
-			received,
+			received.Load(),
 			fake.RedeliveryRequests(),
 			fake.Deliveries(),
 		)
 	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if fake.Deliveries()[0].Redelivery {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("redelivery was not recorded after asynchronous arrival")
 }
 
 // clientPullRequest is deliberately independent of the fake's response type.

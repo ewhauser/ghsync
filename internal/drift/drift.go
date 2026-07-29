@@ -3,6 +3,7 @@ package drift
 
 import (
 	"context"
+	"crypto/md5" //nolint:gosec // non-security content identity
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,22 +24,35 @@ import (
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/queue"
+	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
 const jobKindDetect = "drift_detect"
 
+var driftEntityKinds = []string{
+	"repository",
+	"pull_request",
+	"stack",
+	"repo_rules",
+	"review_threads",
+	"checks",
+}
+
 type Config struct {
-	InstallationID int64
-	Period         time.Duration
-	SampleSize     int
-	PageSize       int
-	Now            func() time.Time
-	Observer       Observer
+	InstallationID     int64
+	Period             time.Duration
+	SampleSize         int
+	PageSize           int
+	ResolvedRetention  time.Duration
+	RetentionBatchSize int
+	Now                func() time.Time
+	Observer           Observer
 }
 
 type Observer interface {
 	Divergence(context.Context, dbgen.DriftFinding)
+	PersistentDivergence(context.Context, dbgen.DriftFinding)
 }
 
 type LogObserver struct{}
@@ -56,34 +70,59 @@ func (LogObserver) Divergence(
 	)
 }
 
+func (LogObserver) PersistentDivergence(
+	_ context.Context,
+	finding dbgen.DriftFinding,
+) {
+	slog.Error(
+		"C-O3 semantic cache drift persisted after self-heal",
+		"finding_id", finding.ID,
+		"entity_kind", finding.EntityKind,
+		"entity_key", finding.EntityKey,
+		"occurrences", finding.OccurrenceCount,
+		"diff", string(finding.Diff),
+	)
+}
+
 type noopObserver struct{}
 
 func (noopObserver) Divergence(context.Context, dbgen.DriftFinding) {}
+func (noopObserver) PersistentDivergence(
+	context.Context,
+	dbgen.DriftFinding,
+) {
+}
 
 type Options struct {
-	Pool   *pgxpool.Pool
-	REST   *gh.RESTClient
-	Config Config
+	Pool    *pgxpool.Pool
+	REST    *gh.RESTClient
+	GraphQL *gh.GraphQLClient
+	Config  Config
 }
 
 type Service struct {
-	pool   *pgxpool.Pool
-	rest   *gh.RESTClient
-	config Config
+	pool    *pgxpool.Pool
+	rest    *gh.RESTClient
+	graphQL *gh.GraphQLClient
+	config  Config
 
 	riverMu sync.RWMutex
 	river   *river.Client[pgx.Tx]
 }
 
 func New(options Options) (*Service, error) {
-	if options.Pool == nil || options.REST == nil {
-		return nil, fmt.Errorf("drift detector requires Postgres and REST")
+	if options.Pool == nil || options.REST == nil || options.GraphQL == nil {
+		return nil, fmt.Errorf(
+			"drift detector requires Postgres, REST, and GraphQL",
+		)
 	}
 	if options.Config.InstallationID <= 0 ||
 		options.Config.Period <= 0 ||
-		options.Config.SampleSize <= 0 ||
+		options.Config.SampleSize < len(driftEntityKinds) ||
 		options.Config.PageSize <= 0 ||
-		options.Config.PageSize > 100 {
+		options.Config.PageSize > 100 ||
+		options.Config.ResolvedRetention <= 0 ||
+		options.Config.RetentionBatchSize <= 0 {
 		return nil, fmt.Errorf("invalid drift detector configuration")
 	}
 	if options.Config.Now == nil {
@@ -93,9 +132,10 @@ func New(options Options) (*Service, error) {
 		options.Config.Observer = noopObserver{}
 	}
 	return &Service{
-		pool:   options.Pool,
-		rest:   options.REST,
-		config: options.Config,
+		pool:    options.Pool,
+		rest:    options.REST,
+		graphQL: options.GraphQL,
+		config:  options.Config,
 	}, nil
 }
 
@@ -145,7 +185,7 @@ func (s *Service) PeriodicJobs() []*river.PeriodicJob {
 						SampleSize:     s.config.SampleSize,
 					},
 					&river.InsertOpts{
-						Queue:    queue.QueueSweep,
+						Queue:    queue.QueueDrift,
 						Priority: 1,
 					}
 			},
@@ -157,6 +197,10 @@ func (s *Service) PeriodicJobs() []*river.PeriodicJob {
 	}
 }
 
+func PeriodicJobs(config Config) []*river.PeriodicJob {
+	return (&Service{config: config}).PeriodicJobs()
+}
+
 func (s *Service) Detect(
 	ctx context.Context,
 	args DetectArgs,
@@ -164,79 +208,308 @@ func (s *Service) Detect(
 	if args.InstallationID != s.config.InstallationID {
 		return nil, nil
 	}
-	if args.SampleSize <= 0 {
-		return nil, fmt.Errorf("drift sample size must be positive")
-	}
-	rows, err := dbgen.New(s.pool).SampleCachedEntities(
-		ctx,
-		dbgen.SampleCachedEntitiesParams{
-			InstallationID: args.InstallationID,
-			SampleSize:     int32(args.SampleSize),
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("sample cached entities: %w", err)
-	}
-	findings := make([]dbgen.DriftFinding, 0)
-	for _, row := range rows {
-		upstream, spec, err := s.fullFetch(
-			ctx,
-			row.EntityKind,
-			row.EntityKey,
+	if args.SampleSize < len(driftEntityKinds) {
+		return nil, fmt.Errorf(
+			"drift sample size must cover all %d entity classes",
+			len(driftEntityKinds),
 		)
-		if err != nil {
-			return nil, err
+	}
+	queries := dbgen.New(s.pool)
+	findings := make([]dbgen.DriftFinding, 0)
+	baseQuota := args.SampleSize / len(driftEntityKinds)
+	extra := args.SampleSize % len(driftEntityKinds)
+	for index, kind := range driftEntityKinds {
+		quota := baseQuota
+		if index < extra {
+			quota++
 		}
-		equal, diff, err := semanticDiff(row.CacheSnapshot, upstream)
-		if err != nil {
+		var afterID int64
+		afterID, err := queries.GetDriftSampleCursor(
+			ctx,
+			dbgen.GetDriftSampleCursorParams{
+				InstallationID: args.InstallationID,
+				EntityKind:     kind,
+			},
+		)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf(
-				"compare drift entity %s: %w",
-				row.EntityKey,
+				"read %s drift cursor: %w",
+				kind,
 				err,
 			)
 		}
-		if equal {
-			continue
-		}
-		finding, err := s.recordAndHeal(
+		rows, err := queries.SampleCachedEntitiesByKind(
 			ctx,
-			row,
-			upstream,
-			diff,
-			spec,
+			dbgen.SampleCachedEntitiesByKindParams{
+				InstallationID: args.InstallationID,
+				EntityKind:     kind,
+				AfterSourceID:  afterID,
+				SampleSize:     int32(quota),
+			},
 		)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf(
+				"sample cached %s entities: %w",
+				kind,
+				err,
+			)
 		}
-		findings = append(findings, finding)
-		s.config.Observer.Divergence(ctx, finding)
+		for _, row := range rows {
+			finding, recorded, err := s.inspectSample(
+				ctx,
+				driftSample{
+					EntityKind:    row.EntityKind,
+					SourceID:      row.SourceID,
+					EntityKey:     row.EntityKey,
+					LockKey:       row.LockKey,
+					CacheSnapshot: row.CacheSnapshot,
+				},
+			)
+			if err != nil {
+				return nil, err
+			}
+			if recorded {
+				findings = append(findings, finding)
+			}
+		}
+		if len(rows) > 0 {
+			if err := queries.UpsertDriftSampleCursor(
+				ctx,
+				dbgen.UpsertDriftSampleCursorParams{
+					InstallationID: args.InstallationID,
+					EntityKind:     kind,
+					SourceID:       rows[len(rows)-1].SourceID,
+				},
+			); err != nil {
+				return nil, fmt.Errorf(
+					"advance %s drift cursor: %w",
+					kind,
+					err,
+				)
+			}
+		}
+	}
+	if _, err := queries.PruneResolvedDriftFindingBatch(
+		ctx,
+		dbgen.PruneResolvedDriftFindingBatchParams{
+			Cutoff: timestamptz(
+				s.config.Now().Add(-s.config.ResolvedRetention),
+			),
+			BatchSize: int32(s.config.RetentionBatchSize),
+		},
+	); err != nil {
+		return nil, fmt.Errorf("prune resolved drift findings: %w", err)
 	}
 	return findings, nil
 }
 
+type driftSample struct {
+	EntityKind    string
+	SourceID      int64
+	EntityKey     string
+	LockKey       string
+	CacheSnapshot []byte
+}
+
+func (s *Service) inspectSample(
+	ctx context.Context,
+	sample driftSample,
+) (dbgen.DriftFinding, bool, error) {
+	observation, err := store.NewEntityWriter(s.pool).BeginObservation(
+		ctx,
+		sample.LockKey,
+	)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, fmt.Errorf(
+			"lock drift sample %s: %w",
+			sample.EntityKey,
+			err,
+		)
+	}
+	defer observation.Close() //nolint:errcheck
+	current, err := dbgen.New(s.pool).GetCachedEntitySnapshot(
+		ctx,
+		dbgen.GetCachedEntitySnapshotParams{
+			InstallationID: s.config.InstallationID,
+			EntityKind:     sample.EntityKind,
+			EntityKey:      sample.EntityKey,
+		},
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return dbgen.DriftFinding{}, false, nil
+	}
+	if err != nil {
+		return dbgen.DriftFinding{}, false, fmt.Errorf(
+			"reread locked drift sample %s: %w",
+			sample.EntityKey,
+			err,
+		)
+	}
+	upstream, spec, err := s.fullFetch(
+		ctx,
+		current.EntityKind,
+		current.EntityKey,
+	)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, err
+	}
+	equal, diff, err := semanticDiff(
+		current.CacheSnapshot,
+		upstream,
+	)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, fmt.Errorf(
+			"compare drift entity %s: %w",
+			current.EntityKey,
+			err,
+		)
+	}
+	if equal {
+		if _, err := dbgen.New(s.pool).ResolveOpenDriftFindings(
+			ctx,
+			dbgen.ResolveOpenDriftFindingsParams{
+				ResolvedAt:     timestamptz(s.config.Now()),
+				InstallationID: s.config.InstallationID,
+				EntityKind:     current.EntityKind,
+				EntityKey:      current.EntityKey,
+			},
+		); err != nil {
+			return dbgen.DriftFinding{}, false, fmt.Errorf(
+				"resolve drift findings: %w",
+				err,
+			)
+		}
+		return dbgen.DriftFinding{}, false, nil
+	}
+	finding, first, escalated, err := s.recordAndHeal(
+		ctx,
+		driftSample{
+			EntityKind:    current.EntityKind,
+			SourceID:      current.SourceID,
+			EntityKey:     current.EntityKey,
+			LockKey:       current.LockKey,
+			CacheSnapshot: current.CacheSnapshot,
+		},
+		upstream,
+		diff,
+		spec,
+	)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, err
+	}
+	if first {
+		s.config.Observer.Divergence(ctx, finding)
+	}
+	if escalated {
+		s.config.Observer.PersistentDivergence(ctx, finding)
+	}
+	return finding, true, nil
+}
+
 func (s *Service) recordAndHeal(
 	ctx context.Context,
-	sample dbgen.SampleCachedEntitiesRow,
+	sample driftSample,
 	upstream []byte,
 	diff []byte,
 	spec queue.RefreshSpec,
-) (dbgen.DriftFinding, error) {
+) (dbgen.DriftFinding, bool, bool, error) {
 	client := s.riverClient()
 	if client == nil {
-		return dbgen.DriftFinding{}, fmt.Errorf(
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"drift River client is not configured",
 		)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return dbgen.DriftFinding{}, fmt.Errorf(
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"begin drift finding: %w",
 			err,
 		)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	now := s.config.Now().UTC()
-	finding, err := dbgen.New(tx).InsertDriftFinding(
+	// Match the upgrade backfill in migration 0011. This is a content
+	// identity for deduplication, not a security boundary.
+	hash := fmt.Sprintf("%x", md5.Sum(diff)) //nolint:gosec
+	queries := dbgen.New(tx)
+	finding, err := queries.GetOpenDriftFindingByHash(
+		ctx,
+		dbgen.GetOpenDriftFindingByHashParams{
+			InstallationID: s.config.InstallationID,
+			EntityKind:     sample.EntityKind,
+			EntityKey:      sample.EntityKey,
+			DiffHash:       hash,
+		},
+	)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
+			"read open drift finding: %w",
+			err,
+		)
+	}
+	if err == nil {
+		state, stateErr := queries.GetRefreshIntentState(
+			ctx,
+			dbgen.GetRefreshIntentStateParams{
+				Kind:       spec.Kind,
+				RefreshKey: spec.Key,
+			},
+		)
+		if stateErr != nil && !errors.Is(stateErr, pgx.ErrNoRows) {
+			return dbgen.DriftFinding{}, false, false, fmt.Errorf(
+				"read drift heal generation: %w",
+				stateErr,
+			)
+		}
+		escalated := finding.HealGeneration > 0 &&
+			state.CompletedGeneration >= finding.HealGeneration &&
+			!finding.EscalatedAt.Valid
+		if escalated {
+			result, updateErr := queries.EscalateOpenDriftFinding(
+				ctx,
+				dbgen.EscalateOpenDriftFindingParams{
+					LastSeenAt:       timestamptz(now),
+					CacheSnapshot:    sample.CacheSnapshot,
+					UpstreamSnapshot: upstream,
+					Diff:             diff,
+					EscalatedAt:      timestamptz(now),
+					ID:               finding.ID,
+				},
+			)
+			if updateErr != nil {
+				return dbgen.DriftFinding{}, false, false, fmt.Errorf(
+					"escalate drift finding: %w",
+					updateErr,
+				)
+			}
+			finding = result
+		} else {
+			finding, err = queries.TouchOpenDriftFinding(
+				ctx,
+				dbgen.TouchOpenDriftFindingParams{
+					LastSeenAt:       timestamptz(now),
+					CacheSnapshot:    sample.CacheSnapshot,
+					UpstreamSnapshot: upstream,
+					Diff:             diff,
+					ID:               finding.ID,
+				},
+			)
+			if err != nil {
+				return dbgen.DriftFinding{}, false, false, fmt.Errorf(
+					"touch drift finding: %w",
+					err,
+				)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return dbgen.DriftFinding{}, false, false, fmt.Errorf(
+				"commit persistent drift finding: %w",
+				err,
+			)
+		}
+		return finding, false, escalated, nil
+	}
+	finding, err = queries.InsertDriftFinding(
 		ctx,
 		dbgen.InsertDriftFindingParams{
 			InstallationID:    s.config.InstallationID,
@@ -246,31 +519,52 @@ func (s *Service) recordAndHeal(
 			CacheSnapshot:     sample.CacheSnapshot,
 			UpstreamSnapshot:  upstream,
 			Diff:              diff,
+			DiffHash:          hash,
 			RefreshEnqueuedAt: timestamptz(now),
 		},
 	)
 	if err != nil {
-		return dbgen.DriftFinding{}, fmt.Errorf(
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"insert drift finding: %w",
 			err,
 		)
 	}
-	if err := queue.InsertRefreshesTx(
+	generations, err := queue.InsertRefreshesTxReturning(
 		ctx,
 		tx,
 		client,
 		[]queue.RefreshSpec{spec},
 		queue.QueueSweep,
-	); err != nil {
-		return dbgen.DriftFinding{}, err
+	)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, false, err
+	}
+	if len(generations) != 1 {
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
+			"drift heal inserted %d generations",
+			len(generations),
+		)
+	}
+	finding, err = queries.SetDriftFindingHealGeneration(
+		ctx,
+		dbgen.SetDriftFindingHealGenerationParams{
+			HealGeneration: generations[0].Generation,
+			ID:             finding.ID,
+		},
+	)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
+			"record drift heal generation: %w",
+			err,
+		)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return dbgen.DriftFinding{}, fmt.Errorf(
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"commit drift finding: %w",
 			err,
 		)
 	}
-	return finding, nil
+	return finding, true, false, nil
 }
 
 func (s *Service) fullFetch(
@@ -451,10 +745,7 @@ func (s *Service) fullFetch(
 				err,
 			)
 		}
-		sort.Slice(rules, func(i, j int) bool {
-			return rules[i].ID < rules[j].ID
-		})
-		semanticRules := make([]any, 0, len(rules))
+		semanticRules := make(map[string]any, len(rules))
 		for _, rule := range rules {
 			var semantic any
 			if err := json.Unmarshal(rule.Raw, &semantic); err != nil {
@@ -463,10 +754,59 @@ func (s *Service) fullFetch(
 					err,
 				)
 			}
-			semanticRules = append(semanticRules, semantic)
+			semanticRules[strconv.FormatInt(rule.ID, 10)] = semantic
 		}
 		return encodeSnapshot(map[string]any{
-			"rules": semanticRules,
+			"rules_by_id": semanticRules,
+		}), spec, nil
+	case "review_threads":
+		repo, number, err := numberedKey(key, "review_threads:")
+		if err != nil {
+			return nil, queue.RefreshSpec{}, err
+		}
+		owner, name, err := splitRepo(repo)
+		if err != nil {
+			return nil, queue.RefreshSpec{}, err
+		}
+		pull, _, err := s.rest.GetPull(
+			ctx,
+			budget.Sweep,
+			owner,
+			name,
+			number,
+			"",
+		)
+		spec := queue.RefreshSpec{
+			Kind: queue.KindRefreshPR,
+			Key:  fmt.Sprintf("pr:%s:%d", repo, number),
+		}
+		if isNotFound(err) {
+			return tombstoneSnapshot(), spec, nil
+		}
+		if err != nil {
+			return nil, spec, fmt.Errorf(
+				"drift fetch review-thread PR %s: %w",
+				key,
+				err,
+			)
+		}
+		nodes, _, err := s.graphQL.BatchPullRequests(
+			ctx,
+			budget.Sweep,
+			[]string{pull.GetNodeID()},
+		)
+		if err != nil {
+			return nil, spec, fmt.Errorf(
+				"drift fetch review threads %s: %w",
+				key,
+				err,
+			)
+		}
+		if len(nodes) != 1 || nodes[0] == nil {
+			return tombstoneSnapshot(), spec, nil
+		}
+		return encodeSnapshot(map[string]any{
+			"threads": semanticReviewThreads(nodes[0]),
 		}), spec, nil
 	case "checks":
 		repo, headSHA, err := stringKey(key, "checks:")
@@ -540,6 +880,48 @@ func (s *Service) fullFetch(
 	}
 }
 
+func semanticReviewThreads(node *gh.PullRequestNode) []map[string]any {
+	threads := append(
+		[]gh.ReviewThreadNode(nil),
+		node.ReviewThreads.Nodes...,
+	)
+	sort.Slice(threads, func(i, j int) bool {
+		return threads[i].ID < threads[j].ID
+	})
+	result := make([]map[string]any, 0, len(threads))
+	for _, thread := range threads {
+		comments := append(
+			[]gh.ReviewCommentNode(nil),
+			thread.Comments.Nodes...,
+		)
+		sort.Slice(comments, func(i, j int) bool {
+			return comments[i].ID < comments[j].ID
+		})
+		semanticComments := make([]map[string]any, 0, len(comments))
+		for _, comment := range comments {
+			author := ""
+			if comment.Author != nil {
+				author = comment.Author.Login
+			}
+			semanticComments = append(semanticComments, map[string]any{
+				"id":           comment.ID,
+				"body":         comment.Body,
+				"updated_at":   comment.UpdatedAt,
+				"author_login": author,
+			})
+		}
+		result = append(result, map[string]any{
+			"id":          thread.ID,
+			"is_resolved": thread.IsResolved,
+			"is_outdated": thread.IsOutdated,
+			"path":        thread.Path,
+			"line":        thread.Line,
+			"comments":    semanticComments,
+		})
+	}
+	return result
+}
+
 func semanticDiff(cache, upstream []byte) (bool, []byte, error) {
 	var cachedValue, upstreamValue any
 	if err := json.Unmarshal(cache, &cachedValue); err != nil {
@@ -548,6 +930,8 @@ func semanticDiff(cache, upstream []byte) (bool, []byte, error) {
 	if err := json.Unmarshal(upstream, &upstreamValue); err != nil {
 		return false, nil, fmt.Errorf("decode upstream snapshot: %w", err)
 	}
+	cachedValue = normalizeSemantic(cachedValue)
+	upstreamValue = normalizeSemantic(upstreamValue)
 	if reflect.DeepEqual(cachedValue, upstreamValue) {
 		return true, []byte(`{}`), nil
 	}
@@ -557,6 +941,43 @@ func semanticDiff(cache, upstream []byte) (bool, []byte, error) {
 		return false, nil, fmt.Errorf("encode semantic diff: %w", err)
 	}
 	return false, encoded, nil
+}
+
+func normalizeSemantic(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		normalized := make(map[string]any, len(typed))
+		for key, child := range typed {
+			normalized[key] = normalizeSemantic(child)
+		}
+		return normalized
+	case []any:
+		normalized := make([]any, len(typed))
+		allHaveID := len(typed) > 0
+		for index, child := range typed {
+			normalized[index] = normalizeSemantic(child)
+			item, ok := normalized[index].(map[string]any)
+			if !ok {
+				allHaveID = false
+				continue
+			}
+			if _, ok := item["id"].(string); !ok {
+				if _, numeric := item["id"].(float64); !numeric {
+					allHaveID = false
+				}
+			}
+		}
+		if allHaveID {
+			sort.SliceStable(normalized, func(i, j int) bool {
+				left := fmt.Sprint(normalized[i].(map[string]any)["id"])
+				right := fmt.Sprint(normalized[j].(map[string]any)["id"])
+				return left < right
+			})
+		}
+		return normalized
+	default:
+		return value
+	}
 }
 
 func diffValue(cached, upstream any) any {

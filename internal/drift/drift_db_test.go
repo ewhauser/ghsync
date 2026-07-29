@@ -23,8 +23,18 @@ import (
 )
 
 type findingObserver struct {
-	mu       sync.Mutex
-	findings []dbgen.DriftFinding
+	mu         sync.Mutex
+	findings   []dbgen.DriftFinding
+	persistent []dbgen.DriftFinding
+}
+
+func (o *findingObserver) PersistentDivergence(
+	_ context.Context,
+	finding dbgen.DriftFinding,
+) {
+	o.mu.Lock()
+	o.persistent = append(o.persistent, finding)
+	o.mu.Unlock()
 }
 
 func (o *findingObserver) Divergence(
@@ -73,14 +83,17 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	}
 	observer := &findingObserver{}
 	service, err := New(Options{
-		Pool: pool,
-		REST: rest,
+		Pool:    pool,
+		REST:    rest,
+		GraphQL: graphQL,
 		Config: Config{
-			InstallationID: 1,
-			Period:         time.Hour,
-			SampleSize:     100,
-			PageSize:       100,
-			Observer:       observer,
+			InstallationID:     1,
+			Period:             time.Hour,
+			SampleSize:         100,
+			PageSize:           100,
+			ResolvedRetention:  30 * 24 * time.Hour,
+			RetentionBatchSize: 100,
+			Observer:           observer,
 		},
 	})
 	if err != nil {
@@ -108,6 +121,39 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err := handler.RefreshPR(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshPRArgs(
+				"pr:acme/monolith:4812",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.RefreshStack(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshStackArgs(
+				"stack:acme/monolith:142",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.RefreshChecks(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshChecksArgs(
+				"checks:acme/monolith:8f31c2d",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
 	if err := handler.RefreshRepoRules(
 		ctx,
 		queue.RefreshRequest{
@@ -118,6 +164,40 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 		},
 	); err != nil {
 		t.Fatal(err)
+	}
+
+	// Model a sample selected before a concurrent legitimate cache refresh.
+	// inspectSample must discard this stale snapshot and reread while holding
+	// the same entity observation lock used by refresh writers.
+	current, err := dbgen.New(pool).GetCachedEntitySnapshot(
+		ctx,
+		dbgen.GetCachedEntitySnapshotParams{
+			InstallationID: 1,
+			EntityKind:     "pull_request",
+			EntityKey:      "pr:acme/monolith:4812",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleSampleFinding, recorded, err := service.inspectSample(
+		ctx,
+		driftSample{
+			EntityKind:    current.EntityKind,
+			SourceID:      current.SourceID,
+			EntityKey:     current.EntityKey,
+			LockKey:       current.LockKey,
+			CacheSnapshot: []byte(`{"stale_sample":true}`),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded {
+		t.Fatalf(
+			"stale pre-lock cache sample produced a false drift finding: %s",
+			staleSampleFinding.Diff,
+		)
 	}
 
 	// Change authoritative truth behind the cache with webhooks disabled.
@@ -146,6 +226,19 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	if observed != 1 {
 		t.Fatalf("divergence signals = %d, want 1", observed)
 	}
+	var sampledKinds int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM drift_sample_cursors
+	`).Scan(&sampledKinds); err != nil {
+		t.Fatal(err)
+	}
+	if sampledKinds != len(driftEntityKinds) {
+		t.Fatalf(
+			"stratified drift cursors = %d, want %d",
+			sampledKinds,
+			len(driftEntityKinds),
+		)
+	}
 	var generation int64
 	if err := pool.QueryRow(ctx, `
 		SELECT generation
@@ -173,6 +266,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 		_ = riverClient.StopAndCancel(stopCtx)
 	}()
 	deadline := time.Now().Add(10 * time.Second)
+	converged := false
 	for time.Now().Before(deadline) {
 		row, rowErr := dbgen.New(pool).GetPullRequestByKey(
 			ctx,
@@ -182,11 +276,156 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 			},
 		)
 		if rowErr == nil && row.Title == "mutated behind cache" {
-			return
+			converged = true
+			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("drift self-heal did not converge the cached PR")
+	if !converged {
+		t.Fatal("drift self-heal did not converge the cached PR")
+	}
+	for time.Now().Before(deadline) {
+		var completedGeneration int64
+		if err := pool.QueryRow(ctx, `
+			SELECT completed_generation
+			FROM refresh_intent_generations
+			WHERE kind = 'refresh_pr'
+			  AND refresh_key = 'pr:acme/monolith:4812'
+		`).Scan(&completedGeneration); err != nil {
+			t.Fatal(err)
+		}
+		if completedGeneration >= generation {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Reintroduce the exact same semantic mismatch after the heal generation
+	// completed. It must escalate the one open finding without scheduling a
+	// second heal loop.
+	if _, err := pool.Exec(ctx, `
+		UPDATE pull_requests
+		SET title = 'BM25F ranker integration'
+		WHERE number = 4812
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var completedGeneration int64
+	if err := pool.QueryRow(ctx, `
+		SELECT completed_generation
+		FROM refresh_intent_generations
+		WHERE kind = 'refresh_pr'
+		  AND refresh_key = 'pr:acme/monolith:4812'
+	`).Scan(&completedGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if completedGeneration < generation {
+		t.Fatalf(
+			"completed generation = %d, want at least %d",
+			completedGeneration,
+			generation,
+		)
+	}
+	if _, err := service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var findingCount int
+	var occurrenceCount, generationAfter int64
+	var escalated bool
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), max(occurrence_count),
+		       bool_or(escalated_at IS NOT NULL)
+		FROM drift_findings
+		WHERE entity_key = 'pr:acme/monolith:4812'
+	`).Scan(&findingCount, &occurrenceCount, &escalated); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT generation
+		FROM refresh_intent_generations
+		WHERE kind = 'refresh_pr'
+		  AND refresh_key = 'pr:acme/monolith:4812'
+	`).Scan(&generationAfter); err != nil {
+		t.Fatal(err)
+	}
+	observer.mu.Lock()
+	persistentSignals := len(observer.persistent)
+	observer.mu.Unlock()
+	if findingCount != 1 || occurrenceCount != 2 || !escalated ||
+		generationAfter != generation || persistentSignals != 1 {
+		t.Fatalf(
+			"bounded self-heal count=%d occurrences=%d escalated=%v generation=%d->%d signals=%d",
+			findingCount,
+			occurrenceCount,
+			escalated,
+			generation,
+			generationAfter,
+			persistentSignals,
+		)
+	}
+
+	if err := handler.RefreshPR(
+		ctx,
+		queue.RefreshRequest{
+			Args: queue.NewRefreshPRArgs(
+				"pr:acme/monolith:4812",
+			).RefreshArgs,
+			Queue: queue.QueueSweep,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE drift_findings
+		SET resolved_at = now() - interval '31 days'
+		WHERE entity_key = 'pr:acme/monolith:4812'
+		  AND resolved_at IS NOT NULL
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM drift_findings
+		WHERE entity_key = 'pr:acme/monolith:4812'
+	`).Scan(&findingCount); err != nil {
+		t.Fatal(err)
+	}
+	if findingCount != 0 {
+		t.Fatalf("expired resolved drift findings = %d, want 0", findingCount)
+	}
+}
+
+func TestSemanticDiffNormalizesIDOrderedCollections(t *testing.T) {
+	cache := []byte(`{"runs":[{"id":10,"name":"ten"},{"id":2,"name":"two"}]}`)
+	upstream := []byte(`{"runs":[{"name":"two","id":2},{"name":"ten","id":10}]}`)
+	equal, diff, err := semanticDiff(cache, upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal || string(diff) != "{}" {
+		t.Fatalf("normalization-stable compare equal=%v diff=%s", equal, diff)
+	}
 }
 
 func driftTestDatabase(t *testing.T) *pgxpool.Pool {

@@ -1,6 +1,8 @@
 package dispatch
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -145,6 +147,51 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("intents = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRulesFileFailsClosedOnSchemaAndSemanticErrors(t *testing.T) {
+	tests := map[string]string{
+		"unknown key": `rules:
+  - event: pull_request
+    action: "*"
+    target: pull_request
+    stacked_targte: stack
+`,
+		"trailing document": `rules:
+  - event: push
+    action: "*"
+    target: branch
+---
+rules: []
+`,
+		"untrimmed action": `rules:
+  - event: pull_request
+    action: " opened "
+    target: pull_request
+`,
+		"invalid target combination": `rules:
+  - event: push
+    action: "*"
+    target: checks
+`,
+		"invalid stacked target combination": `rules:
+  - event: check_run
+    action: "*"
+    target: checks
+    stacked_target: stack
+`,
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rules.yaml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadRulesFile(path); err == nil {
+				t.Fatalf("invalid rules file accepted:\n%s", body)
 			}
 		})
 	}

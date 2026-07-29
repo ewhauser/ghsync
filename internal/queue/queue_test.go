@@ -90,6 +90,94 @@ func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 	stopped = true
 }
 
+func TestExplicitQueueSelectionDoesNotPollUnownedQueues(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := store.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+	if err := store.Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	client, err := NewClient(
+		pool,
+		WithQueues(QueueDrift),
+		WithoutRefreshWorkers(),
+	)
+	if err != nil {
+		t.Fatalf("new isolated client: %v", err)
+	}
+	owned, err := client.Insert(
+		ctx,
+		NoopArgs{},
+		&river.InsertOpts{Queue: QueueDrift},
+	)
+	if err != nil {
+		t.Fatalf("insert owned queue job: %v", err)
+	}
+	unowned, err := client.Insert(
+		ctx,
+		NoopArgs{},
+		&river.InsertOpts{Queue: QueueSweep},
+	)
+	if err != nil {
+		t.Fatalf("insert unowned queue job: %v", err)
+	}
+	events, unsubscribe := client.Subscribe(
+		river.EventKindJobCompleted,
+		river.EventKindJobFailed,
+	)
+	defer unsubscribe()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("start isolated client: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = client.StopAndCancel(stopCtx)
+	}()
+
+	for {
+		select {
+		case event := <-events:
+			if event.Job.ID != owned.Job.ID {
+				continue
+			}
+			if event.Kind == river.EventKindJobFailed {
+				t.Fatalf("owned queue job %d failed", event.Job.ID)
+			}
+			var state string
+			if err := pool.QueryRow(ctx, `
+				SELECT state
+				FROM river_job
+				WHERE id = $1
+			`, unowned.Job.ID).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			if state != "available" {
+				t.Fatalf(
+					"unowned queue job state = %q, want available",
+					state,
+				)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatalf("waiting for owned queue job: %v", ctx.Err())
+		}
+	}
+}
+
 func TestDirtyGenerationReinsertsFollowUpAfterCompletion(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {

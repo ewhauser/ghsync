@@ -3,8 +3,11 @@
 package dispatch
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -98,8 +101,22 @@ func LoadRulesFile(path string) ([]Rule, error) {
 	var document struct {
 		Rules []Rule `json:"rules" yaml:"rules"`
 	}
-	if err := yaml.Unmarshal(body, &document); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(body))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&document); err != nil {
 		return nil, fmt.Errorf("decode dispatcher rules file: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf(
+				"decode dispatcher rules file: trailing YAML document",
+			)
+		}
+		return nil, fmt.Errorf(
+			"decode dispatcher rules file trailing data: %w",
+			err,
+		)
 	}
 	if len(document.Rules) == 0 {
 		return nil, fmt.Errorf("dispatcher rules file has no rules")
@@ -116,8 +133,8 @@ func validateRule(rule Rule) error {
 	if rule.Event == "" || strings.TrimSpace(rule.Event) != rule.Event {
 		return fmt.Errorf("event must be non-empty and trimmed")
 	}
-	if rule.Action == "" {
-		return fmt.Errorf("action must be non-empty")
+	if rule.Action == "" || strings.TrimSpace(rule.Action) != rule.Action {
+		return fmt.Errorf("action must be non-empty and trimmed")
 	}
 	if !validTarget(rule.Target) {
 		return fmt.Errorf("unsupported target %q", rule.Target)
@@ -127,6 +144,40 @@ func validateRule(rule Rule) error {
 			"unsupported stacked target %q",
 			rule.StackedTarget,
 		)
+	}
+	switch rule.Target {
+	case TargetPullRequest, TargetResolveStackMembership:
+		if rule.Event != "pull_request" {
+			return fmt.Errorf(
+				"target %q requires event pull_request",
+				rule.Target,
+			)
+		}
+	case TargetChecks:
+		if rule.Event != "check_run" && rule.Event != "check_suite" {
+			return fmt.Errorf(
+				"target %q requires check_run or check_suite",
+				rule.Target,
+			)
+		}
+	case TargetBranch:
+		if rule.Event != "push" {
+			return fmt.Errorf("target %q requires event push", rule.Target)
+		}
+	case TargetStack:
+		return fmt.Errorf(
+			"target stack is only valid as stacked_target",
+		)
+	}
+	if rule.StackedTarget != "" {
+		if rule.StackedTarget != TargetStack {
+			return fmt.Errorf("stacked_target must be stack")
+		}
+		if rule.Target != TargetPullRequest && rule.Target != TargetBranch {
+			return fmt.Errorf(
+				"stacked_target requires pull_request or branch target",
+			)
+		}
 	}
 	return nil
 }

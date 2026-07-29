@@ -263,12 +263,6 @@ func (h *Handler) RefreshPR(
 	if err != nil {
 		return err
 	}
-	if request.Queue == queue.QueueSweep {
-		// C-B4: reconciliation validates possibly unchanged entities with the
-		// cached REST ETag. Event/interactive work may still use the richer
-		// ganged GraphQL path.
-		return h.refreshPRREST(ctx, key, class, source, request.Queue)
-	}
 	metadata, err := h.writer.PullRequestMetadata(
 		ctx,
 		key.Repo,

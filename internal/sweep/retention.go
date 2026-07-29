@@ -3,6 +3,7 @@ package sweep
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/acme/frontier/internal/store/dbgen"
 )
@@ -12,25 +13,49 @@ import (
 func (s *Service) Prune(ctx context.Context) (int64, int64, error) {
 	now := s.config.Now().UTC()
 	cutoff := now.Add(-s.config.RetentionAge)
+	var totalPayloads, totalHistory int64
+	for {
+		payloads, history, err := s.pruneBatch(ctx, now, cutoff)
+		if err != nil {
+			return totalPayloads, totalHistory, err
+		}
+		totalPayloads += payloads
+		totalHistory += history
+		if payloads < int64(s.config.RetentionBatchSize) &&
+			history < int64(s.config.RetentionBatchSize) {
+			return totalPayloads, totalHistory, nil
+		}
+	}
+}
+
+func (s *Service) pruneBatch(
+	ctx context.Context,
+	now time.Time,
+	cutoff time.Time,
+) (int64, int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, 0, fmt.Errorf("begin retention prune: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	queries := dbgen.New(tx)
-	payloads, err := queries.PruneWebhookDeliveryPayloads(
+	payloads, err := queries.PruneWebhookDeliveryPayloadBatch(
 		ctx,
-		dbgen.PruneWebhookDeliveryPayloadsParams{
-			PrunedAt: timestamptz(now),
-			Cutoff:   timestamptz(cutoff),
+		dbgen.PruneWebhookDeliveryPayloadBatchParams{
+			Cutoff:    timestamptz(cutoff),
+			BatchSize: int32(s.config.RetentionBatchSize),
+			PrunedAt:  timestamptz(now),
 		},
 	)
 	if err != nil {
 		return 0, 0, fmt.Errorf("prune webhook payloads: %w", err)
 	}
-	history, err := queries.DeleteCheckHistoryBefore(
+	history, err := queries.DeleteCheckHistoryBatch(
 		ctx,
-		timestamptz(cutoff),
+		dbgen.DeleteCheckHistoryBatchParams{
+			Cutoff:    timestamptz(cutoff),
+			BatchSize: int32(s.config.RetentionBatchSize),
+		},
 	)
 	if err != nil {
 		return 0, 0, fmt.Errorf("prune check history: %w", err)

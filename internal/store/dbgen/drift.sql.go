@@ -23,8 +23,96 @@ func (q *Queries) CountDriftFindings(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const escalateOpenDriftFinding = `-- name: EscalateOpenDriftFinding :one
+UPDATE drift_findings
+SET last_seen_at = $1,
+    occurrence_count = occurrence_count + 1,
+    cache_snapshot = $2,
+    upstream_snapshot = $3,
+    diff = $4,
+    escalated_at = COALESCE(escalated_at, $5)
+WHERE id = $6
+  AND resolved_at IS NULL
+RETURNING drift_findings.id, drift_findings.installation_id, drift_findings.entity_kind, drift_findings.entity_key, drift_findings.detected_at, drift_findings.cache_snapshot, drift_findings.upstream_snapshot, drift_findings.diff, drift_findings.refresh_enqueued_at, drift_findings.diff_hash, drift_findings.first_seen_at, drift_findings.last_seen_at, drift_findings.occurrence_count, drift_findings.heal_generation, drift_findings.escalated_at, drift_findings.resolved_at
+`
+
+type EscalateOpenDriftFindingParams struct {
+	LastSeenAt       pgtype.Timestamptz
+	CacheSnapshot    []byte
+	UpstreamSnapshot []byte
+	Diff             []byte
+	EscalatedAt      pgtype.Timestamptz
+	ID               int64
+}
+
+func (q *Queries) EscalateOpenDriftFinding(ctx context.Context, arg EscalateOpenDriftFindingParams) (DriftFinding, error) {
+	row := q.db.QueryRow(ctx, escalateOpenDriftFinding,
+		arg.LastSeenAt,
+		arg.CacheSnapshot,
+		arg.UpstreamSnapshot,
+		arg.Diff,
+		arg.EscalatedAt,
+		arg.ID,
+	)
+	var i DriftFinding
+	err := row.Scan(
+		&i.ID,
+		&i.InstallationID,
+		&i.EntityKind,
+		&i.EntityKey,
+		&i.DetectedAt,
+		&i.CacheSnapshot,
+		&i.UpstreamSnapshot,
+		&i.Diff,
+		&i.RefreshEnqueuedAt,
+		&i.DiffHash,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.OccurrenceCount,
+		&i.HealGeneration,
+		&i.EscalatedAt,
+		&i.ResolvedAt,
+	)
+	return i, err
+}
+
+const getCachedEntitySnapshot = `-- name: GetCachedEntitySnapshot :one
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot
+FROM drift_entities
+WHERE installation_id = $1
+  AND entity_kind = $2
+  AND entity_key = $3
+`
+
+type GetCachedEntitySnapshotParams struct {
+	InstallationID int64
+	EntityKind     string
+	EntityKey      string
+}
+
+type GetCachedEntitySnapshotRow struct {
+	EntityKind    string
+	SourceID      int64
+	EntityKey     string
+	LockKey       string
+	CacheSnapshot []byte
+}
+
+func (q *Queries) GetCachedEntitySnapshot(ctx context.Context, arg GetCachedEntitySnapshotParams) (GetCachedEntitySnapshotRow, error) {
+	row := q.db.QueryRow(ctx, getCachedEntitySnapshot, arg.InstallationID, arg.EntityKind, arg.EntityKey)
+	var i GetCachedEntitySnapshotRow
+	err := row.Scan(
+		&i.EntityKind,
+		&i.SourceID,
+		&i.EntityKey,
+		&i.LockKey,
+		&i.CacheSnapshot,
+	)
+	return i, err
+}
+
 const getDriftFinding = `-- name: GetDriftFinding :one
-SELECT id, installation_id, entity_kind, entity_key, detected_at, cache_snapshot, upstream_snapshot, diff, refresh_enqueued_at
+SELECT id, installation_id, entity_kind, entity_key, detected_at, cache_snapshot, upstream_snapshot, diff, refresh_enqueued_at, diff_hash, first_seen_at, last_seen_at, occurrence_count, heal_generation, escalated_at, resolved_at
 FROM drift_findings
 WHERE id = $1
 `
@@ -42,6 +130,79 @@ func (q *Queries) GetDriftFinding(ctx context.Context, id int64) (DriftFinding, 
 		&i.UpstreamSnapshot,
 		&i.Diff,
 		&i.RefreshEnqueuedAt,
+		&i.DiffHash,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.OccurrenceCount,
+		&i.HealGeneration,
+		&i.EscalatedAt,
+		&i.ResolvedAt,
+	)
+	return i, err
+}
+
+const getDriftSampleCursor = `-- name: GetDriftSampleCursor :one
+SELECT source_id
+FROM drift_sample_cursors
+WHERE installation_id = $1
+  AND entity_kind = $2
+`
+
+type GetDriftSampleCursorParams struct {
+	InstallationID int64
+	EntityKind     string
+}
+
+func (q *Queries) GetDriftSampleCursor(ctx context.Context, arg GetDriftSampleCursorParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getDriftSampleCursor, arg.InstallationID, arg.EntityKind)
+	var source_id int64
+	err := row.Scan(&source_id)
+	return source_id, err
+}
+
+const getOpenDriftFindingByHash = `-- name: GetOpenDriftFindingByHash :one
+SELECT id, installation_id, entity_kind, entity_key, detected_at, cache_snapshot, upstream_snapshot, diff, refresh_enqueued_at, diff_hash, first_seen_at, last_seen_at, occurrence_count, heal_generation, escalated_at, resolved_at
+FROM drift_findings
+WHERE installation_id = $1
+  AND entity_kind = $2
+  AND entity_key = $3
+  AND diff_hash = $4
+  AND resolved_at IS NULL
+FOR UPDATE
+`
+
+type GetOpenDriftFindingByHashParams struct {
+	InstallationID int64
+	EntityKind     string
+	EntityKey      string
+	DiffHash       string
+}
+
+func (q *Queries) GetOpenDriftFindingByHash(ctx context.Context, arg GetOpenDriftFindingByHashParams) (DriftFinding, error) {
+	row := q.db.QueryRow(ctx, getOpenDriftFindingByHash,
+		arg.InstallationID,
+		arg.EntityKind,
+		arg.EntityKey,
+		arg.DiffHash,
+	)
+	var i DriftFinding
+	err := row.Scan(
+		&i.ID,
+		&i.InstallationID,
+		&i.EntityKind,
+		&i.EntityKey,
+		&i.DetectedAt,
+		&i.CacheSnapshot,
+		&i.UpstreamSnapshot,
+		&i.Diff,
+		&i.RefreshEnqueuedAt,
+		&i.DiffHash,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.OccurrenceCount,
+		&i.HealGeneration,
+		&i.EscalatedAt,
+		&i.ResolvedAt,
 	)
 	return i, err
 }
@@ -49,14 +210,16 @@ func (q *Queries) GetDriftFinding(ctx context.Context, id int64) (DriftFinding, 
 const insertDriftFinding = `-- name: InsertDriftFinding :one
 INSERT INTO drift_findings (
     installation_id, entity_kind, entity_key, detected_at, cache_snapshot,
-    upstream_snapshot, diff, refresh_enqueued_at
+    upstream_snapshot, diff, diff_hash, first_seen_at, last_seen_at,
+    occurrence_count, refresh_enqueued_at
 ) VALUES (
     $1, $2,
     $3, $4,
     $5, $6,
-    $7, $8
+    $7, $8, $4,
+    $4, 1, $9
 )
-RETURNING id, installation_id, entity_kind, entity_key, detected_at, cache_snapshot, upstream_snapshot, diff, refresh_enqueued_at
+RETURNING id, installation_id, entity_kind, entity_key, detected_at, cache_snapshot, upstream_snapshot, diff, refresh_enqueued_at, diff_hash, first_seen_at, last_seen_at, occurrence_count, heal_generation, escalated_at, resolved_at
 `
 
 type InsertDriftFindingParams struct {
@@ -67,6 +230,7 @@ type InsertDriftFindingParams struct {
 	CacheSnapshot     []byte
 	UpstreamSnapshot  []byte
 	Diff              []byte
+	DiffHash          string
 	RefreshEnqueuedAt pgtype.Timestamptz
 }
 
@@ -79,6 +243,7 @@ func (q *Queries) InsertDriftFinding(ctx context.Context, arg InsertDriftFinding
 		arg.CacheSnapshot,
 		arg.UpstreamSnapshot,
 		arg.Diff,
+		arg.DiffHash,
 		arg.RefreshEnqueuedAt,
 	)
 	var i DriftFinding
@@ -92,153 +257,120 @@ func (q *Queries) InsertDriftFinding(ctx context.Context, arg InsertDriftFinding
 		&i.UpstreamSnapshot,
 		&i.Diff,
 		&i.RefreshEnqueuedAt,
+		&i.DiffHash,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.OccurrenceCount,
+		&i.HealGeneration,
+		&i.EscalatedAt,
+		&i.ResolvedAt,
 	)
 	return i, err
 }
 
-const sampleCachedEntities = `-- name: SampleCachedEntities :many
-WITH entities AS (
-    SELECT
-        'repository'::text AS entity_kind,
-        ('repo:' || repos.full_name || ':metadata')::text AS entity_key,
-        jsonb_build_object(
-            'id', repos.gh_id,
-            'node_id', repos.node_id,
-            'owner', repos.owner,
-            'name', repos.name,
-            'full_name', repos.full_name,
-            'default_branch', repos.default_branch,
-            'archived', repos.archived
-        ) AS cache_snapshot
-    FROM repos
-    WHERE repos.installation_id = $2
-      AND repos.tombstoned_at IS NULL
-
-    UNION ALL
-
-    SELECT
-        'pull_request'::text,
-        ('pr:' || repos.full_name || ':' || pull_requests.number)::text,
-        jsonb_build_object(
-            'id', pull_requests.gh_id,
-            'node_id', pull_requests.node_id,
-            'number', pull_requests.number,
-            'title', pull_requests.title,
-            'state', pull_requests.state,
-            'draft', pull_requests.draft,
-            'author_login', pull_requests.author_login,
-            'head_ref', pull_requests.head_ref,
-            'head_sha', pull_requests.head_sha,
-            'base_ref', pull_requests.base_ref,
-            'base_sha', pull_requests.base_sha,
-            'review_decision', pull_requests.review_decision,
-            'mergeable_state', pull_requests.mergeable_state,
-            'stack_number', pull_requests.stack_number,
-            'stack_position', pull_requests.stack_position
-        )
-    FROM pull_requests
-    JOIN repos ON repos.id = pull_requests.repo_id
-    WHERE repos.installation_id = $2
-      AND repos.tombstoned_at IS NULL
-      AND pull_requests.tombstoned_at IS NULL
-
-    UNION ALL
-
-    SELECT
-        'stack'::text,
-        ('stack:' || repos.full_name || ':' || stacks.number)::text,
-        jsonb_build_object(
-            'id', stacks.gh_id,
-            'node_id', stacks.node_id,
-            'number', stacks.number,
-            'base_ref', stacks.base_ref,
-            'base_sha', stacks.base_sha,
-            'open', stacks.open,
-            'entries', stacks.entries
-        )
-    FROM stacks
-    JOIN repos ON repos.id = stacks.repo_id
-    WHERE repos.installation_id = $2
-      AND repos.tombstoned_at IS NULL
-      AND stacks.tombstoned_at IS NULL
-
-    UNION ALL
-
-    SELECT
-        'repo_rules'::text,
-        ('repo_rules:' || repos.full_name || ':rules')::text,
-        jsonb_build_object(
-            'rules',
-            COALESCE(
-                jsonb_agg(repo_rules.rule ORDER BY repo_rules.rule_key)
-                    FILTER (WHERE repo_rules.rule_key IS NOT NULL),
-                '[]'::jsonb
-            )
-        )
-    FROM repos
-    LEFT JOIN repo_rules
-      ON repo_rules.repo_id = repos.id
-     AND repo_rules.tombstoned_at IS NULL
-    WHERE repos.installation_id = $2
-      AND repos.tombstoned_at IS NULL
-    GROUP BY repos.id, repos.full_name
-
-    UNION ALL
-
-    SELECT
-        'checks'::text,
-        ('checks:' || repos.full_name || ':' || check_runs.head_sha)::text,
-        jsonb_build_object(
-            'runs',
-            jsonb_agg(
-                jsonb_build_object(
-                    'id', check_runs.gh_id,
-                    'node_id', check_runs.node_id,
-                    'name', check_runs.name,
-                    'status', check_runs.status,
-                    'conclusion', check_runs.conclusion,
-                    'details_url', check_runs.details_url,
-                    'app_slug', check_runs.app_slug
-                )
-                ORDER BY check_runs.gh_id
-            )
-        )
-    FROM check_runs
-    JOIN repos ON repos.id = check_runs.repo_id
-    WHERE repos.installation_id = $2
-      AND repos.tombstoned_at IS NULL
-      AND check_runs.tombstoned_at IS NULL
-    GROUP BY repos.id, repos.full_name, check_runs.head_sha
+const pruneResolvedDriftFindingBatch = `-- name: PruneResolvedDriftFindingBatch :execrows
+DELETE FROM drift_findings AS finding
+WHERE finding.id IN (
+    SELECT candidate.id
+    FROM drift_findings AS candidate
+    WHERE candidate.resolved_at < $1
+    ORDER BY candidate.resolved_at, candidate.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
 )
-SELECT entity_kind, entity_key, cache_snapshot
-FROM entities
-ORDER BY random()
-LIMIT $1
 `
 
-type SampleCachedEntitiesParams struct {
-	SampleSize     int32
-	InstallationID int64
+type PruneResolvedDriftFindingBatchParams struct {
+	Cutoff    pgtype.Timestamptz
+	BatchSize int32
 }
 
-type SampleCachedEntitiesRow struct {
+func (q *Queries) PruneResolvedDriftFindingBatch(ctx context.Context, arg PruneResolvedDriftFindingBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneResolvedDriftFindingBatch, arg.Cutoff, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resolveOpenDriftFindings = `-- name: ResolveOpenDriftFindings :execrows
+UPDATE drift_findings
+SET resolved_at = $1,
+    last_seen_at = $1
+WHERE installation_id = $2
+  AND entity_kind = $3
+  AND entity_key = $4
+  AND resolved_at IS NULL
+`
+
+type ResolveOpenDriftFindingsParams struct {
+	ResolvedAt     pgtype.Timestamptz
+	InstallationID int64
+	EntityKind     string
+	EntityKey      string
+}
+
+func (q *Queries) ResolveOpenDriftFindings(ctx context.Context, arg ResolveOpenDriftFindingsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resolveOpenDriftFindings,
+		arg.ResolvedAt,
+		arg.InstallationID,
+		arg.EntityKind,
+		arg.EntityKey,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const sampleCachedEntitiesByKind = `-- name: SampleCachedEntitiesByKind :many
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot
+FROM drift_entities
+WHERE installation_id = $1
+  AND entity_kind = $2
+ORDER BY (source_id <= $3), source_id
+LIMIT $4
+`
+
+type SampleCachedEntitiesByKindParams struct {
+	InstallationID int64
+	EntityKind     string
+	AfterSourceID  int64
+	SampleSize     int32
+}
+
+type SampleCachedEntitiesByKindRow struct {
 	EntityKind    string
+	SourceID      int64
 	EntityKey     string
+	LockKey       string
 	CacheSnapshot []byte
 }
 
-// C-O3 samples semantic entity snapshots only. Validation/provenance columns
-// are deliberately excluded from comparison.
-func (q *Queries) SampleCachedEntities(ctx context.Context, arg SampleCachedEntitiesParams) ([]SampleCachedEntitiesRow, error) {
-	rows, err := q.db.Query(ctx, sampleCachedEntities, arg.SampleSize, arg.InstallationID)
+// The boolean leading sort wraps at the end of one entity-kind population.
+// source_id is each table's indexed surrogate key (or a stable group minimum),
+// avoiding a full-population random sort.
+func (q *Queries) SampleCachedEntitiesByKind(ctx context.Context, arg SampleCachedEntitiesByKindParams) ([]SampleCachedEntitiesByKindRow, error) {
+	rows, err := q.db.Query(ctx, sampleCachedEntitiesByKind,
+		arg.InstallationID,
+		arg.EntityKind,
+		arg.AfterSourceID,
+		arg.SampleSize,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []SampleCachedEntitiesRow
+	var items []SampleCachedEntitiesByKindRow
 	for rows.Next() {
-		var i SampleCachedEntitiesRow
-		if err := rows.Scan(&i.EntityKind, &i.EntityKey, &i.CacheSnapshot); err != nil {
+		var i SampleCachedEntitiesByKindRow
+		if err := rows.Scan(
+			&i.EntityKind,
+			&i.SourceID,
+			&i.EntityKey,
+			&i.LockKey,
+			&i.CacheSnapshot,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -247,4 +379,111 @@ func (q *Queries) SampleCachedEntities(ctx context.Context, arg SampleCachedEnti
 		return nil, err
 	}
 	return items, nil
+}
+
+const setDriftFindingHealGeneration = `-- name: SetDriftFindingHealGeneration :one
+UPDATE drift_findings
+SET heal_generation = $1
+WHERE id = $2
+RETURNING id, installation_id, entity_kind, entity_key, detected_at, cache_snapshot, upstream_snapshot, diff, refresh_enqueued_at, diff_hash, first_seen_at, last_seen_at, occurrence_count, heal_generation, escalated_at, resolved_at
+`
+
+type SetDriftFindingHealGenerationParams struct {
+	HealGeneration int64
+	ID             int64
+}
+
+func (q *Queries) SetDriftFindingHealGeneration(ctx context.Context, arg SetDriftFindingHealGenerationParams) (DriftFinding, error) {
+	row := q.db.QueryRow(ctx, setDriftFindingHealGeneration, arg.HealGeneration, arg.ID)
+	var i DriftFinding
+	err := row.Scan(
+		&i.ID,
+		&i.InstallationID,
+		&i.EntityKind,
+		&i.EntityKey,
+		&i.DetectedAt,
+		&i.CacheSnapshot,
+		&i.UpstreamSnapshot,
+		&i.Diff,
+		&i.RefreshEnqueuedAt,
+		&i.DiffHash,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.OccurrenceCount,
+		&i.HealGeneration,
+		&i.EscalatedAt,
+		&i.ResolvedAt,
+	)
+	return i, err
+}
+
+const touchOpenDriftFinding = `-- name: TouchOpenDriftFinding :one
+UPDATE drift_findings
+SET last_seen_at = $1,
+    cache_snapshot = $2,
+    upstream_snapshot = $3,
+    diff = $4
+WHERE id = $5
+  AND resolved_at IS NULL
+RETURNING id, installation_id, entity_kind, entity_key, detected_at, cache_snapshot, upstream_snapshot, diff, refresh_enqueued_at, diff_hash, first_seen_at, last_seen_at, occurrence_count, heal_generation, escalated_at, resolved_at
+`
+
+type TouchOpenDriftFindingParams struct {
+	LastSeenAt       pgtype.Timestamptz
+	CacheSnapshot    []byte
+	UpstreamSnapshot []byte
+	Diff             []byte
+	ID               int64
+}
+
+func (q *Queries) TouchOpenDriftFinding(ctx context.Context, arg TouchOpenDriftFindingParams) (DriftFinding, error) {
+	row := q.db.QueryRow(ctx, touchOpenDriftFinding,
+		arg.LastSeenAt,
+		arg.CacheSnapshot,
+		arg.UpstreamSnapshot,
+		arg.Diff,
+		arg.ID,
+	)
+	var i DriftFinding
+	err := row.Scan(
+		&i.ID,
+		&i.InstallationID,
+		&i.EntityKind,
+		&i.EntityKey,
+		&i.DetectedAt,
+		&i.CacheSnapshot,
+		&i.UpstreamSnapshot,
+		&i.Diff,
+		&i.RefreshEnqueuedAt,
+		&i.DiffHash,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.OccurrenceCount,
+		&i.HealGeneration,
+		&i.EscalatedAt,
+		&i.ResolvedAt,
+	)
+	return i, err
+}
+
+const upsertDriftSampleCursor = `-- name: UpsertDriftSampleCursor :exec
+INSERT INTO drift_sample_cursors (
+    installation_id, entity_kind, source_id
+) VALUES (
+    $1, $2, $3
+)
+ON CONFLICT (installation_id, entity_kind) DO UPDATE
+SET source_id = EXCLUDED.source_id,
+    updated_at = now()
+`
+
+type UpsertDriftSampleCursorParams struct {
+	InstallationID int64
+	EntityKind     string
+	SourceID       int64
+}
+
+func (q *Queries) UpsertDriftSampleCursor(ctx context.Context, arg UpsertDriftSampleCursorParams) error {
+	_, err := q.db.Exec(ctx, upsertDriftSampleCursor, arg.InstallationID, arg.EntityKind, arg.SourceID)
+	return err
 }

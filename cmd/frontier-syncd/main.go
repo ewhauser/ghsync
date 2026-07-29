@@ -241,6 +241,13 @@ func serve(args []string) error {
 	if err := cfg.RequireDatabase(); err != nil {
 		return err
 	}
+	var classifier dispatch.Classifier
+	if roles[roleDispatch] {
+		classifier, err = dispatcherClassifier(cfg.DispatchRulesFile)
+		if err != nil {
+			return err
+		}
+	}
 	if roles[roleIngress] {
 		if err := cfg.RequireWebhookSecret(); err != nil {
 			return err
@@ -250,6 +257,13 @@ func serve(args []string) error {
 		if err := cfg.RequireFetchCredentials(); err != nil {
 			return err
 		}
+	}
+	worksJobs := roles[roleFetch] || roles[roleSweep] ||
+		roles[roleDrift] || roles[rolePruner]
+	if worksJobs && cfg.GitHubInstallationID <= 0 {
+		return fmt.Errorf(
+			"GITHUB_INSTALLATION_ID is required for periodic scheduling",
+		)
 	}
 
 	signalCtx, stopSignals := signal.NotifyContext(
@@ -272,6 +286,7 @@ func serve(args []string) error {
 	var riverClient *river.Client[pgx.Tx]
 	var githubGate *budget.Gate
 	var rest *gh.RESTClient
+	var graphQL *gh.GraphQLClient
 	var deliveryClient *gh.DeliveriesClient
 	var tokens gh.TokenProvider
 	budgetCtx, cancelBudget := context.WithCancel(context.Background())
@@ -342,6 +357,14 @@ func serve(args []string) error {
 		if err != nil {
 			return fmt.Errorf("GitHub REST client: %w", err)
 		}
+		graphQL, err = gh.NewGraphQLClient(
+			cfg.GitHubBaseURL,
+			githubGate,
+			tokens,
+		)
+		if err != nil {
+			return fmt.Errorf("GitHub GraphQL client: %w", err)
+		}
 		if roles[roleSweep] {
 			deliveryClient, err = gh.NewDeliveriesClient(
 				cfg.GitHubBaseURL,
@@ -358,15 +381,7 @@ func serve(args []string) error {
 		roles[roleSweep] || roles[roleDrift] || roles[rolePruner]
 	if needsRiver {
 		var fetchHandler *fetch.Handler
-		if needsGitHub {
-			graphQL, graphErr := gh.NewGraphQLClient(
-				cfg.GitHubBaseURL,
-				githubGate,
-				tokens,
-			)
-			if graphErr != nil {
-				return fmt.Errorf("GitHub GraphQL client: %w", graphErr)
-			}
+		if roles[roleFetch] {
 			fetchHandler, err = fetch.New(fetch.Options{
 				Pool:           pool,
 				REST:           rest,
@@ -384,24 +399,7 @@ func serve(args []string) error {
 				Pool:       pool,
 				REST:       rest,
 				Deliveries: deliveryClient,
-				Config: sweep.Config{
-					InstallationID: cfg.GitHubInstallationID,
-					OpenStackMaxStaleness: cfg.
-						SweepOpenStackMaxStaleness,
-					OpenPRMaxStaleness: cfg.SweepOpenPRMaxStaleness,
-					RepoRulesMaxStaleness: cfg.
-						SweepRepoRulesMaxStaleness,
-					ClosedMaxStaleness:   cfg.SweepClosedMaxStaleness,
-					RepositoryListPeriod: cfg.SweepRepositoryListPeriod,
-					PageSize:             cfg.SweepPageSize,
-					GapHealPeriod:        cfg.GapHealPeriod,
-					GapWindow:            cfg.GapWindow,
-					GapPageSize:          cfg.GapPageSize,
-					GapMaxPages:          cfg.GapMaxPages,
-					RetentionPeriod:      cfg.RetentionPeriod,
-					RetentionAge:         cfg.RetentionAge,
-					Observer:             sweep.LogObserver{},
-				},
+				Config:     sweepConfig(cfg),
 			})
 			if err != nil {
 				return err
@@ -410,31 +408,44 @@ func serve(args []string) error {
 		var driftService *drift.Service
 		if roles[roleDrift] {
 			driftService, err = drift.New(drift.Options{
-				Pool: pool,
-				REST: rest,
-				Config: drift.Config{
-					InstallationID: cfg.GitHubInstallationID,
-					Period:         cfg.DriftPeriod,
-					SampleSize:     cfg.DriftSampleSize,
-					PageSize:       cfg.SweepPageSize,
-					Observer:       drift.LogObserver{},
-				},
+				Pool:    pool,
+				REST:    rest,
+				GraphQL: graphQL,
+				Config:  driftConfig(cfg),
 			})
 			if err != nil {
 				return err
 			}
 		}
 		var clientOptions []queue.ClientOption
-		if fetchHandler != nil {
+		plan := riverPlanForRoles(roles)
+		clientOptions = append(
+			clientOptions,
+			queue.WithQueues(plan.queues...),
+		)
+		if roles[roleFetch] {
 			clientOptions = append(
 				clientOptions,
 				queue.WithRefreshHandler(fetchHandler),
+				queue.WithDeadlineObserver(
+					queue.LogDeadlineObserver{},
+				),
 			)
-		}
-		if roles[rolePruner] && !roles[roleDispatch] && !needsGitHub {
+		} else {
 			clientOptions = append(
 				clientOptions,
 				queue.WithoutRefreshWorkers(),
+			)
+		}
+		if worksJobs {
+			// River elects one cluster leader. Every leader-eligible client
+			// therefore receives the same schedule table, independent of the
+			// queues and workers owned by this process's roles.
+			clientOptions = append(
+				clientOptions,
+				queue.WithPeriodicJobs(
+					allPeriodicJobs(cfg)...,
+				),
 			)
 		}
 		if roles[roleSweep] {
@@ -442,9 +453,6 @@ func serve(args []string) error {
 				clientOptions,
 				queue.WithWorkerRegistrar(
 					sweepService.RegisterReconciliationWorkers,
-				),
-				queue.WithPeriodicJobs(
-					sweepService.ReconciliationPeriodicJobs()...,
 				),
 			)
 		}
@@ -454,16 +462,12 @@ func serve(args []string) error {
 				queue.WithWorkerRegistrar(
 					sweepService.RegisterPrunerWorker,
 				),
-				queue.WithPeriodicJobs(
-					sweepService.PrunerPeriodicJobs()...,
-				),
 			)
 		}
 		if driftService != nil {
 			clientOptions = append(
 				clientOptions,
 				queue.WithWorkerRegistrar(driftService.RegisterWorker),
-				queue.WithPeriodicJobs(driftService.PeriodicJobs()...),
 			)
 		}
 		riverClient, err = queue.NewClient(pool, clientOptions...)
@@ -479,24 +483,12 @@ func serve(args []string) error {
 		if driftService != nil {
 			driftService.SetRiverClient(riverClient)
 		}
-		worksJobs := roles[roleFetch] || roles[roleSweep] ||
-			roles[roleDrift] || roles[rolePruner]
 		if worksJobs {
 			if err := riverClient.Start(serviceCtx); err != nil {
 				return fmt.Errorf("river start: %w", err)
 			}
 		}
 		if roles[roleDispatch] {
-			classifier := dispatch.DefaultClassifier()
-			if cfg.DispatchRulesFile != "" {
-				rules, loadErr := dispatch.LoadRulesFile(
-					cfg.DispatchRulesFile,
-				)
-				if loadErr != nil {
-					return loadErr
-				}
-				classifier = dispatch.NewClassifier(rules)
-			}
 			dispatcher := dispatch.New(pool, riverClient, dispatch.Config{
 				BatchSize:    cfg.DispatchBatchSize,
 				MaxAttempts:  cfg.DispatchMaxAttempts,
@@ -601,9 +593,86 @@ func serve(args []string) error {
 	return serviceErr
 }
 
+func dispatcherClassifier(path string) (dispatch.Classifier, error) {
+	if path == "" {
+		return dispatch.DefaultClassifier(), nil
+	}
+	rules, err := dispatch.LoadRulesFile(path)
+	if err != nil {
+		return dispatch.Classifier{}, err
+	}
+	return dispatch.NewClassifier(rules), nil
+}
+
 func validateRoles(roles string) error {
 	_, err := parseRoles(roles)
 	return err
+}
+
+type riverRolePlan struct {
+	queues []string
+}
+
+func riverPlanForRoles(roles map[string]bool) riverRolePlan {
+	var queues []string
+	if roles[roleFetch] {
+		queues = append(
+			queues,
+			queue.QueueInteractive,
+			queue.QueueEvent,
+			queue.QueueSweep,
+		)
+	}
+	if roles[roleSweep] {
+		queues = append(queues, queue.QueueReconcile)
+	}
+	if roles[roleDrift] {
+		queues = append(queues, queue.QueueDrift)
+	}
+	if roles[rolePruner] {
+		queues = append(queues, queue.QueuePruner)
+	}
+	return riverRolePlan{queues: queues}
+}
+
+func sweepConfig(cfg config.Config) sweep.Config {
+	return sweep.Config{
+		InstallationID:        cfg.GitHubInstallationID,
+		OpenStackMaxStaleness: cfg.SweepOpenStackMaxStaleness,
+		OpenPRMaxStaleness:    cfg.SweepOpenPRMaxStaleness,
+		RepoRulesMaxStaleness: cfg.SweepRepoRulesMaxStaleness,
+		ClosedMaxStaleness:    cfg.SweepClosedMaxStaleness,
+		RepositoryListPeriod:  cfg.SweepRepositoryListPeriod,
+		PageSize:              cfg.SweepPageSize,
+		GapHealPeriod:         cfg.GapHealPeriod,
+		GapWindow:             cfg.GapWindow,
+		GapPageSize:           cfg.GapPageSize,
+		GapMaxPages:           cfg.GapMaxPages,
+		RetentionPeriod:       cfg.RetentionPeriod,
+		RetentionAge:          cfg.RetentionAge,
+		RetentionBatchSize:    cfg.RetentionBatchSize,
+		Observer:              sweep.LogObserver{},
+	}
+}
+
+func driftConfig(cfg config.Config) drift.Config {
+	return drift.Config{
+		InstallationID:     cfg.GitHubInstallationID,
+		Period:             cfg.DriftPeriod,
+		SampleSize:         cfg.DriftSampleSize,
+		PageSize:           cfg.SweepPageSize,
+		ResolvedRetention:  cfg.DriftResolvedRetention,
+		RetentionBatchSize: cfg.RetentionBatchSize,
+		Observer:           drift.LogObserver{},
+	}
+}
+
+func allPeriodicJobs(cfg config.Config) []*river.PeriodicJob {
+	sweepCfg := sweepConfig(cfg)
+	jobs := sweep.ReconciliationPeriodicJobs(sweepCfg)
+	jobs = append(jobs, sweep.PrunerPeriodicJobs(sweepCfg)...)
+	jobs = append(jobs, drift.PeriodicJobs(driftConfig(cfg))...)
+	return jobs
 }
 
 func parseRoles(raw string) (map[string]bool, error) {
