@@ -253,6 +253,25 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 			unmatchedEvents = append(unmatchedEvents, delivery.Event)
 		}
 		classified := result.intents
+		if result.stackHint != nil {
+			matches, matchErr := stackSummaryMatchesCache(
+				ctx,
+				queries,
+				result.stackHint,
+			)
+			if matchErr != nil {
+				return 0, fmt.Errorf(
+					"compare webhook stack summary: %w",
+					matchErr,
+				)
+			}
+			if matches {
+				classified = withoutMatchingStackRefresh(
+					classified,
+					result.stackHint,
+				)
+			}
+		}
 		intents = append(intents, classified...)
 		for _, intent := range classified {
 			receivedAt := delivery.ReceivedAt.Time
@@ -326,6 +345,57 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 		}
 	}
 	return len(deliveries), nil
+}
+
+func stackSummaryMatchesCache(
+	ctx context.Context,
+	queries *dbgen.Queries,
+	hint *stackSummaryHint,
+) (bool, error) {
+	stack, err := queries.GetStackByKey(
+		ctx,
+		dbgen.GetStackByKeyParams{
+			RepoFullName: hint.Repo,
+			StackNumber:  int32(hint.Number),
+		},
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if stack.TombstonedAt.Valid ||
+		!stack.GhID.Valid ||
+		stack.GhID.Int64 != hint.ID ||
+		stack.BaseRef != hint.BaseRef ||
+		stack.BaseSha != hint.BaseSHA {
+		return false, nil
+	}
+	var entries []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(stack.Entries, &entries); err != nil {
+		return false, fmt.Errorf("decode cached stack entries: %w", err)
+	}
+	return len(entries) == hint.Size &&
+		hint.Position <= len(entries) &&
+		entries[hint.Position-1].Number == hint.PRNumber, nil
+}
+
+func withoutMatchingStackRefresh(
+	intents []Intent,
+	hint *stackSummaryHint,
+) []Intent {
+	stackKey := fmt.Sprintf("stack:%s:%d", hint.Repo, hint.Number)
+	filtered := make([]Intent, 0, len(intents)-1)
+	for _, intent := range intents {
+		if intent.Kind == queue.KindRefreshStack && intent.Key == stackKey {
+			continue
+		}
+		filtered = append(filtered, intent)
+	}
+	return filtered
 }
 
 func (d *Dispatcher) insertParams(

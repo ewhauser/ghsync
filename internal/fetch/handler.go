@@ -674,9 +674,6 @@ func (h *Handler) pullRequestHook(
 	queueName string,
 ) store.PullRequestHook {
 	return func(result store.ApplyPullRequestResult) store.TransactionHook {
-		if !result.DomainChanged {
-			return nil
-		}
 		specs := pullRequestFollowupSpecs(repo, result)
 		return h.insertFollowupsHook(specs, queueName)
 	}
@@ -693,18 +690,20 @@ func pullRequestFollowupSpecs(
 			Key:  fmt.Sprintf("checks:%s:%s", repo, result.NewHeadSHA),
 		})
 	}
-	stackNumbers := make(map[int]struct{}, 2)
-	if result.OldStackNumber != nil {
-		stackNumbers[*result.OldStackNumber] = struct{}{}
-	}
-	if result.NewStackNumber != nil {
-		stackNumbers[*result.NewStackNumber] = struct{}{}
-	}
-	for stackNumber := range stackNumbers {
-		specs = append(specs, queue.RefreshSpec{
-			Kind: queue.KindRefreshStack,
-			Key:  fmt.Sprintf("stack:%s:%d", repo, stackNumber),
-		})
+	if result.StackStateChanged {
+		stackNumbers := make(map[int]struct{}, 2)
+		if result.OldStackNumber != nil {
+			stackNumbers[*result.OldStackNumber] = struct{}{}
+		}
+		if result.NewStackNumber != nil {
+			stackNumbers[*result.NewStackNumber] = struct{}{}
+		}
+		for stackNumber := range stackNumbers {
+			specs = append(specs, queue.RefreshSpec{
+				Kind: queue.KindRefreshStack,
+				Key:  fmt.Sprintf("stack:%s:%d", repo, stackNumber),
+			})
+		}
 	}
 	return specs
 }

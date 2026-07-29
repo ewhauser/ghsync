@@ -200,6 +200,109 @@ func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
 	}
 }
 
+func TestPullRequestResultSeparatesStackStateFromTitleChanges(t *testing.T) {
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/stack-diff", 2150, baseTime)
+	stackNumber := 142
+	stackPosition := 2
+	if _, err := writer.ApplyStack(
+		context.Background(),
+		StackRecord{
+			Repository: repository,
+			GitHubID:   7000,
+			NodeID:     "stack-node-142",
+			Number:     stackNumber,
+			BaseRef:    "main",
+			BaseSHA:    "base-one",
+			Open:       true,
+			Entries: []StackEntry{
+				{
+					Number:    41,
+					State:     "open",
+					UpdatedAt: baseTime,
+					HeadRef:   "stack/one",
+					HeadSHA:   "head-zero",
+				},
+				{
+					Number:    42,
+					State:     "open",
+					UpdatedAt: baseTime,
+					HeadRef:   "feature",
+					HeadSHA:   "head-one",
+				},
+			},
+			GitHubUpdatedAt: baseTime,
+			SyncedAt:        baseTime,
+			Source:          SyncSourceWebhook,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	first := storeTestPull(&repository, baseTime, "head-one")
+	first.StackNumber = &stackNumber
+	first.StackPosition = &stackPosition
+	first.StackSummary = &StackSummaryRecord{
+		GitHubID: 7000,
+		Number:   stackNumber,
+		Size:     2,
+		Position: stackPosition,
+		BaseRef:  "main",
+		BaseSHA:  "base-one",
+	}
+	first.MembershipKnown = true
+	initial, err := writer.ApplyPullRequest(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initial.StackStateChanged {
+		t.Fatalf("initial stacked PR result = %+v", initial)
+	}
+
+	titleOnly := first
+	titleOnly.Title = "new title"
+	titleOnly.GitHubUpdatedAt = baseTime.Add(time.Minute)
+	titleOnly.SyncedAt = first.SyncedAt.Add(time.Minute)
+	titleResult, err := writer.ApplyPullRequest(context.Background(), titleOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !titleResult.DomainChanged || titleResult.StackStateChanged {
+		t.Fatalf("title-only PR result = %+v", titleResult)
+	}
+
+	newHead := titleOnly
+	newHead.HeadSHA = "head-two"
+	newHead.GitHubUpdatedAt = baseTime.Add(2 * time.Minute)
+	newHead.SyncedAt = first.SyncedAt.Add(2 * time.Minute)
+	headResult, err := writer.ApplyPullRequest(context.Background(), newHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !headResult.DomainChanged || !headResult.StackStateChanged {
+		t.Fatalf("head-changing PR result = %+v", headResult)
+	}
+
+	summaryMismatch := newHead
+	summaryMismatch.ReviewDecision = "APPROVED"
+	summaryMismatch.GitHubUpdatedAt = baseTime.Add(3 * time.Minute)
+	summaryMismatch.SyncedAt = first.SyncedAt.Add(3 * time.Minute)
+	mismatchingSummary := *summaryMismatch.StackSummary
+	mismatchingSummary.Size = 3
+	summaryMismatch.StackSummary = &mismatchingSummary
+	summaryResult, err := writer.ApplyPullRequest(
+		context.Background(),
+		summaryMismatch,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summaryResult.DomainChanged || !summaryResult.StackStateChanged {
+		t.Fatalf("summary-mismatching PR result = %+v", summaryResult)
+	}
+}
+
 func TestEntityKeyConstructorsMatchSQLGrammar(t *testing.T) {
 	pool, _ := storeTestDatabase(t)
 	writer := NewEntityWriter(pool)

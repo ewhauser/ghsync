@@ -990,14 +990,23 @@ func waitUntil(ctx context.Context, target time.Time) error {
 func loadEvents(path string) ([]event, error) {
 	if path == "" {
 		result := make([]event, 0, 4)
-		for _, number := range []int{4812, 4815, 4816, 4820} {
+		for position, number := range []int{4812, 4815, 4816, 4820} {
 			payload, err := json.Marshal(map[string]any{
 				"action":     "synchronize",
 				"number":     number,
 				"repository": map[string]any{"full_name": "acme/monolith"},
 				"pull_request": map[string]any{
 					"number": number,
-					"stack":  nil,
+					"stack": map[string]any{
+						"id":       9876543,
+						"number":   142,
+						"size":     5,
+						"position": position + 2,
+						"base": map[string]any{
+							"ref": "main",
+							"sha": "aaaa000",
+						},
+					},
 				},
 			})
 			if err != nil {

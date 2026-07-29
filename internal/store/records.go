@@ -90,6 +90,7 @@ type PullRequestRecord struct {
 	MergeableState  string
 	StackNumber     *int
 	StackPosition   *int
+	StackSummary    *StackSummaryRecord
 	MembershipKnown bool
 	GitHubUpdatedAt time.Time
 	ReviewThreads   []ReviewThreadRecord
@@ -97,6 +98,17 @@ type PullRequestRecord struct {
 	ETag            string
 	SyncedAt        time.Time
 	Source          SyncSource
+}
+
+// StackSummaryRecord is the complete stack tuple embedded in an authoritative
+// pull-request response.
+type StackSummaryRecord struct {
+	GitHubID int64
+	Number   int
+	Size     int
+	Position int
+	BaseRef  string
+	BaseSHA  string
 }
 
 // StackEntry is one ordered pull request in a stack snapshot.
@@ -171,12 +183,13 @@ type RepoRulesRecord struct {
 
 // ApplyPullRequestResult describes the accepted pull-request transition.
 type ApplyPullRequestResult struct {
-	Applied        bool
-	DomainChanged  bool
-	OldStackNumber *int
-	NewStackNumber *int
-	OldHeadSHA     string
-	NewHeadSHA     string
+	Applied           bool
+	DomainChanged     bool
+	StackStateChanged bool
+	OldStackNumber    *int
+	NewStackNumber    *int
+	OldHeadSHA        string
+	NewHeadSHA        string
 }
 
 // ApplyStackResult describes stack membership changes caused by a write.
@@ -248,6 +261,19 @@ func validatePullRequest(pull *PullRequestRecord) error {
 	if pull.MembershipKnown &&
 		((pull.StackNumber == nil) != (pull.StackPosition == nil)) {
 		return fmt.Errorf("PR stack number and position must both be set or nil")
+	}
+	if pull.StackSummary != nil &&
+		(!pull.MembershipKnown ||
+			pull.StackNumber == nil ||
+			pull.StackPosition == nil ||
+			pull.StackSummary.GitHubID <= 0 ||
+			pull.StackSummary.Number != *pull.StackNumber ||
+			pull.StackSummary.Size <= 0 ||
+			pull.StackSummary.Position != *pull.StackPosition ||
+			pull.StackSummary.Position > pull.StackSummary.Size ||
+			pull.StackSummary.BaseRef == "" ||
+			pull.StackSummary.BaseSHA == "") {
+		return fmt.Errorf("invalid PR stack summary")
 	}
 	return nil
 }

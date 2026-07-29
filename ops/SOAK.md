@@ -13,6 +13,13 @@ and exits nonzero unless all of the following are true:
 - run-scoped C-Q2 p95/p99 remain within 20s/60s;
 - every mutated pull request in fake truth exactly matches the final cache.
 
+The built-in smoke events carry the complete preview `pull_request.stack`
+tuple. Once backfill has populated the matching stack, repeated title-only
+mutations exercise the summary-diff optimization: they retain the
+authoritative PR refresh without issuing a redundant eager stack refresh.
+Recorded event files may still include partial or mismatching tuples; those
+fail open to the stack refresh.
+
 The default smoke arithmetic is explicit: `120 seconds * 1 event/second * 10`
 = **1,200 successful deliveries**. The 48-hour default is
 `172,800 seconds * 1 * 10` = **1,728,000 successful deliveries**.

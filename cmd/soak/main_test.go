@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strconv"
 	"strings"
@@ -48,6 +49,46 @@ func TestSmokeLoadArithmeticIsExactlyTenTimesRecordedRate(t *testing.T) {
 			achieved,
 			recordedRate*multiplier,
 		)
+	}
+}
+
+func TestDefaultEventsCarryCompleteStackSummary(t *testing.T) {
+	events, err := loadEvents("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("default events = %d, want 4", len(events))
+	}
+	for index, item := range events {
+		var payload struct {
+			Number      int `json:"number"`
+			PullRequest struct {
+				Number int `json:"number"`
+				Stack  struct {
+					ID       int64 `json:"id"`
+					Number   int   `json:"number"`
+					Size     int   `json:"size"`
+					Position int   `json:"position"`
+					Base     struct {
+						Ref string `json:"ref"`
+						SHA string `json:"sha"`
+					} `json:"base"`
+				} `json:"stack"`
+			} `json:"pull_request"`
+		}
+		if err := json.Unmarshal(item.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Number != payload.PullRequest.Number ||
+			payload.PullRequest.Stack.ID != 9876543 ||
+			payload.PullRequest.Stack.Number != 142 ||
+			payload.PullRequest.Stack.Size != 5 ||
+			payload.PullRequest.Stack.Position != index+2 ||
+			payload.PullRequest.Stack.Base.Ref != "main" ||
+			payload.PullRequest.Stack.Base.SHA != "aaaa000" {
+			t.Fatalf("default event %d stack summary = %+v", index, payload)
+		}
 	}
 }
 

@@ -109,6 +109,49 @@ func TestStackOrderOnlyChangeSchedulesMovedPRs(t *testing.T) {
 	}
 }
 
+func TestPullRequestFollowupsSkipStackForNonStackDomainChange(t *testing.T) {
+	t.Parallel()
+	stackNumber := 142
+	titleOnly := pullRequestFollowupSpecs(
+		"acme/monolith",
+		store.ApplyPullRequestResult{
+			DomainChanged:  true,
+			OldStackNumber: &stackNumber,
+			NewStackNumber: &stackNumber,
+			OldHeadSHA:     "head-one",
+			NewHeadSHA:     "head-one",
+		},
+	)
+	if len(titleOnly) != 0 {
+		t.Fatalf("title-only PR change followups = %v, want none", titleOnly)
+	}
+
+	stackChanged := pullRequestFollowupSpecs(
+		"acme/monolith",
+		store.ApplyPullRequestResult{
+			DomainChanged:     true,
+			StackStateChanged: true,
+			OldStackNumber:    &stackNumber,
+			NewStackNumber:    &stackNumber,
+			OldHeadSHA:        "head-one",
+			NewHeadSHA:        "head-two",
+		},
+	)
+	want := []queue.RefreshSpec{
+		{
+			Kind: queue.KindRefreshChecks,
+			Key:  "checks:acme/monolith:head-two",
+		},
+		{
+			Kind: queue.KindRefreshStack,
+			Key:  "stack:acme/monolith:142",
+		},
+	}
+	if !reflect.DeepEqual(stackChanged, want) {
+		t.Fatalf("stack-state PR followups = %v, want %v", stackChanged, want)
+	}
+}
+
 func TestStackFollowupSpecsHaveDeterministicOrder(t *testing.T) {
 	t.Parallel()
 	result := store.ApplyStackResult{

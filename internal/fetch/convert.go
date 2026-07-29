@@ -60,11 +60,20 @@ func pullRecordFromREST(
 	syncedAt time.Time,
 ) store.PullRequestRecord {
 	var stackNumber, stackPosition *int
+	var stackSummary *store.StackSummaryRecord
 	if pull.Stack != nil {
 		number := pull.Stack.Number
 		position := pull.Stack.Position
 		stackNumber = &number
 		stackPosition = &position
+		stackSummary = &store.StackSummaryRecord{
+			GitHubID: pull.Stack.ID,
+			Number:   pull.Stack.Number,
+			Size:     pull.Stack.Size,
+			Position: pull.Stack.Position,
+			BaseRef:  pull.Stack.Base.Ref,
+			BaseSHA:  pull.Stack.Base.SHA,
+		}
 	}
 	var updatedAt time.Time
 	if pull.UpdatedAt != nil {
@@ -87,6 +96,7 @@ func pullRecordFromREST(
 		MergeableState:  pull.GetMergeableState(),
 		StackNumber:     stackNumber,
 		StackPosition:   stackPosition,
+		StackSummary:    stackSummary,
 		MembershipKnown: true,
 		GitHubUpdatedAt: updatedAt,
 		ETag:            etag,

@@ -235,6 +235,36 @@ func (w *EntityWriter) applyPullRequest(
 		}
 		result.NewStackNumber = intPointer(row.StackNumber)
 		result.NewHeadSHA = row.HeadSha
+		if upsertErr == nil {
+			result.StackStateChanged = errors.Is(oldErr, pgx.ErrNoRows) &&
+				row.StackNumber.Valid
+			if oldErr == nil {
+				result.StackStateChanged =
+					(old.StackNumber.Valid || row.StackNumber.Valid) &&
+						(old.StackNumber != row.StackNumber ||
+							old.StackPosition != row.StackPosition ||
+							old.State != row.State ||
+							old.Draft != row.Draft ||
+							old.HeadRef != row.HeadRef ||
+							old.HeadSha != row.HeadSha ||
+							old.BaseRef != row.BaseRef ||
+							old.BaseSha != row.BaseSha)
+			}
+		}
+		if pull.StackSummary != nil {
+			matches, err := pullStackSummaryMatches(
+				ctx,
+				queries,
+				pull.Repository.GitHubID,
+				pull.Number,
+				pull.StackSummary,
+			)
+			if err != nil {
+				return err
+			}
+			result.StackStateChanged =
+				result.StackStateChanged || !matches
+		}
 		if err := queries.TouchPullRequestCheckedAt(
 			ctx,
 			dbgen.TouchPullRequestCheckedAtParams{
@@ -320,6 +350,44 @@ func (w *EntityWriter) applyPullRequest(
 		false,
 	)
 	return result, nil
+}
+
+func pullStackSummaryMatches(
+	ctx context.Context,
+	queries *dbgen.Queries,
+	repoGitHubID int64,
+	prNumber int,
+	summary *StackSummaryRecord,
+) (bool, error) {
+	stack, err := queries.GetStackByIdentity(
+		ctx,
+		dbgen.GetStackByIdentityParams{
+			RepoGhID:    repoGitHubID,
+			StackNumber: int32(summary.Number),
+		},
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read PR stack summary target: %w", err)
+	}
+	if stack.TombstonedAt.Valid ||
+		!stack.GhID.Valid ||
+		stack.GhID.Int64 != summary.GitHubID ||
+		stack.BaseRef != summary.BaseRef ||
+		stack.BaseSha != summary.BaseSHA {
+		return false, nil
+	}
+	var entries []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(stack.Entries, &entries); err != nil {
+		return false, fmt.Errorf("decode PR stack summary target: %w", err)
+	}
+	return len(entries) == summary.Size &&
+		summary.Position <= len(entries) &&
+		entries[summary.Position-1].Number == prNumber, nil
 }
 
 // ApplyPullRequestBatch preserves independent outcomes. Transport errors are
@@ -421,6 +489,7 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 		if err == nil {
 			result.Applied = true
 			result.DomainChanged = true
+			result.StackStateChanged = result.OldStackNumber != nil
 			result.NewHeadSHA = row.HeadSha
 			if err := w.markAndEmit(
 				ctx,

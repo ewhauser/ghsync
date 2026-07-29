@@ -261,6 +261,62 @@ func TestKnownMalformedEventFailsClassification(t *testing.T) {
 	}
 }
 
+func TestCompleteStackSummaryHintRequiresAuthoritativeResolver(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"action":"synchronize",
+		"number":72787,
+		"repository":{"full_name":"acme/monolith"},
+		"pull_request":{
+			"number":72787,
+			"stack":{
+				"id":46101,
+				"number":72787,
+				"base":{
+					"ref":"main",
+					"sha":"89850dd46b0e9edb77b61bf2ea8c376e58fc5aca"
+				},
+				"size":6,
+				"position":1
+			}
+		}
+	}`)
+	result, err := DefaultClassifier().classify("pull_request", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &stackSummaryHint{
+		Repo:     "acme/monolith",
+		PRNumber: 72787,
+		ID:       46101,
+		Number:   72787,
+		Size:     6,
+		Position: 1,
+		BaseRef:  "main",
+		BaseSHA:  "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+	}
+	if !reflect.DeepEqual(result.stackHint, want) {
+		t.Fatalf("stack hint = %+v, want %+v", result.stackHint, want)
+	}
+
+	stackOnly := NewClassifier([]Rule{{
+		Event:         "pull_request",
+		Action:        ActionAny,
+		Target:        TargetPullRequest,
+		StackedTarget: TargetStack,
+	}})
+	result, err = stackOnly.classify("pull_request", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.stackHint != nil {
+		t.Fatalf(
+			"stack hint without authoritative PR resolver = %+v",
+			result.stackHint,
+		)
+	}
+}
+
 func TestRuleTableControlsActions(t *testing.T) {
 	t.Parallel()
 	classifier := NewClassifier([]Rule{{

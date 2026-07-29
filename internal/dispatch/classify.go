@@ -237,10 +237,8 @@ type payloadEnvelope struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
 	PullRequest struct {
-		Number int `json:"number"`
-		Stack  *struct {
-			Number int `json:"number"`
-		} `json:"stack"`
+		Number int              `json:"number"`
+		Stack  *payloadStackRef `json:"stack"`
 	} `json:"pull_request"`
 	// Stack is populated by synthetic M2 fixtures to model the branch-to-stack
 	// relationship that M3 will resolve from the authoritative cache.
@@ -255,9 +253,32 @@ type payloadEnvelope struct {
 	} `json:"check_suite"`
 }
 
+type payloadStackRef struct {
+	ID       int64 `json:"id"`
+	Number   int   `json:"number"`
+	Size     int   `json:"size"`
+	Position int   `json:"position"`
+	Base     struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	} `json:"base"`
+}
+
+type stackSummaryHint struct {
+	Repo     string
+	PRNumber int
+	ID       int64
+	Number   int
+	Size     int
+	Position int
+	BaseRef  string
+	BaseSHA  string
+}
+
 type classification struct {
 	intents      []Intent
 	matchedRules int
+	stackHint    *stackSummaryHint
 }
 
 // Classify parses only events that have a configured rule. Unknown events are
@@ -317,10 +338,12 @@ func (c Classifier) classify(event string, body []byte) (classification, error) 
 			Priority: PriorityEvent,
 		})
 	}
-	return classification{
+	result := classification{
 		intents:      intents,
 		matchedRules: matchedRules,
-	}, nil
+	}
+	result.stackHint = completeStackSummaryHint(&payload, intents)
+	return result, nil
 }
 
 func intentKey(
@@ -402,4 +425,54 @@ func payloadStack(payload *payloadEnvelope) *stackPointer {
 		return &stackPointer{Number: payload.Stack.Number}
 	}
 	return nil
+}
+
+func completeStackSummaryHint(
+	payload *payloadEnvelope,
+	intents []Intent,
+) *stackSummaryHint {
+	stack := payload.PullRequest.Stack
+	prNumber := payload.Number
+	if prNumber == 0 {
+		prNumber = payload.PullRequest.Number
+	}
+	if stack == nil ||
+		payload.Repository.FullName == "" ||
+		prNumber <= 0 ||
+		stack.ID <= 0 ||
+		stack.Number <= 0 ||
+		stack.Size <= 0 ||
+		stack.Position <= 0 ||
+		stack.Position > stack.Size ||
+		stack.Base.Ref == "" ||
+		stack.Base.SHA == "" {
+		return nil
+	}
+	stackKey := "stack:" + payload.Repository.FullName + ":" +
+		strconv.Itoa(stack.Number)
+	prKey := "pr:" + payload.Repository.FullName + ":" +
+		strconv.Itoa(prNumber)
+	var refreshesStack, resolvesMembership bool
+	for _, intent := range intents {
+		if intent.Kind == queue.KindRefreshStack && intent.Key == stackKey {
+			refreshesStack = true
+		}
+		if intent.Kind == queue.KindResolveStackMembership &&
+			intent.Key == prKey {
+			resolvesMembership = true
+		}
+	}
+	if !refreshesStack || !resolvesMembership {
+		return nil
+	}
+	return &stackSummaryHint{
+		Repo:     payload.Repository.FullName,
+		PRNumber: prNumber,
+		ID:       stack.ID,
+		Number:   stack.Number,
+		Size:     stack.Size,
+		Position: stack.Position,
+		BaseRef:  stack.Base.Ref,
+		BaseSHA:  stack.Base.SHA,
+	}
 }

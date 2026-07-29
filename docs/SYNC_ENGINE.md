@@ -73,9 +73,15 @@ Consequences baked into the design:
    carries the stack summary, most membership drift is detected
    opportunistically within seconds — the sweep only covers changes that
    generate no PR events at all (pure reorder, unstack of an idle stack).
-2. **Stacked-PR events escalate scope.** For a PR in a stack, `closed`,
-   `synchronize`, and base-edit events refresh the stack, not the PR — the
-   interesting state transitions (ghsync movement, retarget) are stack-level.
+   When the complete tuple matches the cached stack ID, base, size, and member
+   at that position, dispatch suppresses the eager stack fetch but retains the
+   authoritative PR refresh. A resulting membership, position, head, state, or
+   draft change still enqueues the stack transactionally.
+2. **Stacked-PR events escalate scope when needed.** For a PR in a stack,
+   `closed`, `synchronize`, and base-edit events always retain an authoritative
+   PR refresh. A tuple mismatch or a fetched membership, position, head, state,
+   or draft change also refreshes the stack because those transitions affect
+   stack-level truth.
 3. **Preview instability is a named risk.** These webhook semantics are a
    private-preview surface and may change without notice. Mitigations: the
    sweep floor (correctness never depends on stack webhooks), the drift

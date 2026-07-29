@@ -447,6 +447,132 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 	}
 }
 
+func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
+	tests := []struct {
+		name         string
+		size         int
+		wantStackJob bool
+	}{
+		{name: "matching tuple", size: 6},
+		{name: "size mismatch", size: 7, wantStackJob: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool := dispatchTestDatabase(t)
+			riverClient, err := queue.NewClient(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 7, 29, 20, 0, 0, 0, time.UTC)
+			repository := store.RepositoryRecord{
+				InstallationID:  1,
+				OrgID:           1,
+				GitHubID:        1001,
+				NodeID:          "R_stack_summary",
+				Owner:           "acme",
+				Name:            "monolith",
+				FullName:        "acme/monolith",
+				DefaultBranch:   "main",
+				GitHubUpdatedAt: now,
+			}
+			entries := make([]store.StackEntry, 6)
+			for index := range entries {
+				entries[index] = store.StackEntry{
+					Number:    72787 + index,
+					State:     "open",
+					UpdatedAt: now,
+					HeadRef:   fmt.Sprintf("stack/layer-%d", index+1),
+					HeadSHA:   fmt.Sprintf("head-%d", index+1),
+				}
+			}
+			if _, err := store.NewEntityWriter(pool).ApplyStack(
+				context.Background(),
+				store.StackRecord{
+					Repository:      repository,
+					GitHubID:        46101,
+					NodeID:          "S_stack_summary",
+					Number:          72787,
+					BaseRef:         "main",
+					BaseSHA:         "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+					Open:            true,
+					Entries:         entries,
+					GitHubUpdatedAt: now,
+					SyncedAt:        now,
+					Source:          store.SyncSourceWebhook,
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := json.Marshal(map[string]any{
+				"action":     "synchronize",
+				"number":     72787,
+				"repository": map[string]any{"full_name": "acme/monolith"},
+				"pull_request": map[string]any{
+					"number": 72787,
+					"stack": map[string]any{
+						"id":       46101,
+						"number":   72787,
+						"size":     test.size,
+						"position": 1,
+						"base": map[string]any{
+							"ref": "main",
+							"sha": "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+						},
+					},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(context.Background(), `
+				INSERT INTO webhook_deliveries (
+					delivery_guid, event, raw_body, headers, received_at
+				)
+				VALUES ($1, 'pull_request', $2, '{}'::jsonb, $3)
+			`, "stack-summary-"+test.name, payload, now); err != nil {
+				t.Fatal(err)
+			}
+			dispatcher := mustNewDispatcher(t, pool, riverClient, Config{
+				BatchSize:    10,
+				MaxAttempts:  3,
+				Debounce:     5 * time.Second,
+				PollInterval: time.Millisecond,
+				Now:          func() time.Time { return now },
+				Classifier:   DefaultClassifier(),
+			})
+			if count, err := dispatcher.DispatchBatch(
+				context.Background(),
+			); err != nil || count != 1 {
+				t.Fatalf("dispatch count=%d err=%v", count, err)
+			}
+			var resolverJobs, stackJobs int
+			if err := pool.QueryRow(context.Background(), `
+				SELECT
+					count(*) FILTER (
+						WHERE kind = 'resolve_stack_membership'
+					),
+					count(*) FILTER (WHERE kind = 'refresh_stack')
+				FROM river_job
+				WHERE args->>'key' LIKE '%:acme/monolith:%'
+			`).Scan(&resolverJobs, &stackJobs); err != nil {
+				t.Fatal(err)
+			}
+			wantStackJobs := 0
+			if test.wantStackJob {
+				wantStackJobs = 1
+			}
+			if resolverJobs != 1 || stackJobs != wantStackJobs {
+				t.Fatalf(
+					"resolver/stack jobs = %d/%d, want 1/%d",
+					resolverJobs,
+					stackJobs,
+					wantStackJobs,
+				)
+			}
+		})
+	}
+}
+
 func TestRunningRefreshRetryableTransitionCannotCollide(t *testing.T) {
 	pool := dispatchTestDatabase(t)
 	riverClient, err := queue.NewClient(pool)
