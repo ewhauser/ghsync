@@ -27,6 +27,7 @@ import (
 
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/config"
+	"github.com/acme/frontier/internal/derive"
 	"github.com/acme/frontier/internal/dispatch"
 	"github.com/acme/frontier/internal/drift"
 	"github.com/acme/frontier/internal/fetch"
@@ -35,6 +36,7 @@ import (
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
+	streammaint "github.com/acme/frontier/internal/stream"
 	"github.com/acme/frontier/internal/sweep"
 )
 
@@ -52,6 +54,8 @@ const (
 	roleSweep              = "sweep"
 	roleDrift              = "drift"
 	rolePruner             = "pruner"
+	roleWatermarker        = "watermarker"
+	roleDeriver            = "deriver"
 )
 
 func main() {
@@ -224,7 +228,7 @@ func serve(args []string) error {
 	rolesFlag := fs.String(
 		"roles",
 		"all",
-		"comma-separated roles: ingress,dispatch,fetch,sweep,drift,pruner, or all",
+		"comma-separated roles: ingress,dispatch,fetch,sweep,drift,pruner,watermarker,deriver, or all",
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -281,7 +285,66 @@ func serve(args []string) error {
 
 	serviceCtx, cancelServices := context.WithCancel(context.Background())
 	defer cancelServices()
-	serviceErrors := make(chan error, 4)
+	serviceErrors := make(chan error, 8)
+
+	if roles[roleWatermarker] {
+		owner, hostErr := os.Hostname()
+		if hostErr != nil {
+			return fmt.Errorf("watermarker lease owner: %w", hostErr)
+		}
+		watermarker, createErr := streammaint.NewWatermarker(
+			pool,
+			streammaint.WatermarkOptions{
+				RefreshInterval: cfg.WatermarkRefresh,
+				LeaseTTL:        cfg.WatermarkLeaseTTL,
+				Owner:           owner,
+			},
+		)
+		if createErr != nil {
+			return createErr
+		}
+		go func() {
+			if runErr := watermarker.Run(serviceCtx); runErr != nil {
+				serviceErrors <- fmt.Errorf("watermarker: %w", runErr)
+			}
+		}()
+	}
+	if roles[roleDeriver] {
+		deriver, createErr := derive.New(derive.Options{
+			Pool:         pool,
+			Deriver:      derive.NoopDeriver{},
+			DirtyCap:     cfg.DeriverDirtyCap,
+			PollInterval: cfg.DeriverPollInterval,
+		})
+		if createErr != nil {
+			return createErr
+		}
+		go func() {
+			if runErr := deriver.Run(serviceCtx); runErr != nil {
+				serviceErrors <- fmt.Errorf("deriver: %w", runErr)
+			}
+		}()
+	}
+	if roles[rolePruner] {
+		retention, createErr := streammaint.NewRetention(
+			pool,
+			streammaint.RetentionOptions{
+				Age:       cfg.StreamRetentionAge,
+				Period:    cfg.StreamRetentionPeriod,
+				BatchSize: cfg.StreamRetentionBatch,
+			},
+		)
+		if createErr != nil {
+			return createErr
+		}
+		go func() {
+			if runErr := retention.Run(serviceCtx); runErr != nil {
+				serviceErrors <- fmt.Errorf(
+					"change-event retention: %w", runErr,
+				)
+			}
+		}()
+	}
 
 	var riverClient *river.Client[pgx.Tx]
 	var githubGate *budget.Gate
@@ -678,15 +741,17 @@ func allPeriodicJobs(cfg config.Config) []*river.PeriodicJob {
 func parseRoles(raw string) (map[string]bool, error) {
 	if raw == "all" {
 		return map[string]bool{
-			roleIngress:  true,
-			roleDispatch: true,
-			roleFetch:    true,
-			roleSweep:    true,
-			roleDrift:    true,
-			rolePruner:   true,
+			roleIngress:     true,
+			roleDispatch:    true,
+			roleFetch:       true,
+			roleSweep:       true,
+			roleDrift:       true,
+			rolePruner:      true,
+			roleWatermarker: true,
+			roleDeriver:     true,
 		}, nil
 	}
-	roles := make(map[string]bool, 6)
+	roles := make(map[string]bool, 8)
 	for _, role := range strings.Split(raw, ",") {
 		switch role {
 		case roleIngress,
@@ -694,11 +759,13 @@ func parseRoles(raw string) (map[string]bool, error) {
 			roleFetch,
 			roleSweep,
 			roleDrift,
-			rolePruner:
+			rolePruner,
+			roleWatermarker,
+			roleDeriver:
 			roles[role] = true
 		default:
 			return nil, fmt.Errorf(
-				"--roles=%q contains unsupported role %q (want ingress, dispatch, fetch, sweep, drift, pruner, or all)",
+				"--roles=%q contains unsupported role %q (want ingress, dispatch, fetch, sweep, drift, pruner, watermarker, deriver, or all)",
 				raw,
 				role,
 			)

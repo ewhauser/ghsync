@@ -35,6 +35,7 @@ type ChangeEvent struct {
 	EntityKey  string
 	OccurredAt pgtype.Timestamptz
 	Payload    []byte
+	OutboxTxid pgtype.Uint64
 }
 
 type CheckHistory struct {
@@ -73,6 +74,13 @@ type CheckRun struct {
 	TombstonedAt    pgtype.Timestamptz
 	SemanticVersion string
 	LastCheckedAt   pgtype.Timestamptz
+}
+
+type ConsumerCursor struct {
+	Consumer  string
+	Stream    string
+	Seq       int64
+	UpdatedAt pgtype.Timestamptz
 }
 
 type DerivationDirty struct {
@@ -263,6 +271,22 @@ type Stack struct {
 	LastCheckedAt pgtype.Timestamptz
 }
 
+type StreamHorizon struct {
+	Stream           string
+	PrunedThroughSeq int64
+	UpdatedAt        pgtype.Timestamptz
+}
+
+type StreamWatermark struct {
+	Singleton    bool
+	SafeSeq      int64
+	CandidateSeq pgtype.Int8
+	CandidateXid pgtype.Uint64
+	UpdatedAt    pgtype.Timestamptz
+	LeaseToken   pgtype.Text
+	LeaseUntil   pgtype.Timestamptz
+}
+
 type SweepCursor struct {
 	InstallationID int64
 	SweepKind      string
@@ -296,4 +320,11 @@ type WebhookDelivery struct {
 	Attempts        int32
 	LastError       pgtype.Text
 	PayloadPrunedAt pgtype.Timestamptz
+}
+
+type WorkItem struct {
+	IdentityKey string
+	OrgID       int64
+	Payload     []byte
+	UpdatedAt   pgtype.Timestamptz
 }

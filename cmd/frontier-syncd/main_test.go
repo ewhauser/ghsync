@@ -20,7 +20,9 @@ func TestValidateRoles(t *testing.T) {
 		"sweep",
 		"drift",
 		"pruner",
-		"ingress,dispatch,fetch,sweep,drift,pruner",
+		"watermarker",
+		"deriver",
+		"ingress,dispatch,fetch,sweep,drift,pruner,watermarker,deriver",
 	} {
 		if err := validateRoles(roles); err != nil {
 			t.Fatalf("%q rejected: %v", roles, err)
@@ -44,6 +46,8 @@ func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
 		"sweep":           {queue.QueueReconcile},
 		"drift":           {queue.QueueDrift},
 		"pruner":          {queue.QueuePruner},
+		"watermarker":     nil,
+		"deriver":         nil,
 		"dispatch,pruner": {queue.QueuePruner},
 		"fetch,sweep,drift,pruner": {
 			queue.QueueInteractive,

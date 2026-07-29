@@ -32,6 +32,14 @@ const (
 	defaultRetentionPeriod         = 24 * time.Hour
 	defaultRetentionAge            = 90 * 24 * time.Hour
 	defaultRetentionBatchSize      = 1000
+
+	defaultWatermarkRefresh      = 100 * time.Millisecond
+	defaultWatermarkLeaseTTL     = 3 * time.Second
+	defaultStreamRetentionPeriod = time.Hour
+	defaultStreamRetentionAge    = 7 * 24 * time.Hour
+	defaultStreamRetentionBatch  = 1000
+	defaultDeriverPoll           = 500 * time.Millisecond
+	defaultDeriverDirtyCap       = 500
 )
 
 type Config struct {
@@ -97,6 +105,15 @@ type Config struct {
 	RetentionPeriod    time.Duration
 	RetentionAge       time.Duration
 	RetentionBatchSize int
+
+	// M5 C-S/C-D maintenance settings.
+	WatermarkRefresh      time.Duration
+	WatermarkLeaseTTL     time.Duration
+	StreamRetentionPeriod time.Duration
+	StreamRetentionAge    time.Duration
+	StreamRetentionBatch  int
+	DeriverPollInterval   time.Duration
+	DeriverDirtyCap       int
 }
 
 func FromEnv() (Config, error) {
@@ -129,6 +146,13 @@ func FromEnv() (Config, error) {
 		RetentionPeriod:            defaultRetentionPeriod,
 		RetentionAge:               defaultRetentionAge,
 		RetentionBatchSize:         defaultRetentionBatchSize,
+		WatermarkRefresh:           defaultWatermarkRefresh,
+		WatermarkLeaseTTL:          defaultWatermarkLeaseTTL,
+		StreamRetentionPeriod:      defaultStreamRetentionPeriod,
+		StreamRetentionAge:         defaultStreamRetentionAge,
+		StreamRetentionBatch:       defaultStreamRetentionBatch,
+		DeriverPollInterval:        defaultDeriverPoll,
+		DeriverDirtyCap:            defaultDeriverDirtyCap,
 	}
 	if raw := os.Getenv("GITHUB_APP_ID"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
@@ -206,6 +230,10 @@ func FromEnv() (Config, error) {
 		{"DRIFT_PERIOD", &cfg.DriftPeriod},
 		{"DRIFT_RESOLVED_RETENTION", &cfg.DriftResolvedRetention},
 		{"RETENTION_PERIOD", &cfg.RetentionPeriod},
+		{"STREAM_WATERMARK_REFRESH", &cfg.WatermarkRefresh},
+		{"STREAM_WATERMARK_LEASE_TTL", &cfg.WatermarkLeaseTTL},
+		{"STREAM_RETENTION_PERIOD", &cfg.StreamRetentionPeriod},
+		{"DERIVER_POLL_INTERVAL", &cfg.DeriverPollInterval},
 	}
 	for _, item := range durationValues {
 		if raw := os.Getenv(item.key); raw != "" {
@@ -225,6 +253,8 @@ func FromEnv() (Config, error) {
 		{"GAP_MAX_PAGES", &cfg.GapMaxPages},
 		{"DRIFT_SAMPLE_SIZE", &cfg.DriftSampleSize},
 		{"RETENTION_BATCH_SIZE", &cfg.RetentionBatchSize},
+		{"STREAM_RETENTION_BATCH_SIZE", &cfg.StreamRetentionBatch},
+		{"DERIVER_DIRTY_CAP", &cfg.DeriverDirtyCap},
 	}
 	for _, item := range intValues {
 		if raw := os.Getenv(item.key); raw != "" {
@@ -247,6 +277,24 @@ func FromEnv() (Config, error) {
 			)
 		}
 		cfg.RetentionAge = value
+	}
+	if raw := os.Getenv("STREAM_RETENTION_AGE"); raw != "" {
+		value, err := parsePositiveDuration("STREAM_RETENTION_AGE", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		if value < defaultStreamRetentionAge {
+			return Config{}, fmt.Errorf(
+				"STREAM_RETENTION_AGE must be at least the locked 7-day policy (%s)",
+				defaultStreamRetentionAge,
+			)
+		}
+		cfg.StreamRetentionAge = value
+	}
+	if cfg.WatermarkRefresh >= cfg.WatermarkLeaseTTL/2 {
+		return Config{}, fmt.Errorf(
+			"STREAM_WATERMARK_REFRESH must be less than half STREAM_WATERMARK_LEASE_TTL",
+		)
 	}
 	if cfg.SweepPageSize > 100 || cfg.GapPageSize > 100 {
 		return Config{}, fmt.Errorf(

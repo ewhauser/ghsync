@@ -24,7 +24,7 @@ make gen       # regenerate sqlc code after editing db/queries or db/migrations
 `backfill` (the configured installation), `requeue --guid=…|--all-parked`,
 `version`.
 Serve roles are `ingress`, `dispatch`, `fetch`, `sweep`, `drift`, and
-`pruner`; `all` enables the complete pipeline.
+`pruner`, `watermarker`, and `deriver`; `all` enables the complete pipeline.
 `fake-github` (cmd/fake-github) serves a canned enrolled repo and emits
 HMAC-signed webhooks; docker-compose runs it beside Postgres.
 
@@ -77,6 +77,26 @@ environment configuration. Dispatcher rules can be loaded from
 `DISPATCH_RULES_FILE`; the real-repository validation protocol is
 [`ops/PHASE0-WEBHOOK-VALIDATION.md`](ops/PHASE0-WEBHOOK-VALIDATION.md).
 
+### M5 change stream and derivation seam
+
+The public Postgres interface is documented in
+[`db/CONTRACT.md`](db/CONTRACT.md). `pkg/streamclient` is the reference
+consumer: it pages only through `stream_watermark.safe_seq`, ties handler
+database effects to durable cursor advancement, uses `LISTEN/NOTIFY` only as a
+wake hint, and returns typed `ErrResyncRequired` below a pruned horizon.
+`cmd/stream-tail` is a runnable example; pass `--bootstrap` when intentionally
+replacing a local projection.
+
+The leased `watermarker` role refreshes at 100 ms by default. The `pruner`
+role removes `change_events` after the floor-enforced seven-day window,
+independently of cursors. The `deriver` role drains whole dirty sets in one
+transaction per capped batch; M5 wires `NoopDeriver` until the separate
+classification project supplies an implementation. Relevant environment
+settings are `STREAM_WATERMARK_REFRESH`, `STREAM_WATERMARK_LEASE_TTL`,
+`STREAM_RETENTION_PERIOD`, `STREAM_RETENTION_AGE`,
+`STREAM_RETENTION_BATCH_SIZE`, `DERIVER_POLL_INTERVAL`, and
+`DERIVER_DIRTY_CAP`.
+
 ## Status
 
 - [x] M0 — foundations: module, migrations (River + own), three River
@@ -85,5 +105,5 @@ environment configuration. Dispatcher rules can be loaded from
 - [x] M2 — ingestion, dispatch, coalescing
 - [x] M3 — cache & fetchers
 - [x] M4 — reconciliation & webhook validation
-- [ ] M5 — change stream, derivation seam, contract
+- [x] M5 — change stream, derivation seam, contract
 - [ ] M6 — hardening & operations
