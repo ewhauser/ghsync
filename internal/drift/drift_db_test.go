@@ -408,6 +408,68 @@ func TestDetectRecordsZeroSampleHeartbeat(t *testing.T) {
 	}
 }
 
+func TestDetectSkipsWhileChildBackfillPending(t *testing.T) {
+	pool := driftTestDatabase(t)
+	ctx := context.Background()
+	// The installation cursor is 'done' (seeded by driftTestDatabase), but a
+	// child seed is still in flight: sampling now would compare half-seeded
+	// entities against upstream truth.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO backfill_cursors (
+		    installation_id, repo_full_name, phase, page, completed_at
+		) VALUES (1, 'acme/monolith', 'pull_requests', 1, NULL)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO backfill_children (
+		    installation_id, repo_full_name, kind, refresh_key,
+		    target_generation
+		) VALUES (1, 'acme/monolith', 'refresh_pr', 'pr:acme/monolith:4812', 1)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(Options{
+		Pool:    pool,
+		REST:    &gh.RESTClient{},
+		GraphQL: &gh.GraphQLClient{},
+		Config: Config{
+			InstallationID:     1,
+			Period:             time.Hour,
+			SampleSize:         100,
+			PageSize:           100,
+			ResolvedRetention:  30 * 24 * time.Hour,
+			RetentionBatchSize: 100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	findings, err := service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings during child backfill = %d, want 0", len(findings))
+	}
+	var skippedHeartbeats int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'drift'
+		  AND operation = 'detector_skipped'
+	`).Scan(&skippedHeartbeats); err != nil {
+		t.Fatal(err)
+	}
+	if skippedHeartbeats != 1 {
+		t.Fatalf("detector_skipped heartbeats = %d, want 1", skippedHeartbeats)
+	}
+}
+
 func TestStackDriftIgnoresMemberUpdatedAtChurn(t *testing.T) {
 	pool := driftTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()

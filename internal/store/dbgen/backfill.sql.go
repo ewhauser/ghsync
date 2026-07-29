@@ -292,20 +292,38 @@ func (q *Queries) GetInstallationBackfillCursorForUpdate(ctx context.Context, in
 }
 
 const isInstallationBackfillDone = `-- name: IsInstallationBackfillDone :one
-SELECT EXISTS (
-    SELECT 1
-    FROM installation_backfill_cursors
-    WHERE installation_id = $1
-      AND phase = 'done'
-      AND completed_at IS NOT NULL
-)
+SELECT (
+    EXISTS (
+        SELECT 1
+        FROM installation_backfill_cursors
+        WHERE installation_backfill_cursors.installation_id =
+              $1
+          AND phase = 'done'
+          AND completed_at IS NOT NULL
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM backfill_cursors
+        WHERE backfill_cursors.installation_id = $1
+          AND phase <> 'done'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM backfill_children
+        WHERE backfill_children.installation_id = $1
+          AND completed_at IS NULL
+    )
+)::boolean
 `
 
+// Done means SETTLED: the installation cursor alone flips 'done' while
+// per-repo child seeding is still in flight, and drift sampling in that
+// window compares half-seeded entities against upstream truth.
 func (q *Queries) IsInstallationBackfillDone(ctx context.Context, installationID int64) (bool, error) {
 	row := q.db.QueryRow(ctx, isInstallationBackfillDone, installationID)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const listSeenBackfillRefreshKeys = `-- name: ListSeenBackfillRefreshKeys :many
