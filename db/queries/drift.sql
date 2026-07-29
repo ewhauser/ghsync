@@ -14,19 +14,32 @@ ON CONFLICT (installation_id, entity_kind) DO UPDATE
 SET source_id = EXCLUDED.source_id,
     updated_at = now();
 
--- name: SampleCachedEntitiesByKind :many
--- The boolean leading sort wraps at the end of one entity-kind population.
--- source_id is each table's indexed surrogate key (or a stable group minimum),
--- avoiding a full-population random sort.
-SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot
+-- name: SampleCachedEntitiesAfter :many
+-- Q11: the forward half of the rotating sample is a plain indexed source_id
+-- range. Detect issues a second bounded range only when this reaches the end.
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
+       last_checked_at
 FROM drift_entities
 WHERE installation_id = sqlc.arg(installation_id)
   AND entity_kind = sqlc.arg(entity_kind)
-ORDER BY (source_id <= sqlc.arg(after_source_id)), source_id
+  AND source_id > sqlc.arg(after_source_id)
+ORDER BY source_id
+LIMIT sqlc.arg(sample_size);
+
+-- name: SampleCachedEntitiesThrough :many
+-- The wrap half cannot overlap the forward half and retains source_id order.
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
+       last_checked_at
+FROM drift_entities
+WHERE installation_id = sqlc.arg(installation_id)
+  AND entity_kind = sqlc.arg(entity_kind)
+  AND source_id <= sqlc.arg(through_source_id)
+ORDER BY source_id
 LIMIT sqlc.arg(sample_size);
 
 -- name: GetCachedEntitySnapshot :one
-SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
+       last_checked_at
 FROM drift_entities
 WHERE installation_id = sqlc.arg(installation_id)
   AND entity_kind = sqlc.arg(entity_kind)

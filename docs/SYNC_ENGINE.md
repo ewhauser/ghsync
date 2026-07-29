@@ -23,11 +23,13 @@ system means one backup/restore/failover story.
 
 In scope: webhook ingestion, authoritative refetch, cache writes, burst
 coalescing, rate-budget management, reconciliation sweeps, derivation
-triggering, and the change feed that powers `WatchWorkItems`.
+triggering, and the versioned Postgres change feed that a future
+`WatchWorkItems` API can consume.
 
 Non-goals: the derivation engine's classification rules (separate pure
 package), the git worker (dry-runs/rebases), mutation execution
-(PreviewService), and the agent-runner integration.
+(PreviewService), the gRPC/SSE API in `API_SPEC.md`, and the agent-runner
+integration. Direct Postgres is the only v1 delivery transport.
 
 ## 2. The one architectural decision everything follows from
 
@@ -167,12 +169,21 @@ Consequences baked into the design:
 - **C-Q1 — Bursts collapse to one fetch.** Refresh intents are keyed
   (`repo`, `entity`, and where applicable `head_sha`). A rebase cascade that
   emits ~20 events across 3 branches in 10 seconds results in ≤ 1 fetch per
-  affected entity. Implemented with River **unique jobs**: insert with
-  `ScheduledAt = now() + debounce` and `UniqueOpts{ByArgs (the entity key),
-  ByState: pending/scheduled/available}` — subsequent intents for the same
-  key while the job is queued are no-op inserts. The uniqueness scope must
-  exclude running/completed states so an event arriving *while a fetch runs*
-  schedules a follow-up (no lost update between fetch start and event).
+  affected entity. Implemented with River **unique jobs** plus a durable
+  refresh generation for each `(kind, key)`.
+
+  (Mechanism amended during M2 review: River 0.41 requires `running` in the
+  supported public uniqueness mask. The shipped mask is
+  `available/pending/retryable/running/scheduled`, not the originally
+  specified running-excluded mask. The dispatcher and every other refresh
+  producer bump `refresh_intent_generations.generation` in the same
+  transaction that attempts the River insert. A worker records the generation
+  it started, fetches authoritative truth, then locks and rechecks the durable
+  generation in its completion transaction. If an intent arrived while it
+  ran, the worker completes the current job and reinserts a follow-up pointer
+  before committing. Thus a queued burst still collapses to one job, while an
+  in-flight signal cannot be lost. The guarantee is unchanged; the durable
+  generation protocol supplies it through River 0.41's supported mask.)
 - **C-Q2 — Debounce is bounded.** The first intent fixes `ScheduledAt`;
   because coalesced duplicates never reschedule it, the delay is exactly one
   debounce window (default 5s) — the 15s hard cap holds by construction.
@@ -219,12 +230,14 @@ Consequences baked into the design:
   the UI or the Watch stream.
 - **C-D4 — Exactly-once-per-cursor change feed.** Derived changes are
   emitted through a transactional outbox with a per-org monotonic sequence.
-  `WatchWorkItems` = snapshot at sequence S, then deltas > S. A watcher that
-  reconnects with its cursor misses nothing and duplicates nothing *per that
-  cursor*; the outbox itself is at-least-once and consumers are keyed by
-  sequence.
-- **C-D5 — Snapshot-consistent reads.** List/Get read from derived rows in
-  a single transaction; a reader never observes a half-applied recompute.
+  The v1 Postgres consumer contract is snapshot at sequence S, then deltas
+  > S. A consumer that reconnects with its cursor misses nothing and
+  duplicates nothing *per that cursor*; the outbox itself is at-least-once
+  and consumers are keyed by sequence. A future `WatchWorkItems` API builds
+  on this contract.
+- **C-D5 — Snapshot-consistent reads.** Consumers read derived rows in a
+  single Postgres transaction; a reader never observes a half-applied
+  recompute. Future List/Get methods build on the same read model.
 
 ### Change stream for consumers (C-S)
 
@@ -257,31 +270,46 @@ consumer.
   holds a shared advisory lock; the watermarker's momentary exclusive
   acquisition proves no writer is in flight, at which point
   max(committed seq) is safe. Read-only snapshots never take the fence.)
+
+  (Mechanism hardened during the Wave A review: the exclusive fence is a
+  bounded global write barrier. The watermarker applies a local
+  `lock_timeout`; a busy or stuck writer produces a retryable, metered timeout
+  instead of leaving a pending exclusive acquisition that freezes new
+  writers. Every pooled connection also has an
+  `idle_in_transaction_session_timeout`, and migration `0024` installs a
+  database-enforced `BEFORE INSERT` trigger that rejects an unfenced
+  `change_events` write. A stuck writer therefore times out rather than
+  freezing the stream, and the trigger prevents a new writer from bypassing
+  the fence; enforcement no longer depends on convention.)
+
   No consumer may ever observe a gap that later fills; this is the
   constraint that makes cursors trustworthy, and it gets its own test (§9).
 - **C-S3 — Snapshot-then-stream bootstrap.** A consumer's contract is:
   snapshot at watermark W, then deltas with seq > W, resuming by cursor after
   disconnect — exactly-once per cursor (same contract C-D4 gives
-  `WatchWorkItems`; C-S makes it uniform for every stream). For the SPA the
-  transport is the gRPC server-stream / SSE from the API layer; SSE
-  `Last-Event-ID` maps directly to the cursor.
-- **C-S4 — Bounded buffers, explicit resync.** Per-connection fan-out
-  buffers are bounded. On overflow — or when a resuming cursor has fallen
-  below retention (C-S7) — the server terminates the stream with an explicit
-  `RESYNC_REQUIRED`, and the client re-snapshots. Slow consumers are never
-  silently dropped events mid-stream, and one slow consumer never bloats
-  server memory or blocks pruning.
-- **C-S5 — One tailer per process, in-memory fan-out.** Each API process
-  runs a single outbox tailer (LISTEN/NOTIFY as wake-up, short-interval poll
-  as the correctness path) and broadcasts to its subscribed connections with
-  server-side stream/scope filters. Per-connection database polling is
-  banned; N watchers cost one tail, not N.
+  `WatchWorkItems`; C-S makes it uniform for every stream).
+  `pkg/streamclient` implements this transaction over direct Postgres, the
+  **only v1 transport**. The gRPC server-stream and SSE/`Last-Event-ID`
+  mapping belong to the future API project in `API_SPEC.md`.
+- **C-S4 — Explicit resync.** When a resuming cursor has fallen below
+  retention (C-S7), `pkg/streamclient` returns typed
+  `ErrResyncRequired`, and the consumer replaces its projection through
+  Bootstrap before resuming. Slow consumers are never silently advanced and
+  never block pruning. V1 has no API-server connection or fan-out buffer;
+  bounded connection buffers remain an obligation of the future API project.
+- **C-S5 — Exactly one tailer per consumer and stream.** A
+  `(consumer, stream)` cursor has one tailer; sharing it across replicas
+  intentionally produces `REPEATABLE READ` serialization failures. Elect a
+  single tailer and fan out locally, or give independent consumers distinct
+  names. `LISTEN/NOTIFY` is a wake-up hint and short-interval Postgres polling
+  is the correctness path.
 - **C-S6 — Envelope stability.** Events carry {seq, stream, kind, entity
   reference, occurred_at, versioned payload} — never internal row images.
   Evolution is additive-only; consumers must ignore unknown kinds and fields.
   The `entities`-stream payload is a *reference* (what changed, not the new
-  state): consumers fetch current state via the read API, which keeps the
-  stream cheap and re-uses C-S3's consistency story.
+  state): v1 consumers fetch current state from the public Postgres read
+  model in `db/CONTRACT.md`, which keeps the stream cheap and re-uses C-S3's
+  consistency story.
 - **C-S7 — Stream retention is independent of consumers.** Events prune at
   7 days (config). Pruning never waits on a lagging cursor — a consumer that
   falls behind retention gets `RESYNC_REQUIRED` (C-S4). This is the
@@ -299,14 +327,20 @@ else, so no pipeline stage does per-event work that could be per-batch work.
   (durable-before-ack) forces a commit inside that request; there is nothing
   to batch against. The constraint is that this commit is *one single-row
   insert* into an append-only table whose write cost stays O(1) — no
-  parsing beyond signature check, no classification, no joins. Indexing:
-  the GUID primary key, plus at most a small partial index over
-  undispatched rows (`WHERE status = 'pending'`) so the dispatcher's claim
-  poll scales with pending work, not retained history; the partial index is
-  empty at steady state and costs the ingress hot path nothing. (Amended
-  from "exactly one index" during M2 review: claim-poll cost and
-  ingress-write cost are both constraints, and the pending-only partial
-  index is the reconciliation.)
+  parsing beyond signature check, no classification, no joins.
+
+  (Index policy amended during M2 and ingestion review: the shipped table has
+  the `delivery_guid` primary key;
+  `webhook_deliveries_pending_received_guid_idx`, a partial claim index over
+  `(received_at, delivery_guid) WHERE status = 'pending'`;
+  `webhook_deliveries_unfinished_received_idx`, a partial status index over
+  `(status, received_at) WHERE status IN
+  ('pending', 'processing', 'parked')`; and the compact
+  `webhook_deliveries_received_at_brin_idx` used by retention. Claim-poll and
+  retention cost are constraints alongside ingress-write cost, so the earlier
+  "exactly one index" and pending-only descriptions are no longer the
+  contract. Migrations are the source of truth for the exact index set.)
+
   Concurrent deliveries amortize WAL flushes via Postgres group commit.
   Budget: a single-row commit is ~1ms; even a 200 deliveries/sec redelivery
   burst is well inside a small instance's capacity. `synchronous_commit`
@@ -332,7 +366,7 @@ else, so no pipeline stage does per-event work that could be per-batch work.
   recomputes affected stacks in one engine pass, and writes work items +
   outbox deltas in one transaction per batch. A storm that dirties 50 stacks
   is one recompute cycle, not 50.
-- **C-P6 — Feed consumers page.** Outbox tailing (Watch fan-out) reads
+- **C-P6 — Feed consumers page.** Direct Postgres outbox tailing reads
   `WHERE seq > $cursor ORDER BY seq LIMIT N` batches; budget-state
   persistence is periodic snapshots from the in-memory budgeter, never
   per-request writes.
@@ -392,8 +426,8 @@ GitHub ──webhook──▶ ingress (verify, C-I1..3) ──▶ webhook_delive
                                                         ▼
                                     Tx: upsert work_items + outbox deltas (C-D4)
                                                         ▼
-                                    API processes: List/Get (C-D5), Watch
-                                    (snapshot seq + LISTEN/NOTIFY tail)
+                                    Direct Postgres consumers: read model
+                                    + streamclient snapshot/cursor tail
 ```
 
 `LISTEN/NOTIFY` is a wake-up latency optimization only; correctness comes
@@ -404,14 +438,16 @@ events).
 
 ```sql
 -- Ingestion
-webhook_deliveries(id, delivery_guid UNIQUE, event, action, repo_id,
-                   payload JSONB, received_at, status, attempts, error)
+webhook_deliveries(delivery_guid PRIMARY KEY, event, raw_body, headers,
+                   received_at, status, attempts, last_error,
+                   payload_pruned_at)
 
 -- Job queue: River-owned tables (river_job, river_leader, ...) via River's
 -- migrations. Our conventions on top:
---   queues:      interactive | event | sweep        (C-B3 priority classes)
+--   priority queues: interactive | event | sweep    (C-B3 fetch classes)
+--   component queues: reconcile | drift | pruner
 --   job args:    {kind, key} where key = 'pr:acme/monolith:4812' | 'stack:...:142'
---   coalescing:  UniqueOpts by args+state per C-Q1 (no bespoke queue table)
+--   coalescing:  River UniqueOpts + durable refresh generations per C-Q1
 
 -- Cache (mirrors; all rows carry provenance C-C5)
 repos(...), repo_rules(...),
@@ -462,17 +498,20 @@ maps to River's discarded state plus our error surfacing.
 |---|---|---|
 | `ingress` | HTTP handler: verify, persist, ack | C-I1, C-I2, C-I3, C-P1 |
 | `dispatcher` | Batch-claims deliveries → refresh intents; payload-as-hint classification | C-I4, C-I5, C-Q1, C-Q3, C-P2 |
-| `fetcher` | River workers on the three queues; gangs due jobs into GraphQL batches; transactional set-writes | C-C1..C-C3, C-O1, C-P3, C-P4 |
+| `fetcher` | River workers on the three fetch-priority queues; gangs due jobs into GraphQL batches; transactional set-writes | C-C1..C-C3, C-O1, C-P3, C-P4 |
 | `budgeter` | Per-installation gate (leased singleton); classes, headers, concurrency | C-B1..C-B6 |
 | `sweeper` | River **periodic jobs** (leader-elected by River) enqueue sweep work; cursors + disappearance checks + gap healing in ordinary workers | C-R1..C-R4 |
 | `deriver` | Drain dirty scopes as a set → run pure engine → write derived + outbox per batch | C-D1..C-D4, C-P5 |
-| `api` (existing) | List/Get/Watch reads; single outbox tailer per process + in-memory fan-out | C-D5, C-S3..C-S5 |
-| `watermarker` | Leader-elected (River periodic); advances the visibility watermark | C-S2 |
+| Postgres consumer (external) | Snapshot-consistent reads and exactly one `streamclient` tailer per `(consumer, stream)` | C-D5, C-S3..C-S5 |
+| `watermarker` | Leased singleton loop; advances the visibility watermark through the bounded writer fence | C-S2 |
 
 Internal interfaces to keep the seams honest:
 
 ```go
 type GitHubGate interface { // the only path to GitHub (C-B1)
+    // Do holds the C-B6 admission slot through the response-body lifetime.
+    // Reading to EOF or closing the body releases the slot. The
+    // internal/budget package doc comments are the normative admission contract.
     Do(ctx, Class, *Request) (*Response, error)
 }
 type EntityWriter interface { // fetch result → tx (C-C2, C-C3)
@@ -505,7 +544,7 @@ an outage) degrading gracefully by priority instead of failing.
 
 | Need | Choice | Notes |
 |---|---|---|
-| Job queue | **`riverqueue/river`** (decided) | Queues = priority classes; unique jobs = C-Q1 coalescing; periodic jobs + leader election = sweeper scheduling; its own migrations sit alongside ours |
+| Job queue | **`riverqueue/river`** (decided) | Three priority queues plus reconcile/drift/pruner component queues; supported-mask unique jobs + durable generations = C-Q1 coalescing; periodic jobs + leader election = sweeper scheduling; its own migrations sit alongside ours |
 | Data layer | **`sqlc` + `jackc/pgx/v5`** (decided) | SQL-first: write-if-newer, dirty-marking, and outbox queries are named sqlc queries; transactions via pgx `Tx` passed to sqlc `WithTx` and to River's `InsertTx` so C-C3's single-transaction rule spans entity write + outbox + job insert |
 | Migrations | `golang-migrate` or `tern` | Plain SQL files; run River's migrations in the same pipeline |
 | GitHub REST | `google/go-github` | Plus thin wrapper for stacks endpoints (preview; not in the lib) |

@@ -76,7 +76,8 @@ opaque cursor. The drift job rotates a quota through every semantic entity
 class, deduplicates attached diffs, and permits one self-healing generation
 before persistent divergence is escalated. The pruner removes webhook
 bodies/headers and `check_history` older than the locked minimum 90-day
-boundary in bounded transactions; it does not prune `change_events`.
+boundary in bounded transactions. Those are the M4 retention duties; M5 adds
+the same role's independent `change_events` retention described below.
 
 The C-R1 durations, gap window, drift sample, and retention settings are
 environment configuration. Dispatcher rules can be loaded from
@@ -123,8 +124,8 @@ fresh Postgres; the reproducible 48-hour release procedure is in
 
 ## Status
 
-- [x] M0 — foundations: module, migrations (River + own), three River
-      queues, config, fake GitHub skeleton, CI
+- [x] M0 — foundations: module, migrations (River + own), River queue
+      plumbing, config, fake GitHub skeleton, CI
 - [x] M1 — GitHub plumbing & budgeter
 - [x] M2 — ingestion, dispatch, coalescing
 - [x] M3 — cache & fetchers

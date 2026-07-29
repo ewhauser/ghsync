@@ -576,12 +576,45 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	for range 2 {
-		if count, err := dispatcher.DispatchBatch(context.Background()); err != nil || count != 1 {
-			t.Fatalf("poison dispatch count=%d err=%v", count, err)
-		}
+	firstAttemptStarted := time.Now().UTC()
+	if count, err := dispatcher.DispatchBatch(context.Background()); err != nil ||
+		count != 1 {
+		t.Fatalf("first poison dispatch count=%d err=%v", count, err)
 	}
-	poison, err := dbgen.New(pool).GetWebhookDelivery(context.Background(), "poison-known")
+	poison, err := dbgen.New(pool).GetWebhookDelivery(
+		context.Background(),
+		"poison-known",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poison.Status != "pending" ||
+		poison.Attempts != 1 ||
+		!poison.NextAttemptAt.Valid ||
+		poison.NextAttemptAt.Time.Before(
+			firstAttemptStarted.Add(classificationRetryBaseBackoff),
+		) {
+		t.Fatalf("first poison attempt = %+v", poison)
+	}
+	if count, err := dispatcher.DispatchBatch(context.Background()); err != nil ||
+		count != 0 {
+		t.Fatalf("not-yet-due poison dispatch count=%d err=%v", count, err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE webhook_deliveries
+		SET next_attempt_at = clock_timestamp()
+		WHERE delivery_guid = 'poison-known'
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := dispatcher.DispatchBatch(context.Background()); err != nil ||
+		count != 1 {
+		t.Fatalf("due poison dispatch count=%d err=%v", count, err)
+	}
+	poison, err = dbgen.New(pool).GetWebhookDelivery(
+		context.Background(),
+		"poison-known",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

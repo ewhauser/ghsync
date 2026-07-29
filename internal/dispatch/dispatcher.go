@@ -22,7 +22,11 @@ import (
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
-const MaxDebounce = 15 * time.Second
+const (
+	MaxDebounce                    = 15 * time.Second
+	classificationRetryBaseBackoff = time.Second
+	classificationRetryMaxBackoff  = time.Minute
+)
 
 // Config controls dispatcher batching, poison tolerance, and bounded debounce.
 type Config struct {
@@ -183,7 +187,10 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
 	queries := dbgen.New(tx)
-	deliveries, err := queries.ClaimWebhookDeliveries(ctx, int32(d.config.BatchSize))
+	deliveries, err := queries.ClaimWebhookDeliveries(
+		ctx,
+		int32(d.config.BatchSize),
+	)
 	if err != nil {
 		return 0, fmt.Errorf("claim webhook deliveries: %w", err)
 	}
@@ -198,9 +205,10 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	}
 
 	type deliveryResult struct {
-		DeliveryGUID string `json:"delivery_guid"`
-		Status       string `json:"status"`
-		LastError    string `json:"last_error"`
+		DeliveryGUID      string `json:"delivery_guid"`
+		Status            string `json:"status"`
+		LastError         string `json:"last_error"`
+		RetryDelaySeconds *int32 `json:"retry_delay_seconds,omitempty"`
 	}
 	results := make([]deliveryResult, 0, len(deliveries))
 	intents := make([]Intent, 0, len(deliveries))
@@ -213,13 +221,21 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 		)
 		if classifyErr != nil {
 			status := "pending"
+			var retryDelaySeconds *int32
 			if int(delivery.Attempts) >= d.config.MaxAttempts {
 				status = "parked"
+			} else {
+				delay := int32(
+					classificationRetryBackoff(delivery.Attempts) /
+						time.Second,
+				)
+				retryDelaySeconds = &delay
 			}
 			results = append(results, deliveryResult{
-				DeliveryGUID: delivery.DeliveryGuid,
-				Status:       status,
-				LastError:    classifyErr.Error(),
+				DeliveryGUID:      delivery.DeliveryGuid,
+				Status:            status,
+				LastError:         classifyErr.Error(),
+				RetryDelaySeconds: retryDelaySeconds,
 			})
 			continue
 		}
@@ -338,6 +354,17 @@ func refreshArgs(intent Intent) (rivertype.JobArgs, error) {
 	default:
 		return nil, fmt.Errorf("unsupported refresh kind %q", intent.Kind)
 	}
+}
+
+func classificationRetryBackoff(attempt int32) time.Duration {
+	delay := classificationRetryBaseBackoff
+	for current := int32(1); current < attempt; current++ {
+		if delay >= classificationRetryMaxBackoff/2 {
+			return classificationRetryMaxBackoff
+		}
+		delay *= 2
+	}
+	return delay
 }
 
 func dedupeIntents(intents []Intent) []Intent {

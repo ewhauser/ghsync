@@ -27,20 +27,30 @@ If payload is pruned, use GitHub's delivery view; never reconstruct it from
 
 ## Remediation
 
-Fix `DISPATCH_RULES_FILE`, roll dispatch, then test one GUID:
+Fix `DISPATCH_RULES_FILE`, then roll the dispatch role through the deployment
+platform. If starting it manually, keep this foreground process running in a
+separate shell/deployment action:
 
 ```sh
-frontier-syncd requeue --guid=DELIVERY_GUID
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=dispatch
 ```
 
-After it processes cleanly:
+Once the fixed dispatch role is ready, test one GUID:
 
 ```sh
-# Replay at most 100 exact GUIDs:
-frontier-syncd requeue --guids=guid-1,guid-2
+frontier-syncd requeue --guid=DELIVERY_GUID
+```
 
-# Or replay the next bounded batch sharing one diagnosed signature:
+After it processes cleanly, replay at most 100 exact GUIDs:
+
+```sh
+frontier-syncd requeue --guids=guid-1,guid-2
+```
+
+Alternatively, replay the next bounded batch sharing one diagnosed signature:
+
+```sh
 frontier-syncd requeue \
   --event=pull_request \
   --error-contains='unsupported action reopened'

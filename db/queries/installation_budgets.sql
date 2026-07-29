@@ -77,7 +77,13 @@ SET remaining = CASE budgets.class
         WHEN 'rest' THEN sqlc.narg(rest_reset_at)::timestamptz
         WHEN 'graphql' THEN sqlc.narg(graphql_reset_at)::timestamptz
     END,
-    backoff_until = sqlc.narg(backoff_until)::timestamptz,
+    backoff_until = CASE
+        WHEN budgets.backoff_until IS NULL
+          OR budgets.backoff_until <
+             sqlc.narg(backoff_until)::timestamptz
+        THEN sqlc.narg(backoff_until)::timestamptz
+        ELSE budgets.backoff_until
+    END,
     updated_at = observed.checked_at
 FROM observed
 WHERE budgets.installation_id = sqlc.arg(installation_id)

@@ -267,9 +267,9 @@ func (s *Service) Detect(
 				err,
 			)
 		}
-		rows, err := queries.SampleCachedEntitiesByKind(
+		afterRows, err := queries.SampleCachedEntitiesAfter(
 			ctx,
-			dbgen.SampleCachedEntitiesByKindParams{
+			dbgen.SampleCachedEntitiesAfterParams{
 				InstallationID: args.InstallationID,
 				EntityKind:     kind,
 				AfterSourceID:  afterID,
@@ -283,16 +283,49 @@ func (s *Service) Detect(
 				err,
 			)
 		}
-		for _, row := range rows {
-			finding, recorded, sampleSkipped, err := s.inspectSample(
+		samples := make([]driftSample, 0, quota)
+		for _, row := range afterRows {
+			samples = append(samples, driftSample{
+				EntityKind:    row.EntityKind,
+				SourceID:      row.SourceID,
+				EntityKey:     row.EntityKey,
+				LockKey:       row.LockKey,
+				CacheSnapshot: row.CacheSnapshot,
+				LastCheckedAt: row.LastCheckedAt,
+			})
+		}
+		if remaining := quota - len(samples); remaining > 0 {
+			wrapped, wrapErr := queries.SampleCachedEntitiesThrough(
 				ctx,
-				driftSample{
+				dbgen.SampleCachedEntitiesThroughParams{
+					InstallationID:  args.InstallationID,
+					EntityKind:      kind,
+					ThroughSourceID: afterID,
+					SampleSize:      int32(remaining),
+				},
+			)
+			if wrapErr != nil {
+				return nil, fmt.Errorf(
+					"wrap cached %s entity sample: %w",
+					kind,
+					wrapErr,
+				)
+			}
+			for _, row := range wrapped {
+				samples = append(samples, driftSample{
 					EntityKind:    row.EntityKind,
 					SourceID:      row.SourceID,
 					EntityKey:     row.EntityKey,
 					LockKey:       row.LockKey,
 					CacheSnapshot: row.CacheSnapshot,
-				},
+					LastCheckedAt: row.LastCheckedAt,
+				})
+			}
+		}
+		for _, sample := range samples {
+			finding, recorded, sampleSkipped, err := s.inspectSample(
+				ctx,
+				sample,
 			)
 			if err != nil {
 				return nil, err
@@ -306,13 +339,13 @@ func (s *Service) Detect(
 				findings = append(findings, finding)
 			}
 		}
-		if len(rows) > 0 {
+		if len(samples) > 0 {
 			if err := queries.UpsertDriftSampleCursor(
 				ctx,
 				dbgen.UpsertDriftSampleCursorParams{
 					InstallationID: args.InstallationID,
 					EntityKind:     kind,
-					SourceID:       rows[len(rows)-1].SourceID,
+					SourceID:       samples[len(samples)-1].SourceID,
 				},
 			); err != nil {
 				return nil, fmt.Errorf(
@@ -365,12 +398,31 @@ type driftSample struct {
 	EntityKey     string
 	LockKey       string
 	CacheSnapshot []byte
+	LastCheckedAt pgtype.Timestamptz
 }
 
 func (s *Service) inspectSample(
 	ctx context.Context,
 	sample driftSample,
 ) (dbgen.DriftFinding, bool, bool, error) {
+	spec, err := refreshSpecForEntity(sample.EntityKind, sample.EntityKey)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, false, err
+	}
+	if skipped, err := s.skipForOutstandingRefresh(ctx, spec); err != nil {
+		return dbgen.DriftFinding{}, false, false, err
+	} else if skipped {
+		s.logSkippedSample(sample.EntityKind, sample.EntityKey, spec)
+		return dbgen.DriftFinding{}, false, true, nil
+	}
+	upstream, spec, err := s.fullFetch(
+		ctx,
+		sample.EntityKind,
+		sample.EntityKey,
+	)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, false, err
+	}
 	observation, err := store.NewEntityWriter(s.pool).BeginObservation(
 		ctx,
 		sample.LockKey,
@@ -401,27 +453,17 @@ func (s *Service) inspectSample(
 			err,
 		)
 	}
-	spec, err := refreshSpecForEntity(current.EntityKind, current.EntityKey)
-	if err != nil {
-		return dbgen.DriftFinding{}, false, false, err
-	}
-	if skipped, err := s.skipForOutstandingRefresh(ctx, spec); err != nil {
-		return dbgen.DriftFinding{}, false, false, err
-	} else if skipped {
-		s.logSkippedSample(current.EntityKind, current.EntityKey, spec)
+	if !sample.LastCheckedAt.Valid ||
+		!current.LastCheckedAt.Valid ||
+		!current.LastCheckedAt.Time.Equal(sample.LastCheckedAt.Time) {
+		// The upstream read is paired only with the cache observation selected
+		// before it. A writer that moved validation time makes the comparison
+		// stale, so discard it without reporting convergence or divergence.
 		return dbgen.DriftFinding{}, false, true, nil
 	}
-	upstream, spec, err := s.fullFetch(
-		ctx,
-		current.EntityKind,
-		current.EntityKey,
-	)
-	if err != nil {
-		return dbgen.DriftFinding{}, false, false, err
-	}
 	// A refresh may be enqueued while the authoritative read is in progress.
-	// Recheck under the observation lock so a legitimate writer waiting on this
-	// comparison cannot be reported as drift.
+	// Recheck after locking so queued authoritative work wins over this
+	// read-only comparison.
 	if skipped, err := s.skipForOutstandingRefresh(ctx, spec); err != nil {
 		return dbgen.DriftFinding{}, false, false, err
 	} else if skipped {

@@ -124,6 +124,25 @@ func TestObserveSecondaryLimitAcceptsHTTPDateRetryAfter(t *testing.T) {
 	}
 }
 
+func TestGateOptionsConfigureBudgetSurface(t *testing.T) {
+	gate := New(nil, Options{
+		MaxConcurrent:          12,
+		RESTLimit:              12000,
+		GraphQLLimit:           4000,
+		SweepFloor:             0.30,
+		EventFloor:             0.15,
+		SecondaryLimitFallback: 90 * time.Second,
+	})
+	if gate.maxConcurrent != 12 ||
+		gate.rest.Limit != 12000 ||
+		gate.graphql.Limit != 4000 ||
+		gate.sweepFloor != 0.30 ||
+		gate.eventFloor != 0.15 ||
+		gate.secondaryLimitFallback != 90*time.Second {
+		t.Fatalf("configured gate surface not preserved: %+v", gate)
+	}
+}
+
 func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
 	var active atomic.Int64
 	var maxActive atomic.Int64

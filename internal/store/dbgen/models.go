@@ -97,6 +97,7 @@ type DriftEntity struct {
 	EntityKey      string
 	LockKey        string
 	CacheSnapshot  []byte
+	LastCheckedAt  pgtype.Timestamptz
 }
 
 type DriftFinding struct {
@@ -307,7 +308,6 @@ type SweepCursor struct {
 	SweepKind      string
 	ScopeKey       string
 	Cursor         string
-	SeenKeys       []byte
 	StartedAt      pgtype.Timestamptz
 	UpdatedAt      pgtype.Timestamptz
 	CompletedAt    pgtype.Timestamptz
@@ -325,6 +325,14 @@ type SweepPage struct {
 	ListSeenAt     pgtype.Timestamptz
 }
 
+type SweepSeenKey struct {
+	InstallationID int64
+	SweepKind      string
+	ScopeKey       string
+	EntityKey      string
+	FirstSeenAt    pgtype.Timestamptz
+}
+
 type WebhookDelivery struct {
 	DeliveryGuid    string
 	Event           string
@@ -335,6 +343,7 @@ type WebhookDelivery struct {
 	Attempts        int32
 	LastError       pgtype.Text
 	PayloadPrunedAt pgtype.Timestamptz
+	NextAttemptAt   pgtype.Timestamptz
 }
 
 type WorkItem struct {

@@ -73,6 +73,131 @@ func TestFromEnvDispatchDebounceHardCap(t *testing.T) {
 	}
 }
 
+func TestFromEnvFetchDefaultsAndOverrides(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FetchBatchWindow != defaultFetchBatchWindow ||
+		cfg.BackfillPageSize != defaultBackfillPageSize {
+		t.Fatalf("unexpected fetch defaults: %+v", cfg)
+	}
+
+	t.Setenv("FETCH_BATCH_WINDOW", "12ms")
+	t.Setenv("BACKFILL_PAGE_SIZE", "75")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FetchBatchWindow != 12*time.Millisecond ||
+		cfg.BackfillPageSize != 75 {
+		t.Fatalf("unexpected fetch overrides: %+v", cfg)
+	}
+}
+
+func TestFromEnvRejectsInvalidFetchValues(t *testing.T) {
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{key: "FETCH_BATCH_WINDOW", value: "0s"},
+		{key: "BACKFILL_PAGE_SIZE", value: "0"},
+		{key: "BACKFILL_PAGE_SIZE", value: "101"},
+	} {
+		t.Run(test.key+"="+test.value, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv(test.key, test.value)
+			if _, err := FromEnv(); err == nil {
+				t.Fatalf("%s=%q accepted", test.key, test.value)
+			}
+		})
+	}
+}
+
+func TestFromEnvBudgetDefaultsAndOverrides(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BudgetSweepFloor != defaultBudgetSweepFloor ||
+		cfg.BudgetEventFloor != defaultBudgetEventFloor ||
+		cfg.BudgetMaxConcurrent != defaultBudgetMaxConcurrent ||
+		cfg.BudgetRESTLimit != defaultBudgetRESTLimit ||
+		cfg.BudgetGraphQLLimit != defaultBudgetGraphQLLimit ||
+		cfg.BudgetSecondaryFallback != defaultBudgetSecondaryFallback {
+		t.Fatalf("unexpected budget defaults: %+v", cfg)
+	}
+
+	t.Setenv("BUDGET_SWEEP_FLOOR", "0.30")
+	t.Setenv("BUDGET_EVENT_FLOOR", "0.15")
+	t.Setenv("BUDGET_MAX_CONCURRENT", "12")
+	t.Setenv("BUDGET_REST_LIMIT", "12000")
+	t.Setenv("BUDGET_GRAPHQL_LIMIT", "4000")
+	t.Setenv("BUDGET_SECONDARY_FALLBACK", "90s")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BudgetSweepFloor != 0.30 ||
+		cfg.BudgetEventFloor != 0.15 ||
+		cfg.BudgetMaxConcurrent != 12 ||
+		cfg.BudgetRESTLimit != 12000 ||
+		cfg.BudgetGraphQLLimit != 4000 ||
+		cfg.BudgetSecondaryFallback != 90*time.Second {
+		t.Fatalf("unexpected budget overrides: %+v", cfg)
+	}
+}
+
+func TestFromEnvRejectsInvalidBudgetValues(t *testing.T) {
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{key: "BUDGET_SWEEP_FLOOR", value: "0"},
+		{key: "BUDGET_SWEEP_FLOOR", value: "1"},
+		{key: "BUDGET_EVENT_FLOOR", value: "0"},
+		{key: "BUDGET_EVENT_FLOOR", value: "1"},
+		{key: "BUDGET_MAX_CONCURRENT", value: "0"},
+		{key: "BUDGET_REST_LIMIT", value: "-1"},
+		{key: "BUDGET_GRAPHQL_LIMIT", value: "many"},
+		{key: "BUDGET_SECONDARY_FALLBACK", value: "0s"},
+	} {
+		t.Run(test.key+"="+test.value, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv(test.key, test.value)
+			if _, err := FromEnv(); err == nil {
+				t.Fatalf("%s=%q accepted", test.key, test.value)
+			}
+		})
+	}
+}
+
+func TestFromEnvRequiresEventFloorBelowSweepFloor(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		eventFloor string
+		sweepFloor string
+	}{
+		{name: "equal", eventFloor: "0.20", sweepFloor: "0.20"},
+		{name: "event higher", eventFloor: "0.21", sweepFloor: "0.20"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BUDGET_EVENT_FLOOR", test.eventFloor)
+			t.Setenv("BUDGET_SWEEP_FLOOR", test.sweepFloor)
+			if _, err := FromEnv(); err == nil {
+				t.Fatalf(
+					"event floor %s with sweep floor %s accepted",
+					test.eventFloor,
+					test.sweepFloor,
+				)
+			}
+		})
+	}
+}
+
 func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 	clearConfigEnv(t)
 	cfg, err := FromEnv()
@@ -83,6 +208,7 @@ func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 		cfg.SweepOpenPRMaxStaleness != 10*time.Minute ||
 		cfg.SweepRepoRulesMaxStaleness != time.Hour ||
 		cfg.SweepClosedMaxStaleness != 24*time.Hour ||
+		cfg.DriftPageSize != defaultDriftPageSize ||
 		cfg.RetentionAge != 90*24*time.Hour {
 		t.Fatalf("unexpected M4 defaults: %+v", cfg)
 	}
@@ -90,6 +216,7 @@ func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("SWEEP_PAGE_SIZE", "50")
 	t.Setenv("GAP_COMPARISON_WINDOW", "2h")
 	t.Setenv("DRIFT_SAMPLE_SIZE", "7")
+	t.Setenv("DRIFT_PAGE_SIZE", "50")
 	t.Setenv("RETENTION_AGE", "2160h")
 	t.Setenv("DISPATCH_RULES_FILE", "/tmp/rules.yaml")
 	cfg, err = FromEnv()
@@ -100,6 +227,7 @@ func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 		cfg.SweepPageSize != 50 ||
 		cfg.GapWindow != 2*time.Hour ||
 		cfg.DriftSampleSize != 7 ||
+		cfg.DriftPageSize != 50 ||
 		cfg.RetentionAge != 90*24*time.Hour ||
 		cfg.DispatchRulesFile != "/tmp/rules.yaml" {
 		t.Fatalf("unexpected M4 overrides: %+v", cfg)
@@ -113,6 +241,7 @@ func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
 		"GAP_PAGE_SIZE":               "101",
 		"GAP_MAX_PAGES":               "0",
 		"DRIFT_SAMPLE_SIZE":           "none",
+		"DRIFT_PAGE_SIZE":             "101",
 		"RETENTION_AGE":               "-1h",
 		"RETENTION_BATCH_SIZE":        "0",
 	} {
@@ -141,6 +270,74 @@ func TestRetentionAgeCannotShortenLockedPolicy(t *testing.T) {
 	}
 	if cfg.RetentionAge != 2400*time.Hour {
 		t.Fatalf("retention age = %s, want 2400h", cfg.RetentionAge)
+	}
+}
+
+func TestWatermarkRefreshMustBeLessThanHalfLeaseTTL(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("STREAM_WATERMARK_LEASE_TTL", "2s")
+	t.Setenv("STREAM_WATERMARK_REFRESH", "999.999999ms")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("refresh just below boundary rejected: %v", err)
+	}
+	if cfg.WatermarkRefresh != time.Second-time.Nanosecond {
+		t.Fatalf("watermark refresh = %s", cfg.WatermarkRefresh)
+	}
+
+	clearConfigEnv(t)
+	t.Setenv("STREAM_WATERMARK_LEASE_TTL", "2s")
+	t.Setenv("STREAM_WATERMARK_REFRESH", "1s")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("refresh equal to half the lease TTL accepted")
+	}
+}
+
+func TestWatermarkFenceTimeoutDefaultsOverridesAndValidates(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WatermarkFenceTimeout != defaultWatermarkFenceTimeout {
+		t.Fatalf(
+			"watermark fence timeout = %s, want %s",
+			cfg.WatermarkFenceTimeout,
+			defaultWatermarkFenceTimeout,
+		)
+	}
+
+	t.Setenv("STREAM_WATERMARK_FENCE_LOCK_TIMEOUT", "750ms")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatalf("watermark fence timeout override rejected: %v", err)
+	}
+	if cfg.WatermarkFenceTimeout != 750*time.Millisecond {
+		t.Fatalf("watermark fence timeout = %s, want 750ms", cfg.WatermarkFenceTimeout)
+	}
+
+	clearConfigEnv(t)
+	t.Setenv("STREAM_WATERMARK_FENCE_LOCK_TIMEOUT", "0s")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("zero watermark fence timeout accepted")
+	}
+}
+
+func TestStreamRetentionAgeCannotShortenSevenDayPolicy(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("STREAM_RETENTION_AGE", "167h")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("STREAM_RETENTION_AGE=167h shortened the seven-day policy")
+	}
+
+	clearConfigEnv(t)
+	t.Setenv("STREAM_RETENTION_AGE", "168h")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("seven-day boundary rejected: %v", err)
+	}
+	if cfg.StreamRetentionAge != 7*24*time.Hour {
+		t.Fatalf("stream retention age = %s, want 168h", cfg.StreamRetentionAge)
 	}
 }
 
@@ -194,6 +391,14 @@ func clearConfigEnv(t *testing.T) {
 		"DISPATCH_DEBOUNCE",
 		"DISPATCH_POLL_INTERVAL",
 		"DISPATCH_RULES_FILE",
+		"FETCH_BATCH_WINDOW",
+		"BACKFILL_PAGE_SIZE",
+		"BUDGET_SWEEP_FLOOR",
+		"BUDGET_EVENT_FLOOR",
+		"BUDGET_MAX_CONCURRENT",
+		"BUDGET_REST_LIMIT",
+		"BUDGET_GRAPHQL_LIMIT",
+		"BUDGET_SECONDARY_FALLBACK",
 		"SWEEP_OPEN_STACK_MAX_STALENESS",
 		"SWEEP_OPEN_PR_MAX_STALENESS",
 		"SWEEP_REPO_RULES_MAX_STALENESS",
@@ -206,10 +411,19 @@ func clearConfigEnv(t *testing.T) {
 		"GAP_MAX_PAGES",
 		"DRIFT_PERIOD",
 		"DRIFT_SAMPLE_SIZE",
+		"DRIFT_PAGE_SIZE",
 		"DRIFT_RESOLVED_RETENTION",
 		"RETENTION_PERIOD",
 		"RETENTION_AGE",
 		"RETENTION_BATCH_SIZE",
+		"STREAM_WATERMARK_REFRESH",
+		"STREAM_WATERMARK_LEASE_TTL",
+		"STREAM_WATERMARK_FENCE_LOCK_TIMEOUT",
+		"STREAM_RETENTION_PERIOD",
+		"STREAM_RETENTION_AGE",
+		"STREAM_RETENTION_BATCH_SIZE",
+		"DERIVER_POLL_INTERVAL",
+		"DERIVER_DIRTY_CAP",
 	} {
 		t.Setenv(key, "")
 	}

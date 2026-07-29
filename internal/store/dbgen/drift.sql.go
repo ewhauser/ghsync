@@ -77,7 +77,8 @@ func (q *Queries) EscalateOpenDriftFinding(ctx context.Context, arg EscalateOpen
 }
 
 const getCachedEntitySnapshot = `-- name: GetCachedEntitySnapshot :one
-SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
+       last_checked_at
 FROM drift_entities
 WHERE installation_id = $1
   AND entity_kind = $2
@@ -96,6 +97,7 @@ type GetCachedEntitySnapshotRow struct {
 	EntityKey     string
 	LockKey       string
 	CacheSnapshot []byte
+	LastCheckedAt pgtype.Timestamptz
 }
 
 func (q *Queries) GetCachedEntitySnapshot(ctx context.Context, arg GetCachedEntitySnapshotParams) (GetCachedEntitySnapshotRow, error) {
@@ -107,6 +109,7 @@ func (q *Queries) GetCachedEntitySnapshot(ctx context.Context, arg GetCachedEnti
 		&i.EntityKey,
 		&i.LockKey,
 		&i.CacheSnapshot,
+		&i.LastCheckedAt,
 	)
 	return i, err
 }
@@ -323,35 +326,37 @@ func (q *Queries) ResolveOpenDriftFindings(ctx context.Context, arg ResolveOpenD
 	return result.RowsAffected(), nil
 }
 
-const sampleCachedEntitiesByKind = `-- name: SampleCachedEntitiesByKind :many
-SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot
+const sampleCachedEntitiesAfter = `-- name: SampleCachedEntitiesAfter :many
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
+       last_checked_at
 FROM drift_entities
 WHERE installation_id = $1
   AND entity_kind = $2
-ORDER BY (source_id <= $3), source_id
+  AND source_id > $3
+ORDER BY source_id
 LIMIT $4
 `
 
-type SampleCachedEntitiesByKindParams struct {
+type SampleCachedEntitiesAfterParams struct {
 	InstallationID int64
 	EntityKind     string
 	AfterSourceID  int64
 	SampleSize     int32
 }
 
-type SampleCachedEntitiesByKindRow struct {
+type SampleCachedEntitiesAfterRow struct {
 	EntityKind    string
 	SourceID      int64
 	EntityKey     string
 	LockKey       string
 	CacheSnapshot []byte
+	LastCheckedAt pgtype.Timestamptz
 }
 
-// The boolean leading sort wraps at the end of one entity-kind population.
-// source_id is each table's indexed surrogate key (or a stable group minimum),
-// avoiding a full-population random sort.
-func (q *Queries) SampleCachedEntitiesByKind(ctx context.Context, arg SampleCachedEntitiesByKindParams) ([]SampleCachedEntitiesByKindRow, error) {
-	rows, err := q.db.Query(ctx, sampleCachedEntitiesByKind,
+// Q11: the forward half of the rotating sample is a plain indexed source_id
+// range. Detect issues a second bounded range only when this reaches the end.
+func (q *Queries) SampleCachedEntitiesAfter(ctx context.Context, arg SampleCachedEntitiesAfterParams) ([]SampleCachedEntitiesAfterRow, error) {
+	rows, err := q.db.Query(ctx, sampleCachedEntitiesAfter,
 		arg.InstallationID,
 		arg.EntityKind,
 		arg.AfterSourceID,
@@ -361,15 +366,76 @@ func (q *Queries) SampleCachedEntitiesByKind(ctx context.Context, arg SampleCach
 		return nil, err
 	}
 	defer rows.Close()
-	var items []SampleCachedEntitiesByKindRow
+	var items []SampleCachedEntitiesAfterRow
 	for rows.Next() {
-		var i SampleCachedEntitiesByKindRow
+		var i SampleCachedEntitiesAfterRow
 		if err := rows.Scan(
 			&i.EntityKind,
 			&i.SourceID,
 			&i.EntityKey,
 			&i.LockKey,
 			&i.CacheSnapshot,
+			&i.LastCheckedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sampleCachedEntitiesThrough = `-- name: SampleCachedEntitiesThrough :many
+SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
+       last_checked_at
+FROM drift_entities
+WHERE installation_id = $1
+  AND entity_kind = $2
+  AND source_id <= $3
+ORDER BY source_id
+LIMIT $4
+`
+
+type SampleCachedEntitiesThroughParams struct {
+	InstallationID  int64
+	EntityKind      string
+	ThroughSourceID int64
+	SampleSize      int32
+}
+
+type SampleCachedEntitiesThroughRow struct {
+	EntityKind    string
+	SourceID      int64
+	EntityKey     string
+	LockKey       string
+	CacheSnapshot []byte
+	LastCheckedAt pgtype.Timestamptz
+}
+
+// The wrap half cannot overlap the forward half and retains source_id order.
+func (q *Queries) SampleCachedEntitiesThrough(ctx context.Context, arg SampleCachedEntitiesThroughParams) ([]SampleCachedEntitiesThroughRow, error) {
+	rows, err := q.db.Query(ctx, sampleCachedEntitiesThrough,
+		arg.InstallationID,
+		arg.EntityKind,
+		arg.ThroughSourceID,
+		arg.SampleSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SampleCachedEntitiesThroughRow
+	for rows.Next() {
+		var i SampleCachedEntitiesThroughRow
+		if err := rows.Scan(
+			&i.EntityKind,
+			&i.SourceID,
+			&i.EntityKey,
+			&i.LockKey,
+			&i.CacheSnapshot,
+			&i.LastCheckedAt,
 		); err != nil {
 			return nil, err
 		}

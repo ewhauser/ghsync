@@ -11,10 +11,13 @@ import (
 
 const claimWebhookDeliveries = `-- name: ClaimWebhookDeliveries :many
 WITH candidates AS (
-    SELECT delivery_guid
-    FROM webhook_deliveries
-    WHERE status = 'pending'
-    ORDER BY received_at, delivery_guid
+    SELECT candidate.delivery_guid
+    FROM webhook_deliveries AS candidate
+    WHERE candidate.status = 'pending'
+      AND candidate.next_attempt_at <= clock_timestamp()
+    ORDER BY candidate.next_attempt_at,
+             candidate.received_at,
+             candidate.delivery_guid
     LIMIT $1
     FOR UPDATE SKIP LOCKED
 )
@@ -24,7 +27,7 @@ SET status = 'processing',
     last_error = NULL
 FROM candidates
 WHERE delivery.delivery_guid = candidates.delivery_guid
-RETURNING delivery.delivery_guid, delivery.event, delivery.raw_body, delivery.headers, delivery.received_at, delivery.status, delivery.attempts, delivery.last_error, delivery.payload_pruned_at
+RETURNING delivery.delivery_guid, delivery.event, delivery.raw_body, delivery.headers, delivery.received_at, delivery.status, delivery.attempts, delivery.last_error, delivery.payload_pruned_at, delivery.next_attempt_at
 `
 
 // C-P2/C-O2: claim a bounded batch without blocking another dispatcher. The
@@ -49,6 +52,7 @@ func (q *Queries) ClaimWebhookDeliveries(ctx context.Context, batchSize int32) (
 			&i.Attempts,
 			&i.LastError,
 			&i.PayloadPrunedAt,
+			&i.NextAttemptAt,
 		); err != nil {
 			return nil, err
 		}
@@ -72,7 +76,7 @@ func (q *Queries) CountWebhookDeliveriesByStatus(ctx context.Context, status str
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at FROM webhook_deliveries WHERE delivery_guid = $1
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at, next_attempt_at FROM webhook_deliveries WHERE delivery_guid = $1
 `
 
 func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (WebhookDelivery, error) {
@@ -88,6 +92,7 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (
 		&i.Attempts,
 		&i.LastError,
 		&i.PayloadPrunedAt,
+		&i.NextAttemptAt,
 	)
 	return i, err
 }
@@ -120,7 +125,7 @@ func (q *Queries) InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDe
 }
 
 const listParkedWebhookDeliveries = `-- name: ListParkedWebhookDeliveries :many
-SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at, next_attempt_at
 FROM webhook_deliveries
 WHERE status = 'parked'
 ORDER BY received_at, delivery_guid
@@ -148,6 +153,7 @@ func (q *Queries) ListParkedWebhookDeliveries(ctx context.Context, resultLimit i
 			&i.Attempts,
 			&i.LastError,
 			&i.PayloadPrunedAt,
+			&i.NextAttemptAt,
 		); err != nil {
 			return nil, err
 		}
@@ -215,6 +221,7 @@ candidates AS (
 UPDATE webhook_deliveries AS delivery
 SET status = 'pending',
     attempts = 0,
+    next_attempt_at = clock_timestamp(),
     last_error = format(
         'operator requeue at %s; attempts reset from %s; prior error: %s',
         clock_timestamp(),
@@ -247,9 +254,21 @@ func (q *Queries) RequeueParkedWebhookDeliveries(ctx context.Context, arg Requeu
 const setWebhookDeliveryResults = `-- name: SetWebhookDeliveryResults :execrows
 UPDATE webhook_deliveries AS delivery
 SET status = result.status,
-    last_error = NULLIF(result.last_error, '')
+    last_error = NULLIF(result.last_error, ''),
+    next_attempt_at = CASE
+        WHEN result.retry_delay_seconds IS NULL
+        THEN delivery.next_attempt_at
+        ELSE clock_timestamp() + make_interval(
+            secs => result.retry_delay_seconds
+        )
+    END
 FROM jsonb_to_recordset($1::jsonb)
-    AS result(delivery_guid text, status text, last_error text)
+    AS result(
+        delivery_guid text,
+        status text,
+        last_error text,
+        retry_delay_seconds int
+    )
 WHERE delivery.delivery_guid = result.delivery_guid
   AND delivery.status = 'processing'
 `

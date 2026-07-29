@@ -27,11 +27,21 @@ finding already enqueues exactly one heal.
 
 ## Remediation
 
-Ensure detector and heal workers are present:
+Ensure detector and heal workers are present. When starting roles manually,
+each foreground invocation is a separate shell/deployment action:
 
 ```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=fetch,sweep,drift
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=watermarker
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=metrics
 ```
 

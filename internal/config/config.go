@@ -9,12 +9,24 @@ import (
 )
 
 const (
+	defaultHTTPAddr            = ":8080"
+	defaultGitHubBaseURL       = "https://api.github.com"
 	defaultWebhookMaxBodyBytes = int64(2 << 20)
 	defaultDispatchBatchSize   = 100
 	defaultDispatchMaxAttempts = 5
 	defaultDispatchDebounce    = 5 * time.Second
 	defaultDispatchPoll        = 250 * time.Millisecond
 	maxDispatchDebounce        = 15 * time.Second
+
+	defaultFetchBatchWindow = 5 * time.Millisecond
+	defaultBackfillPageSize = 100
+
+	defaultBudgetSweepFloor        = 0.20
+	defaultBudgetEventFloor        = 0.10
+	defaultBudgetMaxConcurrent     = 40
+	defaultBudgetRESTLimit         = int64(15000)
+	defaultBudgetGraphQLLimit      = int64(5000)
+	defaultBudgetSecondaryFallback = 60 * time.Second
 
 	defaultSweepOpenStackStaleness = 5 * time.Minute
 	defaultSweepOpenPRStaleness    = 10 * time.Minute
@@ -28,6 +40,7 @@ const (
 	defaultGapMaxPages             = 10
 	defaultDriftPeriod             = time.Hour
 	defaultDriftSampleSize         = 10
+	defaultDriftPageSize           = 100
 	defaultDriftResolvedRetention  = 30 * 24 * time.Hour
 	defaultRetentionPeriod         = 24 * time.Hour
 	defaultRetentionAge            = 90 * 24 * time.Hour
@@ -35,6 +48,7 @@ const (
 
 	defaultWatermarkRefresh      = 100 * time.Millisecond
 	defaultWatermarkLeaseTTL     = 3 * time.Second
+	defaultWatermarkFenceTimeout = time.Second
 	defaultStreamRetentionPeriod = time.Hour
 	defaultStreamRetentionAge    = 7 * 24 * time.Hour
 	defaultStreamRetentionBatch  = 1000
@@ -84,6 +98,27 @@ type Config struct {
 	// with YAML/JSON data (DISPATCH_RULES_FILE).
 	DispatchRulesFile string
 
+	// FetchBatchWindow is the collection window for a pull-request GraphQL gang
+	// (FETCH_BATCH_WINDOW).
+	FetchBatchWindow time.Duration
+	// BackfillPageSize is the GitHub page size for resumable backfill work
+	// (BACKFILL_PAGE_SIZE).
+	BackfillPageSize int
+
+	// BudgetSweepFloor and BudgetEventFloor reserve installation rate-budget
+	// headroom for higher-priority request classes.
+	BudgetSweepFloor float64
+	BudgetEventFloor float64
+	// BudgetMaxConcurrent is the installation-wide GitHub request ceiling.
+	BudgetMaxConcurrent int
+	// BudgetRESTLimit and BudgetGraphQLLimit are pessimistic denominators until
+	// GitHub supplies authoritative rate-limit observations.
+	BudgetRESTLimit    int64
+	BudgetGraphQLLimit int64
+	// BudgetSecondaryFallback is used when a secondary-limit response supplies
+	// no valid Retry-After value.
+	BudgetSecondaryFallback time.Duration
+
 	// M4 C-R1 bounds and periodic schedules are runtime configuration rather
 	// than constants in the sweeper.
 	SweepOpenStackMaxStaleness time.Duration
@@ -98,8 +133,11 @@ type Config struct {
 	GapPageSize   int
 	GapMaxPages   int
 
-	DriftPeriod            time.Duration
-	DriftSampleSize        int
+	DriftPeriod     time.Duration
+	DriftSampleSize int
+	// DriftPageSize independently bounds drift pagination
+	// (DRIFT_PAGE_SIZE).
+	DriftPageSize          int
 	DriftResolvedRetention time.Duration
 
 	RetentionPeriod    time.Duration
@@ -107,8 +145,11 @@ type Config struct {
 	RetentionBatchSize int
 
 	// M5 C-S/C-D maintenance settings.
-	WatermarkRefresh      time.Duration
-	WatermarkLeaseTTL     time.Duration
+	WatermarkRefresh  time.Duration
+	WatermarkLeaseTTL time.Duration
+	// WatermarkFenceTimeout bounds the exclusive writer-fence wait
+	// (STREAM_WATERMARK_FENCE_LOCK_TIMEOUT).
+	WatermarkFenceTimeout time.Duration
 	StreamRetentionPeriod time.Duration
 	StreamRetentionAge    time.Duration
 	StreamRetentionBatch  int
@@ -119,17 +160,25 @@ type Config struct {
 func FromEnv() (Config, error) {
 	cfg := Config{
 		DatabaseURL:                os.Getenv("DATABASE_URL"),
-		HTTPAddr:                   envOr("HTTP_ADDR", ":8080"),
+		HTTPAddr:                   envOr("HTTP_ADDR", defaultHTTPAddr),
 		GitHubPrivateKeyPath:       os.Getenv("GITHUB_PRIVATE_KEY_PATH"),
 		GitHubWebhookSecret:        os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GitHubToken:                os.Getenv("GITHUB_TOKEN"),
-		GitHubBaseURL:              envOr("GITHUB_BASE_URL", "https://api.github.com"),
+		GitHubBaseURL:              envOr("GITHUB_BASE_URL", defaultGitHubBaseURL),
 		WebhookMaxBodyBytes:        defaultWebhookMaxBodyBytes,
 		DispatchBatchSize:          defaultDispatchBatchSize,
 		DispatchMaxAttempts:        defaultDispatchMaxAttempts,
 		DispatchDebounce:           defaultDispatchDebounce,
 		DispatchPollInterval:       defaultDispatchPoll,
 		DispatchRulesFile:          os.Getenv("DISPATCH_RULES_FILE"),
+		FetchBatchWindow:           defaultFetchBatchWindow,
+		BackfillPageSize:           defaultBackfillPageSize,
+		BudgetSweepFloor:           defaultBudgetSweepFloor,
+		BudgetEventFloor:           defaultBudgetEventFloor,
+		BudgetMaxConcurrent:        defaultBudgetMaxConcurrent,
+		BudgetRESTLimit:            defaultBudgetRESTLimit,
+		BudgetGraphQLLimit:         defaultBudgetGraphQLLimit,
+		BudgetSecondaryFallback:    defaultBudgetSecondaryFallback,
 		SweepOpenStackMaxStaleness: defaultSweepOpenStackStaleness,
 		SweepOpenPRMaxStaleness:    defaultSweepOpenPRStaleness,
 		SweepRepoRulesMaxStaleness: defaultSweepRepoRulesStaleness,
@@ -142,12 +191,14 @@ func FromEnv() (Config, error) {
 		GapMaxPages:                defaultGapMaxPages,
 		DriftPeriod:                defaultDriftPeriod,
 		DriftSampleSize:            defaultDriftSampleSize,
+		DriftPageSize:              defaultDriftPageSize,
 		DriftResolvedRetention:     defaultDriftResolvedRetention,
 		RetentionPeriod:            defaultRetentionPeriod,
 		RetentionAge:               defaultRetentionAge,
 		RetentionBatchSize:         defaultRetentionBatchSize,
 		WatermarkRefresh:           defaultWatermarkRefresh,
 		WatermarkLeaseTTL:          defaultWatermarkLeaseTTL,
+		WatermarkFenceTimeout:      defaultWatermarkFenceTimeout,
 		StreamRetentionPeriod:      defaultStreamRetentionPeriod,
 		StreamRetentionAge:         defaultStreamRetentionAge,
 		StreamRetentionBatch:       defaultStreamRetentionBatch,
@@ -230,8 +281,11 @@ func FromEnv() (Config, error) {
 		{"DRIFT_PERIOD", &cfg.DriftPeriod},
 		{"DRIFT_RESOLVED_RETENTION", &cfg.DriftResolvedRetention},
 		{"RETENTION_PERIOD", &cfg.RetentionPeriod},
+		{"FETCH_BATCH_WINDOW", &cfg.FetchBatchWindow},
+		{"BUDGET_SECONDARY_FALLBACK", &cfg.BudgetSecondaryFallback},
 		{"STREAM_WATERMARK_REFRESH", &cfg.WatermarkRefresh},
 		{"STREAM_WATERMARK_LEASE_TTL", &cfg.WatermarkLeaseTTL},
+		{"STREAM_WATERMARK_FENCE_LOCK_TIMEOUT", &cfg.WatermarkFenceTimeout},
 		{"STREAM_RETENTION_PERIOD", &cfg.StreamRetentionPeriod},
 		{"DERIVER_POLL_INTERVAL", &cfg.DeriverPollInterval},
 	}
@@ -252,13 +306,48 @@ func FromEnv() (Config, error) {
 		{"GAP_PAGE_SIZE", &cfg.GapPageSize},
 		{"GAP_MAX_PAGES", &cfg.GapMaxPages},
 		{"DRIFT_SAMPLE_SIZE", &cfg.DriftSampleSize},
+		{"DRIFT_PAGE_SIZE", &cfg.DriftPageSize},
 		{"RETENTION_BATCH_SIZE", &cfg.RetentionBatchSize},
+		{"BACKFILL_PAGE_SIZE", &cfg.BackfillPageSize},
+		{"BUDGET_MAX_CONCURRENT", &cfg.BudgetMaxConcurrent},
 		{"STREAM_RETENTION_BATCH_SIZE", &cfg.StreamRetentionBatch},
 		{"DERIVER_DIRTY_CAP", &cfg.DeriverDirtyCap},
 	}
 	for _, item := range intValues {
 		if raw := os.Getenv(item.key); raw != "" {
 			value, err := parsePositiveInt(item.key, raw)
+			if err != nil {
+				return Config{}, err
+			}
+			*item.target = value
+		}
+	}
+	int64Values := []struct {
+		key    string
+		target *int64
+	}{
+		{"BUDGET_REST_LIMIT", &cfg.BudgetRESTLimit},
+		{"BUDGET_GRAPHQL_LIMIT", &cfg.BudgetGraphQLLimit},
+	}
+	for _, item := range int64Values {
+		if raw := os.Getenv(item.key); raw != "" {
+			value, err := parsePositiveInt64(item.key, raw)
+			if err != nil {
+				return Config{}, err
+			}
+			*item.target = value
+		}
+	}
+	floatValues := []struct {
+		key    string
+		target *float64
+	}{
+		{"BUDGET_SWEEP_FLOOR", &cfg.BudgetSweepFloor},
+		{"BUDGET_EVENT_FLOOR", &cfg.BudgetEventFloor},
+	}
+	for _, item := range floatValues {
+		if raw := os.Getenv(item.key); raw != "" {
+			value, err := parseUnitFraction(item.key, raw)
 			if err != nil {
 				return Config{}, err
 			}
@@ -296,9 +385,18 @@ func FromEnv() (Config, error) {
 			"STREAM_WATERMARK_REFRESH must be less than half STREAM_WATERMARK_LEASE_TTL",
 		)
 	}
-	if cfg.SweepPageSize > 100 || cfg.GapPageSize > 100 {
+	if cfg.BudgetEventFloor >= cfg.BudgetSweepFloor {
 		return Config{}, fmt.Errorf(
-			"SWEEP_PAGE_SIZE and GAP_PAGE_SIZE must not exceed 100",
+			"BUDGET_EVENT_FLOOR must be less than BUDGET_SWEEP_FLOOR",
+		)
+	}
+	if cfg.BackfillPageSize > 100 {
+		return Config{}, fmt.Errorf("BACKFILL_PAGE_SIZE must not exceed 100")
+	}
+	if cfg.SweepPageSize > 100 || cfg.GapPageSize > 100 ||
+		cfg.DriftPageSize > 100 {
+		return Config{}, fmt.Errorf(
+			"SWEEP_PAGE_SIZE, GAP_PAGE_SIZE, and DRIFT_PAGE_SIZE must not exceed 100",
 		)
 	}
 	return cfg, nil
@@ -349,6 +447,22 @@ func parsePositiveInt(key, raw string) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return value, nil
+}
+
+func parsePositiveInt64(key, raw string) (int64, error) {
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return value, nil
+}
+
+func parseUnitFraction(key, raw string) (float64, error) {
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || !(value > 0 && value < 1) {
+		return 0, fmt.Errorf("%s must be greater than 0 and less than 1", key)
 	}
 	return value, nil
 }

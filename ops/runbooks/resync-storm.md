@@ -40,9 +40,11 @@ event between the pruned horizon and the watermark—while leaving the real
 projection stale.
 
 After confirming the consumer follows the transactional replacement protocol,
-keep the maintenance roles available:
+keep the maintenance roles available. If starting them manually, run the
+foreground process in a separate shell/deployment action:
 
 ```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=watermarker,pruner
 ```
 

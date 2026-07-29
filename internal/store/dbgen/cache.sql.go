@@ -648,16 +648,15 @@ SELECT pull_requests.number, pull_requests.stack_number,
        repos.gh_id AS repo_gh_id, repos.installation_id
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
-JOIN repo_aliases ON repo_aliases.repo_id = repos.id
-WHERE repo_aliases.full_name = $1
+WHERE repos.gh_id = $1
   AND pull_requests.head_sha = $2
   AND pull_requests.tombstoned_at IS NULL
 ORDER BY pull_requests.number
 `
 
 type ListPRScopesByHeadSHAParams struct {
-	RepoFullName string
-	HeadSha      string
+	RepoGhID int64
+	HeadSha  string
 }
 
 type ListPRScopesByHeadSHARow struct {
@@ -668,7 +667,7 @@ type ListPRScopesByHeadSHARow struct {
 }
 
 func (q *Queries) ListPRScopesByHeadSHA(ctx context.Context, arg ListPRScopesByHeadSHAParams) ([]ListPRScopesByHeadSHARow, error) {
-	rows, err := q.db.Query(ctx, listPRScopesByHeadSHA, arg.RepoFullName, arg.HeadSha)
+	rows, err := q.db.Query(ctx, listPRScopesByHeadSHA, arg.RepoGhID, arg.HeadSha)
 	if err != nil {
 		return nil, err
 	}
@@ -1515,7 +1514,9 @@ INSERT INTO pull_requests (
     $20, $21, $22, NULL,
     CASE WHEN $6::text = 'open'
          THEN NULL
-         ELSE clock_timestamp() + interval '30 days'
+         ELSE clock_timestamp() + make_interval(
+             secs => $23::int
+         )
     END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
@@ -1553,7 +1554,9 @@ SET gh_id = EXCLUDED.gh_id,
     display_until = CASE
         WHEN EXCLUDED.state = 'open' THEN NULL
         WHEN pull_requests.state = 'open'
-        THEN clock_timestamp() + interval '30 days'
+        THEN clock_timestamp() + make_interval(
+            secs => $23::int
+        )
         ELSE pull_requests.display_until
     END
 WHERE pull_requests.gh_updated_at IS NULL
@@ -1587,28 +1590,29 @@ RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login
 `
 
 type UpsertPullRequestWriteIfNewerParams struct {
-	RepoID          int64
-	GhID            pgtype.Int8
-	NodeID          string
-	PrNumber        int32
-	Title           string
-	State           string
-	Draft           bool
-	AuthorLogin     string
-	HeadRef         string
-	HeadSha         string
-	BaseRef         string
-	BaseSha         string
-	ReviewDecision  string
-	MergeableState  string
-	MembershipKnown bool
-	StackNumber     pgtype.Int4
-	StackPosition   pgtype.Int4
-	GhUpdatedAt     pgtype.Timestamptz
-	SyncedAt        pgtype.Timestamptz
-	LastCheckedAt   pgtype.Timestamptz
-	Etag            string
-	SyncSource      string
+	RepoID               int64
+	GhID                 pgtype.Int8
+	NodeID               string
+	PrNumber             int32
+	Title                string
+	State                string
+	Draft                bool
+	AuthorLogin          string
+	HeadRef              string
+	HeadSha              string
+	BaseRef              string
+	BaseSha              string
+	ReviewDecision       string
+	MergeableState       string
+	MembershipKnown      bool
+	StackNumber          pgtype.Int4
+	StackPosition        pgtype.Int4
+	GhUpdatedAt          pgtype.Timestamptz
+	SyncedAt             pgtype.Timestamptz
+	LastCheckedAt        pgtype.Timestamptz
+	Etag                 string
+	SyncSource           string
+	DisplayWindowSeconds int32
 }
 
 func (q *Queries) UpsertPullRequestWriteIfNewer(ctx context.Context, arg UpsertPullRequestWriteIfNewerParams) (PullRequest, error) {
@@ -1635,6 +1639,7 @@ func (q *Queries) UpsertPullRequestWriteIfNewer(ctx context.Context, arg UpsertP
 		arg.LastCheckedAt,
 		arg.Etag,
 		arg.SyncSource,
+		arg.DisplayWindowSeconds,
 	)
 	var i PullRequest
 	err := row.Scan(
@@ -1835,7 +1840,9 @@ INSERT INTO stacks (
     $13, $14, NULL,
     CASE WHEN $7::boolean
          THEN NULL
-         ELSE clock_timestamp() + interval '30 days'
+         ELSE clock_timestamp() + make_interval(
+             secs => $15::int
+         )
     END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
@@ -1854,7 +1861,9 @@ SET gh_id = EXCLUDED.gh_id,
     tombstoned_at = NULL,
     display_until = CASE
         WHEN EXCLUDED.open THEN NULL
-        WHEN stacks.open THEN clock_timestamp() + interval '30 days'
+        WHEN stacks.open THEN clock_timestamp() + make_interval(
+            secs => $15::int
+        )
         ELSE stacks.display_until
     END
 WHERE stacks.gh_updated_at IS NULL
@@ -1878,20 +1887,21 @@ RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries
 `
 
 type UpsertStackWriteIfNewerParams struct {
-	RepoID        int64
-	GhID          pgtype.Int8
-	NodeID        string
-	StackNumber   int32
-	BaseRef       string
-	BaseSha       string
-	Open          bool
-	Entries       []byte
-	GhUpdatedAt   pgtype.Timestamptz
-	HeadSha       string
-	SyncedAt      pgtype.Timestamptz
-	LastCheckedAt pgtype.Timestamptz
-	Etag          string
-	SyncSource    string
+	RepoID               int64
+	GhID                 pgtype.Int8
+	NodeID               string
+	StackNumber          int32
+	BaseRef              string
+	BaseSha              string
+	Open                 bool
+	Entries              []byte
+	GhUpdatedAt          pgtype.Timestamptz
+	HeadSha              string
+	SyncedAt             pgtype.Timestamptz
+	LastCheckedAt        pgtype.Timestamptz
+	Etag                 string
+	SyncSource           string
+	DisplayWindowSeconds int32
 }
 
 func (q *Queries) UpsertStackWriteIfNewer(ctx context.Context, arg UpsertStackWriteIfNewerParams) (Stack, error) {
@@ -1910,6 +1920,7 @@ func (q *Queries) UpsertStackWriteIfNewer(ctx context.Context, arg UpsertStackWr
 		arg.LastCheckedAt,
 		arg.Etag,
 		arg.SyncSource,
+		arg.DisplayWindowSeconds,
 	)
 	var i Stack
 	err := row.Scan(

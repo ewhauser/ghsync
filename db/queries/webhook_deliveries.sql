@@ -15,10 +15,13 @@ SELECT count(*) FROM webhook_deliveries WHERE status = $1;
 -- processing transition and attempt increment remain in the caller's batch
 -- transaction, so a crashed dispatcher rolls the claim back to pending.
 WITH candidates AS (
-    SELECT delivery_guid
-    FROM webhook_deliveries
-    WHERE status = 'pending'
-    ORDER BY received_at, delivery_guid
+    SELECT candidate.delivery_guid
+    FROM webhook_deliveries AS candidate
+    WHERE candidate.status = 'pending'
+      AND candidate.next_attempt_at <= clock_timestamp()
+    ORDER BY candidate.next_attempt_at,
+             candidate.received_at,
+             candidate.delivery_guid
     LIMIT sqlc.arg(batch_size)
     FOR UPDATE SKIP LOCKED
 )
@@ -34,9 +37,21 @@ RETURNING delivery.*;
 -- C-P2: finish the entire claimed batch with one set-based status update.
 UPDATE webhook_deliveries AS delivery
 SET status = result.status,
-    last_error = NULLIF(result.last_error, '')
+    last_error = NULLIF(result.last_error, ''),
+    next_attempt_at = CASE
+        WHEN result.retry_delay_seconds IS NULL
+        THEN delivery.next_attempt_at
+        ELSE clock_timestamp() + make_interval(
+            secs => result.retry_delay_seconds
+        )
+    END
 FROM jsonb_to_recordset(sqlc.arg(results)::jsonb)
-    AS result(delivery_guid text, status text, last_error text)
+    AS result(
+        delivery_guid text,
+        status text,
+        last_error text,
+        retry_delay_seconds int
+    )
 WHERE delivery.delivery_guid = result.delivery_guid
   AND delivery.status = 'processing';
 
@@ -109,6 +124,7 @@ candidates AS (
 UPDATE webhook_deliveries AS delivery
 SET status = 'pending',
     attempts = 0,
+    next_attempt_at = clock_timestamp(),
     last_error = format(
         'operator requeue at %s; attempts reset from %s; prior error: %s',
         clock_timestamp(),

@@ -28,17 +28,29 @@ Server headers are authoritative; do not calculate a replacement allowance.
 ## Remediation
 
 Honor `backoff_until`; never clear it manually. Leave latency-critical roles
-running while an avoidable sweep fan-out is repaired:
+running while an avoidable sweep fan-out is repaired. When starting roles
+manually, each foreground `serve` invocation below is a separate
+shell/deployment action:
 
 ```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=ingress,dispatch,watermarker
 ```
 
-After fixing ETags or request fan-out, restore background roles:
+After fixing ETags or request fan-out, restore each background role group:
 
 ```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=fetch,sweep,drift
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=pruner
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=metrics
 ```
 

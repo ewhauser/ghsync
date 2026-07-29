@@ -231,7 +231,13 @@ SET remaining = CASE budgets.class
         WHEN 'rest' THEN $5::timestamptz
         WHEN 'graphql' THEN $6::timestamptz
     END,
-    backoff_until = $7::timestamptz,
+    backoff_until = CASE
+        WHEN budgets.backoff_until IS NULL
+          OR budgets.backoff_until <
+             $7::timestamptz
+        THEN $7::timestamptz
+        ELSE budgets.backoff_until
+    END,
     updated_at = observed.checked_at
 FROM observed
 WHERE budgets.installation_id = $8

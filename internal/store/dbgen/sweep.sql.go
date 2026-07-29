@@ -50,20 +50,18 @@ func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCu
 const advanceSweepCursor = `-- name: AdvanceSweepCursor :one
 UPDATE sweep_cursors
 SET cursor = $1,
-    seen_keys = $2,
-    pass_new_count = $3,
-    updated_at = $4
-WHERE installation_id = $5
-  AND sweep_kind = $6
-  AND scope_key = $7
-  AND cursor = $8
+    pass_new_count = $2,
+    updated_at = $3
+WHERE installation_id = $4
+  AND sweep_kind = $5
+  AND scope_key = $6
+  AND cursor = $7
   AND completed_at IS NULL
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+RETURNING installation_id, sweep_kind, scope_key, cursor, started_at, updated_at, completed_at, pass_new_count
 `
 
 type AdvanceSweepCursorParams struct {
 	NextCursor     string
-	SeenKeys       []byte
 	PassNewCount   int32
 	UpdatedAt      pgtype.Timestamptz
 	InstallationID int64
@@ -75,7 +73,6 @@ type AdvanceSweepCursorParams struct {
 func (q *Queries) AdvanceSweepCursor(ctx context.Context, arg AdvanceSweepCursorParams) (SweepCursor, error) {
 	row := q.db.QueryRow(ctx, advanceSweepCursor,
 		arg.NextCursor,
-		arg.SeenKeys,
 		arg.PassNewCount,
 		arg.UpdatedAt,
 		arg.InstallationID,
@@ -89,7 +86,6 @@ func (q *Queries) AdvanceSweepCursor(ctx context.Context, arg AdvanceSweepCursor
 		&i.SweepKind,
 		&i.ScopeKey,
 		&i.Cursor,
-		&i.SeenKeys,
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
@@ -132,20 +128,18 @@ func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHeal
 const completeSweepCursor = `-- name: CompleteSweepCursor :one
 UPDATE sweep_cursors
 SET cursor = '',
-    seen_keys = $1,
     pass_new_count = 0,
-    updated_at = $2,
-    completed_at = $2
-WHERE installation_id = $3
-  AND sweep_kind = $4
-  AND scope_key = $5
-  AND cursor = $6
+    updated_at = $1,
+    completed_at = $1
+WHERE installation_id = $2
+  AND sweep_kind = $3
+  AND scope_key = $4
+  AND cursor = $5
   AND completed_at IS NULL
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+RETURNING installation_id, sweep_kind, scope_key, cursor, started_at, updated_at, completed_at, pass_new_count
 `
 
 type CompleteSweepCursorParams struct {
-	SeenKeys       []byte
 	CompletedAt    pgtype.Timestamptz
 	InstallationID int64
 	SweepKind      string
@@ -155,7 +149,6 @@ type CompleteSweepCursorParams struct {
 
 func (q *Queries) CompleteSweepCursor(ctx context.Context, arg CompleteSweepCursorParams) (SweepCursor, error) {
 	row := q.db.QueryRow(ctx, completeSweepCursor,
-		arg.SeenKeys,
 		arg.CompletedAt,
 		arg.InstallationID,
 		arg.SweepKind,
@@ -168,7 +161,6 @@ func (q *Queries) CompleteSweepCursor(ctx context.Context, arg CompleteSweepCurs
 		&i.SweepKind,
 		&i.ScopeKey,
 		&i.Cursor,
-		&i.SeenKeys,
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
@@ -232,7 +224,7 @@ INSERT INTO sweep_cursors (
 )
 ON CONFLICT (installation_id, sweep_kind, scope_key) DO UPDATE
 SET sweep_kind = EXCLUDED.sweep_kind
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+RETURNING installation_id, sweep_kind, scope_key, cursor, started_at, updated_at, completed_at, pass_new_count
 `
 
 type EnsureSweepCursorParams struct {
@@ -249,7 +241,6 @@ func (q *Queries) EnsureSweepCursor(ctx context.Context, arg EnsureSweepCursorPa
 		&i.SweepKind,
 		&i.ScopeKey,
 		&i.Cursor,
-		&i.SeenKeys,
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
@@ -280,7 +271,7 @@ func (q *Queries) GetGapHealCursorForUpdate(ctx context.Context, installationID 
 }
 
 const getSweepCursor = `-- name: GetSweepCursor :one
-SELECT installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+SELECT installation_id, sweep_kind, scope_key, cursor, started_at, updated_at, completed_at, pass_new_count
 FROM sweep_cursors
 WHERE installation_id = $1
   AND sweep_kind = $2
@@ -301,7 +292,6 @@ func (q *Queries) GetSweepCursor(ctx context.Context, arg GetSweepCursorParams) 
 		&i.SweepKind,
 		&i.ScopeKey,
 		&i.Cursor,
-		&i.SeenKeys,
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
@@ -311,7 +301,7 @@ func (q *Queries) GetSweepCursor(ctx context.Context, arg GetSweepCursorParams) 
 }
 
 const getSweepCursorForUpdate = `-- name: GetSweepCursorForUpdate :one
-SELECT installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+SELECT installation_id, sweep_kind, scope_key, cursor, started_at, updated_at, completed_at, pass_new_count
 FROM sweep_cursors
 WHERE installation_id = $1
   AND sweep_kind = $2
@@ -333,7 +323,6 @@ func (q *Queries) GetSweepCursorForUpdate(ctx context.Context, arg GetSweepCurso
 		&i.SweepKind,
 		&i.ScopeKey,
 		&i.Cursor,
-		&i.SeenKeys,
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
@@ -377,6 +366,45 @@ func (q *Queries) GetSweepPage(ctx context.Context, arg GetSweepPageParams) (Swe
 		&i.ListSeenAt,
 	)
 	return i, err
+}
+
+const insertSweepSeenKeys = `-- name: InsertSweepSeenKeys :one
+WITH input AS (
+    SELECT DISTINCT entity_key
+    FROM unnest($1::text[]) AS keys(entity_key)
+),
+inserted AS (
+    INSERT INTO sweep_seen_keys (
+        installation_id, sweep_kind, scope_key, entity_key, first_seen_at
+    )
+    SELECT $2, $3,
+           $4, input.entity_key, $5
+    FROM input
+    ON CONFLICT DO NOTHING
+    RETURNING entity_key
+)
+SELECT count(*) FROM inserted
+`
+
+type InsertSweepSeenKeysParams struct {
+	EntityKeys     []string
+	InstallationID int64
+	SweepKind      string
+	ScopeKey       string
+	FirstSeenAt    pgtype.Timestamptz
+}
+
+func (q *Queries) InsertSweepSeenKeys(ctx context.Context, arg InsertSweepSeenKeysParams) (int64, error) {
+	row := q.db.QueryRow(ctx, insertSweepSeenKeys,
+		arg.EntityKeys,
+		arg.InstallationID,
+		arg.SweepKind,
+		arg.ScopeKey,
+		arg.FirstSeenAt,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const listExistingWebhookDeliveryGUIDs = `-- name: ListExistingWebhookDeliveryGUIDs :many
@@ -506,6 +534,79 @@ func (q *Queries) ListLiveStackNumbers(ctx context.Context, arg ListLiveStackNum
 	return items, nil
 }
 
+const listMissingSweepEntityKeys = `-- name: ListMissingSweepEntityKeys :many
+WITH cached AS (
+    SELECT ('repo:' || repos.full_name || ':metadata')::text AS entity_key
+    FROM repos
+    WHERE $2::text = 'repositories'
+      AND repos.installation_id = $1
+      AND repos.tombstoned_at IS NULL
+
+    UNION ALL
+
+    SELECT ('stack:' || repos.full_name || ':' || stacks.number)::text
+    FROM stacks
+    JOIN repos ON repos.id = stacks.repo_id
+    WHERE $2::text = 'stacks'
+      AND repos.installation_id = $1
+      AND repos.full_name = $3
+      AND repos.tombstoned_at IS NULL
+      AND stacks.tombstoned_at IS NULL
+
+    UNION ALL
+
+    SELECT ('pr:' || repos.full_name || ':' ||
+            pull_requests.number)::text
+    FROM pull_requests
+    JOIN repos ON repos.id = pull_requests.repo_id
+    WHERE $2::text = 'pull_requests'
+      AND repos.installation_id = $1
+      AND repos.full_name = $3
+      AND repos.tombstoned_at IS NULL
+      AND pull_requests.tombstoned_at IS NULL
+      AND pull_requests.state = 'open'
+)
+SELECT cached.entity_key
+FROM cached
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM sweep_seen_keys AS seen
+    WHERE seen.installation_id = $1
+      AND seen.sweep_kind = $2
+      AND seen.scope_key = $3
+      AND seen.entity_key = cached.entity_key
+)
+ORDER BY cached.entity_key
+`
+
+type ListMissingSweepEntityKeysParams struct {
+	InstallationID int64
+	SweepKind      string
+	ScopeKey       string
+}
+
+// C-R3/Q13: disappearance candidates are cached live entities absent from the
+// row-oriented membership set accumulated by the completed listing.
+func (q *Queries) ListMissingSweepEntityKeys(ctx context.Context, arg ListMissingSweepEntityKeysParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listMissingSweepEntityKeys, arg.InstallationID, arg.SweepKind, arg.ScopeKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var entity_key string
+		if err := rows.Scan(&entity_key); err != nil {
+			return nil, err
+		}
+		items = append(items, entity_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStaleClosedPullRequests = `-- name: ListStaleClosedPullRequests :many
 SELECT repos.full_name AS repo_full_name, pull_requests.number,
        pull_requests.last_checked_at
@@ -517,7 +618,9 @@ WHERE repos.installation_id = $1
   AND pull_requests.state <> 'open'
   AND pull_requests.display_until > clock_timestamp()
   AND pull_requests.last_checked_at <= $2
-ORDER BY pull_requests.last_checked_at, repos.full_name, pull_requests.number
+ORDER BY pull_requests.last_checked_at,
+         pull_requests.repo_id,
+         pull_requests.number
 `
 
 type ListStaleClosedPullRequestsParams struct {
@@ -562,7 +665,7 @@ WHERE repos.installation_id = $1
   AND NOT stacks.open
   AND stacks.display_until > clock_timestamp()
   AND stacks.last_checked_at <= $2
-ORDER BY stacks.last_checked_at, repos.full_name, stacks.number
+ORDER BY stacks.last_checked_at, stacks.repo_id, stacks.number
 `
 
 type ListStaleClosedStacksParams struct {
@@ -606,7 +709,9 @@ WHERE repos.installation_id = $1
   AND pull_requests.tombstoned_at IS NULL
   AND pull_requests.state = 'open'
   AND pull_requests.last_checked_at <= $2
-ORDER BY pull_requests.last_checked_at, repos.full_name, pull_requests.number
+ORDER BY pull_requests.last_checked_at,
+         pull_requests.repo_id,
+         pull_requests.number
 `
 
 type ListStaleOpenPullRequestsParams struct {
@@ -650,7 +755,7 @@ WHERE repos.installation_id = $1
   AND stacks.tombstoned_at IS NULL
   AND stacks.open
   AND stacks.last_checked_at <= $2
-ORDER BY stacks.last_checked_at, repos.full_name, stacks.number
+ORDER BY stacks.last_checked_at, stacks.repo_id, stacks.number
 `
 
 type ListStaleOpenStacksParams struct {
@@ -801,23 +906,45 @@ func (q *Queries) PruneWebhookDeliveryPayloadBatch(ctx context.Context, arg Prun
 	return result.RowsAffected(), nil
 }
 
+const reapOrphanedRepositorySweepCursors = `-- name: ReapOrphanedRepositorySweepCursors :execrows
+DELETE FROM sweep_cursors AS cursor
+WHERE cursor.installation_id = $1
+  AND cursor.sweep_kind IN ('stacks', 'pull_requests')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM repos
+      WHERE repos.installation_id = cursor.installation_id
+        AND repos.full_name = cursor.scope_key
+        AND repos.tombstoned_at IS NULL
+  )
+`
+
+// Q16: repository-scoped cursors use mutable names to call GitHub. Remove
+// scopes whose current live repository identity no longer owns that name;
+// child pages and seen keys follow via ON DELETE CASCADE.
+func (q *Queries) ReapOrphanedRepositorySweepCursors(ctx context.Context, installationID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, reapOrphanedRepositorySweepCursors, installationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const restartSweepCursorPass = `-- name: RestartSweepCursorPass :one
 UPDATE sweep_cursors
 SET cursor = $1,
-    seen_keys = $2,
     pass_new_count = 0,
-    updated_at = $3
-WHERE installation_id = $4
-  AND sweep_kind = $5
-  AND scope_key = $6
-  AND cursor = $7
+    updated_at = $2
+WHERE installation_id = $3
+  AND sweep_kind = $4
+  AND scope_key = $5
+  AND cursor = $6
   AND completed_at IS NULL
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+RETURNING installation_id, sweep_kind, scope_key, cursor, started_at, updated_at, completed_at, pass_new_count
 `
 
 type RestartSweepCursorPassParams struct {
 	FirstCursor    string
-	SeenKeys       []byte
 	UpdatedAt      pgtype.Timestamptz
 	InstallationID int64
 	SweepKind      string
@@ -828,7 +955,6 @@ type RestartSweepCursorPassParams struct {
 func (q *Queries) RestartSweepCursorPass(ctx context.Context, arg RestartSweepCursorPassParams) (SweepCursor, error) {
 	row := q.db.QueryRow(ctx, restartSweepCursorPass,
 		arg.FirstCursor,
-		arg.SeenKeys,
 		arg.UpdatedAt,
 		arg.InstallationID,
 		arg.SweepKind,
@@ -841,7 +967,6 @@ func (q *Queries) RestartSweepCursorPass(ctx context.Context, arg RestartSweepCu
 		&i.SweepKind,
 		&i.ScopeKey,
 		&i.Cursor,
-		&i.SeenKeys,
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
@@ -882,17 +1007,24 @@ func (q *Queries) StartGapHealCursor(ctx context.Context, arg StartGapHealCursor
 }
 
 const startSweepCursor = `-- name: StartSweepCursor :one
+WITH cleared AS (
+    DELETE FROM sweep_seen_keys
+    WHERE installation_id = $3
+      AND sweep_kind = $4
+      AND scope_key = $5
+    RETURNING entity_key
+)
 UPDATE sweep_cursors
 SET cursor = $1,
-    seen_keys = '[]'::jsonb,
     pass_new_count = 0,
     started_at = $2,
     updated_at = $2,
     completed_at = NULL
-WHERE installation_id = $3
-  AND sweep_kind = $4
-  AND scope_key = $5
-RETURNING installation_id, sweep_kind, scope_key, cursor, seen_keys, started_at, updated_at, completed_at, pass_new_count
+WHERE sweep_cursors.installation_id = $3
+  AND sweep_cursors.sweep_kind = $4
+  AND sweep_cursors.scope_key = $5
+  AND (SELECT count(*) FROM cleared) >= 0
+RETURNING installation_id, sweep_kind, scope_key, cursor, started_at, updated_at, completed_at, pass_new_count
 `
 
 type StartSweepCursorParams struct {
@@ -917,7 +1049,6 @@ func (q *Queries) StartSweepCursor(ctx context.Context, arg StartSweepCursorPara
 		&i.SweepKind,
 		&i.ScopeKey,
 		&i.Cursor,
-		&i.SeenKeys,
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,

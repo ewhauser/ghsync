@@ -1,12 +1,12 @@
 package sweep
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
-	"encoding/pem"
-	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -593,7 +593,16 @@ func TestPullListingOverlapPassRecoversConcurrentPageShift(t *testing.T) {
 		t.Fatalf("overlap sweep did not stabilize: %+v", state)
 	}
 	var seen []string
-	if err := json.Unmarshal(state.SeenKeys, &seen); err != nil {
+	if err := h.pool.QueryRow(ctx, `
+		SELECT COALESCE(
+		    array_agg(entity_key ORDER BY entity_key),
+		    ARRAY[]::text[]
+		)
+		FROM sweep_seen_keys
+		WHERE installation_id = 1
+		  AND sweep_kind = 'pull_requests'
+		  AND scope_key = 'acme/monolith'
+	`).Scan(&seen); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(seen, "pr:acme/monolith:4816") {
@@ -825,6 +834,111 @@ func TestSweepCursorResumesAfterMidSweepCrashAndSignalsOverrun(
 	}
 	if !cursor.CompletedAt.Valid || cursor.Cursor != "" {
 		t.Fatalf("resumed sweep cursor = %+v, want completed", cursor)
+	}
+}
+
+func TestRepositorySweepCursorsReapRenamedAndTombstonedScopes(
+	t *testing.T,
+) {
+	h := newSweepHarness(t, 100)
+	h.seedCache(t, []int{4812}, false, false)
+	ctx := context.Background()
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcilePage(ctx, ListPageArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+		ScopeKey:     "acme/monolith",
+		Cursor:       "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var oldSeen int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM sweep_seen_keys
+		WHERE installation_id = 1
+		  AND sweep_kind = 'pull_requests'
+		  AND scope_key = 'acme/monolith'
+	`).Scan(&oldSeen); err != nil {
+		t.Fatal(err)
+	}
+	if oldSeen == 0 {
+		t.Fatal("pre-rename sweep did not persist membership rows")
+	}
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE repos
+		SET full_name = 'platform/renamed'
+		WHERE installation_id = 1
+		  AND gh_id = 1001
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var oldCursors, oldPages, oldKeys, renamedCursors int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM sweep_cursors
+		     WHERE scope_key = 'acme/monolith'),
+		    (SELECT count(*) FROM sweep_pages
+		     WHERE scope_key = 'acme/monolith'),
+		    (SELECT count(*) FROM sweep_seen_keys
+		     WHERE scope_key = 'acme/monolith'),
+		    (SELECT count(*) FROM sweep_cursors
+		     WHERE scope_key = 'platform/renamed')
+	`).Scan(
+		&oldCursors,
+		&oldPages,
+		&oldKeys,
+		&renamedCursors,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if oldCursors != 0 || oldPages != 0 || oldKeys != 0 ||
+		renamedCursors != 1 {
+		t.Fatalf(
+			"rename reap old cursors/pages/keys=%d/%d/%d renamed=%d",
+			oldCursors,
+			oldPages,
+			oldKeys,
+			renamedCursors,
+		)
+	}
+
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE repos
+		SET tombstoned_at = clock_timestamp()
+		WHERE installation_id = 1
+		  AND gh_id = 1001
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM sweep_cursors
+		WHERE installation_id = 1
+		  AND sweep_kind = 'pull_requests'
+	`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("tombstoned repository sweep cursors = %d, want 0", remaining)
 	}
 }
 

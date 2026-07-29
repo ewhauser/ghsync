@@ -517,7 +517,14 @@ func (s *Service) kickoffRepositoryScopes(
 	kind string,
 	period time.Duration,
 ) error {
-	repositories, err := dbgen.New(s.pool).ListSweepRepositories(
+	queries := dbgen.New(s.pool)
+	if _, err := queries.ReapOrphanedRepositorySweepCursors(
+		ctx,
+		s.config.InstallationID,
+	); err != nil {
+		return fmt.Errorf("reap orphaned repository sweep cursors: %w", err)
+	}
+	repositories, err := queries.ListSweepRepositories(
 		ctx,
 		s.config.InstallationID,
 	)
@@ -874,20 +881,21 @@ func (s *Service) persistPage(
 	if current.CompletedAt.Valid || current.Cursor != args.Cursor {
 		return tx.Commit(ctx)
 	}
-	seen, err := mergeKeys(current.SeenKeys, page.keys)
-	if err != nil {
-		return err
-	}
-	newKeys, err := countNewKeys(current.SeenKeys, page.keys)
-	if err != nil {
-		return err
-	}
-	passNewCount := int(current.PassNewCount) + newKeys
-	encodedSeen, err := json.Marshal(seen)
-	if err != nil {
-		return fmt.Errorf("encode sweep seen keys: %w", err)
-	}
 	now := s.config.Now().UTC()
+	newKeys, err := queries.InsertSweepSeenKeys(
+		ctx,
+		dbgen.InsertSweepSeenKeysParams{
+			EntityKeys:     sortedUnique(page.keys),
+			InstallationID: args.Installation,
+			SweepKind:      args.SweepKind,
+			ScopeKey:       args.ScopeKey,
+			FirstSeenAt:    timestamptz(now),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("persist sweep seen keys: %w", err)
+	}
+	passNewCount := int64(current.PassNewCount) + newKeys
 	if err := queries.UpsertSweepPage(
 		ctx,
 		dbgen.UpsertSweepPageParams{
@@ -913,7 +921,6 @@ func (s *Service) persistPage(
 				ctx,
 				dbgen.RestartSweepCursorPassParams{
 					FirstCursor:    "1",
-					SeenKeys:       encodedSeen,
 					UpdatedAt:      timestamptz(now),
 					InstallationID: args.Installation,
 					SweepKind:      args.SweepKind,
@@ -944,7 +951,6 @@ func (s *Service) persistPage(
 				ctx,
 				queries,
 				args,
-				seen,
 			)
 			if err != nil {
 				return err
@@ -953,7 +959,6 @@ func (s *Service) persistPage(
 			if _, err := queries.CompleteSweepCursor(
 				ctx,
 				dbgen.CompleteSweepCursorParams{
-					SeenKeys:       encodedSeen,
 					CompletedAt:    timestamptz(now),
 					InstallationID: args.Installation,
 					SweepKind:      args.SweepKind,
@@ -970,7 +975,6 @@ func (s *Service) persistPage(
 			ctx,
 			dbgen.AdvanceSweepCursorParams{
 				NextCursor:     page.nextCursor,
-				SeenKeys:       encodedSeen,
 				PassNewCount:   int32(passNewCount),
 				UpdatedAt:      timestamptz(now),
 				InstallationID: args.Installation,
@@ -1026,65 +1030,17 @@ func (s *Service) missingVerificationSpecs(
 	ctx context.Context,
 	queries *dbgen.Queries,
 	args ListPageArgs,
-	seen []string,
 ) ([]queue.RefreshSpec, error) {
-	seenSet := make(map[string]struct{}, len(seen))
-	for _, key := range seen {
-		seenSet[key] = struct{}{}
-	}
-	var cached []string
 	var kind string
 	var bound time.Duration
 	switch args.SweepKind {
 	case KindRepositories:
-		names, err := queries.ListLiveRepositoryNames(
-			ctx,
-			args.Installation,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("list cached repositories: %w", err)
-		}
-		for _, name := range names {
-			cached = append(cached, "repo:"+name+":metadata")
-		}
 		kind = queue.KindRefreshRepository
 		bound = s.config.RepositoryListPeriod
 	case KindStacks:
-		numbers, err := queries.ListLiveStackNumbers(
-			ctx,
-			dbgen.ListLiveStackNumbersParams{
-				InstallationID: args.Installation,
-				RepoFullName:   args.ScopeKey,
-			},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("list cached stacks: %w", err)
-		}
-		for _, number := range numbers {
-			cached = append(
-				cached,
-				fmt.Sprintf("stack:%s:%d", args.ScopeKey, number),
-			)
-		}
 		kind = queue.KindRefreshStack
 		bound = s.config.OpenStackMaxStaleness
 	case KindPullRequests:
-		numbers, err := queries.ListLiveOpenPullRequestNumbers(
-			ctx,
-			dbgen.ListLiveOpenPullRequestNumbersParams{
-				InstallationID: args.Installation,
-				RepoFullName:   args.ScopeKey,
-			},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("list cached pull requests: %w", err)
-		}
-		for _, number := range numbers {
-			cached = append(
-				cached,
-				fmt.Sprintf("pr:%s:%d", args.ScopeKey, number),
-			)
-		}
 		kind = queue.KindRefreshPR
 		bound = s.config.OpenPRMaxStaleness
 	default:
@@ -1093,14 +1049,22 @@ func (s *Service) missingVerificationSpecs(
 			args.SweepKind,
 		)
 	}
-	var specs []queue.RefreshSpec
+	missing, err := queries.ListMissingSweepEntityKeys(
+		ctx,
+		dbgen.ListMissingSweepEntityKeysParams{
+			InstallationID: args.Installation,
+			SweepKind:      args.SweepKind,
+			ScopeKey:       args.ScopeKey,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list missing sweep entities: %w", err)
+	}
+	specs := make([]queue.RefreshSpec, 0, len(missing))
 	deadline := s.config.Now().Add(
 		scheduleForBound(bound).CompletionHeadroom,
 	)
-	for _, key := range cached {
-		if _, present := seenSet[key]; present {
-			continue
-		}
+	for _, key := range missing {
 		// C-R3: listing absence is only a hint. The ordinary entity worker
 		// performs the verification fetch, and only a 404 writes a tombstone.
 		specs = append(specs, queue.RefreshSpec{
@@ -1259,41 +1223,6 @@ func (s *Service) enqueueRefreshes(
 		return fmt.Errorf("commit stale refresh enqueue: %w", err)
 	}
 	return nil
-}
-
-func mergeKeys(existing []byte, added []string) ([]string, error) {
-	var keys []string
-	if len(existing) > 0 {
-		if err := json.Unmarshal(existing, &keys); err != nil {
-			return nil, fmt.Errorf("decode sweep seen keys: %w", err)
-		}
-	}
-	return sortedUnique(append(keys, added...)), nil
-}
-
-func countNewKeys(existing []byte, added []string) (int, error) {
-	var keys []string
-	if len(existing) > 0 {
-		if err := json.Unmarshal(existing, &keys); err != nil {
-			return 0, fmt.Errorf("decode sweep seen keys: %w", err)
-		}
-	}
-	seen := make(map[string]struct{}, len(keys)+len(added))
-	for _, key := range keys {
-		seen[key] = struct{}{}
-	}
-	count := 0
-	for _, key := range added {
-		if key == "" {
-			continue
-		}
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		count++
-	}
-	return count, nil
 }
 
 func sortedUnique(keys []string) []string {

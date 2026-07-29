@@ -887,7 +887,7 @@ func classAndSource(
 ) (budget.Class, store.SyncSource, error) {
 	switch queueName {
 	case queue.QueueInteractive:
-		return budget.Interactive, store.SyncSourceBackfill, nil
+		return budget.Interactive, store.SyncSourceInteractive, nil
 	case queue.QueueEvent:
 		return budget.Event, store.SyncSourceWebhook, nil
 	case queue.QueueSweep:

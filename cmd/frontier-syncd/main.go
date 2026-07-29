@@ -307,7 +307,8 @@ func serve(args []string) error {
 			return err
 		}
 	}
-	worksJobs := roles[roleFetch] || roles[rolePruner]
+	worksJobs := roles[roleFetch] || roles[roleSweep] ||
+		roles[roleDrift] || roles[rolePruner]
 
 	signalCtx, stopSignals := signal.NotifyContext(
 		context.Background(),
@@ -371,11 +372,12 @@ func serve(args []string) error {
 		watermarker, createErr := streammaint.NewWatermarker(
 			pool,
 			streammaint.WatermarkOptions{
-				RefreshInterval: cfg.WatermarkRefresh,
-				LeaseTTL:        cfg.WatermarkLeaseTTL,
-				Owner:           owner,
-				Observer:        watermarkMetricsAdapter{runtime: runtimeMetrics},
-				InstallationID:  cfg.GitHubInstallationID,
+				RefreshInterval:  cfg.WatermarkRefresh,
+				LeaseTTL:         cfg.WatermarkLeaseTTL,
+				FenceLockTimeout: cfg.WatermarkFenceTimeout,
+				Owner:            owner,
+				Observer:         watermarkMetricsAdapter{runtime: runtimeMetrics},
+				InstallationID:   cfg.GitHubInstallationID,
 			},
 		)
 		if createErr != nil {
@@ -433,17 +435,7 @@ func serve(args []string) error {
 	var deliveryClient *gh.DeliveriesClient
 	var tokens gh.TokenProvider
 	budgetCtx, cancelBudget := context.WithCancel(context.Background())
-	defer func() {
-		if githubGate != nil {
-			closeCtx, cancelClose := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			_ = githubGate.Close(closeCtx)
-			cancelClose()
-		}
-		cancelBudget()
-	}()
+	defer cancelBudget()
 	needsGitHub := roles[roleFetch] || roles[roleSweep] || roles[roleDrift]
 	if needsGitHub {
 		owner, hostErr := os.Hostname()
@@ -454,8 +446,14 @@ func serve(args []string) error {
 			budgetCtx,
 			http.DefaultClient,
 			budget.Options{
-				OnStarvation: runtimeMetrics.BudgetStarvation,
-				OnRequest:    runtimeMetrics.BudgetRequest,
+				MaxConcurrent:          cfg.BudgetMaxConcurrent,
+				RESTLimit:              cfg.BudgetRESTLimit,
+				GraphQLLimit:           cfg.BudgetGraphQLLimit,
+				SweepFloor:             cfg.BudgetSweepFloor,
+				EventFloor:             cfg.BudgetEventFloor,
+				SecondaryLimitFallback: cfg.BudgetSecondaryFallback,
+				OnStarvation:           runtimeMetrics.BudgetStarvation,
+				OnRequest:              runtimeMetrics.BudgetRequest,
 			},
 			budget.NewPostgresLeaseStore(pool),
 			budget.LeaseOptions{
@@ -529,12 +527,14 @@ func serve(args []string) error {
 		var fetchHandler *fetch.Handler
 		if roles[roleFetch] {
 			fetchHandler, err = fetch.New(fetch.Options{
-				Pool:           pool,
-				REST:           rest,
-				GraphQL:        graphQL,
-				InstallationID: cfg.GitHubInstallationID,
-				OrgID:          cfg.GitHubOrgID,
-				CacheObserver:  runtimeMetrics,
+				Pool:             pool,
+				REST:             rest,
+				GraphQL:          graphQL,
+				InstallationID:   cfg.GitHubInstallationID,
+				OrgID:            cfg.GitHubOrgID,
+				BatchWindow:      cfg.FetchBatchWindow,
+				BackfillPageSize: cfg.BackfillPageSize,
+				CacheObserver:    runtimeMetrics,
 			})
 			if err != nil {
 				return err
@@ -717,9 +717,7 @@ func serve(args []string) error {
 	if httpErr != nil && serviceErr == nil {
 		serviceErr = fmt.Errorf("HTTP graceful shutdown: %w", httpErr)
 	}
-	if riverClient != nil &&
-		(roles[roleFetch] || roles[roleSweep] ||
-			roles[roleDrift] || roles[rolePruner]) {
+	if riverClient != nil && worksJobs {
 		riverCtx, cancelRiver := context.WithTimeout(
 			context.Background(),
 			riverShutdownTimeout,
@@ -856,7 +854,7 @@ func driftConfig(cfg config.Config) drift.Config {
 		InstallationID:     cfg.GitHubInstallationID,
 		Period:             cfg.DriftPeriod,
 		SampleSize:         cfg.DriftSampleSize,
-		PageSize:           cfg.SweepPageSize,
+		PageSize:           cfg.DriftPageSize,
 		ResolvedRetention:  cfg.DriftResolvedRetention,
 		RetentionBatchSize: cfg.RetentionBatchSize,
 		Observer:           drift.LogObserver{},

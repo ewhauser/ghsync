@@ -24,16 +24,20 @@ import (
 type SyncSource string
 
 const (
-	SyncSourceWebhook   SyncSource = "webhook"
-	SyncSourceReconcile SyncSource = "reconcile"
-	SyncSourceBackfill  SyncSource = "backfill"
-	SyncSourceManual    SyncSource = "manual"
+	SyncSourceWebhook     SyncSource = "webhook"
+	SyncSourceReconcile   SyncSource = "reconcile"
+	SyncSourceBackfill    SyncSource = "backfill"
+	SyncSourceManual      SyncSource = "manual"
+	SyncSourceInteractive SyncSource = "interactive"
 )
 
 func (s SyncSource) Valid() bool {
 	return s == SyncSourceWebhook || s == SyncSourceReconcile ||
-		s == SyncSourceBackfill || s == SyncSourceManual
+		s == SyncSourceBackfill || s == SyncSourceManual ||
+		s == SyncSourceInteractive
 }
+
+const displayWindow = 30 * 24 * time.Hour
 
 type RepositoryRecord struct {
 	InstallationID  int64
@@ -752,28 +756,29 @@ func (w *EntityWriter) applyPullRequest(
 	row, upsertErr := queries.UpsertPullRequestWriteIfNewer(
 		ctx,
 		dbgen.UpsertPullRequestWriteIfNewerParams{
-			RepoID:          repo.ID,
-			GhID:            nullableInt8(pull.GitHubID),
-			NodeID:          pull.NodeID,
-			PrNumber:        int32(pull.Number),
-			Title:           pull.Title,
-			State:           strings.ToLower(pull.State),
-			Draft:           pull.Draft,
-			AuthorLogin:     pull.AuthorLogin,
-			HeadRef:         pull.HeadRef,
-			HeadSha:         pull.HeadSHA,
-			BaseRef:         pull.BaseRef,
-			BaseSha:         pull.BaseSHA,
-			ReviewDecision:  pull.ReviewDecision,
-			MergeableState:  pull.MergeableState,
-			StackNumber:     nullableInt4(pull.StackNumber),
-			StackPosition:   nullableInt4(pull.StackPosition),
-			MembershipKnown: pull.MembershipKnown,
-			GhUpdatedAt:     timestamp(pull.GitHubUpdatedAt),
-			SyncedAt:        timestamp(pull.SyncedAt),
-			LastCheckedAt:   timestamp(pull.SyncedAt),
-			Etag:            pull.ETag,
-			SyncSource:      string(pull.Source),
+			RepoID:               repo.ID,
+			GhID:                 nullableInt8(pull.GitHubID),
+			NodeID:               pull.NodeID,
+			PrNumber:             int32(pull.Number),
+			Title:                pull.Title,
+			State:                strings.ToLower(pull.State),
+			Draft:                pull.Draft,
+			AuthorLogin:          pull.AuthorLogin,
+			HeadRef:              pull.HeadRef,
+			HeadSha:              pull.HeadSHA,
+			BaseRef:              pull.BaseRef,
+			BaseSha:              pull.BaseSHA,
+			ReviewDecision:       pull.ReviewDecision,
+			MergeableState:       pull.MergeableState,
+			StackNumber:          nullableInt4(pull.StackNumber),
+			StackPosition:        nullableInt4(pull.StackPosition),
+			MembershipKnown:      pull.MembershipKnown,
+			GhUpdatedAt:          timestamp(pull.GitHubUpdatedAt),
+			SyncedAt:             timestamp(pull.SyncedAt),
+			LastCheckedAt:        timestamp(pull.SyncedAt),
+			Etag:                 pull.ETag,
+			SyncSource:           string(pull.Source),
+			DisplayWindowSeconds: int32(displayWindow / time.Second),
 		},
 	)
 	if upsertErr != nil && !errors.Is(upsertErr, pgx.ErrNoRows) {
@@ -1104,20 +1109,21 @@ func (w *EntityWriter) applyStack(
 	_, upsertErr := queries.UpsertStackWriteIfNewer(
 		ctx,
 		dbgen.UpsertStackWriteIfNewerParams{
-			RepoID:        repo.ID,
-			GhID:          nullableInt8(stack.GitHubID),
-			NodeID:        stack.NodeID,
-			StackNumber:   int32(stack.Number),
-			BaseRef:       stack.BaseRef,
-			BaseSha:       stack.BaseSHA,
-			Open:          stack.Open,
-			Entries:       entries,
-			GhUpdatedAt:   timestamp(stack.GitHubUpdatedAt),
-			HeadSha:       stackHeadSHA(stack.Entries, stack.BaseSHA),
-			SyncedAt:      timestamp(stack.SyncedAt),
-			LastCheckedAt: timestamp(stack.SyncedAt),
-			Etag:          stack.ETag,
-			SyncSource:    string(stack.Source),
+			RepoID:               repo.ID,
+			GhID:                 nullableInt8(stack.GitHubID),
+			NodeID:               stack.NodeID,
+			StackNumber:          int32(stack.Number),
+			BaseRef:              stack.BaseRef,
+			BaseSha:              stack.BaseSHA,
+			Open:                 stack.Open,
+			Entries:              entries,
+			GhUpdatedAt:          timestamp(stack.GitHubUpdatedAt),
+			HeadSha:              stackHeadSHA(stack.Entries, stack.BaseSHA),
+			SyncedAt:             timestamp(stack.SyncedAt),
+			LastCheckedAt:        timestamp(stack.SyncedAt),
+			Etag:                 stack.ETag,
+			SyncSource:           string(stack.Source),
+			DisplayWindowSeconds: int32(displayWindow / time.Second),
 		},
 	)
 	if upsertErr != nil && !errors.Is(upsertErr, pgx.ErrNoRows) {
@@ -1401,8 +1407,8 @@ func (w *EntityWriter) ApplyChecksObserved(
 		scopes, err := queries.ListPRScopesByHeadSHA(
 			ctx,
 			dbgen.ListPRScopesByHeadSHAParams{
-				RepoFullName: checks.Repository.FullName,
-				HeadSha:      checks.HeadSHA,
+				RepoGhID: checks.Repository.GitHubID,
+				HeadSha:  checks.HeadSHA,
 			},
 		)
 		if err != nil {

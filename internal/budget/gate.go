@@ -16,12 +16,14 @@ import (
 
 const (
 	defaultConcurrency       = 40
+	defaultRESTLimit         = int64(15000)
+	defaultGraphQLLimit      = int64(5000)
 	defaultRESTEstimate      = 1
 	defaultGraphQLEstimate   = 100
 	defaultSecondaryBackoff  = 60 * time.Second
+	defaultSweepFloor        = 0.20
+	defaultEventFloor        = 0.10
 	secondaryBodyInspectSize = 64 << 10
-	sweepFloor               = 0.20
-	eventFloor               = 0.10
 )
 
 // Options configures a Gate. Limits are initial floor denominators only; an
@@ -29,9 +31,13 @@ const (
 // pessimism and never replace or persist server-authoritative remaining values
 // (C-B2/C-B3).
 type Options struct {
-	MaxConcurrent          int
-	RESTLimit              int64
-	GraphQLLimit           int64
+	MaxConcurrent int
+	RESTLimit     int64
+	GraphQLLimit  int64
+	// SweepFloor and EventFloor are fractions in (0,1); EventFloor must be
+	// lower because event work has priority over sweep work.
+	SweepFloor             float64
+	EventFloor             float64
 	RESTRequestEstimate    int64
 	GraphQLPointEstimate   int64
 	SecondaryLimitFallback time.Duration
@@ -57,6 +63,8 @@ type Gate struct {
 	graphqlReserved        int64
 	restEstimate           int64
 	graphqlEstimate        int64
+	sweepFloor             float64
+	eventFloor             float64
 	backoffUntil           time.Time
 	secondaryLimitFallback time.Duration
 	unavailable            error
@@ -109,10 +117,20 @@ func New(client *http.Client, options Options) *Gate {
 		options.MaxConcurrent = defaultConcurrency
 	}
 	if options.RESTLimit <= 0 {
-		options.RESTLimit = 15000
+		options.RESTLimit = defaultRESTLimit
 	}
 	if options.GraphQLLimit <= 0 {
-		options.GraphQLLimit = 5000
+		options.GraphQLLimit = defaultGraphQLLimit
+	}
+	if options.SweepFloor <= 0 || options.SweepFloor >= 1 {
+		options.SweepFloor = defaultSweepFloor
+	}
+	if options.EventFloor <= 0 || options.EventFloor >= 1 {
+		options.EventFloor = defaultEventFloor
+	}
+	if options.EventFloor >= options.SweepFloor {
+		options.SweepFloor = defaultSweepFloor
+		options.EventFloor = defaultEventFloor
 	}
 	if options.RESTRequestEstimate <= 0 {
 		options.RESTRequestEstimate = defaultRESTEstimate
@@ -135,6 +153,8 @@ func New(client *http.Client, options Options) *Gate {
 		graphql:                ResourceBudget{Limit: options.GraphQLLimit},
 		restEstimate:           options.RESTRequestEstimate,
 		graphqlEstimate:        options.GraphQLPointEstimate,
+		sweepFloor:             options.SweepFloor,
+		eventFloor:             options.EventFloor,
 		secondaryLimitFallback: options.SecondaryLimitFallback,
 		onStarvation:           options.OnStarvation,
 		onRequest:              options.OnRequest,
@@ -145,6 +165,19 @@ func New(client *http.Client, options Options) *Gate {
 // Do admits and performs exactly one GitHub request (C-B1). REST state comes
 // only from x-ratelimit-* headers; GraphQL state comes only from the supplied
 // rateLimit observer (C-B2/C-B5).
+//
+// Admission owns a C-B6 concurrency slot until the response body reaches EOF
+// or is closed. Do may return a non-nil Response alongside a non-nil error;
+// callers must still close every non-nil response body. Forgetting to close
+// permanently leaks that slot, and enough leaks stop all installation traffic.
+// Redirect following is disabled because a redirect would otherwise hide an
+// unadmitted request inside http.Client.Do.
+//
+// An Auth request issued from a BeforeSend hook reuses its outer request's
+// admission. It is exempt from an additional concurrency slot and rate-floor
+// reservation so installation-token renewal cannot deadlock behind its own
+// admitted request; it inherits the outer availability/backoff decision rather
+// than performing a second admission check.
 func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, error) {
 	if err := validateDo(ctx, class, req); err != nil {
 		return nil, err
@@ -332,7 +365,7 @@ func (g *Gate) tryAdmit(
 		state := g.resourceLocked(resource)
 		if state.Known && now.Before(state.ResetAt) {
 			afterReservation := state.Remaining - g.reservedLocked(resource) - cost
-			floor := floorFor(class)
+			floor := g.floorFor(class)
 			floorRemaining := int64(math.Ceil(float64(state.Limit) * floor))
 			if afterReservation < 0 || (floor > 0 && afterReservation < floorRemaining) {
 				return true, state.ResetAt, g.changed, &Starvation{
@@ -653,12 +686,12 @@ func retryAfterDeadline(now time.Time, raw string) (time.Time, error) {
 	return when, nil
 }
 
-func floorFor(class Class) float64 {
+func (g *Gate) floorFor(class Class) float64 {
 	switch class {
 	case Sweep:
-		return sweepFloor
+		return g.sweepFloor
 	case Event:
-		return eventFloor
+		return g.eventFloor
 	default:
 		return 0
 	}

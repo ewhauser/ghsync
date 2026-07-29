@@ -165,7 +165,9 @@ INSERT INTO pull_requests (
     sqlc.arg(last_checked_at), sqlc.arg(etag), sqlc.arg(sync_source), NULL,
     CASE WHEN sqlc.arg(state)::text = 'open'
          THEN NULL
-         ELSE clock_timestamp() + interval '30 days'
+         ELSE clock_timestamp() + make_interval(
+             secs => sqlc.arg(display_window_seconds)::int
+         )
     END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
@@ -203,7 +205,9 @@ SET gh_id = EXCLUDED.gh_id,
     display_until = CASE
         WHEN EXCLUDED.state = 'open' THEN NULL
         WHEN pull_requests.state = 'open'
-        THEN clock_timestamp() + interval '30 days'
+        THEN clock_timestamp() + make_interval(
+            secs => sqlc.arg(display_window_seconds)::int
+        )
         ELSE pull_requests.display_until
     END
 WHERE pull_requests.gh_updated_at IS NULL
@@ -295,7 +299,9 @@ INSERT INTO stacks (
     sqlc.arg(etag), sqlc.arg(sync_source), NULL,
     CASE WHEN sqlc.arg(open)::boolean
          THEN NULL
-         ELSE clock_timestamp() + interval '30 days'
+         ELSE clock_timestamp() + make_interval(
+             secs => sqlc.arg(display_window_seconds)::int
+         )
     END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
@@ -314,7 +320,9 @@ SET gh_id = EXCLUDED.gh_id,
     tombstoned_at = NULL,
     display_until = CASE
         WHEN EXCLUDED.open THEN NULL
-        WHEN stacks.open THEN clock_timestamp() + interval '30 days'
+        WHEN stacks.open THEN clock_timestamp() + make_interval(
+            secs => sqlc.arg(display_window_seconds)::int
+        )
         ELSE stacks.display_until
     END
 WHERE stacks.gh_updated_at IS NULL
@@ -733,8 +741,7 @@ SELECT pull_requests.number, pull_requests.stack_number,
        repos.gh_id AS repo_gh_id, repos.installation_id
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
-JOIN repo_aliases ON repo_aliases.repo_id = repos.id
-WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
+WHERE repos.gh_id = sqlc.arg(repo_gh_id)
   AND pull_requests.head_sha = sqlc.arg(head_sha)
   AND pull_requests.tombstoned_at IS NULL
 ORDER BY pull_requests.number;

@@ -219,6 +219,49 @@ func TestRepositoryRenameKeepsAliasesImmutableEventsAndDirtyScopes(
 			immutableEvents,
 		)
 	}
+
+	if _, err := pool.Exec(
+		context.Background(),
+		`TRUNCATE derivation_dirty`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := writer.ApplyChecksObserved(
+		context.Background(),
+		nil,
+		store.ChecksRecord{
+			// Model a queued job carrying the pre-rename alias. Dirty-scope
+			// resolution must use immutable GitHub identity, not this name.
+			Repository: oldRepository,
+			HeadSHA:    pull.HeadSHA,
+			Runs: []store.CheckRunRecord{{
+				GitHubID:   22001,
+				NodeID:     "rename-check",
+				Name:       "unit",
+				Status:     "completed",
+				Conclusion: "success",
+				Observed:   json.RawMessage(`{"id":22001}`),
+			}},
+			SyncedAt: baseTime.Add(3 * time.Minute),
+			Source:   store.SyncSourceWebhook,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("stale-name check observation was not applied")
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM derivation_dirty
+		WHERE scope_key = 'pr:1:2200:42'
+	`).Scan(&dirty); err != nil {
+		t.Fatal(err)
+	}
+	if dirty != 1 {
+		t.Fatalf("stale-name check dirty scopes = %d, want 1", dirty)
+	}
 }
 
 func TestTimestampLessChecksOnlyAppendAcceptedTransitions(t *testing.T) {

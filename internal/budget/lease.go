@@ -27,10 +27,12 @@ const (
 // LeaseStore coordinates the one active budgeter for an installation and
 // persists periodic C-P6 state snapshots. Acquire and Renew return Postgres's
 // authoritative lease expiry; callers must never derive it from local time.
-// Acquire's boolean reports whether the lease was acquired. For Renew, Save,
-// and SaveBackoff, false means the store has proven that the caller no longer
-// owns the lease. Transport failures must be returned as errors; returning
-// false for a transport failure violates this contract.
+// Acquire false means the store proved that another unexpired owner holds the
+// lease. For Renew, Save, and SaveBackoff, false means the store has proven
+// that the caller no longer owns the lease. Transport failures must always be
+// returned as errors; returning false for a transport failure violates this
+// contract. Release returns any cleanup failure rather than translating it
+// into ownership loss.
 type LeaseStore interface {
 	Acquire(
 		context.Context,

@@ -595,6 +595,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 			EntityKey:     current.EntityKey,
 			LockKey:       current.LockKey,
 			CacheSnapshot: []byte(`{"stale_sample":true}`),
+			LastCheckedAt: current.LastCheckedAt,
 		},
 	)
 	if err != nil {

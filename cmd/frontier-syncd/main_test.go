@@ -133,6 +133,19 @@ func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
 	}
 }
 
+func TestDriftPageSizeIsIndependentFromSweepPageSize(t *testing.T) {
+	cfg := config.Config{
+		SweepPageSize: 25,
+		DriftPageSize: 75,
+	}
+	if got := sweepConfig(cfg).PageSize; got != 25 {
+		t.Fatalf("sweep page size = %d, want 25", got)
+	}
+	if got := driftConfig(cfg).PageSize; got != 75 {
+		t.Fatalf("drift page size = %d, want 75", got)
+	}
+}
+
 func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
 	cfg := config.Config{
 		GitHubInstallationID:       1,
@@ -148,6 +161,7 @@ func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
 		GapMaxPages:                10,
 		DriftPeriod:                time.Hour,
 		DriftSampleSize:            10,
+		DriftPageSize:              100,
 		DriftResolvedRetention:     30 * 24 * time.Hour,
 		RetentionPeriod:            24 * time.Hour,
 		RetentionAge:               90 * 24 * time.Hour,

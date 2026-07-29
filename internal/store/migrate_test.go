@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
@@ -119,10 +121,13 @@ func TestMigrateIdempotent(t *testing.T) {
 		FROM pg_indexes
 		WHERE schemaname = current_schema()
 		  AND tablename = 'webhook_deliveries'
-		  AND indexname = 'webhook_deliveries_pending_received_guid_idx'
+		  AND indexname = 'webhook_deliveries_pending_due_idx'
 	`).Scan(&partialIndexDefinition)
 	if err != nil ||
-		!strings.Contains(partialIndexDefinition, "(received_at, delivery_guid)") ||
+		!strings.Contains(
+			partialIndexDefinition,
+			"(next_attempt_at, received_at, delivery_guid)",
+		) ||
 		!strings.Contains(partialIndexDefinition, "WHERE (status = 'pending'::text)") {
 		t.Fatalf(
 			"pending partial index = %q (err=%v)",
@@ -147,10 +152,10 @@ func TestMigrateIdempotent(t *testing.T) {
 		FROM pg_indexes
 		WHERE schemaname = current_schema()
 		  AND tablename = 'check_history'
-		  AND indexname = 'check_history_synced_at_brin_idx'
+		  AND indexname = 'check_history_prunable_btree_idx'
 	`).Scan(&historyRetentionIndex)
 	if err != nil ||
-		!strings.Contains(historyRetentionIndex, "USING brin (synced_at)") {
+		!strings.Contains(historyRetentionIndex, "(synced_at, id)") {
 		t.Fatalf(
 			"global check-history retention index = %q (err=%v)",
 			historyRetentionIndex,
@@ -163,10 +168,17 @@ func TestMigrateIdempotent(t *testing.T) {
 		FROM pg_indexes
 		WHERE schemaname = current_schema()
 		  AND tablename = 'webhook_deliveries'
-		  AND indexname = 'webhook_deliveries_received_at_brin_idx'
+		  AND indexname = 'webhook_deliveries_prunable_btree_idx'
 	`).Scan(&deliveryRetentionIndex)
 	if err != nil ||
-		!strings.Contains(deliveryRetentionIndex, "USING brin (received_at)") {
+		!strings.Contains(
+			deliveryRetentionIndex,
+			"(received_at, delivery_guid)",
+		) ||
+		!strings.Contains(
+			deliveryRetentionIndex,
+			"WHERE ((raw_body IS NOT NULL) AND (status = 'processed'::text))",
+		) {
 		t.Fatalf(
 			"delivery retention index = %q (err=%v)",
 			deliveryRetentionIndex,
@@ -185,5 +197,72 @@ func TestVerifyChecksum(t *testing.T) {
 	}
 	if err := verifyChecksum("0001.sql", nil, checksum); err == nil {
 		t.Fatal("missing checksum accepted")
+	}
+}
+
+func TestInstallationBudgetSnapshotPreservesLaterBackoff(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	installationID := -time.Now().UnixNano()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	wantBackoff := now.Add(10 * time.Minute)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO installation_budgets (
+		    installation_id, class, lease_owner, lease_until, backoff_until
+		) VALUES
+		    ($1, 'rest', 'snapshot-test', $2, $3),
+		    ($1, 'graphql', 'snapshot-test', $2, $3)
+	`, installationID, now.Add(time.Hour), wantBackoff); err != nil {
+		t.Fatal(err)
+	}
+	affected, err := dbgen.New(tx).SaveInstallationBudgetSnapshot(
+		ctx,
+		dbgen.SaveInstallationBudgetSnapshotParams{
+			BackoffUntil: pgtype.Timestamptz{
+				Time:  now.Add(time.Minute),
+				Valid: true,
+			},
+			InstallationID: installationID,
+			LeaseToken:     "snapshot-test",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 2 {
+		t.Fatalf("snapshot rows = %d, want 2", affected)
+	}
+	var earlierRows int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM installation_budgets
+		WHERE installation_id = $1
+		  AND backoff_until = $2
+	`, installationID, wantBackoff).Scan(&earlierRows); err != nil {
+		t.Fatal(err)
+	}
+	if earlierRows != 2 {
+		t.Fatalf(
+			"rows preserving later backoff = %d, want 2",
+			earlierRows,
+		)
 	}
 }

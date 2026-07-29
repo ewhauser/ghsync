@@ -41,20 +41,26 @@ schema doc (`db/CONTRACT.md`, written in M5) is part of the deliverable.
 ## 2. Repository layout
 
 ```
-server/                          # Go module (new)
-  cmd/frontier-syncd/            # single binary, role flags (SYNC_ENGINE §6)
-  internal/
-    gh/                          # REST/GraphQL clients, stacks wrapper, ghinstallation
-    budget/                      # C-B gate
-    ingress/  dispatch/  fetch/  sweep/   # pipeline roles
-    store/                       # sqlc output + entity writers (C-C)
-    derive/                      # deriver LOOP + Deriver interface (seam only)
-    stream/                      # outbox, watermarker (C-S)
-  pkg/streamclient/              # public consumer library (§1.3)
-  db/migrations/  db/queries/    # plain SQL (sqlc); River migrations alongside
-  db/CONTRACT.md                 # the consumption contract (§1)
-docker-compose.yml               # postgres 16 + fake-github
-Makefile                         # dev, test, lint, migrate
+.                               # Go module root
+├── cmd/
+│   ├── frontier-syncd/          # single binary, role flags (SYNC_ENGINE §6)
+│   ├── fake-github/             # deterministic GitHub test double
+│   ├── stream-tail/             # reference Postgres stream consumer
+│   └── soak/                    # storm/soak verifier
+├── internal/
+│   ├── gh/                      # REST/GraphQL clients and stacks wrapper
+│   ├── budget/                  # C-B admission and accounting gate
+│   ├── ingress/ dispatch/ fetch/ queue/
+│   ├── sweep/ drift/            # reconciliation and trust loops
+│   ├── store/                   # sqlc output + entity writers (C-C)
+│   ├── derive/ outbox/ stream/  # derivation seam and C-S machinery
+│   └── metrics/                 # operational signals
+├── pkg/streamclient/            # public consumer library (§1.3)
+├── db/
+│   ├── migrations/ queries/     # plain SQL (sqlc); River migrations alongside
+│   └── CONTRACT.md              # the consumption contract (§1)
+├── docker-compose.yml           # Postgres 16 + fake-github
+└── Makefile                     # dev, test, lint, migrate
 ```
 
 No proto/buf: there is no wire API in this project.
@@ -67,7 +73,8 @@ Estimates assume 2 engineers.
 ### M0 — Foundations (≈1 wk)
 
 Go module, sqlc + migration pipeline (ours + River's), River wired with the
-three queues (interactive/event/sweep), config, docker-compose, CI (build,
+three fetch-priority queues (interactive/event/sweep; later milestones add the
+reconcile/drift/pruner component queues), config, docker-compose, CI (build,
 vet, golangci-lint, tests). **Fake GitHub server skeleton** — REST + GraphQL
 + webhook emitter with scriptable scenarios; it is the test substrate for
 every later milestone, so it starts first.
@@ -92,7 +99,8 @@ Ingress (C-I1–I5, C-P1: verify → single-row durable insert → ack, GUID
 dedupe, poison parking). Dispatcher (C-P2 batch claims; hint rules including
 §2.1 stack rules: stack-object diff, whole-stack escalation on member
 events, `stacked` action). Coalescing via River unique jobs (C-Q1–Q3,
-running-state-excluded uniqueness).
+River 0.41's supported uniqueness mask, and the durable refresh-generation
+follow-up protocol).
 
 *Exit:* **replay harness** operational — recorded webhook streams from the
 enrolled test repo, replayed in random permutations with duplicates,

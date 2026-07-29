@@ -35,19 +35,26 @@ WHERE locks.locktype = 'advisory'
 ORDER BY locks.granted, locks.pid;
 ```
 
-The exclusive fence waits only for registered outbox writers; bootstrap
-snapshots do not participate.
+The exclusive fence waits only for outbox writers holding the required shared
+lock; migration `0024` rejects an unfenced `change_events` insert. Its
+acquisition has a local `lock_timeout`, and pooled connections enforce
+`idle_in_transaction_session_timeout`; bootstrap snapshots do not
+participate.
 
 ## Remediation
 
-Gracefully replace the watermarker role so its lease fails over:
+Gracefully replace the watermarker role so its lease fails over. If starting
+the replacement manually, run the foreground process in a separate
+shell/deployment action:
 
 ```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=watermarker
 ```
 
-Terminate a stuck writer only under the database incident procedure. Never
-update `safe_seq` manually.
+A fence timeout is a retryable, metered step outcome; do not treat one timeout
+as permission to alter the stream. Terminate a stuck writer only under the
+database incident procedure. Never update `safe_seq` manually.
 
 ## Escalation
 

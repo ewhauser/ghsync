@@ -26,13 +26,32 @@ current `GITHUB_WEBHOOK_SECRET`.
 
 ## Remediation
 
-Restore at least one instance of each required role:
+Restore at least one instance of each required role through the deployment
+platform. When starting roles manually, each foreground invocation below is a
+separate shell/deployment action:
 
 ```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=ingress
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=dispatch
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=fetch,sweep,drift
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=watermarker
+```
+
+```sh
+# In a separate shell/deployment action:
 frontier-syncd serve --roles=metrics
 ```
 

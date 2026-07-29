@@ -1,12 +1,61 @@
 # Frontier Postgres delivery contract
 
-Contract version: **v1**, introduced by migration `0013` and extended
-additively by migrations `0014`–`0019` and `0021`.
+Contract version: **v1**, introduced by migration `0013`, extended
+additively by migrations `0014`–`0019` and `0021`, and hardened by the
+database-enforced writer fence in migration `0024`.
 
 Postgres is the Frontier sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
 `pkg/streamclient`. The Go package is the reference implementation; consumers
 must not reproduce the watermark, cursor, retention, or resync algorithms.
+Direct Postgres access is the **only v1 transport**. The gRPC and SSE surfaces
+in `docs/API_SPEC.md` belong to a future API project and are not implemented
+by the sync engine.
+
+## Consumer facts
+
+The suggested database role is `frontier_consumer`. Run this block once as a
+role that may create roles and grant access, then grant `frontier_consumer` to
+each application login that runs `pkg/streamclient`:
+
+```sql
+CREATE ROLE frontier_consumer NOLOGIN;
+
+GRANT USAGE ON SCHEMA public TO frontier_consumer;
+
+GRANT SELECT ON TABLE
+    repos,
+    repo_rules,
+    stacks,
+    pull_requests,
+    review_threads,
+    check_runs,
+    check_history,
+    work_items,
+    change_events,
+    stream_watermark,
+    stream_horizons
+TO frontier_consumer;
+
+GRANT SELECT, INSERT, UPDATE ON TABLE consumer_cursors
+TO frontier_consumer;
+```
+
+Run exactly **one tailer per `(consumer, stream)`**. Two processes must not
+share that pair; elect one tailer and fan out locally, or use distinct consumer
+names. `pkg/streamclient` locks the cursor row in a `REPEATABLE READ`
+transaction so handler effects and cursor advancement remain atomic.
+Concurrent tailers for the same pair therefore surface PostgreSQL
+serialization errors by design.
+
+Event order is `seq` alone. `occurred_at` is transaction-start time and is
+**not** monotonic with `seq`: a long writer can commit a high sequence with an
+older `occurred_at` than a faster writer. Never order, deduplicate, or resume
+by `occurred_at`. Retention intentionally prunes by `occurred_at`; when that
+time order differs from sequence order, `stream_horizons.pruned_through_seq`
+may force a resync earlier than the remaining rows alone would require. That
+is the conservative direction: it can cause an extra snapshot, never a silent
+gap.
 
 ## Public v1 schema
 
@@ -210,6 +259,50 @@ the complete required v1 shape; additive fields are allowed. Consumers fetch
 current state from the lookup target, ignore unknown kinds and fields, and use
 `seq` as the idempotency key for external effects.
 
+### Internal key grammars and the shared advisory-lock namespace
+
+Three key namespaces coexist. They are not interchangeable even where two
+forms happen to contain the same text:
+
+1. **Public v1 event/entity keys.** `internal/outbox` constructors, called by
+   the entity writer and deriver, produce immutable GitHub-identity keys. The
+   numbered cache-entity form is
+   `{kind}:{installation_id}:{repo_gh_id}:{number}`; repository and repository
+   rules omit the final number, while checks use `head_sha` there. The
+   `v1-events` manifest above is the exact public grammar, including the
+   separate work-item identity forms. These values are stable across repository
+   rename.
+2. **Internal refresh/job keys.** Dispatcher classification and
+   fetch/backfill/sweep producers create path-addressed pointers consumed by
+   `internal/queue` and parsed by `internal/fetch`:
+   `{kind}:{owner}/{name}:{number_or_value}`. Concrete forms are
+   `repo:{owner}/{name}:metadata`, `repo_rules:{owner}/{name}:rules`,
+   `pr:{owner}/{name}:{number}`, `stack:{owner}/{name}:{number}`,
+   `checks:{owner}/{name}:{head_sha}`, and
+   `branch:{owner}/{name}:{branch}`. They are private, rename-sensitive work
+   pointers, not public event identities.
+3. **Drift-detector fetch and lock keys.** The SQL `drift_entities` view
+   produces a path-addressed `entity_key` for the authoritative refresh and a
+   separate immutable `lock_key` for serialization. Its fetch forms are
+   `repo:{owner}/{name}:metadata`, `pr:{owner}/{name}:{number}`,
+   `stack:{owner}/{name}:{number}`, `repo_rules:{owner}/{name}:rules`,
+   `review_threads:{owner}/{name}:{number}`, and
+   `checks:{owner}/{name}:{head_sha}`. Its lock forms are
+   `repo:{installation_id}:{repo_gh_id}`,
+   `repo_rules:{installation_id}:{repo_gh_id}`,
+   `pr:{installation_id}:{repo_gh_id}:{number}` (also used for review
+   threads), `stack:{installation_id}:{repo_gh_id}:{number}`, and
+   `checks:{installation_id}:{repo_gh_id}:{head_sha}`.
+
+All entity observation and transaction locks share one PostgreSQL advisory-lock
+keyspace, derived with `hashtextextended(key, 0)`. Drift `lock_key` values and
+the entity-writer keys therefore coordinate with each other.
+`store.RepositoryDiscoveryKey` also mints
+`repo-discovery:{installation_id}:{owner}/{name}` into this same keyspace while
+an as-yet-unknown repository is fetched. Do not introduce a new producer or
+change a grammar without checking every producer that participates in this
+shared lock space.
+
 ## Writer fence and visibility watermark
 
 Every transaction that inserts `change_events` has a mandatory obligation:
@@ -222,7 +315,10 @@ SELECT pg_advisory_xact_lock_shared(5076242250190120306);
 
 The value is the ASCII bytes for `Frontier` interpreted as a signed `BIGINT`;
 clients pass it as a parameter. All internal entity-writer and deriver paths use
-`internal/outbox.AcquireWriterFence`. A new internal writer may not bypass it.
+`internal/outbox.AcquireWriterFence`. Migration `0024` adds a
+`BEFORE INSERT` trigger that rejects any `change_events` write whose backend
+does not already hold this shared fence, so the obligation is enforced by
+Postgres rather than convention.
 
 The watermarker briefly takes the exclusive transaction lock on that same key.
 Once acquired, every earlier participating writer has committed or rolled
@@ -230,6 +326,10 @@ back, and no new writer can allocate a sequence. In that transaction the
 watermarker publishes `max(change_events.seq)` and immediately commits,
 releasing the fence. Unrelated transactions and read-only or Bootstrap
 snapshots never take the fence and cannot stall watermark progress.
+The exclusive attempt is a bounded global write barrier: a local
+`lock_timeout` makes a busy fence a retryable, metered watermarker outcome,
+and pooled connections set `idle_in_transaction_session_timeout` so an
+abandoned writer cannot hold the shared side forever.
 
 `change_events.outbox_txid` and
 `stream_watermark.{candidate_seq,candidate_xid,lease_token,lease_until}` are
