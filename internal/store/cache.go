@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/acme/frontier/internal/outbox"
+	"github.com/acme/frontier/internal/pipeline"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
@@ -405,13 +406,17 @@ func (w *EntityWriter) ApplyRepository(
 	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		return false, err
 	}
+	observedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return false, err
+	}
 	_, applied, err := w.applyRepositoryTx(
 		ctx, queries, repository, source, etag, observedAt,
 	)
 	if err != nil {
 		return false, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return false, fmt.Errorf("commit repository write: %w", err)
 	}
 	w.observer.CacheWrite(ctx, "repository", applied, false)
@@ -441,13 +446,17 @@ func (w *EntityWriter) ApplyRepositoryObserved(
 	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		return false, err
 	}
+	observedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return false, err
+	}
 	_, applied, err := w.applyRepositoryTx(
 		ctx, dbgen.New(tx), repository, source, etag, observedAt,
 	)
 	if err != nil {
 		return false, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return false, fmt.Errorf("commit observed repository write: %w", err)
 	}
 	w.observer.CacheWrite(ctx, "repository", applied, false)
@@ -480,10 +489,14 @@ func (w *EntityWriter) TombstoneRepositoryObserved(
 		return false, fmt.Errorf("begin repository tombstone: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	at, err = databaseClock(ctx, tx)
+	if err != nil {
+		return false, err
+	}
 	queries := dbgen.New(tx)
 	current, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, tx.Commit(ctx)
+		return false, w.commitEntityTx(ctx, tx)
 	}
 	if err != nil {
 		return false, fmt.Errorf("read tombstoned repository: %w", err)
@@ -506,7 +519,7 @@ func (w *EntityWriter) TombstoneRepositoryObserved(
 	}
 	applied := tombstoneErr == nil
 	if applied {
-		if err := markAndEmit(
+		if err := w.markAndEmit(
 			ctx,
 			queries,
 			scopes,
@@ -517,7 +530,7 @@ func (w *EntityWriter) TombstoneRepositoryObserved(
 			return false, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return false, fmt.Errorf("commit repository tombstone: %w", err)
 	}
 	w.observer.CacheWrite(ctx, "repository", applied, true)
@@ -589,7 +602,7 @@ func (w *EntityWriter) applyRepositoryTx(
 	if err != nil {
 		return dbgen.Repo{}, false, fmt.Errorf("resolve repository scopes: %w", err)
 	}
-	if err := markAndEmit(
+	if err := w.markAndEmit(
 		ctx,
 		queries,
 		scopes,
@@ -621,6 +634,10 @@ func (w *EntityWriter) TouchPullRequest(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	checkedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return err
+	}
 	repo, err := dbgen.New(tx).GetRepoByGitHubID(ctx, repository.GitHubID)
 	if err != nil {
 		return fmt.Errorf("find PR repository: %w", err)
@@ -636,7 +653,7 @@ func (w *EntityWriter) TouchPullRequest(
 	); err != nil {
 		return fmt.Errorf("touch PR checked_at: %w", err)
 	}
-	return tx.Commit(ctx)
+	return w.commitEntityTx(ctx, tx)
 }
 
 func (w *EntityWriter) ApplyPullRequest(
@@ -685,6 +702,10 @@ func (w *EntityWriter) applyPullRequest(
 		return ApplyPullRequestResult{}, fmt.Errorf("begin PR write: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	pull.SyncedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return ApplyPullRequestResult{}, err
+	}
 	queries := dbgen.New(tx)
 	repo, err := queries.GetRepoByGitHubID(ctx, pull.Repository.GitHubID)
 	if err != nil {
@@ -830,7 +851,7 @@ func (w *EntityWriter) applyPullRequest(
 				pull.Repository, pull.Number, result.NewStackNumber,
 			),
 		)
-		if err := markAndEmit(
+		if err := w.markAndEmit(
 			ctx, queries, scopes, outbox.PullRequestChangedKind, key, pull.SyncedAt,
 		); err != nil {
 			return ApplyPullRequestResult{}, err
@@ -843,7 +864,7 @@ func (w *EntityWriter) applyPullRequest(
 			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return ApplyPullRequestResult{}, fmt.Errorf("commit PR write: %w", err)
 	}
 	w.observer.CacheWrite(
@@ -908,6 +929,10 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 		return ApplyPullRequestResult{}, fmt.Errorf("begin PR tombstone: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	at, err = databaseClock(ctx, tx)
+	if err != nil {
+		return ApplyPullRequestResult{}, err
+	}
 	queries := dbgen.New(tx)
 	repo, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
 	if err != nil {
@@ -921,7 +946,7 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 		},
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ApplyPullRequestResult{}, tx.Commit(ctx)
+		return ApplyPullRequestResult{}, w.commitEntityTx(ctx, tx)
 	}
 	if err != nil {
 		return ApplyPullRequestResult{}, fmt.Errorf("read tombstoned PR: %w", err)
@@ -947,7 +972,7 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 		result.Applied = true
 		result.DomainChanged = true
 		result.NewHeadSHA = row.HeadSha
-		if err := markAndEmit(
+		if err := w.markAndEmit(
 			ctx,
 			queries,
 			[]string{derivationScope(
@@ -967,7 +992,7 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return ApplyPullRequestResult{}, fmt.Errorf("commit PR tombstone: %w", err)
 	}
 	w.observer.CacheWrite(ctx, "pull_request", result.Applied, true)
@@ -1020,6 +1045,10 @@ func (w *EntityWriter) applyStack(
 		return ApplyStackResult{}, fmt.Errorf("begin stack write: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	stack.SyncedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return ApplyStackResult{}, err
+	}
 	queries := dbgen.New(tx)
 	repo, err := queries.GetRepoByGitHubID(ctx, stack.Repository.GitHubID)
 	if err != nil {
@@ -1111,7 +1140,7 @@ func (w *EntityWriter) applyStack(
 				}
 			}
 		}
-		if err := markAndEmit(
+		if err := w.markAndEmit(
 			ctx, queries, []string{key}, outbox.StackChangedKind, key, stack.SyncedAt,
 		); err != nil {
 			return ApplyStackResult{}, err
@@ -1124,7 +1153,7 @@ func (w *EntityWriter) applyStack(
 			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return ApplyStackResult{}, fmt.Errorf("commit stack write: %w", err)
 	}
 	w.observer.CacheWrite(ctx, "stack", result.Applied, false)
@@ -1150,6 +1179,10 @@ func (w *EntityWriter) TouchStack(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	checkedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return err
+	}
 	repo, err := dbgen.New(tx).GetRepoByGitHubID(ctx, repository.GitHubID)
 	if err != nil {
 		return err
@@ -1165,7 +1198,7 @@ func (w *EntityWriter) TouchStack(
 	); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return w.commitEntityTx(ctx, tx)
 }
 
 func (w *EntityWriter) TombstoneStackObserved(
@@ -1188,6 +1221,10 @@ func (w *EntityWriter) TombstoneStackObserved(
 		return ApplyStackResult{}, fmt.Errorf("begin stack tombstone: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	at, err = databaseClock(ctx, tx)
+	if err != nil {
+		return ApplyStackResult{}, err
+	}
 	queries := dbgen.New(tx)
 	repo, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
 	if err != nil {
@@ -1201,7 +1238,7 @@ func (w *EntityWriter) TombstoneStackObserved(
 		},
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ApplyStackResult{}, tx.Commit(ctx)
+		return ApplyStackResult{}, w.commitEntityTx(ctx, tx)
 	}
 	if err != nil {
 		return ApplyStackResult{}, fmt.Errorf("read tombstoned stack: %w", err)
@@ -1232,7 +1269,7 @@ func (w *EntityWriter) TombstoneStackObserved(
 			LeftPRs:  entryNumbers(entries),
 			MovedPRs: nil,
 		}
-		if err := markAndEmit(
+		if err := w.markAndEmit(
 			ctx, queries, []string{key}, outbox.StackTombstonedKind, key, at,
 		); err != nil {
 			return ApplyStackResult{}, err
@@ -1245,7 +1282,7 @@ func (w *EntityWriter) TombstoneStackObserved(
 			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return ApplyStackResult{}, fmt.Errorf("commit stack tombstone: %w", err)
 	}
 	w.observer.CacheWrite(ctx, "stack", result.Applied, true)
@@ -1274,6 +1311,10 @@ func (w *EntityWriter) ApplyChecksObserved(
 		return false, fmt.Errorf("begin checks write: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	checks.SyncedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return false, err
+	}
 	queries := dbgen.New(tx)
 	repo, err := queries.GetRepoByGitHubID(ctx, checks.Repository.GitHubID)
 	if err != nil {
@@ -1353,7 +1394,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 				),
 			)
 		}
-		if err := markAndEmit(
+		if err := w.markAndEmit(
 			ctx,
 			queries,
 			uniqueStrings(scopeKeys...),
@@ -1364,7 +1405,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 			return false, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return false, fmt.Errorf("commit checks write: %w", err)
 	}
 	applied := len(changed) > 0
@@ -1389,6 +1430,10 @@ func (w *EntityWriter) ApplyRepoRulesObserved(
 		return false, fmt.Errorf("begin repository rules write: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	rules.SyncedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return false, err
+	}
 	queries := dbgen.New(tx)
 	repo, err := queries.GetRepoByGitHubID(ctx, rules.Repository.GitHubID)
 	if err != nil {
@@ -1436,7 +1481,7 @@ func (w *EntityWriter) ApplyRepoRulesObserved(
 		if err != nil {
 			return false, fmt.Errorf("resolve repository rule scopes: %w", err)
 		}
-		if err := markAndEmit(
+		if err := w.markAndEmit(
 			ctx,
 			queries,
 			scopes,
@@ -1447,7 +1492,7 @@ func (w *EntityWriter) ApplyRepoRulesObserved(
 			return false, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return false, fmt.Errorf("commit repository rules: %w", err)
 	}
 	applied := len(changed) > 0
@@ -1473,6 +1518,10 @@ func (w *EntityWriter) TouchRepoRules(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	checkedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return err
+	}
 	queries := dbgen.New(tx)
 	repo, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
 	if err != nil {
@@ -1497,7 +1546,7 @@ func (w *EntityWriter) TouchRepoRules(
 	); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return w.commitEntityTx(ctx, tx)
 }
 
 func (w *EntityWriter) BranchTargets(
@@ -1604,7 +1653,7 @@ func requireObservation(observation *Observation, wantKey string) error {
 	return nil
 }
 
-func markAndEmit(
+func (w *EntityWriter) markAndEmit(
 	ctx context.Context,
 	queries *dbgen.Queries,
 	scopes []string,
@@ -1624,7 +1673,7 @@ func markAndEmit(
 		}
 	}
 	payload := []byte(`{"version":1}`)
-	if _, err := queries.InsertChangeEvent(
+	seq, err := queries.InsertChangeEvent(
 		ctx,
 		dbgen.InsertChangeEventParams{
 			Stream:     outbox.EntitiesStream,
@@ -1633,9 +1682,46 @@ func markAndEmit(
 			OccurredAt: timestamp(at),
 			Payload:    payload,
 		},
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("insert entity change event: %w", err)
 	}
+	if err := outbox.AfterSequenceAllocated(
+		ctx,
+		outbox.EntityWriterOrigin,
+		seq,
+	); err != nil {
+		return fmt.Errorf("after entity change sequence allocation: %w", err)
+	}
+	return nil
+}
+
+func databaseClock(ctx context.Context, tx pgx.Tx) (time.Time, error) {
+	var now time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("read PostgreSQL clock: %w", err)
+	}
+	return now, nil
+}
+
+func (w *EntityWriter) commitEntityTx(ctx context.Context, tx pgx.Tx) error {
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if pipeline.EventReceivedAt(ctx).IsZero() {
+		return nil
+	}
+	var committedAt time.Time
+	if err := w.pool.QueryRow(
+		ctx,
+		`SELECT clock_timestamp()`,
+	).Scan(&committedAt); err != nil {
+		return fmt.Errorf(
+			"read PostgreSQL clock after cache commit: %w",
+			err,
+		)
+	}
+	pipeline.MarkCacheCommitted(ctx, committedAt)
 	return nil
 }
 

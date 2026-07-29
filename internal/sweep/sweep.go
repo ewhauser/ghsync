@@ -22,6 +22,7 @@ import (
 	"github.com/riverqueue/river/rivertype"
 
 	"github.com/acme/frontier/internal/gh"
+	"github.com/acme/frontier/internal/opsstate"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
@@ -903,6 +904,7 @@ func (s *Service) persistPage(
 		return fmt.Errorf("persist sweep page validator: %w", err)
 	}
 	specs := append([]queue.RefreshSpec(nil), page.refreshSpecs...)
+	completed := false
 	if page.nextCursor == "" {
 		// PR listings can shrink between numbered pages. Restart from the
 		// leading page until a complete overlap pass adds no identifiers.
@@ -961,6 +963,7 @@ func (s *Service) persistPage(
 			); err != nil {
 				return fmt.Errorf("complete sweep cursor: %w", err)
 			}
+			completed = true
 		}
 	} else {
 		if _, err := queries.AdvanceSweepCursor(
@@ -1000,6 +1003,18 @@ func (s *Service) persistPage(
 		queue.QueueSweep,
 	); err != nil {
 		return err
+	}
+	if completed {
+		if err := opsstate.RecordSuccessN(
+			ctx,
+			tx,
+			args.Installation,
+			"sweep",
+			args.SweepKind,
+			1,
+		); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit sweep page: %w", err)

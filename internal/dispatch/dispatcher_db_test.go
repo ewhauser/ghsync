@@ -413,8 +413,7 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	requeued, err := dbgen.New(pool).RequeueParkedWebhookDeliveries(
 		context.Background(),
 		dbgen.RequeueParkedWebhookDeliveriesParams{
-			AllParked:    false,
-			DeliveryGuid: poison.DeliveryGuid,
+			DeliveryGuids: []string{poison.DeliveryGuid},
 		},
 	)
 	if err != nil {
@@ -440,8 +439,7 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	requeued, err = dbgen.New(pool).RequeueParkedWebhookDeliveries(
 		context.Background(),
 		dbgen.RequeueParkedWebhookDeliveriesParams{
-			AllParked:    false,
-			DeliveryGuid: poison.DeliveryGuid,
+			DeliveryGuids: []string{poison.DeliveryGuid},
 		},
 	)
 	if err != nil {
@@ -464,7 +462,8 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 		t.Fatalf("replayed poison delivery = %+v", poison)
 	}
 
-	for _, guid := range []string{"parked-all-1", "parked-all-2"} {
+	for index := 0; index < 101; index++ {
+		guid := fmt.Sprintf("parked-family-%03d", index)
 		if _, err := pool.Exec(context.Background(), `
 			INSERT INTO webhook_deliveries (
 				delivery_guid, event, raw_body, headers, status, attempts, last_error
@@ -477,28 +476,41 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 	requeued, err = dbgen.New(pool).RequeueParkedWebhookDeliveries(
 		context.Background(),
 		dbgen.RequeueParkedWebhookDeliveriesParams{
-			AllParked: true,
+			Event:         "push",
+			ErrorContains: "poison",
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requeued != 2 {
-		t.Fatalf("all-parked requeued rows = %d, want 2", requeued)
+	if requeued != 100 {
+		t.Fatalf("bounded-family requeued rows = %d, want 100", requeued)
 	}
 	var resetCount int
 	if err := pool.QueryRow(context.Background(), `
 		SELECT count(*)
 		FROM webhook_deliveries
-		WHERE delivery_guid = ANY($1::text[])
+		WHERE delivery_guid LIKE 'parked-family-%'
 		  AND status = 'pending'
 		  AND attempts = 0
 		  AND last_error LIKE 'operator requeue%'
-	`, []string{"parked-all-1", "parked-all-2"}).Scan(&resetCount); err != nil {
+	`).Scan(&resetCount); err != nil {
 		t.Fatal(err)
 	}
-	if resetCount != 2 {
-		t.Fatalf("all-parked reset rows = %d, want 2", resetCount)
+	if resetCount != 100 {
+		t.Fatalf("bounded-family reset rows = %d, want 100", resetCount)
+	}
+	var parkedRemainder int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM webhook_deliveries
+		WHERE delivery_guid LIKE 'parked-family-%'
+		  AND status = 'parked'
+	`).Scan(&parkedRemainder); err != nil {
+		t.Fatal(err)
+	}
+	if parkedRemainder != 1 {
+		t.Fatalf("bounded-family parked remainder = %d, want 1", parkedRemainder)
 	}
 }
 

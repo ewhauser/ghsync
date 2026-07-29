@@ -27,21 +27,9 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	); err != nil {
 		return err
 	}
-	if r.budgetFloor, err = meter.Int64ObservableGauge(
-		"frontier_c_b3_budget_floor",
-		metric.WithDescription("Reserved remaining budget floor by priority and resource (C-B3)."),
-	); err != nil {
-		return err
-	}
-	if r.gateClosed, err = meter.Float64ObservableGauge(
-		"frontier_c_b2_gate_closed_seconds",
-		metric.WithDescription("Seconds until the installation-wide secondary-limit gate reopens (C-B2)."),
-	); err != nil {
-		return err
-	}
-	if r.conditionalRatio, err = meter.Float64ObservableGauge(
-		"frontier_c_b4_conditional_304_ratio",
-		metric.WithDescription("Process-lifetime conditional request 304 ratio by class and resource (C-B4)."),
+	if r.gateClosed, err = meter.Int64ObservableGauge(
+		"frontier_c_b2_gate_closed",
+		metric.WithDescription("Whether the installation-wide secondary-limit gate is closed (C-B2)."),
 	); err != nil {
 		return err
 	}
@@ -54,6 +42,18 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	if r.oldestDeliveryAge, err = meter.Float64ObservableGauge(
 		"frontier_c_q2_oldest_unprocessed_delivery_age_seconds",
 		metric.WithDescription("Age of the oldest pending or processing webhook delivery (C-Q2)."),
+	); err != nil {
+		return err
+	}
+	if r.outstandingGenCount, err = meter.Int64ObservableGauge(
+		"frontier_c_q2_outstanding_generations",
+		metric.WithDescription("Refresh generations not yet completed (C-Q2)."),
+	); err != nil {
+		return err
+	}
+	if r.outstandingGenAge, err = meter.Float64ObservableGauge(
+		"frontier_c_q2_oldest_outstanding_generation_age_seconds",
+		metric.WithDescription("Age of the oldest event-backed incomplete generation (C-Q2)."),
 	); err != nil {
 		return err
 	}
@@ -123,21 +123,21 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	); err != nil {
 		return err
 	}
-	if r.outboxDepth, err = meter.Int64ObservableGauge(
-		"frontier_c_s2_outbox_depth",
-		metric.WithDescription("Retained change-event rows by stream (C-S2/C-S7)."),
+	if r.prunableOutboxDepth, err = meter.Int64ObservableGauge(
+		"frontier_c_s7_prunable_outbox_depth",
+		metric.WithDescription("Retention-eligible change events at or below the safe consumer horizon (C-S7)."),
 	); err != nil {
 		return err
 	}
-	if r.consumerCursorLag, err = meter.Int64ObservableGauge(
-		"frontier_c_s4_consumer_cursor_lag_sequences",
-		metric.WithDescription("Safe watermark minus durable cursor by consumer (C-S4)."),
+	if r.consumerOutstanding, err = meter.Int64ObservableGauge(
+		"frontier_c_s4_consumer_outstanding_events",
+		metric.WithDescription("Visible unconsumed events in the consumer's own stream (C-S4)."),
 	); err != nil {
 		return err
 	}
-	if r.consumerCursorAge, err = meter.Float64ObservableGauge(
-		"frontier_c_s4_consumer_cursor_age_seconds",
-		metric.WithDescription("Age of each consumer's last durable cursor update (C-S4)."),
+	if r.consumerOutstandingAge, err = meter.Float64ObservableGauge(
+		"frontier_c_s4_oldest_outstanding_event_age_seconds",
+		metric.WithDescription("Age of the oldest visible unconsumed event in the consumer's stream (C-S4)."),
 	); err != nil {
 		return err
 	}
@@ -153,6 +153,30 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	); err != nil {
 		return err
 	}
+	if r.operationSuccesses, err = meter.Int64ObservableGauge(
+		"frontier_c_o4_operation_successes",
+		metric.WithDescription("Durable completed trust-operation passes (C-O4)."),
+	); err != nil {
+		return err
+	}
+	if r.operationSamples, err = meter.Int64ObservableGauge(
+		"frontier_c_o4_operation_samples",
+		metric.WithDescription("Durable trust-operation samples inspected (C-O4)."),
+	); err != nil {
+		return err
+	}
+	if r.operationSuccessAge, err = meter.Float64ObservableGauge(
+		"frontier_c_o4_last_operation_success_age_seconds",
+		metric.WithDescription("Age of the last durable trust-operation completion; -1 means never (C-O4)."),
+	); err != nil {
+		return err
+	}
+	if r.operationSampleAge, err = meter.Float64ObservableGauge(
+		"frontier_c_o4_last_operation_sample_age_seconds",
+		metric.WithDescription("Age of the last durable trust-operation sample; -1 means never (C-O4)."),
+	); err != nil {
+		return err
+	}
 	if r.roleEnabled, err = meter.Int64ObservableGauge(
 		"frontier_c_o4_role_enabled",
 		metric.WithDescription("Roles enabled in this frontier-syncd process (C-O4)."),
@@ -164,11 +188,11 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 		r.observe,
 		r.budgetRemaining,
 		r.budgetLimit,
-		r.budgetFloor,
 		r.gateClosed,
-		r.conditionalRatio,
 		r.queueDepth,
 		r.oldestDeliveryAge,
+		r.outstandingGenCount,
+		r.outstandingGenAge,
 		r.parkedCount,
 		r.parkedAge,
 		r.cacheStaleness,
@@ -180,11 +204,15 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 		r.driftFindings,
 		r.watermarkLag,
 		r.watermarkAge,
-		r.outboxDepth,
-		r.consumerCursorLag,
-		r.consumerCursorAge,
+		r.prunableOutboxDepth,
+		r.consumerOutstanding,
+		r.consumerOutstandingAge,
 		r.resyncCount,
 		r.deriverDirtyBacklog,
+		r.operationSuccesses,
+		r.operationSamples,
+		r.operationSuccessAge,
+		r.operationSampleAge,
 		r.roleEnabled,
 	)
 	return err
@@ -198,8 +226,11 @@ func (r *Runtime) observe(ctx context.Context, observer metric.Observer) error {
 			metric.WithAttributes(attribute.String("role", role)),
 		)
 	}
-	r.observeConfiguredBounds(observer)
 	r.observeRatios(observer)
+	if !r.options.CollectDatabase {
+		return nil
+	}
+	r.observeConfiguredBounds(observer)
 	for _, observe := range []func(context.Context, metric.Observer) error{
 		r.observeBudget,
 		r.observeQueues,
@@ -210,6 +241,7 @@ func (r *Runtime) observe(ctx context.Context, observer metric.Observer) error {
 		r.observeDrift,
 		r.observeStream,
 		r.observeDeriver,
+		r.observeOperationHeartbeats,
 	} {
 		if err := observe(ctx, observer); err != nil {
 			return err
@@ -260,20 +292,6 @@ func sweepCadence(bound time.Duration) time.Duration {
 func (r *Runtime) observeRatios(observer metric.Observer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for key, counts := range r.conditional {
-		parts := strings.SplitN(key, "\x00", 2)
-		if counts.total == 0 {
-			continue
-		}
-		observer.ObserveFloat64(
-			r.conditionalRatio,
-			float64(counts.hits)/float64(counts.total),
-			metric.WithAttributes(
-				attribute.String("class", parts[0]),
-				attribute.String("resource", parts[1]),
-			),
-		)
-	}
 	for kind, counts := range r.cas {
 		if counts.total == 0 {
 			continue
@@ -292,15 +310,18 @@ func (r *Runtime) observeBudget(
 	ctx context.Context,
 	observer metric.Observer,
 ) error {
+	type state struct {
+		remaining int64
+		limit     int64
+		closed    bool
+	}
+	states := map[string]state{
+		"rest":    {remaining: -1, limit: -1},
+		"graphql": {remaining: -1, limit: -1},
+	}
 	rows, err := r.options.Pool.Query(ctx, `
 		SELECT class, COALESCE(remaining, -1), COALESCE(rate_limit, -1),
-		       GREATEST(
-		           EXTRACT(EPOCH FROM (
-		               COALESCE(backoff_until, clock_timestamp())
-		               - clock_timestamp()
-		           )),
-		           0
-		       )::double precision
+		       COALESCE(backoff_until > clock_timestamp(), false)
 		FROM installation_budgets
 		WHERE installation_id = $1
 		ORDER BY class
@@ -308,19 +329,35 @@ func (r *Runtime) observeBudget(
 	if err != nil {
 		return fmt.Errorf("collect C-B budget metrics: %w", err)
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var resource string
 		var remaining, limit int64
-		var closedSeconds float64
+		var closed bool
 		if err := rows.Scan(
-			&resource, &remaining, &limit, &closedSeconds,
+			&resource, &remaining, &limit, &closed,
 		); err != nil {
+			rows.Close()
 			return err
 		}
-		observer.ObserveFloat64(
+		states[resource] = state{
+			remaining: remaining,
+			limit:     limit,
+			closed:    closed,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for resource, state := range states {
+		closed := int64(0)
+		if state.closed {
+			closed = 1
+		}
+		observer.ObserveInt64(
 			r.gateClosed,
-			closedSeconds,
+			closed,
 			metric.WithAttributes(
 				attribute.String("installation_id", strconv.FormatInt(
 					r.options.InstallationID, 10,
@@ -328,7 +365,7 @@ func (r *Runtime) observeBudget(
 				attribute.String("resource", resource),
 			),
 		)
-		if remaining < 0 || limit <= 0 {
+		if state.remaining < 0 || state.limit <= 0 {
 			continue
 		}
 		for _, class := range []string{"interactive", "event", "sweep"} {
@@ -339,27 +376,15 @@ func (r *Runtime) observeBudget(
 				attribute.String("class", class),
 				attribute.String("resource", resource),
 			)
-			observer.ObserveInt64(r.budgetRemaining, remaining, attrs)
-			observer.ObserveInt64(r.budgetLimit, limit, attrs)
 			observer.ObserveInt64(
-				r.budgetFloor,
-				budgetFloor(class, limit),
+				r.budgetRemaining,
+				state.remaining,
 				attrs,
 			)
+			observer.ObserveInt64(r.budgetLimit, state.limit, attrs)
 		}
 	}
-	return rows.Err()
-}
-
-func budgetFloor(class string, limit int64) int64 {
-	switch class {
-	case "sweep":
-		return (limit*20 + 99) / 100
-	case "event":
-		return (limit*10 + 99) / 100
-	default:
-		return 0
-	}
+	return nil
 }
 
 func (r *Runtime) observeQueues(
@@ -418,8 +443,8 @@ func (r *Runtime) observeDeliveries(
 	ctx context.Context,
 	observer metric.Observer,
 ) error {
-	var oldestUnprocessed, oldestParked float64
-	var parked int64
+	var oldestUnprocessed, oldestParked, oldestGeneration float64
+	var parked, outstandingGenerations int64
 	err := r.options.Pool.QueryRow(ctx, `
 		SELECT
 		    COALESCE(EXTRACT(EPOCH FROM (
@@ -430,13 +455,34 @@ func (r *Runtime) observeDeliveries(
 		    COALESCE(EXTRACT(EPOCH FROM (
 		        clock_timestamp() - min(received_at)
 		            FILTER (WHERE status = 'parked')
-		    )), 0)::double precision
+		    )), 0)::double precision,
+		    (
+		        SELECT count(*)
+		        FROM refresh_intent_generations
+		        WHERE completed_generation < generation
+		    ),
+		    (
+		        SELECT COALESCE(EXTRACT(EPOCH FROM (
+		            clock_timestamp() - min(event_received_at)
+		        )), 0)::double precision
+		        FROM refresh_intent_generations
+		        WHERE completed_generation < generation
+		          AND event_received_at IS NOT NULL
+		    )
 		FROM webhook_deliveries
-	`).Scan(&oldestUnprocessed, &parked, &oldestParked)
+	`).Scan(
+		&oldestUnprocessed,
+		&parked,
+		&oldestParked,
+		&outstandingGenerations,
+		&oldestGeneration,
+	)
 	if err != nil {
 		return fmt.Errorf("collect C-Q2/C-I5 delivery metrics: %w", err)
 	}
 	observer.ObserveFloat64(r.oldestDeliveryAge, oldestUnprocessed)
+	observer.ObserveInt64(r.outstandingGenCount, outstandingGenerations)
+	observer.ObserveFloat64(r.outstandingGenAge, oldestGeneration)
 	observer.ObserveInt64(r.parkedCount, parked)
 	observer.ObserveFloat64(r.parkedAge, oldestParked)
 	return nil
@@ -496,8 +542,9 @@ func (r *Runtime) observeStaleness(
 		        JOIN repos ON repos.id = stacks.repo_id
 		        WHERE repos.installation_id = $1
 		          AND repos.tombstoned_at IS NULL
-		          AND stacks.tombstoned_at IS NULL
-		          AND NOT stacks.open
+			          AND stacks.tombstoned_at IS NULL
+			          AND NOT stacks.open
+			          AND stacks.display_until > clock_timestamp()
 		        UNION ALL
 		        SELECT EXTRACT(EPOCH FROM (
 		                   clock_timestamp() - pull_requests.last_checked_at
@@ -506,11 +553,12 @@ func (r *Runtime) observeStaleness(
 		        JOIN repos ON repos.id = pull_requests.repo_id
 		        WHERE repos.installation_id = $1
 		          AND repos.tombstoned_at IS NULL
-		          AND pull_requests.tombstoned_at IS NULL
-		          AND pull_requests.state <> 'open'
+			          AND pull_requests.tombstoned_at IS NULL
+			          AND pull_requests.state <> 'open'
+			          AND pull_requests.display_until > clock_timestamp()
 		    ) AS closed
 		)
-		SELECT entity_class, GREATEST(COALESCE(age_seconds, 0), 0)
+		SELECT entity_class, COALESCE(age_seconds, 0)
 		FROM ages
 		ORDER BY entity_class
 	`, r.options.InstallationID)
@@ -667,9 +715,9 @@ func (r *Runtime) observeStream(
 	err := r.options.Pool.QueryRow(ctx, `
 		SELECT watermark.safe_seq,
 		       COALESCE(max(events.seq), 0),
-		       GREATEST(EXTRACT(EPOCH FROM (
+		       EXTRACT(EPOCH FROM (
 		           clock_timestamp() - watermark.updated_at
-		       )), 0)::double precision
+		       ))::double precision
 		FROM stream_watermark AS watermark
 		LEFT JOIN change_events AS events ON true
 		WHERE watermark.singleton
@@ -683,10 +731,16 @@ func (r *Runtime) observeStream(
 
 	depths := map[string]int64{"all": 0}
 	rows, err := r.options.Pool.Query(ctx, `
-		SELECT stream, count(*) FROM change_events GROUP BY stream
-	`)
+		SELECT events.stream, count(*)
+		FROM change_events AS events
+		CROSS JOIN stream_watermark AS watermark
+		WHERE events.occurred_at <
+		      clock_timestamp() - $1::interval
+		  AND events.seq <= watermark.safe_seq
+		GROUP BY events.stream
+	`, r.options.StreamRetentionAge.String())
 	if err != nil {
-		return fmt.Errorf("collect C-S2 outbox metrics: %w", err)
+		return fmt.Errorf("collect C-S7 prunable outbox metrics: %w", err)
 	}
 	for rows.Next() {
 		var stream string
@@ -705,19 +759,26 @@ func (r *Runtime) observeStream(
 	rows.Close()
 	for stream, count := range depths {
 		observer.ObserveInt64(
-			r.outboxDepth,
+			r.prunableOutboxDepth,
 			count,
 			metric.WithAttributes(attribute.String("stream", stream)),
 		)
 	}
 
 	rows, err = r.options.Pool.Query(ctx, `
-		SELECT consumer, stream, seq,
-		       GREATEST(EXTRACT(EPOCH FROM (
-		           clock_timestamp() - updated_at
+		SELECT cursor.consumer, cursor.stream,
+		       count(events.seq),
+		       COALESCE(EXTRACT(EPOCH FROM (
+		           clock_timestamp() - min(events.occurred_at)
 		       )), 0)::double precision,
-		       resync_count
-		FROM consumer_cursors
+		       cursor.resync_count
+		FROM consumer_cursors AS cursor
+		CROSS JOIN stream_watermark AS watermark
+		LEFT JOIN change_events AS events
+		  ON events.stream = cursor.stream
+		 AND events.seq > cursor.seq
+		 AND events.seq <= watermark.safe_seq
+		GROUP BY cursor.consumer, cursor.stream, cursor.resync_count
 		ORDER BY consumer, stream
 	`)
 	if err != nil {
@@ -726,10 +787,14 @@ func (r *Runtime) observeStream(
 	defer rows.Close()
 	for rows.Next() {
 		var consumer, stream string
-		var cursor, resyncs int64
-		var cursorAge float64
+		var outstanding, resyncs int64
+		var oldestOutstandingAge float64
 		if err := rows.Scan(
-			&consumer, &stream, &cursor, &cursorAge, &resyncs,
+			&consumer,
+			&stream,
+			&outstanding,
+			&oldestOutstandingAge,
+			&resyncs,
 		); err != nil {
 			return err
 		}
@@ -737,12 +802,12 @@ func (r *Runtime) observeStream(
 			attribute.String("consumer", consumer),
 			attribute.String("stream", stream),
 		)
-		lag := safeSeq - cursor
-		if lag < 0 {
-			lag = 0
-		}
-		observer.ObserveInt64(r.consumerCursorLag, lag, attrs)
-		observer.ObserveFloat64(r.consumerCursorAge, cursorAge, attrs)
+		observer.ObserveInt64(r.consumerOutstanding, outstanding, attrs)
+		observer.ObserveFloat64(
+			r.consumerOutstandingAge,
+			oldestOutstandingAge,
+			attrs,
+		)
 		observer.ObserveInt64(r.resyncCount, resyncs, attrs)
 	}
 	return rows.Err()
@@ -765,4 +830,72 @@ func (r *Runtime) observeDeriver(
 	}
 	observer.ObserveInt64(r.deriverDirtyBacklog, count)
 	return nil
+}
+
+func (r *Runtime) observeOperationHeartbeats(
+	ctx context.Context,
+	observer metric.Observer,
+) error {
+	rows, err := r.options.Pool.Query(ctx, `
+		WITH expected(component, operation) AS (
+		    VALUES
+		        ('drift', 'detector'),
+		        ('sweep', 'repositories'),
+		        ('sweep', 'stacks'),
+		        ('sweep', 'pull_requests'),
+		        ('sweep', 'repo_rules'),
+		        ('sweep', 'closed_tracked'),
+		        ('watermarker', 'entities')
+		)
+		SELECT expected.component,
+		       expected.operation,
+		       COALESCE(heartbeat.success_count, 0),
+		       COALESCE(heartbeat.sample_count, 0),
+		       CASE
+		           WHEN heartbeat.last_success_at IS NULL THEN -1
+		           ELSE EXTRACT(EPOCH FROM (
+		               clock_timestamp() - heartbeat.last_success_at
+		           ))::double precision
+		       END,
+		       CASE
+		           WHEN heartbeat.last_sample_at IS NULL THEN -1
+		           ELSE EXTRACT(EPOCH FROM (
+		               clock_timestamp() - heartbeat.last_sample_at
+		           ))::double precision
+		       END
+		FROM expected
+		LEFT JOIN operation_heartbeats AS heartbeat
+		  ON heartbeat.installation_id = $1
+		 AND heartbeat.component = expected.component
+		 AND heartbeat.operation = expected.operation
+		ORDER BY expected.component, expected.operation
+	`, r.options.InstallationID)
+	if err != nil {
+		return fmt.Errorf("collect C-O4 operation heartbeats: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var component, operation string
+		var successes, samples int64
+		var age, sampleAge float64
+		if err := rows.Scan(
+			&component,
+			&operation,
+			&successes,
+			&samples,
+			&age,
+			&sampleAge,
+		); err != nil {
+			return err
+		}
+		attrs := metric.WithAttributes(
+			attribute.String("component", component),
+			attribute.String("operation", operation),
+		)
+		observer.ObserveInt64(r.operationSuccesses, successes, attrs)
+		observer.ObserveInt64(r.operationSamples, samples, attrs)
+		observer.ObserveFloat64(r.operationSuccessAge, age, attrs)
+		observer.ObserveFloat64(r.operationSampleAge, sampleAge, attrs)
+	}
+	return rows.Err()
 }

@@ -1,7 +1,7 @@
 # Frontier Postgres delivery contract
 
 Contract version: **v1**, introduced by migration `0013` and extended
-additively by migrations `0014`–`0019`.
+additively by migrations `0014`–`0019` and `0021`.
 
 Postgres is the Frontier sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
@@ -60,6 +60,7 @@ JSON value may be empty.
 | `stacks` | `sync_source` | `text` | no | provenance enum |
 | `stacks` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
 | `stacks` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `stacks` | `display_until` | `timestamp with time zone` | yes | closed-row display-retention boundary |
 | `pull_requests` | `id` | `bigint` | no | primary key; local join key |
 | `pull_requests` | `repo_id` | `bigint` | no | references repos.id; unique with number |
 | `pull_requests` | `gh_id` | `bigint` | yes | GitHub pull-request identity |
@@ -83,6 +84,7 @@ JSON value may be empty.
 | `pull_requests` | `sync_source` | `text` | no | provenance enum |
 | `pull_requests` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
 | `pull_requests` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `pull_requests` | `display_until` | `timestamp with time zone` | yes | closed-row display-retention boundary |
 | `review_threads` | `id` | `text` | no | primary key; GitHub thread node ID |
 | `review_threads` | `repo_id` | `bigint` | no | references repos.id |
 | `review_threads` | `pr_number` | `integer` | no | references pull_requests(repo_id,number) |
@@ -169,6 +171,9 @@ not use `synced_at` as the freshness check after an unchanged response.
 A non-null `tombstoned_at` means a mirror row is retained history and is not
 live. Normal live reads include `tombstoned_at IS NULL`. A later authoritative
 observation may resurrect the row through the monotonic writer.
+For closed stacks and pull requests, `display_until > clock_timestamp()`
+identifies the retained subset still eligible for display and therefore still
+covered by the closed-entity C-R1 validation bound.
 `check_history` is append-only transition history retained for at least 90
 days. Other tombstoned mirror skeletons have no v1 expiry.
 

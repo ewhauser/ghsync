@@ -84,7 +84,7 @@ func (q *Queries) AppendAcceptedCheckHistory(ctx context.Context, arg AppendAcce
 }
 
 const getPullRequestByIdentity = `-- name: GetPullRequestByIdentity :one
-SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, pull_requests.last_checked_at, repos.full_name AS repo_full_name
+SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, pull_requests.last_checked_at, pull_requests.display_until, repos.full_name AS repo_full_name
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
 WHERE repos.gh_id = $1
@@ -120,6 +120,7 @@ type GetPullRequestByIdentityRow struct {
 	SyncSource     string
 	TombstonedAt   pgtype.Timestamptz
 	LastCheckedAt  pgtype.Timestamptz
+	DisplayUntil   pgtype.Timestamptz
 	RepoFullName   string
 }
 
@@ -150,13 +151,14 @@ func (q *Queries) GetPullRequestByIdentity(ctx context.Context, arg GetPullReque
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 		&i.RepoFullName,
 	)
 	return i, err
 }
 
 const getPullRequestByKey = `-- name: GetPullRequestByKey :one
-SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, pull_requests.last_checked_at, repos.full_name AS repo_full_name
+SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, pull_requests.last_checked_at, pull_requests.display_until, repos.full_name AS repo_full_name
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
 JOIN repo_aliases ON repo_aliases.repo_id = repos.id
@@ -193,6 +195,7 @@ type GetPullRequestByKeyRow struct {
 	SyncSource     string
 	TombstonedAt   pgtype.Timestamptz
 	LastCheckedAt  pgtype.Timestamptz
+	DisplayUntil   pgtype.Timestamptz
 	RepoFullName   string
 }
 
@@ -223,6 +226,7 @@ func (q *Queries) GetPullRequestByKey(ctx context.Context, arg GetPullRequestByK
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 		&i.RepoFullName,
 	)
 	return i, err
@@ -368,7 +372,7 @@ func (q *Queries) GetRepoRulesFetchMetadata(ctx context.Context, repoFullName st
 }
 
 const getStackByIdentity = `-- name: GetStackByIdentity :one
-SELECT stacks.id, stacks.repo_id, stacks.gh_id, stacks.node_id, stacks.number, stacks.base_ref, stacks.base_sha, stacks.open, stacks.entries, stacks.gh_updated_at, stacks.head_sha, stacks.synced_at, stacks.etag, stacks.sync_source, stacks.tombstoned_at, stacks.last_checked_at, repos.full_name AS repo_full_name
+SELECT stacks.id, stacks.repo_id, stacks.gh_id, stacks.node_id, stacks.number, stacks.base_ref, stacks.base_sha, stacks.open, stacks.entries, stacks.gh_updated_at, stacks.head_sha, stacks.synced_at, stacks.etag, stacks.sync_source, stacks.tombstoned_at, stacks.last_checked_at, stacks.display_until, repos.full_name AS repo_full_name
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
 WHERE repos.gh_id = $1
@@ -397,6 +401,7 @@ type GetStackByIdentityRow struct {
 	SyncSource    string
 	TombstonedAt  pgtype.Timestamptz
 	LastCheckedAt pgtype.Timestamptz
+	DisplayUntil  pgtype.Timestamptz
 	RepoFullName  string
 }
 
@@ -420,13 +425,14 @@ func (q *Queries) GetStackByIdentity(ctx context.Context, arg GetStackByIdentity
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 		&i.RepoFullName,
 	)
 	return i, err
 }
 
 const getStackByKey = `-- name: GetStackByKey :one
-SELECT stacks.id, stacks.repo_id, stacks.gh_id, stacks.node_id, stacks.number, stacks.base_ref, stacks.base_sha, stacks.open, stacks.entries, stacks.gh_updated_at, stacks.head_sha, stacks.synced_at, stacks.etag, stacks.sync_source, stacks.tombstoned_at, stacks.last_checked_at, repos.full_name AS repo_full_name
+SELECT stacks.id, stacks.repo_id, stacks.gh_id, stacks.node_id, stacks.number, stacks.base_ref, stacks.base_sha, stacks.open, stacks.entries, stacks.gh_updated_at, stacks.head_sha, stacks.synced_at, stacks.etag, stacks.sync_source, stacks.tombstoned_at, stacks.last_checked_at, stacks.display_until, repos.full_name AS repo_full_name
 FROM stacks
 JOIN repos ON repos.id = stacks.repo_id
 JOIN repo_aliases ON repo_aliases.repo_id = repos.id
@@ -456,6 +462,7 @@ type GetStackByKeyRow struct {
 	SyncSource    string
 	TombstonedAt  pgtype.Timestamptz
 	LastCheckedAt pgtype.Timestamptz
+	DisplayUntil  pgtype.Timestamptz
 	RepoFullName  string
 }
 
@@ -479,6 +486,7 @@ func (q *Queries) GetStackByKey(ctx context.Context, arg GetStackByKeyParams) (G
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 		&i.RepoFullName,
 	)
 	return i, err
@@ -1150,13 +1158,14 @@ UPDATE pull_requests
 SET tombstoned_at = $1,
     synced_at = $2,
     last_checked_at = GREATEST(last_checked_at, $1),
+    display_until = NULL,
     etag = '',
     sync_source = $3
 WHERE repo_id = $4
   AND number = $5
   AND tombstoned_at IS NULL
   AND last_checked_at <= $1
-RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at, last_checked_at
+RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at, last_checked_at, display_until
 `
 
 type TombstonePullRequestParams struct {
@@ -1200,6 +1209,7 @@ func (q *Queries) TombstonePullRequest(ctx context.Context, arg TombstonePullReq
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 	)
 	return i, err
 }
@@ -1262,13 +1272,14 @@ SET tombstoned_at = $1,
     open = false,
     synced_at = $2,
     last_checked_at = GREATEST(last_checked_at, $1),
+    display_until = NULL,
     etag = '',
     sync_source = $3
 WHERE repo_id = $4
   AND number = $5
   AND tombstoned_at IS NULL
   AND last_checked_at <= $1
-RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at
+RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at, display_until
 `
 
 type TombstoneStackParams struct {
@@ -1305,6 +1316,7 @@ func (q *Queries) TombstoneStack(ctx context.Context, arg TombstoneStackParams) 
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 	)
 	return i, err
 }
@@ -1437,7 +1449,7 @@ INSERT INTO pull_requests (
     repo_id, gh_id, node_id, number, title, state, draft, author_login,
     head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state,
     stack_number, stack_position, gh_updated_at, synced_at, last_checked_at,
-    etag, sync_source, tombstoned_at
+    etag, sync_source, tombstoned_at, display_until
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6, $7,
@@ -1449,7 +1461,11 @@ INSERT INTO pull_requests (
     CASE WHEN $15::boolean
          THEN $17::int ELSE NULL END,
     $18, $19,
-    $20, $21, $22, NULL
+    $20, $21, $22, NULL,
+    CASE WHEN $6::text = 'open'
+         THEN NULL
+         ELSE clock_timestamp() + interval '30 days'
+    END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
 SET gh_id = EXCLUDED.gh_id,
@@ -1479,7 +1495,13 @@ SET gh_id = EXCLUDED.gh_id,
     last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
     sync_source = EXCLUDED.sync_source,
-    tombstoned_at = NULL
+    tombstoned_at = NULL,
+    display_until = CASE
+        WHEN EXCLUDED.state = 'open' THEN NULL
+        WHEN pull_requests.state = 'open'
+        THEN clock_timestamp() + interval '30 days'
+        ELSE pull_requests.display_until
+    END
 WHERE pull_requests.gh_updated_at IS NULL
    OR EXCLUDED.gh_updated_at > pull_requests.gh_updated_at
    OR (
@@ -1507,7 +1529,7 @@ WHERE pull_requests.gh_updated_at IS NULL
        pull_requests.tombstoned_at IS NOT NULL
        AND EXCLUDED.last_checked_at > pull_requests.tombstoned_at
    )
-RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at, last_checked_at
+RETURNING id, repo_id, gh_id, node_id, number, title, state, draft, author_login, head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state, stack_number, stack_position, gh_updated_at, synced_at, etag, sync_source, tombstoned_at, last_checked_at, display_until
 `
 
 type UpsertPullRequestWriteIfNewerParams struct {
@@ -1585,6 +1607,7 @@ func (q *Queries) UpsertPullRequestWriteIfNewer(ctx context.Context, arg UpsertP
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 	)
 	return i, err
 }
@@ -1749,13 +1772,17 @@ const upsertStackWriteIfNewer = `-- name: UpsertStackWriteIfNewer :one
 INSERT INTO stacks (
     repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries,
     gh_updated_at, head_sha, synced_at, last_checked_at, etag, sync_source,
-    tombstoned_at
+    tombstoned_at, display_until
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     $7, $8, $9,
     $10, $11, $12,
-    $13, $14, NULL
+    $13, $14, NULL,
+    CASE WHEN $7::boolean
+         THEN NULL
+         ELSE clock_timestamp() + interval '30 days'
+    END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
 SET gh_id = EXCLUDED.gh_id,
@@ -1770,7 +1797,12 @@ SET gh_id = EXCLUDED.gh_id,
     last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
     sync_source = EXCLUDED.sync_source,
-    tombstoned_at = NULL
+    tombstoned_at = NULL,
+    display_until = CASE
+        WHEN EXCLUDED.open THEN NULL
+        WHEN stacks.open THEN clock_timestamp() + interval '30 days'
+        ELSE stacks.display_until
+    END
 WHERE stacks.gh_updated_at IS NULL
    OR EXCLUDED.gh_updated_at > stacks.gh_updated_at
    OR (
@@ -1788,7 +1820,7 @@ WHERE stacks.gh_updated_at IS NULL
        stacks.tombstoned_at IS NOT NULL
        AND EXCLUDED.last_checked_at > stacks.tombstoned_at
    )
-RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at
+RETURNING id, repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries, gh_updated_at, head_sha, synced_at, etag, sync_source, tombstoned_at, last_checked_at, display_until
 `
 
 type UpsertStackWriteIfNewerParams struct {
@@ -1843,6 +1875,7 @@ func (q *Queries) UpsertStackWriteIfNewer(ctx context.Context, arg UpsertStackWr
 		&i.SyncSource,
 		&i.TombstonedAt,
 		&i.LastCheckedAt,
+		&i.DisplayUntil,
 	)
 	return i, err
 }

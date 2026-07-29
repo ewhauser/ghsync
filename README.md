@@ -21,10 +21,15 @@ make gen       # regenerate sqlc code after editing db/queries or db/migrations
 ```
 
 `frontier-syncd` commands: `serve --roles=...`, `migrate`,
-`backfill` (the configured installation), `requeue --guid=…|--all-parked`,
+`backfill` (the configured installation), `requeue --guid=…|--guids=…` or
+bounded `requeue --event=… --error-contains=…`,
 `version`.
 Serve roles are `ingress`, `dispatch`, `fetch`, `sweep`, `drift`, `pruner`,
-`watermarker`, and `deriver`; `all` enables the complete pipeline.
+`watermarker`, `deriver`, and `metrics`; `all` enables the complete local/CI
+pipeline. Production runs `fetch,sweep,drift` together as exactly one GitHub
+singleton and runs one dedicated database-aggregate `metrics` role; the
+supported topology and stop/start replacement are in
+[`ops/DEPLOYMENT.md`](ops/DEPLOYMENT.md).
 `fake-github` (cmd/fake-github) serves a canned enrolled repo and emits
 HMAC-signed webhooks; docker-compose runs it beside Postgres.
 Every serve role exposes `/healthz` and OpenTelemetry-backed Prometheus
@@ -108,10 +113,13 @@ procedures under [`ops/runbooks/`](ops/runbooks/). Deployment, complete
 configuration, migrations, rolling safety, and Postgres backup/restore are in
 [`ops/DEPLOYMENT.md`](ops/DEPLOYMENT.md).
 
-`cmd/soak` replays synthetic or recorded traffic through fake GitHub while
-enforcing C-Q2 latency, C-B3 floors, zero drift/parking, and watermark
-progress. CI runs the two-minute profile against fresh Postgres; the 48-hour
-release profile is in [`ops/SOAK.md`](ops/SOAK.md).
+`cmd/soak` replays synthetic or recorded traffic through fake GitHub and exits
+nonzero unless it achieves the exact configured rate/count, drains deliveries,
+the event queue and refresh generations, completes post-population drift and
+watermark passes, meets run-scoped C-Q2 latency, and proves final fake-to-cache
+truth convergence. CI runs the strict 1,200-event two-minute profile against
+fresh Postgres; the reproducible 48-hour release procedure is in
+[`ops/SOAK.md`](ops/SOAK.md).
 
 ## Status
 
@@ -122,4 +130,4 @@ release profile is in [`ops/SOAK.md`](ops/SOAK.md).
 - [x] M3 — cache & fetchers
 - [x] M4 — reconciliation & webhook validation
 - [x] M5 — change stream, derivation seam, contract
-- [x] M6 — hardening & operations
+- [ ] M6 — implementation complete; deployed-system verification pending

@@ -30,8 +30,9 @@ finding already enqueues exactly one heal.
 Ensure detector and heal workers are present:
 
 ```sh
-frontier-syncd serve --roles=drift
-frontier-syncd serve --roles=fetch,watermarker
+frontier-syncd serve --roles=fetch,sweep,drift
+frontier-syncd serve --roles=watermarker
+frontier-syncd serve --roles=metrics
 ```
 
 Fix the conversion, CAS, or missing event/sweep rule. The detector resolves

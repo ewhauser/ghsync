@@ -2,135 +2,281 @@ groups:
   - name: frontier-sync-engine
     rules:
       - alert: FrontierSweepConditionalHitRateLow
-        expr: frontier_c_b4_conditional_304_ratio{class="sweep",resource="rest"} < 0.80
+        expr: >-
+          (
+            sum(rate(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"}[15m]))
+            /
+            clamp_min(sum(rate(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m])), 1)
+          ) < 0.80
+          or absent(frontier_c_b4_conditional_requests_total{class="sweep",resource="rest"})
+          or absent(frontier_c_b4_conditional_304s_total{class="sweep",resource="rest"})
         for: 15m
         labels: {severity: warning}
         annotations:
           constraint: C-B4
-          summary: Sweep conditional 304 ratio is below 80 percent
-          description: Quiet-org sweeps must return at least 80 percent 304s; check persisted ETags and response handling.
-      - alert: FrontierBudgetFloorBreached
-        expr: frontier_c_b3_budget_remaining{class=~"event|sweep"} < on(installation_id,class,resource) frontier_c_b3_budget_floor
-        for: 1m
-        labels: {severity: page}
-        annotations:
-          constraint: C-B3
-          summary: A background budget class crossed its reserved floor
-          description: The gate must retain 10 percent for event and 20 percent for sweep admission.
+          summary: Sweep-scoped rolling conditional 304 ratio is below 80 percent
+          description: The rolling sweep request counters are absent or quiet-org validation is not returning at least 80 percent 304s.
       - alert: FrontierBudgetClassStarved
-        expr: increase(frontier_c_b3_starvations_total[5m]) > 0
+        expr: >-
+          increase(frontier_c_b3_starvations_total[5m]) > 0
+          or absent(frontier_c_b3_starvations_total)
         labels: {severity: page}
         annotations:
           constraint: C-B3
-          summary: A GitHub request class is starved
-          description: At least one request waited behind a reserved floor; inspect remaining budget and queued work.
+          summary: A GitHub request class is starved or unobservable
+          description: Inspect the server-authoritative budget, singleton GitHub role, and queued work.
       - alert: FrontierSecondaryGateClosed
-        expr: frontier_c_b2_gate_closed_seconds > 60
+        expr: >-
+          max(frontier_c_b2_gate_closed) == 1
+          or absent(frontier_c_b2_gate_closed)
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-B2
-          summary: The installation-wide GitHub gate is closed
-          description: A secondary-limit response is blocking all GitHub calls for more than five minutes.
+          summary: The installation-wide GitHub gate is closed or unobservable
+          description: A secondary-limit response has blocked all GitHub calls continuously, or the metrics collector is absent.
       - alert: FrontierEventCacheP95SLOBreach
-        expr: histogram_quantile(0.95, sum by (le) (rate(frontier_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 20
+        expr: >-
+          histogram_quantile(0.95, sum by (le) (rate(frontier_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 20
+          or absent(frontier_c_q2_event_to_cache_latency_seconds_bucket)
         for: 10m
         labels: {severity: page}
         annotations:
           constraint: C-Q2
-          summary: Event-to-cache p95 exceeds 20 seconds
-          description: The bounded-debounce freshness SLO is breached at p95.
+          summary: Webhook-receipt to cache-commit p95 exceeds 20 seconds
+          description: The bounded-debounce freshness SLO is breached or its real commit-latency histogram is absent.
       - alert: FrontierEventCacheP99SLOBreach
-        expr: histogram_quantile(0.99, sum by (le) (rate(frontier_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 60
+        expr: >-
+          histogram_quantile(0.99, sum by (le) (rate(frontier_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 60
+          or absent(frontier_c_q2_event_to_cache_latency_seconds_bucket)
         for: 10m
         labels: {severity: page}
         annotations:
           constraint: C-Q2
-          summary: Event-to-cache p99 exceeds 60 seconds
-          description: The bounded-debounce freshness SLO is breached at p99.
+          summary: Webhook-receipt to cache-commit p99 exceeds 60 seconds
+          description: The bounded-debounce freshness SLO is breached or its real commit-latency histogram is absent.
+      - alert: FrontierInvalidEventCacheClock
+        expr: >-
+          increase(frontier_c_q2_invalid_event_cache_latency_total[5m]) > 0
+          or absent(frontier_c_q2_invalid_event_cache_latency_total)
+        labels: {severity: page}
+        annotations:
+          constraint: C-Q2
+          summary: PostgreSQL produced an invalid event-to-commit interval
+          description: Receipt and commit timestamps must share the PostgreSQL clock.
       - alert: FrontierOldestDeliveryTooOld
-        expr: frontier_c_q2_oldest_unprocessed_delivery_age_seconds > 60
+        expr: >-
+          frontier_c_q2_oldest_unprocessed_delivery_age_seconds > 60
+          or absent(frontier_c_q2_oldest_unprocessed_delivery_age_seconds)
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-Q2
-          summary: An unprocessed webhook delivery is older than 60 seconds
+          summary: An unprocessed webhook delivery is older than 60 seconds or unobservable
           description: Dispatch or fetch is no longer keeping freshness within the p99 objective.
+      - alert: FrontierOutstandingGenerationTooOld
+        expr: >-
+          frontier_c_q2_oldest_outstanding_generation_age_seconds > 60
+          or absent(frontier_c_q2_oldest_outstanding_generation_age_seconds)
+          or absent(frontier_c_q2_outstanding_generations)
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          constraint: C-Q2
+          summary: An event-backed refresh generation is stuck or unobservable
+          description: A delivery can be processed while its authoritative refresh generation remains incomplete.
       - alert: FrontierEventQueueBacklog
-        expr: frontier_c_p2_queue_depth{queue="event"} > 1000
+        expr: >-
+          frontier_c_p2_queue_depth{queue="event"} > 1000
+          or absent(frontier_c_p2_queue_depth{queue="event"})
         for: 5m
         labels: {severity: warning}
         annotations:
           constraint: C-P2
-          summary: Event queue depth exceeds 1000 jobs
+          summary: Event queue depth exceeds 1000 jobs or is unobservable
           description: Batched dispatch is producing work faster than event workers drain it.
       - alert: FrontierPoisonDeliveryParked
-        expr: frontier_c_i5_parked_deliveries > 0 and frontier_c_i5_oldest_parked_delivery_age_seconds > 300
+        expr: >-
+          (
+            max(frontier_c_i5_parked_deliveries) > 0
+            and
+            max(frontier_c_i5_oldest_parked_delivery_age_seconds) > 300
+          )
+          or absent(frontier_c_i5_parked_deliveries)
+          or absent(frontier_c_i5_oldest_parked_delivery_age_seconds)
         for: 1m
         labels: {severity: page}
         annotations:
           constraint: C-I5
-          summary: A parked delivery has remained unresolved for five minutes
-          description: Diagnose the classification error, fix it, then use frontier-syncd requeue.
+          summary: A parked delivery remains unresolved or poison state is unobservable
+          description: Diagnose one GUID or bounded event/error family, fix it, then use frontier-syncd requeue.
       - alert: FrontierCacheStalenessBoundBreached
-        expr: frontier_c_r1_cache_staleness_seconds > on(entity_class) frontier_c_r1_staleness_bound_seconds
+        expr: >-
+          max by (entity_class) (
+            frontier_c_r1_cache_staleness_seconds
+          )
+            > on(entity_class)
+          max by (entity_class) (
+            frontier_c_r1_staleness_bound_seconds
+          )
+          or absent(frontier_c_r1_cache_staleness_seconds)
+          or absent(frontier_c_r1_staleness_bound_seconds)
         for: 2m
         labels: {severity: page}
         annotations:
           constraint: C-R1
-          summary: A cache entity class is beyond its staleness bound
-          description: Open stacks are bounded at 5m, open PRs at 10m, repo rules at 1h, and closed displayed entities at 24h.
+          summary: A display-eligible cache class is beyond its bound or unobservable
+          description: Staleness uses PostgreSQL validation time and the explicit closed-entity display-retention set.
       - alert: FrontierSweepOverrun
-        expr: increase(frontier_c_r2_sweep_overruns_total[15m]) > 0 or frontier_c_r2_sweep_duration_seconds > on(sweep_kind) frontier_c_r2_sweep_period_seconds
+        expr: >-
+          increase(frontier_c_r2_sweep_overruns_total[15m]) > 0
+          or (
+            max by (sweep_kind) (
+              frontier_c_r2_sweep_duration_seconds
+            )
+              > on(sweep_kind)
+            max by (sweep_kind) (
+              frontier_c_r2_sweep_period_seconds
+            )
+          )
+          or absent(frontier_c_r2_sweep_duration_seconds)
+          or absent(frontier_c_r2_sweep_period_seconds)
         labels: {severity: page}
         annotations:
           constraint: C-R2
-          summary: A resumable sweep cannot finish inside its period
-          description: Inspect its durable cursor, queue latency, and GitHub budget before the next period.
+          summary: A resumable sweep cannot finish inside its period or is unobservable
+          description: Inspect its durable cursor, durable completion heartbeat, queue latency, and GitHub budget.
+      - alert: FrontierSweepPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="sweep"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="sweep"} > 86400
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep"} > 86400
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep"})
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          constraint: C-R2
+          summary: A durable sweep completion is missing or stale
+          description: Every expected sweep kind must commit successful passes.
       - alert: FrontierDriftOpen
-        expr: frontier_c_o3_drift_findings{state="open",entity_kind="all"} > 0
+        expr: >-
+          frontier_c_o3_drift_findings{state="open",entity_kind="all"} > 0
+          or absent(frontier_c_o3_drift_findings{state="open",entity_kind="all"})
         for: 1m
         labels: {severity: page}
         annotations:
           constraint: C-O3
-          summary: Semantic cache drift is open
+          summary: Semantic cache drift is open or unobservable
           description: The cache is not trustworthy until the finding heals and resolves.
+      - alert: FrontierDriftPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"} > 7200
+          or frontier_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"} > 7200
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="drift",operation="detector"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="drift",operation="detector"})
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          constraint: C-O3
+          summary: The durable drift pass heartbeat is missing or stale
+          description: Silence from the drift detector is a trust failure, not success.
       - alert: FrontierWatermarkStalled
-        expr: frontier_c_s2_watermark_lag_sequences > 0 and frontier_c_s2_watermark_age_seconds > 30
+        expr: >-
+          (
+            frontier_c_s2_watermark_lag_sequences > 0
+            and
+            frontier_c_s2_watermark_age_seconds > 30
+          )
+          or absent(frontier_c_s2_watermark_lag_sequences)
+          or absent(frontier_c_s2_watermark_age_seconds)
         for: 2m
         labels: {severity: page}
         annotations:
           constraint: C-S2
-          summary: The visibility watermark is stalled behind committed outbox rows
-          description: Check the watermarker lease and in-flight writer fence before restarting the role.
+          summary: The visibility watermark is stalled or unobservable
+          description: Check the watermarker lease and real writer/deriver fence before restarting the role.
+      - alert: FrontierWatermarkPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"} > 30
+          or frontier_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"} > 30
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="watermarker",operation="entities"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="watermarker",operation="entities"})
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          constraint: C-S2
+          summary: The durable watermark heartbeat is missing or stale
+          description: Watermark silence fires even when no change-event lag series can be trusted.
       - alert: FrontierOutboxBacklog
-        expr: frontier_c_s2_outbox_depth{stream="all"} > 100000
+        expr: >-
+          frontier_c_s7_prunable_outbox_depth{stream="all"} > 100000
+          or absent(frontier_c_s7_prunable_outbox_depth{stream="all"})
         for: 15m
         labels: {severity: warning}
         annotations:
           constraint: C-S7
-          summary: Retained outbox depth exceeds 100000 rows
-          description: Confirm the pruner role is running and retention remains at least seven days.
+          summary: Retention-eligible outbox depth exceeds 100000 rows or is absent
+          description: This counts only rows actually eligible under the safe watermark and seven-day policy.
       - alert: FrontierConsumerCursorStalled
-        expr: frontier_c_s4_consumer_cursor_lag_sequences > 10000 and frontier_c_s4_consumer_cursor_age_seconds > 300
+        expr: >-
+          frontier_c_s4_consumer_outstanding_events > 10000
+          and on(consumer,stream)
+          frontier_c_s4_oldest_outstanding_event_age_seconds > 300
         for: 5m
         labels: {severity: warning}
         annotations:
           constraint: C-S4
-          summary: A consumer cursor is more than 10000 sequences behind
-          description: Contact the named consumer owner before its cursor crosses retention.
+          summary: A consumer has too many old visible events
+          description: Counts and ages are correlated within the consumer's own stream.
+      - alert: FrontierConsumerMetricsAbsent
+        expr: >-
+          absent(frontier_c_s4_consumer_outstanding_events)
+          or absent(frontier_c_s4_oldest_outstanding_event_age_seconds)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          constraint: C-S4
+          summary: Consumer stream-lag metrics are absent
+          description: Confirm whether no consumers are registered before silencing this alert.
       - alert: FrontierResyncStorm
-        expr: increase(frontier_c_s4_resyncs_total[15m]) > 3
+        expr: >-
+          increase(frontier_c_s4_resyncs_total[15m]) > 3
+          or absent(frontier_c_s4_resyncs_total)
         labels: {severity: page}
         annotations:
           constraint: C-S4
-          summary: A consumer entered RESYNC_REQUIRED more than three times in 15 minutes
+          summary: A consumer repeatedly entered RESYNC_REQUIRED or the metric is absent
           description: Repeated bootstrap failure or retention churn is preventing convergence.
       - alert: FrontierDeriverBacklog
-        expr: frontier_c_p5_deriver_dirty_backlog > 500
+        expr: >-
+          frontier_c_p5_deriver_dirty_backlog > 500
+          or absent(frontier_c_p5_deriver_dirty_backlog)
         for: 10m
         labels: {severity: warning}
         annotations:
           constraint: C-P5
-          summary: Derivation dirty backlog exceeds one default batch
+          summary: Derivation dirty backlog exceeds one batch or is unobservable
           description: Deriver passes are not draining dirty scopes at the configured cap.
+      - alert: FrontierRequiredRoleAbsent
+        expr: >-
+          absent(frontier_c_o4_role_enabled{role="metrics"})
+          or absent(frontier_c_o4_role_enabled{role="ingress"})
+          or absent(frontier_c_o4_role_enabled{role="fetch"})
+          or absent(frontier_c_o4_role_enabled{role="sweep"})
+          or absent(frontier_c_o4_role_enabled{role="drift"})
+          or absent(frontier_c_o4_role_enabled{role="dispatch"})
+          or absent(frontier_c_o4_role_enabled{role="pruner"})
+          or absent(frontier_c_o4_role_enabled{role="watermarker"})
+          or absent(frontier_c_o4_role_enabled{role="deriver"})
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          constraint: C-O4
+          summary: A required deployment role is absent
+          description: Role metrics use the real installation topology; absent processes never count as healthy.

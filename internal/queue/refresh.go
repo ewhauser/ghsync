@@ -13,6 +13,7 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivertype"
 
+	"github.com/acme/frontier/internal/pipeline"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
@@ -183,9 +184,10 @@ type RefreshRequest struct {
 }
 
 type RefreshSpec struct {
-	Kind     string
-	Key      string
-	Deadline time.Time
+	Kind            string
+	Key             string
+	Deadline        time.Time
+	EventReceivedAt time.Time
 }
 
 // RefreshHandler is implemented by internal/fetch. Keeping this interface in
@@ -426,6 +428,7 @@ func (w *backfillRepoPageWorker) Work(
 		KindBackfillRepoPage,
 		job.Queue,
 		time.Time{},
+		time.Time{},
 		startedAt,
 		w.monitor.now(),
 		err,
@@ -446,6 +449,7 @@ func (w *backfillInstallationPageWorker) Work(
 		ctx,
 		KindBackfillInstallation,
 		job.Queue,
+		time.Time{},
 		time.Time{},
 		startedAt,
 		w.monitor.now(),
@@ -540,12 +544,15 @@ func runRefresh[T river.JobArgs](
 			"refresh worker %s is not configured",
 			args.PointerKind,
 		)
-	} else if workErr := work(ctx, args); workErr != nil {
+	}
+	workCtx := pipeline.WithEvent(ctx, started.EventReceivedAt.Time)
+	if workErr := work(workCtx, args); workErr != nil {
 		monitor.observeRefresh(
 			ctx,
 			args.PointerKind,
 			job.Queue,
 			started.EventReceivedAt.Time,
+			pipeline.CacheCommittedAt(workCtx),
 			startedAt,
 			now(),
 			workErr,
@@ -553,11 +560,27 @@ func runRefresh[T river.JobArgs](
 		return workErr
 	}
 	completedAt := now()
+	if completeErr := completeRefresh(
+		ctx, pool, job, args, started.Generation,
+	); completeErr != nil {
+		monitor.observeRefresh(
+			ctx,
+			args.PointerKind,
+			job.Queue,
+			started.EventReceivedAt.Time,
+			pipeline.CacheCommittedAt(workCtx),
+			startedAt,
+			completedAt,
+			completeErr,
+		)
+		return completeErr
+	}
 	monitor.observeRefresh(
 		ctx,
 		args.PointerKind,
 		job.Queue,
 		started.EventReceivedAt.Time,
+		pipeline.CacheCommittedAt(workCtx),
 		startedAt,
 		completedAt,
 		nil,
@@ -572,7 +595,7 @@ func runRefresh[T river.JobArgs](
 			completedAt,
 		)
 	}
-	return completeRefresh(ctx, pool, job, args, started.Generation)
+	return nil
 }
 
 func (m refreshDeadlineMonitor) observeRefresh(
@@ -580,6 +603,7 @@ func (m refreshDeadlineMonitor) observeRefresh(
 	kind string,
 	queueName string,
 	eventReceivedAt time.Time,
+	cacheCommittedAt time.Time,
 	startedAt time.Time,
 	completedAt time.Time,
 	err error,
@@ -588,12 +612,13 @@ func (m refreshDeadlineMonitor) observeRefresh(
 		return
 	}
 	m.refreshObserver.RefreshFinished(ctx, RefreshObservation{
-		Kind:            kind,
-		Queue:           queueName,
-		EventReceivedAt: eventReceivedAt,
-		StartedAt:       startedAt,
-		CompletedAt:     completedAt,
-		Err:             err,
+		Kind:             kind,
+		Queue:            queueName,
+		EventReceivedAt:  eventReceivedAt,
+		CacheCommittedAt: cacheCommittedAt,
+		StartedAt:        startedAt,
+		CompletedAt:      completedAt,
+		Err:              err,
 	})
 }
 
@@ -632,9 +657,10 @@ func InsertRefreshesTxReturning(
 		return nil, fmt.Errorf("River client is required")
 	}
 	type generationPointer struct {
-		Kind       string `json:"kind"`
-		RefreshKey string `json:"refresh_key"`
-		DeadlineAt string `json:"deadline_at,omitempty"`
+		Kind            string `json:"kind"`
+		RefreshKey      string `json:"refresh_key"`
+		DeadlineAt      string `json:"deadline_at,omitempty"`
+		EventReceivedAt string `json:"event_received_at,omitempty"`
 	}
 	type refreshKey struct {
 		Kind string
@@ -644,6 +670,9 @@ func InsertRefreshesTxReturning(
 	deduped := make([]RefreshSpec, 0, len(specs))
 	pointers := make([]generationPointer, 0, len(specs))
 	for _, spec := range specs {
+		if spec.EventReceivedAt.IsZero() {
+			spec.EventReceivedAt = pipeline.EventReceivedAt(ctx)
+		}
 		if spec.Key == "" {
 			return nil, fmt.Errorf("refresh key is required")
 		}
@@ -656,6 +685,15 @@ func InsertRefreshesTxReturning(
 				pointers[index].DeadlineAt = spec.Deadline.
 					UTC().Format(time.RFC3339Nano)
 			}
+			if !spec.EventReceivedAt.IsZero() &&
+				(deduped[index].EventReceivedAt.IsZero() ||
+					spec.EventReceivedAt.Before(
+						deduped[index].EventReceivedAt,
+					)) {
+				deduped[index].EventReceivedAt = spec.EventReceivedAt
+				pointers[index].EventReceivedAt = spec.EventReceivedAt.
+					UTC().Format(time.RFC3339Nano)
+			}
 			continue
 		}
 		seen[key] = len(deduped)
@@ -666,6 +704,10 @@ func InsertRefreshesTxReturning(
 		}
 		if !spec.Deadline.IsZero() {
 			pointer.DeadlineAt = spec.Deadline.
+				UTC().Format(time.RFC3339Nano)
+		}
+		if !spec.EventReceivedAt.IsZero() {
+			pointer.EventReceivedAt = spec.EventReceivedAt.
 				UTC().Format(time.RFC3339Nano)
 		}
 		pointers = append(pointers, pointer)

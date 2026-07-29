@@ -31,13 +31,15 @@ Honor `backoff_until`; never clear it manually. Leave latency-critical roles
 running while an avoidable sweep fan-out is repaired:
 
 ```sh
-frontier-syncd serve --roles=ingress,dispatch,fetch,watermarker
+frontier-syncd serve --roles=ingress,dispatch,watermarker
 ```
 
 After fixing ETags or request fan-out, restore background roles:
 
 ```sh
-frontier-syncd serve --roles=sweep,drift,pruner
+frontier-syncd serve --roles=fetch,sweep,drift
+frontier-syncd serve --roles=pruner
+frontier-syncd serve --roles=metrics
 ```
 
 Never lower class floors to force work through.

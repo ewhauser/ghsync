@@ -58,6 +58,7 @@ const (
 	rolePruner             = "pruner"
 	roleWatermarker        = "watermarker"
 	roleDeriver            = "deriver"
+	roleMetrics            = "metrics"
 )
 
 func main() {
@@ -143,26 +144,61 @@ func backfill(args []string) error {
 }
 
 type requeueOptions struct {
-	guid      string
-	allParked bool
+	guids         []string
+	event         string
+	errorContains string
 }
 
 func parseRequeueOptions(args []string) (requeueOptions, error) {
 	fs := flag.NewFlagSet("requeue", flag.ContinueOnError)
 	guid := fs.String("guid", "", "parked delivery GUID to requeue")
-	allParked := fs.Bool("all-parked", false, "requeue every parked delivery")
+	guids := fs.String(
+		"guids",
+		"",
+		"comma-separated parked delivery GUIDs to requeue (maximum 100)",
+	)
+	event := fs.String("event", "", "event name for bounded family replay")
+	errorContains := fs.String(
+		"error-contains",
+		"",
+		"error substring for bounded family replay",
+	)
 	if err := fs.Parse(args); err != nil {
 		return requeueOptions{}, err
 	}
 	if fs.NArg() != 0 {
 		return requeueOptions{}, fmt.Errorf("requeue does not accept positional arguments")
 	}
-	if (*guid == "") == !*allParked {
+	selected := make([]string, 0, 100)
+	if value := strings.TrimSpace(*guid); value != "" {
+		selected = append(selected, value)
+	}
+	for _, value := range strings.Split(*guids, ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			selected = append(selected, value)
+		}
+	}
+	selected = uniqueStrings(selected)
+	family := strings.TrimSpace(*event) != "" ||
+		strings.TrimSpace(*errorContains) != ""
+	if (len(selected) > 0) == family ||
+		(family && (strings.TrimSpace(*event) == "" ||
+			strings.TrimSpace(*errorContains) == "")) {
 		return requeueOptions{}, fmt.Errorf(
-			"requeue requires exactly one of --guid=... or --all-parked",
+			"requeue requires a GUID set or both --event and --error-contains",
 		)
 	}
-	return requeueOptions{guid: *guid, allParked: *allParked}, nil
+	if len(selected) > 100 {
+		return requeueOptions{}, fmt.Errorf("requeue accepts at most 100 GUIDs")
+	}
+	if len(selected) == 0 {
+		selected = nil
+	}
+	return requeueOptions{
+		guids:         selected,
+		event:         strings.TrimSpace(*event),
+		errorContains: strings.TrimSpace(*errorContains),
+	}, nil
 }
 
 func requeue(args []string) error {
@@ -187,17 +223,19 @@ func requeue(args []string) error {
 	count, err := dbgen.New(pool).RequeueParkedWebhookDeliveries(
 		ctx,
 		dbgen.RequeueParkedWebhookDeliveriesParams{
-			AllParked:    options.allParked,
-			DeliveryGuid: options.guid,
+			DeliveryGuids: options.guids,
+			Event:         options.event,
+			ErrorContains: options.errorContains,
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("requeue parked deliveries: %w", err)
 	}
-	if !options.allParked && count != 1 {
+	if len(options.guids) > 0 && count != int64(len(options.guids)) {
 		return fmt.Errorf(
-			"parked delivery %q was not requeued (not found or not parked)",
-			options.guid,
+			"requeued %d of %d selected parked deliveries",
+			count,
+			len(options.guids),
 		)
 	}
 	slog.Info("parked deliveries requeued", "count", count)
@@ -230,7 +268,7 @@ func serve(args []string) error {
 	rolesFlag := fs.String(
 		"roles",
 		"all",
-		"comma-separated roles: ingress,dispatch,fetch,sweep,drift,pruner,watermarker,deriver, or all",
+		"comma-separated roles: ingress,dispatch,fetch+sweep+drift,pruner,watermarker,deriver,metrics, or all",
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -246,6 +284,11 @@ func serve(args []string) error {
 	}
 	if err := cfg.RequireDatabase(); err != nil {
 		return err
+	}
+	if cfg.GitHubInstallationID <= 0 {
+		return fmt.Errorf(
+			"GITHUB_INSTALLATION_ID is required for every serve role",
+		)
 	}
 	var classifier dispatch.Classifier
 	if roles[roleDispatch] {
@@ -264,13 +307,7 @@ func serve(args []string) error {
 			return err
 		}
 	}
-	worksJobs := roles[roleFetch] || roles[roleSweep] ||
-		roles[roleDrift] || roles[rolePruner]
-	if worksJobs && cfg.GitHubInstallationID <= 0 {
-		return fmt.Errorf(
-			"GITHUB_INSTALLATION_ID is required for periodic scheduling",
-		)
-	}
+	worksJobs := roles[roleFetch] || roles[rolePruner]
 
 	signalCtx, stopSignals := signal.NotifyContext(
 		context.Background(),
@@ -294,11 +331,13 @@ func serve(args []string) error {
 			Pool:               pool,
 			InstallationID:     cfg.GitHubInstallationID,
 			Roles:              enabledRoles(roles),
+			CollectDatabase:    roles[roleMetrics],
 			OpenStackStaleness: cfg.SweepOpenStackMaxStaleness,
 			OpenPRStaleness:    cfg.SweepOpenPRMaxStaleness,
 			RepoRulesStaleness: cfg.SweepRepoRulesMaxStaleness,
 			ClosedStaleness:    cfg.SweepClosedMaxStaleness,
 			RepositoryPeriod:   cfg.SweepRepositoryListPeriod,
+			StreamRetentionAge: cfg.StreamRetentionAge,
 		},
 	)
 	if err != nil {
@@ -336,6 +375,7 @@ func serve(args []string) error {
 				LeaseTTL:        cfg.WatermarkLeaseTTL,
 				Owner:           owner,
 				Observer:        runtimeMetrics,
+				InstallationID:  cfg.GitHubInstallationID,
 			},
 		)
 		if createErr != nil {
@@ -842,9 +882,10 @@ func parseRoles(raw string) (map[string]bool, error) {
 			rolePruner:      true,
 			roleWatermarker: true,
 			roleDeriver:     true,
+			roleMetrics:     true,
 		}, nil
 	}
-	roles := make(map[string]bool, 8)
+	roles := make(map[string]bool, 9)
 	for _, role := range strings.Split(raw, ",") {
 		switch role {
 		case roleIngress,
@@ -854,11 +895,12 @@ func parseRoles(raw string) (map[string]bool, error) {
 			roleDrift,
 			rolePruner,
 			roleWatermarker,
-			roleDeriver:
+			roleDeriver,
+			roleMetrics:
 			roles[role] = true
 		default:
 			return nil, fmt.Errorf(
-				"--roles=%q contains unsupported role %q (want ingress, dispatch, fetch, sweep, drift, pruner, watermarker, deriver, or all)",
+				"--roles=%q contains unsupported role %q (want ingress, dispatch, fetch, sweep, drift, pruner, watermarker, deriver, metrics, or all)",
 				raw,
 				role,
 			)
@@ -867,5 +909,29 @@ func parseRoles(raw string) (map[string]bool, error) {
 	if len(roles) == 0 {
 		return nil, fmt.Errorf("--roles must not be empty")
 	}
+	githubRoles := 0
+	for _, role := range []string{roleFetch, roleSweep, roleDrift} {
+		if roles[role] {
+			githubRoles++
+		}
+	}
+	if githubRoles != 0 && githubRoles != 3 {
+		return nil, fmt.Errorf(
+			"fetch, sweep, and drift must be enabled together as one singleton GitHub role group",
+		)
+	}
 	return roles, nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }

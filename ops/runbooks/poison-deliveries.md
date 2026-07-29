@@ -37,7 +37,13 @@ frontier-syncd serve --roles=dispatch
 After it processes cleanly:
 
 ```sh
-frontier-syncd requeue --all-parked
+# Replay at most 100 exact GUIDs:
+frontier-syncd requeue --guids=guid-1,guid-2
+
+# Or replay the next bounded batch sharing one diagnosed signature:
+frontier-syncd requeue \
+  --event=pull_request \
+  --error-contains='unsupported action reopened'
 ```
 
 ## Escalation

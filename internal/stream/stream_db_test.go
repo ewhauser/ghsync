@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,7 +15,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/acme/frontier/internal/derive"
 	"github.com/acme/frontier/internal/outbox"
+	"github.com/acme/frontier/internal/pipeline"
+	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/testdb"
 )
 
@@ -134,6 +138,263 @@ func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
 	if got := <-progress; got.SafeSeq < seq {
 		t.Fatalf("safe seq = %d, want at least %d", got.SafeSeq, seq)
 	}
+}
+
+func TestWatermarkerFencesRealEntityWriterAndDeriverTransactions(
+	t *testing.T,
+) {
+	for _, origin := range []string{
+		outbox.EntityWriterOrigin,
+		outbox.DeriverOrigin,
+	} {
+		for _, commit := range []bool{true, false} {
+			name := origin + "/rollback"
+			if commit {
+				name = origin + "/commit"
+			}
+			t.Run(name, func(t *testing.T) {
+				testRealWriterFence(t, origin, commit)
+			})
+		}
+	}
+}
+
+func TestEntityWriterUsesPostgresValidationAndCommitClock(t *testing.T) {
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var before time.Time
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT clock_timestamp()`,
+	).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	eventCtx := pipeline.WithEvent(ctx, before.Add(-time.Second))
+	repositoryID := time.Now().UnixNano()
+	_, err := store.NewEntityWriter(pool).ApplyRepository(
+		eventCtx,
+		store.RepositoryRecord{
+			InstallationID:  1,
+			OrgID:           1,
+			GitHubID:        repositoryID,
+			NodeID:          fmt.Sprintf("R_%d", repositoryID),
+			Owner:           "clock",
+			Name:            "repo",
+			FullName:        "clock/repo",
+			DefaultBranch:   "main",
+			DefaultHeadSHA:  "head",
+			GitHubUpdatedAt: before,
+		},
+		store.SyncSourceManual,
+		"",
+		before.Add(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkedAt, after time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT last_checked_at, clock_timestamp()
+		FROM repos
+		WHERE gh_id = $1
+	`, repositoryID).Scan(&checkedAt, &after); err != nil {
+		t.Fatal(err)
+	}
+	if checkedAt.Before(before) || checkedAt.After(after) {
+		t.Fatalf(
+			"validation timestamp %s is outside PostgreSQL interval [%s, %s]",
+			checkedAt,
+			before,
+			after,
+		)
+	}
+	committedAt := pipeline.CacheCommittedAt(eventCtx)
+	if committedAt.Before(before) || committedAt.After(after) {
+		t.Fatalf(
+			"cache commit timestamp %s is outside PostgreSQL interval [%s, %s]",
+			committedAt,
+			before,
+			after,
+		)
+	}
+}
+
+func testRealWriterFence(t *testing.T, origin string, commit bool) {
+	t.Helper()
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	allocated := make(chan int64, 1)
+	release := make(chan struct{})
+	rollbackErr := errors.New("force real writer rollback")
+	writerCtx := outbox.WithSequenceAllocationHook(
+		ctx,
+		func(gotOrigin string, seq int64) error {
+			if gotOrigin != origin {
+				return nil
+			}
+			allocated <- seq
+			<-release
+			if !commit {
+				return rollbackErr
+			}
+			return nil
+		},
+	)
+	writerDone := make(chan error, 1)
+	switch origin {
+	case outbox.EntityWriterOrigin:
+		go func() {
+			now := time.Now().UTC()
+			_, err := store.NewEntityWriter(pool).ApplyRepository(
+				writerCtx,
+				store.RepositoryRecord{
+					InstallationID:  1,
+					OrgID:           1,
+					GitHubID:        time.Now().UnixNano(),
+					NodeID:          fmt.Sprintf("R_%d", time.Now().UnixNano()),
+					Owner:           "fence",
+					Name:            "entity",
+					FullName:        "fence/entity",
+					DefaultBranch:   "main",
+					DefaultHeadSHA:  "head",
+					GitHubUpdatedAt: now,
+				},
+				store.SyncSourceManual,
+				"",
+				now,
+			)
+			writerDone <- err
+		}()
+	case outbox.DeriverOrigin:
+		repositoryID := time.Now().UnixNano()
+		scope := fmt.Sprintf("pr:1:%d:42", repositoryID)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO repos (
+			    installation_id, org_id, gh_id, node_id, owner, name,
+			    full_name, default_branch, archived, gh_updated_at,
+			    head_sha, synced_at, last_checked_at, etag, sync_source
+			)
+			VALUES (
+			    1, 1, $1, $2, 'fence', $3, $4, 'main', false,
+			    clock_timestamp(), 'head', clock_timestamp(),
+			    clock_timestamp(), '', 'manual'
+			)
+		`,
+			repositoryID,
+			fmt.Sprintf("R_%d", repositoryID),
+			fmt.Sprintf("derive-%d", repositoryID),
+			fmt.Sprintf("fence/derive-%d", repositoryID),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO derivation_dirty (scope_key, marked_at)
+			VALUES ($1, clock_timestamp())
+		`, scope); err != nil {
+			t.Fatal(err)
+		}
+		service, err := derive.New(derive.Options{
+			Pool: pool,
+			Deriver: fenceDeriver{
+				identity: derive.PullRequestIdentity(repositoryID, 42),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			_, err := service.RunOnce(writerCtx)
+			writerDone <- err
+		}()
+	default:
+		t.Fatalf("unknown writer origin %q", origin)
+	}
+	seq := <-allocated
+
+	watermarker, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval: 10 * time.Millisecond,
+		LeaseTTL:        time.Second,
+		Owner: fmt.Sprintf(
+			"real-%s-%t-%d",
+			origin,
+			commit,
+			time.Now().UnixNano(),
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	beforeFence := make(chan struct{})
+	watermarker.testBeforeFence = func() { close(beforeFence) }
+	stepDone := make(chan error, 1)
+	progress := make(chan WatermarkProgress, 1)
+	go func() {
+		got, err := watermarker.Step(ctx)
+		progress <- got
+		stepDone <- err
+	}()
+	<-beforeFence
+	select {
+	case err := <-stepDone:
+		t.Fatalf(
+			"watermarker crossed real %s transaction before commit/rollback: %v",
+			origin,
+			err,
+		)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	writerErr := <-writerDone
+	if commit && writerErr != nil {
+		t.Fatalf("real %s commit: %v", origin, writerErr)
+	}
+	if !commit && !errors.Is(writerErr, rollbackErr) {
+		t.Fatalf("real %s rollback error = %v", origin, writerErr)
+	}
+	if err := <-stepDone; err != nil {
+		t.Fatal(err)
+	}
+	got := <-progress
+	if commit && got.SafeSeq < seq {
+		t.Fatalf(
+			"real %s committed seq %d exceeds safe seq %d",
+			origin,
+			seq,
+			got.SafeSeq,
+		)
+	}
+	if !commit && got.SafeSeq >= seq {
+		t.Fatalf(
+			"real %s rolled-back seq %d was published at safe seq %d",
+			origin,
+			seq,
+			got.SafeSeq,
+		)
+	}
+}
+
+type fenceDeriver struct {
+	identity string
+}
+
+func (d fenceDeriver) Derive(
+	snapshot derive.Snapshot,
+) []derive.ScopeResult {
+	results := make([]derive.ScopeResult, 0, len(snapshot.Scopes))
+	for _, scope := range snapshot.Scopes {
+		results = append(results, derive.ScopeResult{
+			ScopeKey: scope.ScopeKey,
+			WorkItems: []derive.WorkItem{{
+				IdentityKey: d.identity,
+				OrgID:       scope.OrgID,
+				Payload:     json.RawMessage(`{"state":"fence"}`),
+			}},
+		})
+	}
+	return results
 }
 
 func TestRetentionNeverPrunesAboveSafeWatermark(t *testing.T) {

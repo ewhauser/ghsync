@@ -30,8 +30,10 @@ Restore at least one instance of each required role:
 
 ```sh
 frontier-syncd serve --roles=ingress
-frontier-syncd serve --roles=dispatch,fetch
-frontier-syncd serve --roles=sweep,watermarker
+frontier-syncd serve --roles=dispatch
+frontier-syncd serve --roles=fetch,sweep,drift
+frontier-syncd serve --roles=watermarker
+frontier-syncd serve --roles=metrics
 ```
 
 The sweep role resumes `gap_heal_cursors` and requests missing GUID

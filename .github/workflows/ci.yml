@@ -77,6 +77,7 @@ jobs:
           GITHUB_INSTALLATION_ID: "1"
           GITHUB_ORG_ID: "1"
           HTTP_ADDR: 127.0.0.1:18080
+          DRIFT_PERIOD: 5s
         run: |
           set -euo pipefail
           /tmp/frontier-syncd migrate
@@ -89,10 +90,14 @@ jobs:
             wait "$sync_pid" "$fake_pid" 2>/dev/null || true
           }
           trap cleanup EXIT
+          /tmp/frontier-syncd backfill
           if ! /tmp/frontier-soak \
             --profile=smoke \
             --duration=2m \
+            --recorded-rate=1 \
             --multiplier=10 \
+            --database-url="$DATABASE_URL" \
+            --installation-id="$GITHUB_INSTALLATION_ID" \
             --engine-url=http://127.0.0.1:18080 \
             --fake-github-url=http://127.0.0.1:19797; then
             tail -200 /tmp/frontier-syncd.log

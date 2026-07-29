@@ -155,6 +155,7 @@ WHERE repos.installation_id = sqlc.arg(installation_id)
   AND repos.tombstoned_at IS NULL
   AND stacks.tombstoned_at IS NULL
   AND NOT stacks.open
+  AND stacks.display_until > clock_timestamp()
   AND stacks.last_checked_at <= sqlc.arg(stale_before)
 ORDER BY stacks.last_checked_at, repos.full_name, stacks.number;
 
@@ -179,6 +180,7 @@ WHERE repos.installation_id = sqlc.arg(installation_id)
   AND repos.tombstoned_at IS NULL
   AND pull_requests.tombstoned_at IS NULL
   AND pull_requests.state <> 'open'
+  AND pull_requests.display_until > clock_timestamp()
   AND pull_requests.last_checked_at <= sqlc.arg(stale_before)
 ORDER BY pull_requests.last_checked_at, repos.full_name, pull_requests.number;
 

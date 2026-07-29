@@ -110,8 +110,8 @@ func TestMigrateIdempotent(t *testing.T) {
 		WHERE schemaname = current_schema()
 		  AND tablename = 'webhook_deliveries'
 	`).Scan(&indexCount)
-	if err != nil || indexCount != 3 {
-		t.Fatalf("webhook_deliveries index count = %d (err=%v), want 3", indexCount, err)
+	if err != nil || indexCount != 4 {
+		t.Fatalf("webhook_deliveries index count = %d (err=%v), want 4", indexCount, err)
 	}
 	var partialIndexDefinition string
 	err = pool.QueryRow(ctx, `

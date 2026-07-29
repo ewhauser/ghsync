@@ -214,7 +214,7 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 
 	// C-P5: each claimed scope's complete prior set is reconciled with the
 	// returned set. Changed and removed references share this transaction.
-	if _, err := tx.Exec(ctx, `
+	eventRows, err := tx.Query(ctx, `
 			WITH claimed(scope_key) AS (
 			    SELECT unnest($1::text[])
 			),
@@ -281,14 +281,40 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 			       )
 			FROM events
 			ORDER BY identity_key, kind
+			RETURNING seq
 		`,
 		scopeKeys,
 		encoded,
 		outbox.WorkItemsStream,
 		outbox.WorkItemChangedKind,
 		outbox.WorkItemRemovedKind,
-	); err != nil {
+	)
+	if err != nil {
 		return 0, fmt.Errorf("apply derived work-item batch: %w", err)
+	}
+	eventSeqs, err := pgx.CollectRows(
+		eventRows,
+		func(row pgx.CollectableRow) (int64, error) {
+			var seq int64
+			if err := row.Scan(&seq); err != nil {
+				return 0, err
+			}
+			return seq, nil
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("scan derived change sequences: %w", err)
+	}
+	for _, seq := range eventSeqs {
+		if err := outbox.AfterSequenceAllocated(
+			ctx,
+			outbox.DeriverOrigin,
+			seq,
+		); err != nil {
+			return 0, fmt.Errorf(
+				"after derived change sequence allocation: %w", err,
+			)
+		}
 	}
 
 	// A writer that marks a claimed key during Derive waits on its row lock.

@@ -110,6 +110,19 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	handler.SetRiverClient(riverClient)
 	service.SetRiverClient(riverClient)
 	ctx := context.Background()
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := riverClient.Start(runCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	}()
 	if err := handler.ResolveStackMembership(
 		ctx,
 		queue.RefreshRequest{
@@ -163,6 +176,35 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 			Queue: queue.QueueSweep,
 		},
 	); err != nil {
+		t.Fatal(err)
+	}
+	waitForCacheProducers(t, pool)
+	if findings, err := service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	} else if len(findings) != 0 {
+		t.Fatalf("pre-backfill drift findings = %d, want 0", len(findings))
+	}
+	var preseedHeartbeats int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'drift'
+		  AND operation = 'detector'
+	`).Scan(&preseedHeartbeats); err != nil {
+		t.Fatal(err)
+	}
+	if preseedHeartbeats != 0 {
+		t.Fatal("pre-backfill drift skip was recorded as a successful pass")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO installation_backfill_cursors (
+		    installation_id, phase, page, completed_at
+		) VALUES (1, 'done', 1, clock_timestamp())
+	`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -252,19 +294,6 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 		t.Fatalf("self-heal generation = %d", generation)
 	}
 
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := riverClient.Start(runCtx); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		stopCtx, stopCancel := context.WithTimeout(
-			context.Background(),
-			5*time.Second,
-		)
-		defer stopCancel()
-		_ = riverClient.StopAndCancel(stopCtx)
-	}()
 	deadline := time.Now().Add(10 * time.Second)
 	converged := false
 	for time.Now().Before(deadline) {
@@ -326,6 +355,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 			generation,
 		)
 	}
+	waitForCacheProducers(t, pool)
 	if _, err := service.Detect(ctx, DetectArgs{
 		InstallationID: 1,
 		SampleSize:     100,
@@ -384,6 +414,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	); err != nil {
 		t.Fatal(err)
 	}
+	waitForCacheProducers(t, pool)
 	if _, err := service.Detect(ctx, DetectArgs{
 		InstallationID: 1,
 		SampleSize:     100,
@@ -413,6 +444,43 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	}
 	if findingCount != 0 {
 		t.Fatalf("expired resolved drift findings = %d, want 0", findingCount)
+	}
+}
+
+func waitForCacheProducers(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var activeJobs int64
+		var outstandingGenerations int64
+		if err := pool.QueryRow(context.Background(), `
+			SELECT
+			    (SELECT count(*)
+			     FROM river_job
+			     WHERE queue IN (
+			         'interactive', 'event', 'sweep', 'reconcile'
+			     )
+			       AND state IN (
+			           'available', 'pending', 'retryable',
+			           'running', 'scheduled'
+			       )),
+			    (SELECT count(*)
+			     FROM refresh_intent_generations
+			     WHERE completed_generation < generation)
+		`).Scan(&activeJobs, &outstandingGenerations); err != nil {
+			t.Fatal(err)
+		}
+		if activeJobs == 0 && outstandingGenerations == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"cache producers did not quiesce: jobs=%d generations=%d",
+				activeJobs,
+				outstandingGenerations,
+			)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

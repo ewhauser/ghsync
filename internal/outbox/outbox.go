@@ -29,7 +29,36 @@ const (
 	RepoRulesChangedKind      = "repo_rules.changed"
 	WorkItemChangedKind       = "work_item.changed"
 	WorkItemRemovedKind       = "work_item.removed"
+
+	EntityWriterOrigin = "entity_writer"
+	DeriverOrigin      = "deriver"
 )
+
+type sequenceAllocationHookKey struct{}
+
+// WithSequenceAllocationHook installs a test-only transaction pause/failure
+// seam that runs immediately after a real change_events sequence allocation.
+// It lives beside the fence protocol so tests cannot replace the production
+// entity-writer or deriver transaction with a synthetic writer.
+func WithSequenceAllocationHook(
+	ctx context.Context,
+	hook func(origin string, seq int64) error,
+) context.Context {
+	return context.WithValue(ctx, sequenceAllocationHookKey{}, hook)
+}
+
+// AfterSequenceAllocated runs the context hook, when present.
+func AfterSequenceAllocated(
+	ctx context.Context,
+	origin string,
+	seq int64,
+) error {
+	hook, _ := ctx.Value(sequenceAllocationHookKey{}).(func(string, int64) error)
+	if hook == nil {
+		return nil
+	}
+	return hook(origin, seq)
+}
 
 // Definition is one v1 event variant in the public change-stream contract.
 // db/CONTRACT.md is schema-tested against this manifest.

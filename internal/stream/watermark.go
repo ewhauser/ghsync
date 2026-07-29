@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/acme/frontier/internal/opsstate"
 	"github.com/acme/frontier/internal/outbox"
 )
 
@@ -30,6 +31,7 @@ type WatermarkOptions struct {
 	LeaseTTL        time.Duration
 	Owner           string
 	Observer        WatermarkObserver
+	InstallationID  int64
 }
 
 // WatermarkObserver is M6's C-S2 progress seam.
@@ -61,6 +63,7 @@ type Watermarker struct {
 	leaseTTL        time.Duration
 	token           string
 	observer        WatermarkObserver
+	installationID  int64
 	testBeforeFence func()
 }
 
@@ -100,6 +103,7 @@ func NewWatermarker(
 		leaseTTL:        options.LeaseTTL,
 		token:           owner + ":" + hex.EncodeToString(tokenBytes),
 		observer:        options.Observer,
+		installationID:  options.InstallationID,
 	}, nil
 }
 
@@ -155,6 +159,18 @@ func (w *Watermarker) Step(
 		return WatermarkProgress{}, fmt.Errorf(
 			"publish stream watermark: %w", err,
 		)
+	}
+	if w.installationID > 0 {
+		if err := opsstate.RecordSuccessN(
+			ctx,
+			tx,
+			w.installationID,
+			"watermarker",
+			outbox.EntitiesStream,
+			1,
+		); err != nil {
+			return WatermarkProgress{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return WatermarkProgress{}, fmt.Errorf(

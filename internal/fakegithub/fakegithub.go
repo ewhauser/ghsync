@@ -30,7 +30,10 @@ import (
 
 // ControlEmitPath is a development-only control surface used by cmd/soak to
 // ask the standalone fake to record and emit a signed delivery.
-const ControlEmitPath = "/_frontier/emit"
+const (
+	ControlEmitPath  = "/_frontier/emit"
+	ControlTruthPath = "/_frontier/truth"
+)
 
 type StackRef struct {
 	ID       int64 `json:"id"`
@@ -336,6 +339,7 @@ type Server struct {
 	deliveries     []storedHookDelivery
 	nextDeliveryID int64
 	redeliveries   []int64
+	soakTruth      map[int]string
 }
 
 func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
@@ -361,6 +365,7 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 		requestCounts:  make(map[string]int),
 		notFound:       make(map[string]int),
 		nextDeliveryID: 1,
+		soakTruth:      make(map[int]string),
 	}
 	for _, option := range options {
 		option(s)
@@ -368,6 +373,7 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("POST "+ControlEmitPath, s.controlEmit)
+	mux.HandleFunc("GET "+ControlTruthPath, s.controlTruth)
 	mux.HandleFunc("GET /repos/{owner}/{repo}", s.getRepository)
 	mux.HandleFunc("GET /installation/repositories", s.listInstallationRepositories)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets", s.listRepositoryRules)
@@ -514,6 +520,35 @@ func (s *Server) controlEmit(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"guid": guid})
 }
 
+type SoakTruthPullRequest struct {
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+}
+
+type SoakTruth struct {
+	Repository   string                 `json:"repository"`
+	PullRequests []SoakTruthPullRequest `json:"pull_requests"`
+}
+
+func (s *Server) controlTruth(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	truth := SoakTruth{
+		Repository:   s.fixture.Owner + "/" + s.fixture.Repo,
+		PullRequests: make([]SoakTruthPullRequest, 0, len(s.soakTruth)),
+	}
+	for number, title := range s.soakTruth {
+		truth.PullRequests = append(
+			truth.PullRequests,
+			SoakTruthPullRequest{Number: number, Title: title},
+		)
+	}
+	s.mu.Unlock()
+	sort.Slice(truth.PullRequests, func(i, j int) bool {
+		return truth.PullRequests[i].Number < truth.PullRequests[j].Number
+	})
+	writeJSON(w, truth)
+}
+
 func (s *Server) applySoakMutation(event string, payload json.RawMessage) {
 	if event != "pull_request" {
 		return
@@ -537,6 +572,7 @@ func (s *Server) applySoakMutation(event string, payload json.RawMessage) {
 			envelope.SoakRevision,
 			envelope.Number,
 		)
+		s.soakTruth[pull.Number] = pull.Title
 		pull.UpdatedAt = s.now().UTC()
 		for stackIndex := range s.fixture.Stacks {
 			for prIndex := range s.fixture.Stacks[stackIndex].PullRequests {

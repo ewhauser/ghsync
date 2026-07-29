@@ -155,6 +155,16 @@ type InstallationBudget struct {
 	BackoffUntil   pgtype.Timestamptz
 }
 
+type OperationHeartbeat struct {
+	InstallationID int64
+	Component      string
+	Operation      string
+	SuccessCount   int64
+	LastSuccessAt  pgtype.Timestamptz
+	SampleCount    int64
+	LastSampleAt   pgtype.Timestamptz
+}
+
 type PullRequest struct {
 	ID             int64
 	RepoID         int64
@@ -179,6 +189,7 @@ type PullRequest struct {
 	SyncSource     string
 	TombstonedAt   pgtype.Timestamptz
 	LastCheckedAt  pgtype.Timestamptz
+	DisplayUntil   pgtype.Timestamptz
 }
 
 type RefreshIntentGeneration struct {
@@ -272,6 +283,7 @@ type Stack struct {
 	SyncSource    string
 	TombstonedAt  pgtype.Timestamptz
 	LastCheckedAt pgtype.Timestamptz
+	DisplayUntil  pgtype.Timestamptz
 }
 
 type StreamHorizon struct {

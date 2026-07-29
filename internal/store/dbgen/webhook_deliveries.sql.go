@@ -160,32 +160,55 @@ func (q *Queries) ListParkedWebhookDeliveries(ctx context.Context, resultLimit i
 }
 
 const requeueParkedWebhookDeliveries = `-- name: RequeueParkedWebhookDeliveries :execrows
-UPDATE webhook_deliveries
+WITH candidates AS (
+    SELECT delivery_guid
+    FROM webhook_deliveries
+    WHERE status = 'parked'
+      AND (
+          (
+              COALESCE(
+                  cardinality($1::text[]),
+                  0
+              ) > 0
+              AND delivery_guid = ANY($1::text[])
+          )
+          OR (
+              COALESCE(
+                  cardinality($1::text[]),
+                  0
+              ) = 0
+              AND event = $2::text
+              AND COALESCE(last_error, '') LIKE
+                  '%' || $3::text || '%'
+          )
+      )
+    ORDER BY received_at, delivery_guid
+    LIMIT 100
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE webhook_deliveries AS delivery
 SET status = 'pending',
     attempts = 0,
     last_error = format(
         'operator requeue at %s; attempts reset from %s; prior error: %s',
         clock_timestamp(),
-        attempts,
-        COALESCE(last_error, '<none>')
+        delivery.attempts,
+        COALESCE(delivery.last_error, '<none>')
     )
-WHERE status = 'parked'
-  AND (
-      $1::boolean
-      OR delivery_guid = $2::text
-  )
+FROM candidates
+WHERE delivery.delivery_guid = candidates.delivery_guid
 `
 
 type RequeueParkedWebhookDeliveriesParams struct {
-	AllParked    bool
-	DeliveryGuid string
+	DeliveryGuids []string
+	Event         string
+	ErrorContains string
 }
 
-// C-I5: only parked deliveries may be replayed. Reset attempts so the delivery
-// receives a full retry budget, and retain an operator audit note until the
-// dispatcher claims it.
+// C-I5: replay is deliberately bounded to an explicit GUID set or one
+// event/error signature. There is no unscoped "all parked" path.
 func (q *Queries) RequeueParkedWebhookDeliveries(ctx context.Context, arg RequeueParkedWebhookDeliveriesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, requeueParkedWebhookDeliveries, arg.AllParked, arg.DeliveryGuid)
+	result, err := q.db.Exec(ctx, requeueParkedWebhookDeliveries, arg.DeliveryGuids, arg.Event, arg.ErrorContains)
 	if err != nil {
 		return 0, err
 	}

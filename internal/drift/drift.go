@@ -23,6 +23,7 @@ import (
 
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/gh"
+	"github.com/acme/frontier/internal/opsstate"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
@@ -238,8 +239,56 @@ func (s *Service) Detect(
 			len(driftEntityKinds),
 		)
 	}
+	var eventPipelineBusy bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+		    EXISTS (
+		        SELECT 1
+		        FROM webhook_deliveries
+		        WHERE status IN ('pending', 'processing')
+		    )
+		    OR EXISTS (
+		        SELECT 1
+		        FROM refresh_intent_generations
+		        WHERE completed_generation < generation
+		    )
+		    OR EXISTS (
+		        SELECT 1
+		        FROM river_job
+		        WHERE queue IN (
+		            'interactive', 'event', 'sweep', 'reconcile'
+		        )
+		          AND state IN (
+		              'available', 'pending', 'retryable',
+		              'running', 'scheduled'
+		          )
+		    )
+		    OR EXISTS (
+		        SELECT 1
+		        FROM installation_backfill_cursors
+		        WHERE phase <> 'done'
+		    )
+		    OR NOT EXISTS (
+		        SELECT 1
+		        FROM installation_backfill_cursors
+		        WHERE installation_id = $1
+		          AND phase = 'done'
+		          AND completed_at IS NOT NULL
+		    )
+		    OR EXISTS (
+		        SELECT 1
+		        FROM backfill_cursors
+		        WHERE phase <> 'done'
+		    )
+	`, args.InstallationID).Scan(&eventPipelineBusy); err != nil {
+		return nil, fmt.Errorf("check drift event-pipeline quiescence: %w", err)
+	}
+	if eventPipelineBusy {
+		return nil, nil
+	}
 	queries := dbgen.New(s.pool)
 	findings := make([]dbgen.DriftFinding, 0)
+	var inspected int64
 	baseQuota := args.SampleSize / len(driftEntityKinds)
 	extra := args.SampleSize % len(driftEntityKinds)
 	for index, kind := range driftEntityKinds {
@@ -278,6 +327,7 @@ func (s *Service) Detect(
 				err,
 			)
 		}
+		inspected += int64(len(rows))
 		for _, row := range rows {
 			finding, recorded, err := s.inspectSample(
 				ctx,
@@ -323,6 +373,16 @@ func (s *Service) Detect(
 		},
 	); err != nil {
 		return nil, fmt.Errorf("prune resolved drift findings: %w", err)
+	}
+	if err := opsstate.RecordSuccessN(
+		ctx,
+		s.pool,
+		args.InstallationID,
+		"drift",
+		"detector",
+		inspected,
+	); err != nil {
+		return nil, err
 	}
 	return findings, nil
 }

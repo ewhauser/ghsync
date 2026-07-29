@@ -69,19 +69,27 @@ func TestValidateRoles(t *testing.T) {
 		"all",
 		"ingress",
 		"dispatch",
-		"fetch",
-		"sweep",
-		"drift",
 		"pruner",
 		"watermarker",
 		"deriver",
-		"ingress,dispatch,fetch,sweep,drift,pruner,watermarker,deriver",
+		"metrics",
+		"fetch,sweep,drift",
+		"ingress,dispatch,fetch,sweep,drift,pruner,watermarker,deriver,metrics",
 	} {
 		if err := validateRoles(roles); err != nil {
 			t.Fatalf("%q rejected: %v", roles, err)
 		}
 	}
-	for _, roles := range []string{"", "bogus", "all,event", "ingress,event"} {
+	for _, roles := range []string{
+		"",
+		"bogus",
+		"all,event",
+		"ingress,event",
+		"fetch",
+		"sweep",
+		"drift",
+		"fetch,sweep",
+	} {
 		if err := validateRoles(roles); err == nil {
 			t.Fatalf("roles %q accepted", roles)
 		}
@@ -91,13 +99,13 @@ func TestValidateRoles(t *testing.T) {
 func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
 	tests := map[string][]string{
 		"dispatch": nil,
-		"fetch": {
+		"fetch,sweep,drift": {
 			queue.QueueInteractive,
 			queue.QueueEvent,
 			queue.QueueSweep,
+			queue.QueueReconcile,
+			queue.QueueDrift,
 		},
-		"sweep":           {queue.QueueReconcile},
-		"drift":           {queue.QueueDrift},
 		"pruner":          {queue.QueuePruner},
 		"watermarker":     nil,
 		"deriver":         nil,
@@ -150,9 +158,7 @@ func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
 		t.Fatal("periodic table is empty")
 	}
 	for _, raw := range []string{
-		"fetch",
-		"sweep",
-		"drift",
+		"fetch,sweep,drift",
 		"pruner",
 		"dispatch,pruner",
 	} {
@@ -194,11 +200,23 @@ func TestParseRequeueOptions(t *testing.T) {
 	}{
 		{
 			args: []string{"--guid=delivery-1"},
-			want: requeueOptions{guid: "delivery-1"},
+			want: requeueOptions{guids: []string{"delivery-1"}},
 		},
 		{
-			args: []string{"--all-parked"},
-			want: requeueOptions{allParked: true},
+			args: []string{"--guids=delivery-1,delivery-2"},
+			want: requeueOptions{
+				guids: []string{"delivery-1", "delivery-2"},
+			},
+		},
+		{
+			args: []string{
+				"--event=pull_request",
+				"--error-contains=unsupported action",
+			},
+			want: requeueOptions{
+				event:         "pull_request",
+				errorContains: "unsupported action",
+			},
 		},
 	}
 	for _, test := range tests {
@@ -206,15 +224,17 @@ func TestParseRequeueOptions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%v rejected: %v", test.args, err)
 		}
-		if got != test.want {
+		if !reflect.DeepEqual(got, test.want) {
 			t.Fatalf("%v parsed as %+v, want %+v", test.args, got, test.want)
 		}
 	}
 	for _, args := range [][]string{
 		nil,
-		{"--guid=delivery-1", "--all-parked"},
+		{"--guid=delivery-1", "--event=pull_request", "--error-contains=x"},
 		{"--guid="},
-		{"--all-parked", "extra"},
+		{"--event=pull_request"},
+		{"--error-contains=x"},
+		{"--guid=delivery-1", "extra"},
 	} {
 		if _, err := parseRequeueOptions(args); err == nil {
 			t.Fatalf("%v accepted", args)

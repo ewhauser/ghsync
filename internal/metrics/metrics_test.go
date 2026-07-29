@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/acme/frontier/internal/budget"
+	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/testdb"
 )
 
@@ -81,11 +82,13 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		Pool:               database.Pool,
 		InstallationID:     1,
 		Roles:              []string{"dispatch", "fetch"},
+		CollectDatabase:    true,
 		OpenStackStaleness: 5 * time.Minute,
 		OpenPRStaleness:    10 * time.Minute,
 		RepoRulesStaleness: time.Hour,
 		ClosedStaleness:    24 * time.Hour,
 		RepositoryPeriod:   time.Hour,
+		StreamRetentionAge: 7 * 24 * time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -106,6 +109,24 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		NotModified: true,
 	})
 	runtimeMetrics.CacheWrite(ctx, "pull_request", false, false)
+	receivedAt := time.Now().UTC()
+	runtimeMetrics.RefreshFinished(ctx, queue.RefreshObservation{
+		Kind:            queue.KindRefreshBranch,
+		Queue:           queue.QueueEvent,
+		EventReceivedAt: receivedAt,
+	})
+	runtimeMetrics.RefreshFinished(ctx, queue.RefreshObservation{
+		Kind:             queue.KindRefreshPR,
+		Queue:            queue.QueueEvent,
+		EventReceivedAt:  receivedAt,
+		CacheCommittedAt: receivedAt.Add(-time.Second),
+	})
+	runtimeMetrics.RefreshFinished(ctx, queue.RefreshObservation{
+		Kind:             queue.KindRefreshPR,
+		Queue:            queue.QueueEvent,
+		EventReceivedAt:  receivedAt,
+		CacheCommittedAt: receivedAt.Add(time.Second),
+	})
 
 	response := httptest.NewRecorder()
 	registry.Handler().ServeHTTP(
@@ -118,14 +139,19 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	}
 	for _, name := range []string{
 		"frontier_c_b3_budget_remaining",
-		"frontier_c_b4_conditional_304_ratio",
+		"frontier_c_b4_conditional_304s_total",
 		"frontier_c_c2_cache_cas_reject_ratio",
 		"frontier_c_i5_parked_deliveries",
 		"frontier_c_o3_drift_findings",
 		"frontier_c_s2_watermark_lag_sequences",
+		"frontier_c_q2_outstanding_generations",
+		"frontier_c_o4_operation_samples",
+		"frontier_c_o4_last_operation_sample_age_seconds",
 		"frontier_c_p5_deriver_dirty_backlog",
 		`frontier_c_r2_sweep_period_seconds{sweep_kind="stacks"} 225`,
 		`frontier_c_o4_role_enabled{role="fetch"} 1`,
+		`frontier_c_q2_event_to_cache_latency_seconds_count{kind="refresh_pr"} 1`,
+		`frontier_c_q2_invalid_event_cache_latency_total{kind="refresh_pr"} 1`,
 	} {
 		if !strings.Contains(string(body), name) {
 			t.Errorf("metrics exposition omitted %q", name)

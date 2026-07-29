@@ -132,7 +132,7 @@ INSERT INTO pull_requests (
     repo_id, gh_id, node_id, number, title, state, draft, author_login,
     head_ref, head_sha, base_ref, base_sha, review_decision, mergeable_state,
     stack_number, stack_position, gh_updated_at, synced_at, last_checked_at,
-    etag, sync_source, tombstoned_at
+    etag, sync_source, tombstoned_at, display_until
 ) VALUES (
     sqlc.arg(repo_id), sqlc.arg(gh_id), sqlc.arg(node_id),
     sqlc.arg(pr_number), sqlc.arg(title), sqlc.arg(state), sqlc.arg(draft),
@@ -144,7 +144,11 @@ INSERT INTO pull_requests (
     CASE WHEN sqlc.arg(membership_known)::boolean
          THEN sqlc.narg(stack_position)::int ELSE NULL END,
     sqlc.arg(gh_updated_at), sqlc.arg(synced_at),
-    sqlc.arg(last_checked_at), sqlc.arg(etag), sqlc.arg(sync_source), NULL
+    sqlc.arg(last_checked_at), sqlc.arg(etag), sqlc.arg(sync_source), NULL,
+    CASE WHEN sqlc.arg(state)::text = 'open'
+         THEN NULL
+         ELSE clock_timestamp() + interval '30 days'
+    END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
 SET gh_id = EXCLUDED.gh_id,
@@ -174,7 +178,13 @@ SET gh_id = EXCLUDED.gh_id,
     last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
     sync_source = EXCLUDED.sync_source,
-    tombstoned_at = NULL
+    tombstoned_at = NULL,
+    display_until = CASE
+        WHEN EXCLUDED.state = 'open' THEN NULL
+        WHEN pull_requests.state = 'open'
+        THEN clock_timestamp() + interval '30 days'
+        ELSE pull_requests.display_until
+    END
 WHERE pull_requests.gh_updated_at IS NULL
    OR EXCLUDED.gh_updated_at > pull_requests.gh_updated_at
    OR (
@@ -217,6 +227,7 @@ UPDATE pull_requests
 SET tombstoned_at = sqlc.arg(tombstoned_at),
     synced_at = sqlc.arg(synced_at),
     last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    display_until = NULL,
     etag = '',
     sync_source = sqlc.arg(sync_source)
 WHERE repo_id = sqlc.arg(repo_id)
@@ -254,13 +265,17 @@ WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
 INSERT INTO stacks (
     repo_id, gh_id, node_id, number, base_ref, base_sha, open, entries,
     gh_updated_at, head_sha, synced_at, last_checked_at, etag, sync_source,
-    tombstoned_at
+    tombstoned_at, display_until
 ) VALUES (
     sqlc.arg(repo_id), sqlc.arg(gh_id), sqlc.arg(node_id),
     sqlc.arg(stack_number), sqlc.arg(base_ref), sqlc.arg(base_sha),
     sqlc.arg(open), sqlc.arg(entries), sqlc.narg(gh_updated_at),
     sqlc.arg(head_sha), sqlc.arg(synced_at), sqlc.arg(last_checked_at),
-    sqlc.arg(etag), sqlc.arg(sync_source), NULL
+    sqlc.arg(etag), sqlc.arg(sync_source), NULL,
+    CASE WHEN sqlc.arg(open)::boolean
+         THEN NULL
+         ELSE clock_timestamp() + interval '30 days'
+    END
 )
 ON CONFLICT (repo_id, number) DO UPDATE
 SET gh_id = EXCLUDED.gh_id,
@@ -275,7 +290,12 @@ SET gh_id = EXCLUDED.gh_id,
     last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
     sync_source = EXCLUDED.sync_source,
-    tombstoned_at = NULL
+    tombstoned_at = NULL,
+    display_until = CASE
+        WHEN EXCLUDED.open THEN NULL
+        WHEN stacks.open THEN clock_timestamp() + interval '30 days'
+        ELSE stacks.display_until
+    END
 WHERE stacks.gh_updated_at IS NULL
    OR EXCLUDED.gh_updated_at > stacks.gh_updated_at
    OR (
@@ -309,6 +329,7 @@ SET tombstoned_at = sqlc.arg(tombstoned_at),
     open = false,
     synced_at = sqlc.arg(synced_at),
     last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    display_until = NULL,
     etag = '',
     sync_source = sqlc.arg(sync_source)
 WHERE repo_id = sqlc.arg(repo_id)

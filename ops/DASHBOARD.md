@@ -10,7 +10,8 @@ Use four large stat panels:
 
 1. **Freshness:** C-Q2 p95/p99 from
    `frontier_c_q2_event_to_cache_latency_seconds` beside 20s/60s limits, plus
-   `frontier_c_q2_oldest_unprocessed_delivery_age_seconds`.
+   `frontier_c_q2_oldest_unprocessed_delivery_age_seconds` and
+   `frontier_c_q2_oldest_outstanding_generation_age_seconds`.
 2. **Bounded staleness:** table
    `frontier_c_r1_cache_staleness_seconds` /
    `frontier_c_r1_staleness_bound_seconds` by `entity_class`.
@@ -18,7 +19,8 @@ Use four large stat panels:
    `frontier_c_o3_drift_findings{state="open"}` and
    `frontier_c_i5_parked_deliveries`. Either above zero is red.
 4. **Stream safety:** `frontier_c_s2_watermark_lag_sequences`,
-   `frontier_c_s2_watermark_age_seconds`, and maximum consumer cursor lag.
+   `frontier_c_s2_watermark_age_seconds`, and maximum per-stream consumer
+   outstanding-event count/age.
 
 This row alone answers the on-call question. Link each stat to its runbook.
 
@@ -26,23 +28,32 @@ This row alone answers the on-call question. Link each stat to its runbook.
 
 - Event-to-cache p50/p95/p99 with fixed 20s and 60s lines.
 - Queue depth by queue, oldest delivery age, and dispatch batch-size heatmap.
-- Fetch rate by kind, CAS reject ratio, tombstones, and sweep 304 ratio with a
-  fixed 0.80 line.
+- Fetch rate by kind, CAS reject ratio, tombstones, and the 15-minute
+  sweep-scoped ratio
+  `rate(frontier_c_b4_conditional_304s_total{class="sweep"}[15m]) /
+  rate(frontier_c_b4_conditional_requests_total{class="sweep"}[15m]`
+  with a fixed 0.80 line.
 
 ## Row 3: reconciliation and budget
 
-- Budget remaining and floor by class/resource; request and starvation rates.
-- Gate-closed seconds.
+- Server-authoritative budget remaining by class/resource; request and
+  starvation rates. Starvation, not a post-request floor comparison, is the
+  admission-safety signal.
+- `frontier_c_b2_gate_closed` as a boolean with continuous closed duration
+  supplied by the alert `for` clause.
 - Sweep duration and period by kind, gap-heal requests, drift state, and
-  pruner deletes.
+  pruner deletes. Include durable sweep/drift success count, drift sample
+  count, and age; `-1` or absent is red.
 
 ## Row 4: stream and derivation
 
-- Watermark sequence lag/age, outbox depth, and advance rate.
-- Consumer cursor lag/age by consumer/stream and resync rate.
+- Watermark sequence lag/age, durable watermarker success age,
+  retention-eligible `frontier_c_s7_prunable_outbox_depth`, and advance rate.
+- Consumer own-stream outstanding event count/age and resync rate.
 - Deriver pass duration and dirty backlog.
 
 Keep active alerts down the right edge. Do not split the view by daemon role:
-`frontier_c_o4_role_enabled` identifies the scraped process, while every
-role's `/metrics` reads the same authoritative Postgres state. The verdict
-therefore survives partial rollouts and role outages.
+`frontier_c_o4_role_enabled` identifies each scraped process. Only the
+dedicated `metrics` role reads authoritative aggregate Postgres state; other
+roles expose local counters. Every trust panel has an absence rule, so a
+missing collector or required role is red rather than a blank success.

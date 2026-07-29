@@ -1,5 +1,6 @@
 // soak drives the standalone fake GitHub against a running frontier-syncd and
-// fails unless the C-O4 operational contract remains healthy.
+// exits successfully only after the configured load, run-scoped assertions,
+// durable trust passes, and exact fake-to-cache convergence all succeed.
 package main
 
 import (
@@ -15,8 +16,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
@@ -33,6 +37,7 @@ const (
 	defaultMultiplier     = 10.0
 	defaultScrapeInterval = 2 * time.Second
 	defaultDrainTimeout   = 90 * time.Second
+	emitterConcurrency    = 16
 )
 
 type event struct {
@@ -49,6 +54,8 @@ type recordedEvent struct {
 type config struct {
 	engineURL      string
 	fakeGitHubURL  string
+	databaseURL    string
+	installationID int64
 	profile        string
 	duration       time.Duration
 	recordedRate   float64
@@ -59,11 +66,23 @@ type config struct {
 	httpClient     *http.Client
 }
 
+type histogramSnapshot struct {
+	count   uint64
+	buckets map[float64]uint64
+}
+
 type runState struct {
-	startWatermark float64
-	maxParked      float64
-	samples        int
-	budgetSamples  int
+	startWatermark       float64
+	startStarvations     float64
+	postLoadCaptured     bool
+	postLoadDriftPasses  float64
+	postLoadDriftSamples float64
+	postLoadWatermarks   float64
+	lastHistogram        histogramSnapshot
+	runHistogram         histogramSnapshot
+	histogramWindows     int
+	samples              int
+	budgetSamples        int
 }
 
 func main() {
@@ -82,6 +101,16 @@ func runMain(args []string) error {
 		"fake-github-url",
 		defaultFakeGitHubURL,
 		"standalone fake GitHub base URL",
+	)
+	databaseURL := fs.String(
+		"database-url",
+		os.Getenv("DATABASE_URL"),
+		"Postgres URL used to prove final cache convergence",
+	)
+	installationID := fs.Int64(
+		"installation-id",
+		0,
+		"GitHub installation whose completed cache seed is required (defaults to GITHUB_INSTALLATION_ID)",
 	)
 	profile := fs.String("profile", "smoke", "smoke, 48h, or custom")
 	duration := fs.Duration(
@@ -112,6 +141,16 @@ func runMain(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("soak does not accept positional arguments")
 	}
+	if *installationID == 0 {
+		raw := strings.TrimSpace(os.Getenv("GITHUB_INSTALLATION_ID"))
+		if raw != "" {
+			parsed, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				return fmt.Errorf("parse GITHUB_INSTALLATION_ID: %w", err)
+			}
+			*installationID = parsed
+		}
+	}
 	selectedDuration, err := profileDuration(*profile, *duration)
 	if err != nil {
 		return err
@@ -119,6 +158,8 @@ func runMain(args []string) error {
 	cfg := config{
 		engineURL:      strings.TrimRight(*engineURL, "/"),
 		fakeGitHubURL:  strings.TrimRight(*fakeGitHubURL, "/"),
+		databaseURL:    strings.TrimSpace(*databaseURL),
+		installationID: *installationID,
 		profile:        *profile,
 		duration:       selectedDuration,
 		recordedRate:   *recordedRate,
@@ -131,9 +172,7 @@ func runMain(args []string) error {
 	if err := validateConfig(cfg); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	return run(ctx, cfg)
+	return run(context.Background(), cfg)
 }
 
 func profileDuration(profile string, override time.Duration) (time.Duration, error) {
@@ -157,10 +196,35 @@ func validateConfig(cfg config) error {
 		cfg.scrapeInterval <= 0 || cfg.drainTimeout <= 0 {
 		return fmt.Errorf("durations and event rates must be positive")
 	}
-	if cfg.engineURL == "" || cfg.fakeGitHubURL == "" {
-		return fmt.Errorf("engine and fake GitHub URLs are required")
+	if cfg.engineURL == "" || cfg.fakeGitHubURL == "" ||
+		cfg.databaseURL == "" {
+		return fmt.Errorf("engine, fake GitHub, and database URLs are required")
+	}
+	if cfg.installationID <= 0 {
+		return fmt.Errorf(
+			"installation ID is required and must be positive",
+		)
+	}
+	if expectedEventCount(
+		cfg.duration,
+		cfg.recordedRate,
+		cfg.multiplier,
+	) <= 0 {
+		return fmt.Errorf("configured rate and duration produce no events")
 	}
 	return nil
+}
+
+// expectedEventCount is the load contract. The smoke defaults are exactly:
+// 120 seconds * 1 recorded event/second * 10 = 1,200 successful deliveries.
+func expectedEventCount(
+	duration time.Duration,
+	recordedRate float64,
+	multiplier float64,
+) int64 {
+	return int64(math.Floor(
+		duration.Seconds()*recordedRate*multiplier + 1e-9,
+	))
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -184,8 +248,25 @@ func run(ctx context.Context, cfg config) error {
 	); err != nil {
 		return fmt.Errorf("fake GitHub health: %w", err)
 	}
+	pool, err := pgxpool.New(ctx, cfg.databaseURL)
+	if err != nil {
+		return fmt.Errorf("connect convergence database: %w", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping convergence database: %w", err)
+	}
+	if err := waitForCacheSeed(ctx, cfg, pool); err != nil {
+		return err
+	}
 
 	initial, err := scrape(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	initialHistogram, err := histogramState(
+		initial["frontier_c_q2_event_to_cache_latency_seconds"],
+	)
 	if err != nil {
 		return err
 	}
@@ -195,54 +276,88 @@ func run(ctx context.Context, cfg config) error {
 			"frontier_c_s2_watermark_advances_total",
 			nil,
 		),
+		startStarvations: metricValue(
+			initial,
+			"frontier_c_b3_starvations_total",
+			nil,
+		),
+		lastHistogram: initialHistogram,
+		runHistogram: histogramSnapshot{
+			buckets: make(map[float64]uint64),
+		},
 	}
 	if err := assertLive(initial, &state); err != nil {
 		return fmt.Errorf("initial metrics: %w", err)
 	}
 
-	rate := cfg.recordedRate * cfg.multiplier
-	emitInterval := time.Duration(float64(time.Second) / rate)
-	if emitInterval < time.Millisecond {
-		emitInterval = time.Millisecond
-	}
-	emitTicker := time.NewTicker(emitInterval)
-	defer emitTicker.Stop()
+	target := expectedEventCount(
+		cfg.duration,
+		cfg.recordedRate,
+		cfg.multiplier,
+	)
+	runID := strconv.FormatInt(time.Now().UnixNano(), 36)
+	startedAt := time.Now()
+	loadCtx, cancelLoad := context.WithDeadline(
+		ctx,
+		startedAt.Add(cfg.duration),
+	)
+	defer cancelLoad()
+	emittedCh := make(chan emissionResult, 1)
+	go func() {
+		emittedCh <- emitConfiguredLoad(
+			loadCtx,
+			cfg,
+			events,
+			runID,
+			target,
+			startedAt,
+		)
+	}()
 	scrapeTicker := time.NewTicker(cfg.scrapeInterval)
 	defer scrapeTicker.Stop()
-	finish := time.NewTimer(cfg.duration)
-	defer finish.Stop()
-	runID := strconv.FormatInt(time.Now().UnixNano(), 36)
-	var emitted int64
+	var emission emissionResult
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-finish.C:
-			goto drain
-		case <-emitTicker.C:
-			item := events[int(emitted)%len(events)]
-			emitted++
-			if err := emit(
-				ctx,
-				cfg,
-				item,
-				fmt.Sprintf("soak-%s-%012d", runID, emitted),
-				emitted,
-			); err != nil {
-				return fmt.Errorf("emit event %d: %w", emitted, err)
+		case emission = <-emittedCh:
+			if emission.err != nil {
+				return emission.err
 			}
+			goto drain
 		case <-scrapeTicker.C:
-			families, err := scrape(ctx, cfg)
-			if err != nil {
-				return err
+			families, scrapeErr := scrape(ctx, cfg)
+			if scrapeErr != nil {
+				return scrapeErr
 			}
 			if err := assertLive(families, &state); err != nil {
-				return fmt.Errorf("live assertion after %d events: %w", emitted, err)
+				return fmt.Errorf(
+					"live assertion after %d events: %w",
+					emissionCount(&emission),
+					err,
+				)
 			}
 		}
 	}
 
 drain:
+	if emission.count != target {
+		return fmt.Errorf(
+			"configured load missed: emitted %d, required %d",
+			emission.count,
+			target,
+		)
+	}
+	achievedRate := float64(emission.count) / cfg.duration.Seconds()
+	requiredRate := cfg.recordedRate * cfg.multiplier
+	if achievedRate+1e-9 < requiredRate {
+		return fmt.Errorf(
+			"configured load rate missed: achieved %.3f/s, required %.3f/s",
+			achievedRate,
+			requiredRate,
+		)
+	}
+
 	drainDeadline := time.Now().Add(cfg.drainTimeout)
 	var final map[string]*dto.MetricFamily
 	for {
@@ -253,12 +368,31 @@ drain:
 		if err := assertLive(final, &state); err != nil {
 			return fmt.Errorf("drain assertion: %w", err)
 		}
+		if !state.postLoadCaptured {
+			state.postLoadCaptured = true
+			state.postLoadDriftPasses = operationValue(
+				final, "frontier_c_o4_operation_successes", "drift", "detector",
+			)
+			state.postLoadDriftSamples = operationValue(
+				final, "frontier_c_o4_operation_samples", "drift", "detector",
+			)
+			state.postLoadWatermarks = operationValue(
+				final, "frontier_c_o4_operation_successes", "watermarker", "entities",
+			)
+		}
 		if pipelineDrained(final) {
-			break
+			if err := assertConverged(ctx, cfg, pool); err == nil &&
+				postPopulationTrustCompleted(final, state) {
+				break
+			}
 		}
 		if time.Now().After(drainDeadline) {
+			convergenceErr := assertConverged(ctx, cfg, pool)
 			return fmt.Errorf(
-				"pipeline did not drain within %s (oldest delivery %.1fs, watermark lag %.0f)",
+				"pipeline did not drain, converge, and complete "+
+					"post-load trust passes within %s "+
+					"(delivery_age=%.1fs event_queue=%.0f generations=%.0f "+
+					"watermark_lag=%.0f convergence=%v trust_passes=%t)",
 				cfg.drainTimeout,
 				metricValue(
 					final,
@@ -267,31 +401,285 @@ drain:
 				),
 				metricValue(
 					final,
+					"frontier_c_p2_queue_depth",
+					map[string]string{"queue": "event"},
+				),
+				metricValue(
+					final,
+					"frontier_c_q2_outstanding_generations",
+					nil,
+				),
+				metricValue(
+					final,
 					"frontier_c_s2_watermark_lag_sequences",
 					nil,
 				),
+				convergenceErr,
+				postPopulationTrustCompleted(final, state),
 			)
 		}
-		timer := time.NewTimer(cfg.scrapeInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := wait(ctx, cfg.scrapeInterval); err != nil {
+			return err
 		}
 	}
 	if err := assertFinal(final, state); err != nil {
 		return err
 	}
 	fmt.Printf(
-		"soak %s passed: duration=%s events=%d rate=%.2fx samples=%d\n",
+		"soak %s passed: duration=%s expected=%d emitted=%d "+
+			"required_rate=%.2f/s achieved_rate=%.2f/s samples=%d\n",
 		cfg.profile,
 		cfg.duration,
-		emitted,
-		cfg.multiplier,
+		target,
+		emission.count,
+		requiredRate,
+		achievedRate,
 		state.samples,
 	)
 	return nil
+}
+
+func operationValue(
+	families map[string]*dto.MetricFamily,
+	metricName string,
+	component string,
+	operation string,
+) float64 {
+	return metricValue(
+		families,
+		metricName,
+		map[string]string{
+			"component": component,
+			"operation": operation,
+		},
+	)
+}
+
+func postPopulationTrustCompleted(
+	families map[string]*dto.MetricFamily,
+	state runState,
+) bool {
+	return state.postLoadCaptured &&
+		operationValue(
+			families,
+			"frontier_c_o4_operation_successes",
+			"drift",
+			"detector",
+		) > state.postLoadDriftPasses &&
+		operationValue(
+			families,
+			"frontier_c_o4_operation_samples",
+			"drift",
+			"detector",
+		) > state.postLoadDriftSamples &&
+		operationValue(
+			families,
+			"frontier_c_o4_operation_successes",
+			"watermarker",
+			"entities",
+		) > state.postLoadWatermarks
+}
+
+func waitForCacheSeed(
+	ctx context.Context,
+	cfg config,
+	pool *pgxpool.Pool,
+) error {
+	deadline := time.Now().Add(cfg.drainTimeout)
+	var lastState string
+	for {
+		var installationDone bool
+		var repositories int64
+		var incompleteRepos int64
+		var pendingChildren int64
+		var cacheWriters int64
+		err := pool.QueryRow(ctx, `
+			SELECT
+			    EXISTS (
+			        SELECT 1
+			        FROM installation_backfill_cursors
+			        WHERE installation_id = $1
+			          AND phase = 'done'
+			          AND completed_at IS NOT NULL
+			    ),
+			    (SELECT count(*)
+			     FROM backfill_cursors
+			     WHERE installation_id = $1),
+			    (SELECT count(*)
+			     FROM backfill_cursors
+			     WHERE installation_id = $1
+			       AND phase <> 'done'),
+			    (SELECT count(*)
+			     FROM backfill_children
+			     WHERE installation_id = $1
+			       AND completed_at IS NULL),
+			    (SELECT count(*)
+			     FROM river_job
+			     WHERE queue IN (
+			         'interactive', 'event', 'sweep', 'reconcile'
+			     )
+			       AND state IN (
+			           'available', 'pending', 'retryable',
+			           'running', 'scheduled'
+			       ))
+		`, cfg.installationID).Scan(
+			&installationDone,
+			&repositories,
+			&incompleteRepos,
+			&pendingChildren,
+			&cacheWriters,
+		)
+		if err != nil {
+			return fmt.Errorf("check completed cache seed: %w", err)
+		}
+		lastState = fmt.Sprintf(
+			"installation_done=%t repositories=%d incomplete_repositories=%d "+
+				"pending_children=%d cache_writer_jobs=%d",
+			installationDone,
+			repositories,
+			incompleteRepos,
+			pendingChildren,
+			cacheWriters,
+		)
+		if installationDone && repositories > 0 &&
+			incompleteRepos == 0 && pendingChildren == 0 &&
+			cacheWriters == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf(
+				"cache seed did not complete within %s (%s); "+
+					"run frontier-syncd backfill before soak",
+				cfg.drainTimeout,
+				lastState,
+			)
+		}
+		if err := wait(ctx, 250*time.Millisecond); err != nil {
+			return err
+		}
+	}
+}
+
+type emissionResult struct {
+	count int64
+	err   error
+}
+
+func emissionCount(result *emissionResult) int64 {
+	if result == nil {
+		return 0
+	}
+	return result.count
+}
+
+func emitConfiguredLoad(
+	ctx context.Context,
+	cfg config,
+	events []event,
+	runID string,
+	target int64,
+	startedAt time.Time,
+) emissionResult {
+	rate := cfg.recordedRate * cfg.multiplier
+	jobs := make(chan int64)
+	errs := make(chan error, emitterConcurrency)
+	var succeeded atomic.Int64
+	var workers sync.WaitGroup
+	for worker := 0; worker < emitterConcurrency; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for sequence := range jobs {
+				item := events[int((sequence-1)%int64(len(events)))]
+				if err := emit(
+					ctx,
+					cfg,
+					item,
+					fmt.Sprintf("soak-%s-%012d", runID, sequence),
+					sequence,
+				); err != nil {
+					select {
+					case errs <- fmt.Errorf(
+						"emit event %d: %w",
+						sequence,
+						err,
+					):
+					default:
+					}
+					return
+				}
+				succeeded.Add(1)
+			}
+		}()
+	}
+	scheduleErr := error(nil)
+	for sequence := int64(1); sequence <= target; sequence++ {
+		offset := time.Duration(
+			(float64(sequence-1) / rate) * float64(time.Second),
+		)
+		if err := waitUntil(ctx, startedAt.Add(offset)); err != nil {
+			scheduleErr = fmt.Errorf(
+				"configured load deadline reached after %d/%d events: %w",
+				succeeded.Load(),
+				target,
+				err,
+			)
+			break
+		}
+		select {
+		case jobs <- sequence:
+		case err := <-errs:
+			scheduleErr = err
+		case <-ctx.Done():
+			scheduleErr = fmt.Errorf(
+				"configured load deadline reached after %d/%d events: %w",
+				succeeded.Load(),
+				target,
+				ctx.Err(),
+			)
+		}
+		if scheduleErr != nil {
+			break
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	select {
+	case err := <-errs:
+		if scheduleErr == nil {
+			scheduleErr = err
+		}
+	default:
+	}
+	count := succeeded.Load()
+	if scheduleErr == nil && count != target {
+		scheduleErr = fmt.Errorf(
+			"configured load emitted %d successful events, want %d",
+			count,
+			target,
+		)
+	}
+	return emissionResult{count: count, err: scheduleErr}
+}
+
+func waitUntil(ctx context.Context, target time.Time) error {
+	delay := time.Until(target)
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func loadEvents(path string) ([]event, error) {
@@ -415,13 +803,20 @@ func waitHealthy(
 		if time.Now().After(deadline) {
 			return lastErr
 		}
-		timer := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := wait(ctx, 250*time.Millisecond); err != nil {
+			return err
 		}
+	}
+}
+
+func wait(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -464,11 +859,26 @@ func assertLive(
 	state *runState,
 ) error {
 	state.samples++
-	parked := metricValue(
+	required := []string{
+		"frontier_c_b3_starvations_total",
+		"frontier_c_i5_parked_deliveries",
+		"frontier_c_o3_drift_findings",
+		"frontier_c_o4_operation_successes",
+		"frontier_c_o4_operation_samples",
+		"frontier_c_o4_last_operation_sample_age_seconds",
+		"frontier_c_p2_queue_depth",
+		"frontier_c_q2_oldest_unprocessed_delivery_age_seconds",
+		"frontier_c_q2_outstanding_generations",
+		"frontier_c_s2_watermark_lag_sequences",
+	}
+	for _, name := range required {
+		if families[name] == nil {
+			return fmt.Errorf("required metric %s is absent", name)
+		}
+	}
+	if parked := metricValue(
 		families, "frontier_c_i5_parked_deliveries", nil,
-	)
-	state.maxParked = math.Max(state.maxParked, parked)
-	if parked > 0 {
+	); parked > 0 {
 		return fmt.Errorf("C-I5 parked deliveries = %.0f", parked)
 	}
 	if open := metricValue(
@@ -478,48 +888,58 @@ func assertLive(
 	); open > 0 {
 		return fmt.Errorf("C-O3 open drift findings = %.0f", open)
 	}
-	checked, err := assertBudgetFloors(families)
+	starvations := metricValue(
+		families,
+		"frontier_c_b3_starvations_total",
+		nil,
+	)
+	if starvations > state.startStarvations {
+		return fmt.Errorf(
+			"C-B3 starvation counter increased by %.0f",
+			starvations-state.startStarvations,
+		)
+	}
+	if budget := families["frontier_c_b3_budget_remaining"]; budget != nil && len(budget.Metric) > 0 {
+		state.budgetSamples++
+	}
+	current, err := histogramState(
+		families["frontier_c_q2_event_to_cache_latency_seconds"],
+	)
 	if err != nil {
 		return err
 	}
-	if checked {
-		state.budgetSamples++
+	window, err := subtractHistogram(current, state.lastHistogram)
+	if err != nil {
+		return fmt.Errorf("C-Q2 scrape-window histogram delta: %w", err)
 	}
-	return nil
-}
-
-func assertBudgetFloors(
-	families map[string]*dto.MetricFamily,
-) (bool, error) {
-	remainingFamily := families["frontier_c_b3_budget_remaining"]
-	if remainingFamily == nil {
-		return false, nil
-	}
-	checked := false
-	for _, remainingMetric := range remainingFamily.Metric {
-		labels := labelsOf(remainingMetric)
-		class := labels["class"]
-		if class != "event" && class != "sweep" {
-			continue
+	if window.count > 0 {
+		p95, err := histogramQuantileSnapshot(window, 0.95)
+		if err != nil {
+			return err
 		}
-		remaining := sampleValue(remainingMetric)
-		floor := metricValue(
-			families,
-			"frontier_c_b3_budget_floor",
-			labels,
-		)
-		checked = true
-		if remaining < floor {
-			return true, fmt.Errorf(
-				"C-B3 %s/%s remaining %.0f breached floor %.0f",
-				class,
-				labels["resource"],
-				remaining,
-				floor,
+		p99, err := histogramQuantileSnapshot(window, 0.99)
+		if err != nil {
+			return err
+		}
+		if p95 > 20 {
+			return fmt.Errorf(
+				"C-Q2 scrape-window p95 %.1fs exceeds 20s",
+				p95,
+			)
+		}
+		if p99 > 60 {
+			return fmt.Errorf(
+				"C-Q2 scrape-window p99 %.1fs exceeds 60s",
+				p99,
 			)
 		}
 	}
-	return checked, nil
+	addHistogram(&state.runHistogram, window)
+	if window.count > 0 {
+		state.histogramWindows++
+	}
+	state.lastHistogram = current
+	return nil
 }
 
 func pipelineDrained(families map[string]*dto.MetricFamily) bool {
@@ -527,11 +947,22 @@ func pipelineDrained(families map[string]*dto.MetricFamily) bool {
 		families,
 		"frontier_c_q2_oldest_unprocessed_delivery_age_seconds",
 		nil,
-	) == 0 && metricValue(
-		families,
-		"frontier_c_s2_watermark_lag_sequences",
-		nil,
-	) == 0
+	) == 0 &&
+		metricValue(
+			families,
+			"frontier_c_p2_queue_depth",
+			map[string]string{"queue": "event"},
+		) == 0 &&
+		metricValue(
+			families,
+			"frontier_c_q2_outstanding_generations",
+			nil,
+		) == 0 &&
+		metricValue(
+			families,
+			"frontier_c_s2_watermark_lag_sequences",
+			nil,
+		) == 0
 }
 
 func assertFinal(
@@ -553,62 +984,238 @@ func assertFinal(
 			endWatermark,
 		)
 	}
-	histogram := families["frontier_c_q2_event_to_cache_latency_seconds"]
-	if histogram == nil {
-		return fmt.Errorf("C-Q2 event-to-cache histogram was not observed")
+	endWatermarkPasses := metricValue(
+		families,
+		"frontier_c_o4_operation_successes",
+		map[string]string{
+			"component": "watermarker",
+			"operation": "entities",
+		},
+	)
+	if endWatermarkPasses <= state.postLoadWatermarks {
+		return fmt.Errorf(
+			"C-S2 no post-load durable watermark pass completed "+
+				"(post-load %.0f, end %.0f)",
+			state.postLoadWatermarks,
+			endWatermarkPasses,
+		)
 	}
-	p95, count, err := histogramQuantile(histogram, 0.95)
+	endDriftPasses := metricValue(
+		families,
+		"frontier_c_o4_operation_successes",
+		map[string]string{
+			"component": "drift",
+			"operation": "detector",
+		},
+	)
+	if endDriftPasses <= state.postLoadDriftPasses {
+		return fmt.Errorf(
+			"C-O3 no post-population drift pass completed "+
+				"(post-load %.0f, end %.0f)",
+			state.postLoadDriftPasses,
+			endDriftPasses,
+		)
+	}
+	endDriftSamples := metricValue(
+		families,
+		"frontier_c_o4_operation_samples",
+		map[string]string{
+			"component": "drift",
+			"operation": "detector",
+		},
+	)
+	if endDriftSamples <= state.postLoadDriftSamples {
+		return fmt.Errorf(
+			"C-O3 post-population drift pass inspected no samples "+
+				"(post-load %.0f, end %.0f)",
+			state.postLoadDriftSamples,
+			endDriftSamples,
+		)
+	}
+	if state.runHistogram.count == 0 || state.histogramWindows == 0 {
+		return fmt.Errorf("C-Q2 run-scoped histogram has no new samples")
+	}
+	p95, err := histogramQuantileSnapshot(state.runHistogram, 0.95)
 	if err != nil {
 		return err
 	}
-	p99, _, err := histogramQuantile(histogram, 0.99)
+	p99, err := histogramQuantileSnapshot(state.runHistogram, 0.99)
 	if err != nil {
 		return err
-	}
-	if count == 0 {
-		return fmt.Errorf("C-Q2 event-to-cache histogram has no samples")
 	}
 	if p95 > 20 {
-		return fmt.Errorf("C-Q2 p95 %.1fs exceeds 20s", p95)
+		return fmt.Errorf("C-Q2 run-scoped p95 %.1fs exceeds 20s", p95)
 	}
 	if p99 > 60 {
-		return fmt.Errorf("C-Q2 p99 %.1fs exceeds 60s", p99)
+		return fmt.Errorf("C-Q2 run-scoped p99 %.1fs exceeds 60s", p99)
 	}
 	return nil
+}
+
+func assertConverged(
+	ctx context.Context,
+	cfg config,
+	pool *pgxpool.Pool,
+) error {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		cfg.fakeGitHubURL+fakegithub.ControlTruthPath,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	response, err := cfg.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("read fake truth: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("read fake truth status %d", response.StatusCode)
+	}
+	var truth fakegithub.SoakTruth
+	if err := json.NewDecoder(response.Body).Decode(&truth); err != nil {
+		return fmt.Errorf("decode fake truth: %w", err)
+	}
+	if len(truth.PullRequests) == 0 {
+		return fmt.Errorf("fake truth contains no mutated pull requests")
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT pull.number, pull.title
+		FROM pull_requests AS pull
+		JOIN repos AS repo ON repo.id = pull.repo_id
+		WHERE repo.full_name = $1
+		  AND repo.tombstoned_at IS NULL
+		  AND pull.tombstoned_at IS NULL
+	`, truth.Repository)
+	if err != nil {
+		return fmt.Errorf("query cached truth: %w", err)
+	}
+	cached := make(map[int]string)
+	for rows.Next() {
+		var number int
+		var title string
+		if err := rows.Scan(&number, &title); err != nil {
+			rows.Close()
+			return err
+		}
+		cached[number] = title
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, pull := range truth.PullRequests {
+		got, ok := cached[pull.Number]
+		if !ok {
+			return fmt.Errorf("cache is missing truth PR %d", pull.Number)
+		}
+		if got != pull.Title {
+			return fmt.Errorf(
+				"cache PR %d title %q does not match fake truth %q",
+				pull.Number,
+				got,
+				pull.Title,
+			)
+		}
+	}
+	return nil
+}
+
+func histogramState(
+	family *dto.MetricFamily,
+) (histogramSnapshot, error) {
+	if family == nil {
+		return histogramSnapshot{buckets: make(map[float64]uint64)}, nil
+	}
+	result := histogramSnapshot{buckets: make(map[float64]uint64)}
+	for _, item := range family.Metric {
+		histogram := item.GetHistogram()
+		if histogram == nil {
+			continue
+		}
+		result.count += histogram.GetSampleCount()
+		for _, bucket := range histogram.Bucket {
+			result.buckets[bucket.GetUpperBound()] +=
+				bucket.GetCumulativeCount()
+		}
+	}
+	return result, nil
+}
+
+func subtractHistogram(
+	current histogramSnapshot,
+	prior histogramSnapshot,
+) (histogramSnapshot, error) {
+	if current.count < prior.count {
+		return histogramSnapshot{}, fmt.Errorf(
+			"sample count regressed from %d to %d",
+			prior.count,
+			current.count,
+		)
+	}
+	result := histogramSnapshot{
+		count:   current.count - prior.count,
+		buckets: make(map[float64]uint64),
+	}
+	for bound, value := range current.buckets {
+		before := prior.buckets[bound]
+		if value < before {
+			return histogramSnapshot{}, fmt.Errorf(
+				"bucket %v regressed from %d to %d",
+				bound,
+				before,
+				value,
+			)
+		}
+		result.buckets[bound] = value - before
+	}
+	return result, nil
+}
+
+func addHistogram(target *histogramSnapshot, delta histogramSnapshot) {
+	if target.buckets == nil {
+		target.buckets = make(map[float64]uint64)
+	}
+	target.count += delta.count
+	for bound, value := range delta.buckets {
+		target.buckets[bound] += value
+	}
 }
 
 func histogramQuantile(
 	family *dto.MetricFamily,
 	quantile float64,
 ) (float64, uint64, error) {
-	var count uint64
-	cumulativeByBound := make(map[float64]uint64)
-	for _, item := range family.Metric {
-		histogram := item.GetHistogram()
-		if histogram == nil {
-			continue
-		}
-		count += histogram.GetSampleCount()
-		for _, bucket := range histogram.Bucket {
-			cumulativeByBound[bucket.GetUpperBound()] +=
-				bucket.GetCumulativeCount()
-		}
+	snapshot, err := histogramState(family)
+	if err != nil {
+		return 0, 0, err
 	}
-	if count == 0 {
-		return 0, 0, nil
+	value, err := histogramQuantileSnapshot(snapshot, quantile)
+	return value, snapshot.count, err
+}
+
+func histogramQuantileSnapshot(
+	histogram histogramSnapshot,
+	quantile float64,
+) (float64, error) {
+	if histogram.count == 0 {
+		return 0, nil
 	}
-	target := uint64(math.Ceil(float64(count) * quantile))
-	bounds := make([]float64, 0, len(cumulativeByBound))
-	for bound := range cumulativeByBound {
+	target := uint64(math.Ceil(float64(histogram.count) * quantile))
+	bounds := make([]float64, 0, len(histogram.buckets))
+	for bound := range histogram.buckets {
 		bounds = append(bounds, bound)
 	}
 	sort.Float64s(bounds)
 	for _, bound := range bounds {
-		if cumulativeByBound[bound] >= target {
-			return bound, count, nil
+		if histogram.buckets[bound] >= target {
+			return bound, nil
 		}
 	}
-	return 0, count, fmt.Errorf(
+	return 0, fmt.Errorf(
 		"C-Q2 p%.0f exceeds the largest histogram bucket",
 		quantile*100,
 	)

@@ -74,6 +74,32 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	}
 }
 
+func TestControlTruthReportsLatestMutatedPullState(t *testing.T) {
+	fake := New(DefaultFixture(), "secret")
+	payload := json.RawMessage(`{
+		"number": 4812,
+		"soak_revision": 77
+	}`)
+	fake.applySoakMutation("pull_request", payload)
+	response := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test"+ControlTruthPath,
+		nil,
+	)
+	defer response.Body.Close()
+	var truth SoakTruth
+	if err := json.NewDecoder(response.Body).Decode(&truth); err != nil {
+		t.Fatal(err)
+	}
+	if truth.Repository != "acme/monolith" ||
+		len(truth.PullRequests) != 1 ||
+		truth.PullRequests[0].Number != 4812 ||
+		truth.PullRequests[0].Title != "Soak revision 77 for PR 4812" {
+		t.Fatalf("truth = %+v", truth)
+	}
+}
+
 func TestServesStacksWithRateHeaders(t *testing.T) {
 	resp := serve(
 		New(DefaultFixture(), "secret"),

@@ -145,12 +145,13 @@ func WithDeadlineObserver(observer DeadlineObserver) ClientOption {
 // RefreshObservation describes one authoritative fetch attempt. C-Q2's
 // event-to-cache latency is populated only for event-originated generations.
 type RefreshObservation struct {
-	Kind            string
-	Queue           string
-	EventReceivedAt time.Time
-	StartedAt       time.Time
-	CompletedAt     time.Time
-	Err             error
+	Kind             string
+	Queue            string
+	EventReceivedAt  time.Time
+	CacheCommittedAt time.Time
+	StartedAt        time.Time
+	CompletedAt      time.Time
+	Err              error
 }
 
 type RefreshObserver interface {

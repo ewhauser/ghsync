@@ -18,15 +18,17 @@ import (
 )
 
 type RuntimeOptions struct {
-	Pool           *pgxpool.Pool
-	InstallationID int64
-	Roles          []string
+	Pool            *pgxpool.Pool
+	InstallationID  int64
+	Roles           []string
+	CollectDatabase bool
 
 	OpenStackStaleness time.Duration
 	OpenPRStaleness    time.Duration
 	RepoRulesStaleness time.Duration
 	ClosedStaleness    time.Duration
 	RepositoryPeriod   time.Duration
+	StreamRetentionAge time.Duration
 }
 
 type ratioCounts struct {
@@ -39,55 +41,64 @@ type ratioCounts struct {
 type Runtime struct {
 	options RuntimeOptions
 
-	mu          sync.Mutex
-	conditional map[string]ratioCounts
-	cas         map[string]ratioCounts
+	mu  sync.Mutex
+	cas map[string]ratioCounts
 
-	githubRequests       metric.Int64Counter
-	starvations          metric.Int64Counter
-	dispatchBatches      metric.Int64Histogram
-	fetches              metric.Int64Counter
-	eventToCache         metric.Float64Histogram
-	cacheWrites          metric.Int64Counter
-	sweepOverruns        metric.Int64Counter
-	gapHealRequests      metric.Int64Counter
-	gapWindowIncomplete  metric.Int64Counter
-	driftTransitions     metric.Int64Counter
-	prunerDeletes        metric.Int64Counter
-	watermarkAdvances    metric.Int64Counter
-	deriverPassDuration  metric.Float64Histogram
-	deriverPasses        metric.Int64Counter
-	stalenessMisses      metric.Int64Counter
-	budgetRemaining      metric.Int64ObservableGauge
-	budgetLimit          metric.Int64ObservableGauge
-	budgetFloor          metric.Int64ObservableGauge
-	gateClosed           metric.Float64ObservableGauge
-	conditionalRatio     metric.Float64ObservableGauge
-	queueDepth           metric.Int64ObservableGauge
-	oldestDeliveryAge    metric.Float64ObservableGauge
-	parkedCount          metric.Int64ObservableGauge
-	parkedAge            metric.Float64ObservableGauge
-	cacheStaleness       metric.Float64ObservableGauge
-	stalenessBound       metric.Float64ObservableGauge
-	casRejectRatio       metric.Float64ObservableGauge
-	tombstoneCount       metric.Int64ObservableGauge
-	sweepDuration        metric.Float64ObservableGauge
-	sweepPeriod          metric.Float64ObservableGauge
-	driftFindings        metric.Int64ObservableGauge
-	watermarkLag         metric.Int64ObservableGauge
-	watermarkAge         metric.Float64ObservableGauge
-	outboxDepth          metric.Int64ObservableGauge
-	consumerCursorLag    metric.Int64ObservableGauge
-	consumerCursorAge    metric.Float64ObservableGauge
-	resyncCount          metric.Int64ObservableCounter
-	deriverDirtyBacklog  metric.Int64ObservableGauge
-	roleEnabled          metric.Int64ObservableGauge
-	callbackRegistration metric.Registration
+	githubRequests         metric.Int64Counter
+	conditionalRequests    metric.Int64Counter
+	conditional304s        metric.Int64Counter
+	starvations            metric.Int64Counter
+	dispatchBatches        metric.Int64Histogram
+	fetches                metric.Int64Counter
+	eventToCache           metric.Float64Histogram
+	invalidEventLatency    metric.Int64Counter
+	cacheWrites            metric.Int64Counter
+	sweepOverruns          metric.Int64Counter
+	gapHealRequests        metric.Int64Counter
+	gapWindowIncomplete    metric.Int64Counter
+	driftTransitions       metric.Int64Counter
+	prunerDeletes          metric.Int64Counter
+	watermarkAdvances      metric.Int64Counter
+	deriverPassDuration    metric.Float64Histogram
+	deriverPasses          metric.Int64Counter
+	stalenessMisses        metric.Int64Counter
+	budgetRemaining        metric.Int64ObservableGauge
+	budgetLimit            metric.Int64ObservableGauge
+	gateClosed             metric.Int64ObservableGauge
+	queueDepth             metric.Int64ObservableGauge
+	oldestDeliveryAge      metric.Float64ObservableGauge
+	outstandingGenCount    metric.Int64ObservableGauge
+	outstandingGenAge      metric.Float64ObservableGauge
+	parkedCount            metric.Int64ObservableGauge
+	parkedAge              metric.Float64ObservableGauge
+	cacheStaleness         metric.Float64ObservableGauge
+	stalenessBound         metric.Float64ObservableGauge
+	casRejectRatio         metric.Float64ObservableGauge
+	tombstoneCount         metric.Int64ObservableGauge
+	sweepDuration          metric.Float64ObservableGauge
+	sweepPeriod            metric.Float64ObservableGauge
+	driftFindings          metric.Int64ObservableGauge
+	watermarkLag           metric.Int64ObservableGauge
+	watermarkAge           metric.Float64ObservableGauge
+	prunableOutboxDepth    metric.Int64ObservableGauge
+	consumerOutstanding    metric.Int64ObservableGauge
+	consumerOutstandingAge metric.Float64ObservableGauge
+	resyncCount            metric.Int64ObservableCounter
+	deriverDirtyBacklog    metric.Int64ObservableGauge
+	operationSuccesses     metric.Int64ObservableGauge
+	operationSamples       metric.Int64ObservableGauge
+	operationSuccessAge    metric.Float64ObservableGauge
+	operationSampleAge     metric.Float64ObservableGauge
+	roleEnabled            metric.Int64ObservableGauge
+	callbackRegistration   metric.Registration
 }
 
 func NewRuntime(options RuntimeOptions) (*Runtime, error) {
 	if options.Pool == nil {
 		return nil, fmt.Errorf("runtime metrics require Postgres")
+	}
+	if options.InstallationID <= 0 {
+		return nil, fmt.Errorf("runtime metrics require an installation ID")
 	}
 	for name, bound := range map[string]time.Duration{
 		"open stack": options.OpenStackStaleness,
@@ -100,10 +111,12 @@ func NewRuntime(options RuntimeOptions) (*Runtime, error) {
 			return nil, fmt.Errorf("%s metrics bound must be positive", name)
 		}
 	}
+	if options.StreamRetentionAge <= 0 {
+		return nil, fmt.Errorf("stream retention metrics bound must be positive")
+	}
 	return &Runtime{
-		options:     options,
-		conditional: make(map[string]ratioCounts),
-		cas:         make(map[string]ratioCounts),
+		options: options,
+		cas:     make(map[string]ratioCounts),
 	}, nil
 }
 
@@ -112,6 +125,18 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	if r.githubRequests, err = meter.Int64Counter(
 		"frontier_c_b1_github_requests",
 		metric.WithDescription("Admitted GitHub requests by class and resource (C-B1)."),
+	); err != nil {
+		return err
+	}
+	if r.conditionalRequests, err = meter.Int64Counter(
+		"frontier_c_b4_conditional_requests",
+		metric.WithDescription("Conditional GitHub requests for rolling C-B4 ratios."),
+	); err != nil {
+		return err
+	}
+	if r.conditional304s, err = meter.Int64Counter(
+		"frontier_c_b4_conditional_304s",
+		metric.WithDescription("Conditional GitHub requests answered 304 for rolling C-B4 ratios."),
 	); err != nil {
 		return err
 	}
@@ -136,6 +161,12 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	if r.eventToCache, err = meter.Float64Histogram(
 		"frontier_c_q2_event_to_cache_latency_seconds",
 		metric.WithDescription("Webhook received to authoritative cache completion latency (C-Q2)."),
+	); err != nil {
+		return err
+	}
+	if r.invalidEventLatency, err = meter.Int64Counter(
+		"frontier_c_q2_invalid_event_cache_latency",
+		metric.WithDescription("Invalid negative PostgreSQL event-to-cache intervals (C-Q2)."),
 	); err != nil {
 		return err
 	}
@@ -202,6 +233,11 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	if err := r.registerObservables(meter); err != nil {
 		return err
 	}
+	// Prometheus must see explicit zeroes for "nothing bad happened" counters;
+	// otherwise absent-series alerts cannot distinguish a healthy zero from a
+	// missing process/instrument.
+	r.starvations.Add(context.Background(), 0)
+	r.invalidEventLatency.Add(context.Background(), 0)
 	return nil
 }
 
@@ -220,15 +256,14 @@ func (r *Runtime) BudgetRequest(observation budget.RequestObservation) {
 	if !observation.Conditional {
 		return
 	}
-	key := string(observation.Class) + "\x00" + string(observation.Resource)
-	r.mu.Lock()
-	counts := r.conditional[key]
-	counts.total++
+	attrs := metric.WithAttributes(
+		attribute.String("class", string(observation.Class)),
+		attribute.String("resource", string(observation.Resource)),
+	)
+	r.conditionalRequests.Add(context.Background(), 1, attrs)
 	if observation.NotModified {
-		counts.hits++
+		r.conditional304s.Add(context.Background(), 1, attrs)
 	}
-	r.conditional[key] = counts
-	r.mu.Unlock()
 }
 
 func (r *Runtime) BudgetStarvation(starvation budget.Starvation) {
@@ -259,12 +294,17 @@ func (r *Runtime) RefreshFinished(
 		attribute.String("queue", observation.Queue),
 		attribute.String("outcome", outcome),
 	))
-	if observation.Err == nil && !observation.EventReceivedAt.IsZero() {
-		latency := observation.CompletedAt.Sub(
+	if observation.Err == nil &&
+		!observation.EventReceivedAt.IsZero() &&
+		!observation.CacheCommittedAt.IsZero() {
+		latency := observation.CacheCommittedAt.Sub(
 			observation.EventReceivedAt,
 		).Seconds()
 		if latency < 0 {
-			latency = 0
+			r.invalidEventLatency.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("kind", observation.Kind),
+			))
+			return
 		}
 		r.eventToCache.Record(ctx, latency, metric.WithAttributes(
 			attribute.String("kind", observation.Kind),
