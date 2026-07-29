@@ -123,26 +123,6 @@ func (q *Queries) CompleteRefreshIntentGeneration(ctx context.Context, arg Compl
 	return err
 }
 
-const getRefreshIntentGeneration = `-- name: GetRefreshIntentGeneration :one
-SELECT generation
-FROM refresh_intent_generations
-WHERE kind = $1 AND refresh_key = $2
-`
-
-type GetRefreshIntentGenerationParams struct {
-	Kind       string
-	RefreshKey string
-}
-
-// A running worker snapshots the generation before fetching authoritative
-// state. Signals coalesced before the fetch are thereby covered by that fetch.
-func (q *Queries) GetRefreshIntentGeneration(ctx context.Context, arg GetRefreshIntentGenerationParams) (int64, error) {
-	row := q.db.QueryRow(ctx, getRefreshIntentGeneration, arg.Kind, arg.RefreshKey)
-	var generation int64
-	err := row.Scan(&generation)
-	return generation, err
-}
-
 const getRefreshIntentGenerationForUpdate = `-- name: GetRefreshIntentGenerationForUpdate :one
 SELECT generation
 FROM refresh_intent_generations

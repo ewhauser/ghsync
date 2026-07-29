@@ -15,6 +15,7 @@ import (
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
+// PullRequestMetadata returns conditional-fetch metadata for one pull request.
 func (w *EntityWriter) PullRequestMetadata(
 	ctx context.Context,
 	repo string,
@@ -42,6 +43,7 @@ func (w *EntityWriter) PullRequestMetadata(
 	}, nil
 }
 
+// TouchPullRequest records a successful unchanged pull-request observation.
 func (w *EntityWriter) TouchPullRequest(
 	ctx context.Context,
 	observation *Observation,
@@ -56,44 +58,36 @@ func (w *EntityWriter) TouchPullRequest(
 	if err := requireObservation(observation, key); err != nil {
 		return err
 	}
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			_ pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			checkedAt = databaseTime
-			repo, err := queries.GetRepoByGitHubID(
-				ctx,
-				repository.GitHubID,
-			)
-			if err != nil {
-				return fmt.Errorf("find PR repository: %w", err)
-			}
-			if err := queries.TouchPullRequestCheckedAt(
-				ctx,
-				dbgen.TouchPullRequestCheckedAtParams{
-					CheckedAt: timestamp(checkedAt),
-					RepoID:    repo.ID,
-					PrNumber:  int32(number),
-					Etag:      etag,
-				},
-			); err != nil {
-				return fmt.Errorf("touch PR checked_at: %w", err)
-			}
-			return nil
-		},
-	)
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, queries := entity.ctx, entity.queries
+		checkedAt = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(
+			ctx,
+			repository.GitHubID,
+		)
+		if err != nil {
+			return fmt.Errorf("find PR repository: %w", err)
+		}
+		if err := queries.TouchPullRequestCheckedAt(
+			ctx,
+			dbgen.TouchPullRequestCheckedAtParams{
+				CheckedAt: timestamp(checkedAt),
+				RepoID:    repo.ID,
+				PrNumber:  int32(number),
+				Etag:      etag,
+			},
+		); err != nil {
+			return fmt.Errorf("touch PR checked_at: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("touch PR: %w", err)
 	}
 	return nil
 }
 
+// ApplyPullRequest conditionally applies a direct pull-request observation.
 func (w *EntityWriter) ApplyPullRequest(
 	ctx context.Context,
 	pull PullRequestRecord,
@@ -101,6 +95,8 @@ func (w *EntityWriter) ApplyPullRequest(
 	return w.applyPullRequest(ctx, nil, pull, nil)
 }
 
+// ApplyPullRequestObserved conditionally applies a pull request while holding
+// its observation lock.
 func (w *EntityWriter) ApplyPullRequestObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -147,182 +143,173 @@ func (w *EntityWriter) applyPullRequest(
 		pull.Number,
 	)
 	var result ApplyPullRequestResult
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			tx pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			pull.SyncedAt = databaseTime
-			repo, err := queries.GetRepoByGitHubID(ctx, pull.Repository.GitHubID)
-			if err != nil {
-				return fmt.Errorf("find PR repository: %w", err)
-			}
-			old, oldErr := queries.GetPullRequestByIdentity(
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, tx, queries := entity.ctx, entity.tx, entity.queries
+		pull.SyncedAt = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(ctx, pull.Repository.GitHubID)
+		if err != nil {
+			return fmt.Errorf("find PR repository: %w", err)
+		}
+		old, oldErr := queries.GetPullRequestByIdentity(
+			ctx,
+			dbgen.GetPullRequestByIdentityParams{
+				RepoGhID: pull.Repository.GitHubID,
+				PrNumber: int32(pull.Number),
+			},
+		)
+		if oldErr != nil && !errors.Is(oldErr, pgx.ErrNoRows) {
+			return fmt.Errorf("read prior PR: %w", oldErr)
+		}
+		result = ApplyPullRequestResult{
+			OldStackNumber: stackPointerFromPR(oldErr, old.StackNumber),
+			OldHeadSHA:     old.HeadSha,
+		}
+		row, upsertErr := queries.UpsertPullRequestWriteIfNewer(
+			ctx,
+			dbgen.UpsertPullRequestWriteIfNewerParams{
+				RepoID:               repo.ID,
+				GhID:                 nullableInt8(pull.GitHubID),
+				NodeID:               pull.NodeID,
+				PrNumber:             int32(pull.Number),
+				Title:                pull.Title,
+				State:                strings.ToLower(pull.State),
+				Draft:                pull.Draft,
+				AuthorLogin:          pull.AuthorLogin,
+				HeadRef:              pull.HeadRef,
+				HeadSha:              pull.HeadSHA,
+				BaseRef:              pull.BaseRef,
+				BaseSha:              pull.BaseSHA,
+				ReviewDecision:       pull.ReviewDecision,
+				MergeableState:       pull.MergeableState,
+				StackNumber:          nullableInt4(pull.StackNumber),
+				StackPosition:        nullableInt4(pull.StackPosition),
+				MembershipKnown:      pull.MembershipKnown,
+				GhUpdatedAt:          timestamp(pull.GitHubUpdatedAt),
+				SyncedAt:             timestamp(pull.SyncedAt),
+				LastCheckedAt:        timestamp(pull.SyncedAt),
+				Etag:                 pull.ETag,
+				SyncSource:           string(pull.Source),
+				DisplayWindowSeconds: int32(displayWindow / time.Second),
+			},
+		)
+		if upsertErr != nil && !errors.Is(upsertErr, pgx.ErrNoRows) {
+			return fmt.Errorf("upsert PR: %w", upsertErr)
+		}
+		result.DomainChanged = upsertErr == nil
+		if errors.Is(upsertErr, pgx.ErrNoRows) {
+			current, getErr := queries.GetPullRequestByIdentity(
 				ctx,
 				dbgen.GetPullRequestByIdentityParams{
 					RepoGhID: pull.Repository.GitHubID,
 					PrNumber: int32(pull.Number),
 				},
 			)
-			if oldErr != nil && !errors.Is(oldErr, pgx.ErrNoRows) {
-				return fmt.Errorf("read prior PR: %w", oldErr)
+			if getErr != nil {
+				return fmt.Errorf("get discarded PR: %w", getErr)
 			}
-			result = ApplyPullRequestResult{
-				OldStackNumber: stackPointerFromPR(oldErr, old.StackNumber),
-				OldHeadSHA:     old.HeadSha,
+			row = dbgen.PullRequest{
+				ID:             current.ID,
+				RepoID:         current.RepoID,
+				GhID:           current.GhID,
+				NodeID:         current.NodeID,
+				Number:         current.Number,
+				Title:          current.Title,
+				State:          current.State,
+				Draft:          current.Draft,
+				AuthorLogin:    current.AuthorLogin,
+				HeadRef:        current.HeadRef,
+				HeadSha:        current.HeadSha,
+				BaseRef:        current.BaseRef,
+				BaseSha:        current.BaseSha,
+				ReviewDecision: current.ReviewDecision,
+				MergeableState: current.MergeableState,
+				StackNumber:    current.StackNumber,
+				StackPosition:  current.StackPosition,
+				GhUpdatedAt:    current.GhUpdatedAt,
+				SyncedAt:       current.SyncedAt,
+				Etag:           current.Etag,
+				SyncSource:     current.SyncSource,
+				TombstonedAt:   current.TombstonedAt,
+				LastCheckedAt:  current.LastCheckedAt,
 			}
-			row, upsertErr := queries.UpsertPullRequestWriteIfNewer(
+		}
+		result.NewStackNumber = intPointer(row.StackNumber)
+		result.NewHeadSHA = row.HeadSha
+		if err := queries.TouchPullRequestCheckedAt(
+			ctx,
+			dbgen.TouchPullRequestCheckedAtParams{
+				CheckedAt: timestamp(pull.SyncedAt),
+				RepoID:    repo.ID,
+				PrNumber:  int32(pull.Number),
+				Etag:      pull.ETag,
+			},
+		); err != nil {
+			return fmt.Errorf("touch PR: %w", err)
+		}
+
+		threadsChanged := false
+		if pull.ThreadsKnown {
+			threads, err := encodeReviewThreads(pull.ReviewThreads)
+			if err != nil {
+				return err
+			}
+			changed, err := queries.ReplaceReviewThreads(
 				ctx,
-				dbgen.UpsertPullRequestWriteIfNewerParams{
-					RepoID:               repo.ID,
-					GhID:                 nullableInt8(pull.GitHubID),
-					NodeID:               pull.NodeID,
-					PrNumber:             int32(pull.Number),
-					Title:                pull.Title,
-					State:                strings.ToLower(pull.State),
-					Draft:                pull.Draft,
-					AuthorLogin:          pull.AuthorLogin,
-					HeadRef:              pull.HeadRef,
-					HeadSha:              pull.HeadSHA,
-					BaseRef:              pull.BaseRef,
-					BaseSha:              pull.BaseSHA,
-					ReviewDecision:       pull.ReviewDecision,
-					MergeableState:       pull.MergeableState,
-					StackNumber:          nullableInt4(pull.StackNumber),
-					StackPosition:        nullableInt4(pull.StackPosition),
-					MembershipKnown:      pull.MembershipKnown,
-					GhUpdatedAt:          timestamp(pull.GitHubUpdatedAt),
-					SyncedAt:             timestamp(pull.SyncedAt),
-					LastCheckedAt:        timestamp(pull.SyncedAt),
-					Etag:                 pull.ETag,
-					SyncSource:           string(pull.Source),
-					DisplayWindowSeconds: int32(displayWindow / time.Second),
+				dbgen.ReplaceReviewThreadsParams{
+					Threads:       threads,
+					RepoID:        repo.ID,
+					PrNumber:      int32(pull.Number),
+					HeadSha:       row.HeadSha,
+					SyncedAt:      timestamp(pull.SyncedAt),
+					LastCheckedAt: timestamp(pull.SyncedAt),
+					Etag:          pull.ETag,
+					SyncSource:    string(pull.Source),
 				},
 			)
-			if upsertErr != nil && !errors.Is(upsertErr, pgx.ErrNoRows) {
-				return fmt.Errorf("upsert PR: %w", upsertErr)
+			if err != nil {
+				return fmt.Errorf("replace review threads: %w", err)
 			}
-			result.DomainChanged = upsertErr == nil
-			if errors.Is(upsertErr, pgx.ErrNoRows) {
-				current, getErr := queries.GetPullRequestByIdentity(
-					ctx,
-					dbgen.GetPullRequestByIdentityParams{
-						RepoGhID: pull.Repository.GitHubID,
-						PrNumber: int32(pull.Number),
-					},
-				)
-				if getErr != nil {
-					return fmt.Errorf("get discarded PR: %w", getErr)
-				}
-				row = dbgen.PullRequest{
-					ID:             current.ID,
-					RepoID:         current.RepoID,
-					GhID:           current.GhID,
-					NodeID:         current.NodeID,
-					Number:         current.Number,
-					Title:          current.Title,
-					State:          current.State,
-					Draft:          current.Draft,
-					AuthorLogin:    current.AuthorLogin,
-					HeadRef:        current.HeadRef,
-					HeadSha:        current.HeadSha,
-					BaseRef:        current.BaseRef,
-					BaseSha:        current.BaseSha,
-					ReviewDecision: current.ReviewDecision,
-					MergeableState: current.MergeableState,
-					StackNumber:    current.StackNumber,
-					StackPosition:  current.StackPosition,
-					GhUpdatedAt:    current.GhUpdatedAt,
-					SyncedAt:       current.SyncedAt,
-					Etag:           current.Etag,
-					SyncSource:     current.SyncSource,
-					TombstonedAt:   current.TombstonedAt,
-					LastCheckedAt:  current.LastCheckedAt,
-				}
-			}
-			result.NewStackNumber = intPointer(row.StackNumber)
-			result.NewHeadSHA = row.HeadSha
-			if err := queries.TouchPullRequestCheckedAt(
+			threadsChanged = len(changed) > 0
+			if err := queries.TouchReviewThreadsCheckedAt(
 				ctx,
-				dbgen.TouchPullRequestCheckedAtParams{
+				dbgen.TouchReviewThreadsCheckedAtParams{
 					CheckedAt: timestamp(pull.SyncedAt),
 					RepoID:    repo.ID,
 					PrNumber:  int32(pull.Number),
-					Etag:      pull.ETag,
 				},
 			); err != nil {
-				return fmt.Errorf("touch PR: %w", err)
+				return fmt.Errorf("touch review threads: %w", err)
 			}
+		}
+		result.Applied = result.DomainChanged || threadsChanged
+		if result.Applied {
+			scopes := uniqueStrings(
+				derivationScope(
+					pull.Repository, pull.Number, result.OldStackNumber,
+				),
+				derivationScope(
+					pull.Repository, pull.Number, result.NewStackNumber,
+				),
+			)
+			if err := w.markAndEmit(
+				ctx, queries, scopes, outbox.PullRequestChangedKind, key, pull.SyncedAt,
+			); err != nil {
+				return err
+			}
+		}
+		if hook != nil {
+			if txHook := hook(result); txHook != nil {
+				if err := txHook(ctx, tx); err != nil {
+					return fmt.Errorf(
+						"run PR transaction hook: %w",
+						err,
+					)
+				}
+			}
+		}
 
-			threadsChanged := false
-			if pull.ThreadsKnown {
-				threads, err := encodeReviewThreads(pull.ReviewThreads)
-				if err != nil {
-					return err
-				}
-				changed, err := queries.ReplaceReviewThreads(
-					ctx,
-					dbgen.ReplaceReviewThreadsParams{
-						Threads:       threads,
-						RepoID:        repo.ID,
-						PrNumber:      int32(pull.Number),
-						HeadSha:       row.HeadSha,
-						SyncedAt:      timestamp(pull.SyncedAt),
-						LastCheckedAt: timestamp(pull.SyncedAt),
-						Etag:          pull.ETag,
-						SyncSource:    string(pull.Source),
-					},
-				)
-				if err != nil {
-					return fmt.Errorf("replace review threads: %w", err)
-				}
-				threadsChanged = len(changed) > 0
-				if err := queries.TouchReviewThreadsCheckedAt(
-					ctx,
-					dbgen.TouchReviewThreadsCheckedAtParams{
-						CheckedAt: timestamp(pull.SyncedAt),
-						RepoID:    repo.ID,
-						PrNumber:  int32(pull.Number),
-					},
-				); err != nil {
-					return fmt.Errorf("touch review threads: %w", err)
-				}
-			}
-			result.Applied = result.DomainChanged || threadsChanged
-			if result.Applied {
-				scopes := uniqueStrings(
-					derivationScope(
-						pull.Repository, pull.Number, result.OldStackNumber,
-					),
-					derivationScope(
-						pull.Repository, pull.Number, result.NewStackNumber,
-					),
-				)
-				if err := w.markAndEmit(
-					ctx, queries, scopes, outbox.PullRequestChangedKind, key, pull.SyncedAt,
-				); err != nil {
-					return err
-				}
-			}
-			if hook != nil {
-				if txHook := hook(result); txHook != nil {
-					if err := txHook(ctx, tx); err != nil {
-						return fmt.Errorf(
-							"run PR transaction hook: %w",
-							err,
-						)
-					}
-				}
-			}
-
-			return nil
-		},
-	)
+		return nil
+	})
 	if err != nil {
 		return ApplyPullRequestResult{}, fmt.Errorf("apply PR: %w", err)
 	}
@@ -372,6 +359,8 @@ func (w *EntityWriter) ApplyPullRequestBatch(
 	return outcomes
 }
 
+// TombstonePullRequestObserved conditionally tombstones a pull request while
+// holding its observation lock.
 func (w *EntityWriter) TombstonePullRequestObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -391,82 +380,73 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 		return ApplyPullRequestResult{}, err
 	}
 	var result ApplyPullRequestResult
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			tx pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			at = databaseTime
-			repo, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
-			if err != nil {
-				return fmt.Errorf("find tombstone repo: %w", err)
-			}
-			old, err := queries.GetPullRequestByIdentity(
-				ctx,
-				dbgen.GetPullRequestByIdentityParams{
-					RepoGhID: repository.GitHubID,
-					PrNumber: int32(number),
-				},
-			)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
-			if err != nil {
-				return fmt.Errorf("read tombstoned PR: %w", err)
-			}
-			result = ApplyPullRequestResult{
-				OldStackNumber: intPointer(old.StackNumber),
-				OldHeadSHA:     old.HeadSha,
-			}
-			row, err := queries.TombstonePullRequest(
-				ctx,
-				dbgen.TombstonePullRequestParams{
-					TombstonedAt: timestamp(at),
-					SyncedAt:     timestamp(at),
-					SyncSource:   string(source),
-					RepoID:       repo.ID,
-					PrNumber:     int32(number),
-				},
-			)
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("tombstone PR: %w", err)
-			}
-			if err == nil {
-				result.Applied = true
-				result.DomainChanged = true
-				result.NewHeadSHA = row.HeadSha
-				if err := w.markAndEmit(
-					ctx,
-					queries,
-					[]string{derivationScope(
-						repository, number, result.OldStackNumber,
-					)},
-					outbox.PullRequestTombstonedKind,
-					key,
-					at,
-				); err != nil {
-					return err
-				}
-			}
-			if hook != nil {
-				if txHook := hook(result); txHook != nil {
-					if err := txHook(ctx, tx); err != nil {
-						return fmt.Errorf(
-							"run PR tombstone hook: %w",
-							err,
-						)
-					}
-				}
-			}
-
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, tx, queries := entity.ctx, entity.tx, entity.queries
+		at = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
+		if err != nil {
+			return fmt.Errorf("find tombstone repo: %w", err)
+		}
+		old, err := queries.GetPullRequestByIdentity(
+			ctx,
+			dbgen.GetPullRequestByIdentityParams{
+				RepoGhID: repository.GitHubID,
+				PrNumber: int32(number),
+			},
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
-		},
-	)
+		}
+		if err != nil {
+			return fmt.Errorf("read tombstoned PR: %w", err)
+		}
+		result = ApplyPullRequestResult{
+			OldStackNumber: intPointer(old.StackNumber),
+			OldHeadSHA:     old.HeadSha,
+		}
+		row, err := queries.TombstonePullRequest(
+			ctx,
+			dbgen.TombstonePullRequestParams{
+				TombstonedAt: timestamp(at),
+				SyncedAt:     timestamp(at),
+				SyncSource:   string(source),
+				RepoID:       repo.ID,
+				PrNumber:     int32(number),
+			},
+		)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("tombstone PR: %w", err)
+		}
+		if err == nil {
+			result.Applied = true
+			result.DomainChanged = true
+			result.NewHeadSHA = row.HeadSha
+			if err := w.markAndEmit(
+				ctx,
+				queries,
+				[]string{derivationScope(
+					repository, number, result.OldStackNumber,
+				)},
+				outbox.PullRequestTombstonedKind,
+				key,
+				at,
+			); err != nil {
+				return err
+			}
+		}
+		if hook != nil {
+			if txHook := hook(result); txHook != nil {
+				if err := txHook(ctx, tx); err != nil {
+					return fmt.Errorf(
+						"run PR tombstone hook: %w",
+						err,
+					)
+				}
+			}
+		}
+
+		return nil
+	})
 	if err != nil {
 		return ApplyPullRequestResult{}, fmt.Errorf("tombstone PR: %w", err)
 	}

@@ -19,15 +19,24 @@ import (
 )
 
 const (
-	KindRefreshPR              = "refresh_pr"
-	KindRefreshRepository      = "refresh_repository"
-	KindRefreshRepoRules       = "refresh_repo_rules"
-	KindRefreshStack           = "refresh_stack"
-	KindRefreshChecks          = "refresh_checks"
-	KindRefreshBranch          = "refresh_branch"
+	// KindRefreshPR refreshes one pull request.
+	KindRefreshPR = "refresh_pr"
+	// KindRefreshRepository refreshes one repository.
+	KindRefreshRepository = "refresh_repository"
+	// KindRefreshRepoRules refreshes repository rules.
+	KindRefreshRepoRules = "refresh_repo_rules"
+	// KindRefreshStack refreshes one stack.
+	KindRefreshStack = "refresh_stack"
+	// KindRefreshChecks refreshes check runs for one head SHA.
+	KindRefreshChecks = "refresh_checks"
+	// KindRefreshBranch refreshes branch-dependent entities.
+	KindRefreshBranch = "refresh_branch"
+	// KindResolveStackMembership resolves a pull request's stack ownership.
 	KindResolveStackMembership = "resolve_stack_membership"
-	KindBackfillRepoPage       = "backfill_repo_page"
-	KindBackfillInstallation   = "backfill_installation_page"
+	// KindBackfillRepoPage continues one repository backfill.
+	KindBackfillRepoPage = "backfill_repo_page"
+	// KindBackfillInstallation continues installation repository discovery.
+	KindBackfillInstallation = "backfill_installation_page"
 )
 
 // RefreshArgs is the complete durable job pointer. It intentionally contains
@@ -37,14 +46,28 @@ type RefreshArgs struct {
 	Key         string `json:"key"`
 }
 
+// RefreshPRArgs points at one pull request.
 type RefreshPRArgs struct{ RefreshArgs }
+
+// RefreshRepositoryArgs points at one repository.
 type RefreshRepositoryArgs struct{ RefreshArgs }
+
+// RefreshRepoRulesArgs points at one repository ruleset.
 type RefreshRepoRulesArgs struct{ RefreshArgs }
+
+// RefreshStackArgs points at one stack.
 type RefreshStackArgs struct{ RefreshArgs }
+
+// RefreshChecksArgs points at one repository head SHA.
 type RefreshChecksArgs struct{ RefreshArgs }
+
+// RefreshBranchArgs points at one repository branch.
 type RefreshBranchArgs struct{ RefreshArgs }
+
+// ResolveStackMembershipArgs points at a pull request requiring resolution.
 type ResolveStackMembershipArgs struct{ RefreshArgs }
 
+// BackfillRepoPageArgs identifies one resumable repository backfill page.
 type BackfillRepoPageArgs struct {
 	InstallationID int64  `json:"installation_id"`
 	RepoFullName   string `json:"repo"`
@@ -52,58 +75,86 @@ type BackfillRepoPageArgs struct {
 	Page           int    `json:"page"`
 }
 
+// BackfillInstallationPageArgs identifies one repository-discovery page.
 type BackfillInstallationPageArgs struct {
 	InstallationID int64  `json:"installation_id"`
 	Phase          string `json:"phase"`
 	Page           int    `json:"page"`
 }
 
+// NewRefreshPRArgs constructs a pull-request refresh pointer.
 func NewRefreshPRArgs(key string) RefreshPRArgs {
 	return RefreshPRArgs{RefreshArgs{PointerKind: KindRefreshPR, Key: key}}
 }
 
+// NewRefreshRepositoryArgs constructs a repository refresh pointer.
 func NewRefreshRepositoryArgs(key string) RefreshRepositoryArgs {
 	return RefreshRepositoryArgs{
 		RefreshArgs{PointerKind: KindRefreshRepository, Key: key},
 	}
 }
 
+// NewRefreshRepoRulesArgs constructs a repository-rules refresh pointer.
 func NewRefreshRepoRulesArgs(key string) RefreshRepoRulesArgs {
 	return RefreshRepoRulesArgs{
 		RefreshArgs{PointerKind: KindRefreshRepoRules, Key: key},
 	}
 }
 
+// NewRefreshStackArgs constructs a stack refresh pointer.
 func NewRefreshStackArgs(key string) RefreshStackArgs {
 	return RefreshStackArgs{RefreshArgs{PointerKind: KindRefreshStack, Key: key}}
 }
 
+// NewRefreshChecksArgs constructs a checks refresh pointer.
 func NewRefreshChecksArgs(key string) RefreshChecksArgs {
 	return RefreshChecksArgs{RefreshArgs{PointerKind: KindRefreshChecks, Key: key}}
 }
 
+// NewRefreshBranchArgs constructs a branch refresh pointer.
 func NewRefreshBranchArgs(key string) RefreshBranchArgs {
 	return RefreshBranchArgs{RefreshArgs{PointerKind: KindRefreshBranch, Key: key}}
 }
 
+// NewResolveStackMembershipArgs constructs a membership-resolution pointer.
 func NewResolveStackMembershipArgs(key string) ResolveStackMembershipArgs {
 	return ResolveStackMembershipArgs{
 		RefreshArgs{PointerKind: KindResolveStackMembership, Key: key},
 	}
 }
 
-func (RefreshPRArgs) Kind() string              { return KindRefreshPR }
-func (RefreshRepositoryArgs) Kind() string      { return KindRefreshRepository }
-func (RefreshRepoRulesArgs) Kind() string       { return KindRefreshRepoRules }
-func (RefreshStackArgs) Kind() string           { return KindRefreshStack }
-func (RefreshChecksArgs) Kind() string          { return KindRefreshChecks }
-func (RefreshBranchArgs) Kind() string          { return KindRefreshBranch }
-func (ResolveStackMembershipArgs) Kind() string { return KindResolveStackMembership }
-func (BackfillRepoPageArgs) Kind() string       { return KindBackfillRepoPage }
+// Kind returns the River job kind.
+func (RefreshPRArgs) Kind() string { return KindRefreshPR }
+
+// Kind returns the River job kind.
+func (RefreshRepositoryArgs) Kind() string { return KindRefreshRepository }
+
+// Kind returns the River job kind.
+func (RefreshRepoRulesArgs) Kind() string { return KindRefreshRepoRules }
+
+// Kind returns the River job kind.
+func (RefreshStackArgs) Kind() string { return KindRefreshStack }
+
+// Kind returns the River job kind.
+func (RefreshChecksArgs) Kind() string { return KindRefreshChecks }
+
+// Kind returns the River job kind.
+func (RefreshBranchArgs) Kind() string { return KindRefreshBranch }
+
+// Kind returns the River job kind.
+func (ResolveStackMembershipArgs) Kind() string {
+	return KindResolveStackMembership
+}
+
+// Kind returns the River job kind.
+func (BackfillRepoPageArgs) Kind() string { return KindBackfillRepoPage }
+
+// Kind returns the River job kind.
 func (BackfillInstallationPageArgs) Kind() string {
 	return KindBackfillInstallation
 }
 
+// NewBackfillRepoPageArgs constructs a resumable repository backfill pointer.
 func NewBackfillRepoPageArgs(
 	installationID int64,
 	repoFullName string,
@@ -118,6 +169,7 @@ func NewBackfillRepoPageArgs(
 	}
 }
 
+// NewBackfillInstallationPageArgs constructs a discovery backfill pointer.
 func NewBackfillInstallationPageArgs(
 	installationID int64,
 	phase string,
@@ -137,6 +189,7 @@ func NewRefreshInsertOpts(scheduledAt time.Time) *river.InsertOpts {
 	return NewRefreshInsertOptsForQueue(QueueEvent, scheduledAt)
 }
 
+// NewRefreshInsertOptsForQueue returns refresh uniqueness for queueName.
 func NewRefreshInsertOptsForQueue(
 	queueName string,
 	scheduledAt time.Time,
@@ -158,10 +211,12 @@ func NewRefreshInsertOptsForQueue(
 	}
 }
 
+// NewBackfillInsertOpts returns interactive-queue uniqueness for backfills.
 func NewBackfillInsertOpts() *river.InsertOpts {
 	return NewBackfillInsertOptsForQueue(QueueInteractive)
 }
 
+// NewBackfillInsertOptsForQueue returns backfill uniqueness for queueName.
 func NewBackfillInsertOptsForQueue(queueName string) *river.InsertOpts {
 	return &river.InsertOpts{
 		Queue:    queueName,
@@ -179,11 +234,14 @@ func NewBackfillInsertOptsForQueue(queueName string) *river.InsertOpts {
 	}
 }
 
+// RefreshRequest gives a handler its durable pointer and owning queue.
 type RefreshRequest struct {
 	Args  RefreshArgs
 	Queue string
 }
 
+// RefreshSpec describes one desired refresh generation and optional timing
+// metadata.
 type RefreshSpec struct {
 	Kind            string
 	Key             string
@@ -623,14 +681,16 @@ func (m refreshDeadlineMonitor) observeRefresh(
 	})
 }
 
-// InsertRefreshesTx atomically advances M2's durable generations and inserts
-// follow-up pointers. Stack diffs, branch fan-out, and backfill all use this
-// path so running-state coalescing keeps the same meaning everywhere.
+// RefreshGeneration pairs a deduplicated refresh spec with its durable
+// generation after insertion.
 type RefreshGeneration struct {
 	Spec       RefreshSpec
 	Generation int64
 }
 
+// InsertRefreshesTx atomically advances durable generations and inserts
+// follow-up pointers. Stack diffs, branch fan-out, and backfill all use this
+// path so running-state coalescing keeps the same meaning everywhere.
 func InsertRefreshesTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -644,6 +704,8 @@ func InsertRefreshesTx(
 	return err
 }
 
+// InsertRefreshesTxReturning performs InsertRefreshesTx and returns each
+// deduplicated spec's new durable generation.
 func InsertRefreshesTxReturning(
 	ctx context.Context,
 	tx pgx.Tx,

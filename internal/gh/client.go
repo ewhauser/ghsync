@@ -26,6 +26,7 @@ type TokenProvider interface {
 // StaticToken is useful for fake-GitHub conformance tests.
 type StaticToken string
 
+// Token returns the static test token.
 func (t StaticToken) Token(context.Context) (string, error) {
 	return string(t), nil
 }

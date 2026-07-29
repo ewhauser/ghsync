@@ -12,14 +12,20 @@ import (
 	"github.com/acme/frontier/internal/outbox"
 )
 
+// RepositoryEntityKey returns the normative lock and change-stream key for a
+// repository.
 func RepositoryEntityKey(installationID, repositoryGitHubID int64) string {
 	return outbox.RepositoryKey(installationID, repositoryGitHubID)
 }
 
+// RepositoryDiscoveryKey returns the normative lock key for repository
+// discovery by full name.
 func RepositoryDiscoveryKey(installationID int64, fullName string) string {
 	return fmt.Sprintf("repo-discovery:%d:%s", installationID, fullName)
 }
 
+// PullRequestEntityKey returns the normative lock, scope, and change-stream key
+// for a pull request.
 func PullRequestEntityKey(
 	installationID int64,
 	repositoryGitHubID int64,
@@ -28,6 +34,8 @@ func PullRequestEntityKey(
 	return outbox.PullRequestKey(installationID, repositoryGitHubID, number)
 }
 
+// StackEntityKey returns the normative lock, scope, and change-stream key for a
+// stack.
 func StackEntityKey(
 	installationID int64,
 	repositoryGitHubID int64,
@@ -36,6 +44,8 @@ func StackEntityKey(
 	return outbox.StackKey(installationID, repositoryGitHubID, number)
 }
 
+// ChecksEntityKey returns the normative lock and change-stream key for a head
+// SHA's check runs.
 func ChecksEntityKey(
 	installationID int64,
 	repositoryGitHubID int64,
@@ -44,6 +54,8 @@ func ChecksEntityKey(
 	return outbox.ChecksKey(installationID, repositoryGitHubID, sha)
 }
 
+// RepoRulesEntityKey returns the normative lock and change-stream key for
+// repository rules.
 func RepoRulesEntityKey(
 	installationID int64,
 	repositoryGitHubID int64,

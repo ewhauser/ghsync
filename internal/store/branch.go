@@ -8,6 +8,7 @@ import (
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
+// BranchTargets returns the derivation scopes affected by a branch change.
 func (w *EntityWriter) BranchTargets(
 	ctx context.Context,
 	repoFullName string,

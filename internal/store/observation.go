@@ -24,6 +24,7 @@ type Observation struct {
 	closed bool
 }
 
+// Key returns the entity key protected by the observation.
 func (o *Observation) Key() string {
 	if o == nil {
 		return ""
@@ -31,6 +32,7 @@ func (o *Observation) Key() string {
 	return o.key
 }
 
+// Close releases the observation's advisory lock and dedicated connection.
 func (o *Observation) Close() error {
 	if o == nil {
 		return nil
@@ -80,6 +82,7 @@ type noopCacheObserver struct{}
 
 func (noopCacheObserver) CacheWrite(context.Context, string, bool, bool) {}
 
+// NewEntityWriter constructs a cache writer backed by pool.
 func NewEntityWriter(
 	pool *pgxpool.Pool,
 	observers ...CacheObserver,
@@ -96,6 +99,7 @@ func NewEntityWriter(
 	}
 }
 
+// BeginObservation acquires a session-level advisory lock for entityKey.
 func (w *EntityWriter) BeginObservation(
 	ctx context.Context,
 	entityKey string,
@@ -148,12 +152,14 @@ func (w *EntityWriter) beginEntityTx(
 	return tx, nil
 }
 
-type entityTxFunc func(
-	context.Context,
-	pgx.Tx,
-	*dbgen.Queries,
-	time.Time,
-) error
+type entityTx struct {
+	ctx          context.Context
+	tx           pgx.Tx
+	queries      *dbgen.Queries
+	databaseTime time.Time
+}
+
+type entityTxFunc func(entityTx) error
 
 func (w *EntityWriter) withEntityTx(
 	ctx context.Context,
@@ -171,7 +177,12 @@ func (w *EntityWriter) withEntityTx(
 	if err != nil {
 		return err
 	}
-	if err := fn(ctx, tx, dbgen.New(tx), databaseTime); err != nil {
+	if err := fn(entityTx{
+		ctx:          ctx,
+		tx:           tx,
+		queries:      dbgen.New(tx),
+		databaseTime: databaseTime,
+	}); err != nil {
 		return err
 	}
 	if err := w.commitEntityTx(ctx, tx); err != nil {
@@ -247,7 +258,7 @@ func databaseClock(ctx context.Context, tx pgx.Tx) (time.Time, error) {
 
 func (w *EntityWriter) commitEntityTx(ctx context.Context, tx pgx.Tx) error {
 	if err := tx.Commit(ctx); err != nil {
-		return err
+		return fmt.Errorf("commit cache transaction: %w", err)
 	}
 	if pipeline.EventReceivedAt(ctx).IsZero() {
 		return nil

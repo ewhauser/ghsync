@@ -173,6 +173,25 @@ func TestAPIRequiresFakeInstallationBearer(t *testing.T) {
 	}
 }
 
+func TestAuthorizationRecordingIsBounded(t *testing.T) {
+	server := New(DefaultFixture(), "secret")
+	for index := 0; index < maxRecordedAuthorizations+10; index++ {
+		server.recordAuthorization(strconv.Itoa(index))
+	}
+	got := server.Authorizations()
+	if len(got) != maxRecordedAuthorizations {
+		t.Fatalf(
+			"recorded authorizations = %d, want %d",
+			len(got),
+			maxRecordedAuthorizations,
+		)
+	}
+	if got[0] != "10" ||
+		got[len(got)-1] != strconv.Itoa(maxRecordedAuthorizations+9) {
+		t.Fatalf("bounded authorization window = %q ... %q", got[0], got[len(got)-1])
+	}
+}
+
 func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 	fake := New(DefaultFixture(), "secret")
 	path := "/repos/acme/monolith/pulls/4812"

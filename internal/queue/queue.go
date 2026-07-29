@@ -15,29 +15,20 @@ import (
 )
 
 const (
+	// QueueInteractive serves latency-sensitive user-requested refreshes.
 	QueueInteractive = "interactive"
-	QueueEvent       = "event"
-	QueueSweep       = "sweep"
-	QueueReconcile   = "reconcile"
-	QueueDrift       = "drift"
-	QueuePruner      = "pruner"
+	// QueueEvent serves webhook-originated refreshes.
+	QueueEvent = "event"
+	// QueueSweep serves bounded-staleness refreshes.
+	QueueSweep = "sweep"
+	// QueueReconcile serves sweep state-machine and gap-healing work.
+	QueueReconcile = "reconcile"
+	// QueueDrift serves sampled semantic-drift detection.
+	QueueDrift = "drift"
+	// QueuePruner serves retention deletion work.
+	QueuePruner = "pruner"
 )
 
-// NoopArgs is a placeholder job used to verify queue plumbing end to end
-// before real workers exist (M2+ replaces it).
-type NoopArgs struct{}
-
-func (NoopArgs) Kind() string { return "noop" }
-
-type noopWorker struct {
-	river.WorkerDefaults[NoopArgs]
-}
-
-func (*noopWorker) Work(ctx context.Context, job *river.Job[NoopArgs]) error {
-	return nil
-}
-
-// NewClient builds the River client with the three queues configured.
 type clientOptions struct {
 	refreshHandler        RefreshHandler
 	registerRefreshWorker bool
@@ -51,8 +42,10 @@ type clientOptions struct {
 	now                   func() time.Time
 }
 
+// ClientOption customizes River workers, queues, schedules, and observers.
 type ClientOption func(*clientOptions)
 
+// WithRefreshHandler installs the authoritative refresh implementation.
 func WithRefreshHandler(handler RefreshHandler) ClientOption {
 	return func(options *clientOptions) {
 		options.refreshHandler = handler
@@ -89,6 +82,8 @@ func WithQueueMaxWorkers(queueName string, maxWorkers int) ClientOption {
 	}
 }
 
+// DeadlineObserver receives completed refreshes that missed reconciliation
+// deadlines.
 type DeadlineObserver interface {
 	RefreshDeadlineMissed(
 		context.Context,
@@ -99,6 +94,7 @@ type DeadlineObserver interface {
 	)
 }
 
+// LogDeadlineObserver logs reconciliation deadline misses.
 type LogDeadlineObserver struct{}
 
 func (LogDeadlineObserver) RefreshDeadlineMissed(
@@ -118,6 +114,7 @@ func (LogDeadlineObserver) RefreshDeadlineMissed(
 	)
 }
 
+// DeadlineObservers fans deadline misses out in declaration order.
 type DeadlineObservers []DeadlineObserver
 
 func (observers DeadlineObservers) RefreshDeadlineMissed(
@@ -136,6 +133,7 @@ func (observers DeadlineObservers) RefreshDeadlineMissed(
 	}
 }
 
+// WithDeadlineObserver installs refresh-deadline instrumentation.
 func WithDeadlineObserver(observer DeadlineObserver) ClientOption {
 	return func(options *clientOptions) {
 		options.deadlineObserver = observer
@@ -154,16 +152,19 @@ type RefreshObservation struct {
 	Err              error
 }
 
+// RefreshObserver receives completed authoritative-fetch observations.
 type RefreshObserver interface {
 	RefreshFinished(context.Context, RefreshObservation)
 }
 
+// WithRefreshObserver installs authoritative-fetch instrumentation.
 func WithRefreshObserver(observer RefreshObserver) ClientOption {
 	return func(options *clientOptions) {
 		options.refreshObserver = observer
 	}
 }
 
+// WithNow supplies worker time for deterministic testing.
 func WithNow(now func() time.Time) ClientOption {
 	return func(options *clientOptions) {
 		options.now = now
@@ -189,6 +190,9 @@ func WithPeriodicJobs(jobs ...*river.PeriodicJob) ClientOption {
 	}
 }
 
+// NewClient builds a River client for the selected component queues and
+// worker registrars. Without WithQueues it owns the three priority queues:
+// interactive, event, and sweep.
 func NewClient(
 	pool *pgxpool.Pool,
 	options ...ClientOption,
@@ -198,7 +202,6 @@ func NewClient(
 		option(&configured)
 	}
 	workers := river.NewWorkers()
-	river.AddWorker(workers, &noopWorker{})
 	if configured.registerRefreshWorker {
 		registerRefreshWorkers(
 			workers,

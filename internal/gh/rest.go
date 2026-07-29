@@ -15,11 +15,13 @@ import (
 	"github.com/acme/frontier/internal/budget"
 )
 
+// StackBase identifies a stack's base ref and commit.
 type StackBase struct {
 	Ref string `json:"ref"`
 	SHA string `json:"sha,omitempty"`
 }
 
+// StackPullRequest is one ordered layer in a stack.
 type StackPullRequest struct {
 	Number    int               `json:"number"`
 	State     string            `json:"state"`
@@ -29,6 +31,7 @@ type StackPullRequest struct {
 	Head      PullRequestBranch `json:"head"`
 }
 
+// PullRequestBranch identifies one pull request branch.
 type PullRequestBranch struct {
 	Ref string `json:"ref"`
 	SHA string `json:"sha"`
@@ -65,6 +68,7 @@ type PullRequest struct {
 	ReviewDecision string    `json:"review_decision,omitempty"`
 }
 
+// UnmarshalJSON preserves the private-preview stack extension.
 func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	var core github.PullRequest
 	if err := json.Unmarshal(data, &core); err != nil {
@@ -96,6 +100,7 @@ type Repository struct {
 	PushedAt      time.Time `json:"pushed_at"`
 }
 
+// UnmarshalJSON flattens GitHub's nested owner login.
 func (r *Repository) UnmarshalJSON(data []byte) error {
 	type wireRepository struct {
 		ID            int64     `json:"id"`
@@ -128,6 +133,7 @@ func (r *Repository) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// CheckRun is the cache-relevant check-run shape.
 type CheckRun struct {
 	ID          int64      `json:"id"`
 	NodeID      string     `json:"node_id"`
@@ -141,6 +147,7 @@ type CheckRun struct {
 	CompletedAt *time.Time `json:"completed_at"`
 }
 
+// UnmarshalJSON flattens GitHub's nested App slug.
 func (c *CheckRun) UnmarshalJSON(data []byte) error {
 	type wireCheckRun struct {
 		ID          int64      `json:"id"`
@@ -175,17 +182,20 @@ func (c *CheckRun) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// ListCheckRunsOptions controls checks pagination.
 type ListCheckRunsOptions struct {
 	PerPage int
 	Page    int
 }
 
+// ListStacksOptions controls stack filtering and pagination.
 type ListStacksOptions struct {
 	PullRequest int
 	PerPage     int
 	Page        int
 }
 
+// ListPullsOptions controls pull-request filtering and pagination.
 type ListPullsOptions struct {
 	State     string
 	Sort      string
@@ -194,6 +204,7 @@ type ListPullsOptions struct {
 	Page      int
 }
 
+// ListRepositoriesOptions controls installation repository pagination.
 type ListRepositoriesOptions struct {
 	PerPage int
 	Page    int
@@ -207,6 +218,7 @@ type RepositoryRule struct {
 	Raw       json.RawMessage
 }
 
+// UnmarshalJSON retains the complete raw rule while extracting CAS metadata.
 func (r *RepositoryRule) UnmarshalJSON(data []byte) error {
 	var metadata struct {
 		ID        int64      `json:"id"`
@@ -231,10 +243,12 @@ type RESTResponse struct {
 	NextCursor  string
 }
 
+// RESTClient fetches installation-authenticated GitHub REST resources.
 type RESTClient struct {
 	client client
 }
 
+// NewRESTClient validates dependencies and constructs a REST client.
 func NewRESTClient(
 	baseURL string,
 	gate budget.Doer,
@@ -247,6 +261,9 @@ func NewRESTClient(
 	return &RESTClient{client: common}, nil
 }
 
+// GetRepository fetches one repository. A conditional 304 returns
+// (nil, response, nil); callers must inspect response.NotModified before
+// dereferencing the repository.
 func (c *RESTClient) GetRepository(
 	ctx context.Context,
 	class budget.Class,
@@ -256,13 +273,14 @@ func (c *RESTClient) GetRepository(
 ) (*Repository, *RESTResponse, error) {
 	path := fmt.Sprintf("repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo))
 	var repository Repository
-	response, err := c.getJSON(ctx, class, path, nil, etag, &repository)
+	response, err := c.client.getJSON(ctx, class, path, nil, etag, &repository)
 	if err != nil || response.NotModified {
 		return nil, response, err
 	}
 	return &repository, response, nil
 }
 
+// ListInstallationRepositories fetches one installation repository page.
 func (c *RESTClient) ListInstallationRepositories(
 	ctx context.Context,
 	class budget.Class,
@@ -274,7 +292,7 @@ func (c *RESTClient) ListInstallationRepositories(
 	var payload struct {
 		Repositories []Repository `json:"repositories"`
 	}
-	response, err := c.getJSON(
+	response, err := c.client.getJSON(
 		ctx,
 		class,
 		"installation/repositories",
@@ -285,6 +303,7 @@ func (c *RESTClient) ListInstallationRepositories(
 	return payload.Repositories, response, err
 }
 
+// ListRepositoryRules fetches the complete ruleset page for one repository.
 func (c *RESTClient) ListRepositoryRules(
 	ctx context.Context,
 	class budget.Class,
@@ -298,10 +317,11 @@ func (c *RESTClient) ListRepositoryRules(
 		url.PathEscape(repo),
 	)
 	var rules []RepositoryRule
-	response, err := c.getJSON(ctx, class, path, nil, etag, &rules)
+	response, err := c.client.getJSON(ctx, class, path, nil, etag, &rules)
 	return rules, response, err
 }
 
+// ListStacks fetches one gh-stack preview page.
 func (c *RESTClient) ListStacks(
 	ctx context.Context,
 	class budget.Class,
@@ -317,10 +337,13 @@ func (c *RESTClient) ListStacks(
 	setPagination(query, options.PerPage, options.Page)
 	path := fmt.Sprintf("repos/%s/%s/stacks", url.PathEscape(owner), url.PathEscape(repo))
 	var stacks []Stack
-	response, err := c.getJSON(ctx, class, path, query, etag, &stacks)
+	response, err := c.client.getJSON(ctx, class, path, query, etag, &stacks)
 	return stacks, response, err
 }
 
+// GetStack fetches one stack. A conditional 304 returns
+// (nil, response, nil); callers must inspect response.NotModified before
+// dereferencing the stack.
 func (c *RESTClient) GetStack(
 	ctx context.Context,
 	class budget.Class,
@@ -336,13 +359,14 @@ func (c *RESTClient) GetStack(
 		number,
 	)
 	var stack Stack
-	response, err := c.getJSON(ctx, class, path, nil, etag, &stack)
+	response, err := c.client.getJSON(ctx, class, path, nil, etag, &stack)
 	if err != nil || response.NotModified {
 		return nil, response, err
 	}
 	return &stack, response, nil
 }
 
+// ListPulls fetches one pull-request page.
 func (c *RESTClient) ListPulls(
 	ctx context.Context,
 	class budget.Class,
@@ -364,10 +388,13 @@ func (c *RESTClient) ListPulls(
 	setPagination(query, options.PerPage, options.Page)
 	path := fmt.Sprintf("repos/%s/%s/pulls", url.PathEscape(owner), url.PathEscape(repo))
 	var pulls []PullRequest
-	response, err := c.getJSON(ctx, class, path, query, etag, &pulls)
+	response, err := c.client.getJSON(ctx, class, path, query, etag, &pulls)
 	return pulls, response, err
 }
 
+// GetPull fetches one pull request. A conditional 304 returns
+// (nil, response, nil); callers must inspect response.NotModified before
+// dereferencing the pull request.
 func (c *RESTClient) GetPull(
 	ctx context.Context,
 	class budget.Class,
@@ -383,13 +410,14 @@ func (c *RESTClient) GetPull(
 		number,
 	)
 	var pull PullRequest
-	response, err := c.getJSON(ctx, class, path, nil, etag, &pull)
+	response, err := c.client.getJSON(ctx, class, path, nil, etag, &pull)
 	if err != nil || response.NotModified {
 		return nil, response, err
 	}
 	return &pull, response, nil
 }
 
+// ListCheckRuns fetches one checks page for a head SHA.
 func (c *RESTClient) ListCheckRuns(
 	ctx context.Context,
 	class budget.Class,
@@ -410,11 +438,11 @@ func (c *RESTClient) ListCheckRuns(
 	var payload struct {
 		CheckRuns []CheckRun `json:"check_runs"`
 	}
-	response, err := c.getJSON(ctx, class, path, query, etag, &payload)
+	response, err := c.client.getJSON(ctx, class, path, query, etag, &payload)
 	return payload.CheckRuns, response, err
 }
 
-func (c *RESTClient) getJSON(
+func (c client) getJSON(
 	ctx context.Context,
 	class budget.Class,
 	path string,
@@ -422,17 +450,17 @@ func (c *RESTClient) getJSON(
 	etag string,
 	target any,
 ) (*RESTResponse, error) {
-	req, err := c.client.request(ctx, http.MethodGet, path, query, nil)
+	req, err := c.request(ctx, http.MethodGet, path, query, nil)
 	if err != nil {
 		return nil, err
 	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
-	gated, err := c.client.gate.Do(
+	gated, err := c.gate.Do(
 		ctx,
 		class,
-		budget.NewRESTRequest(req).BeforeSend(c.client.authorize),
+		budget.NewRESTRequest(req).BeforeSend(c.authorize),
 	)
 	if err != nil {
 		if gated != nil {
@@ -445,11 +473,12 @@ func (c *RESTClient) getJSON(
 	if resp.StatusCode == http.StatusNotModified && responseETag == "" {
 		responseETag = req.Header.Get("If-None-Match")
 	}
+	nextPage, nextCursor := parseNextLink(resp.Header.Get("Link"))
 	meta := &RESTResponse{
 		StatusCode: resp.StatusCode,
 		ETag:       responseETag,
-		NextPage:   nextPage(resp.Header.Get("Link")),
-		NextCursor: nextCursor(resp.Header.Get("Link")),
+		NextPage:   nextPage,
+		NextCursor: nextCursor,
 	}
 	if resp.StatusCode == http.StatusNotModified {
 		resp.Body.Close()
@@ -475,7 +504,7 @@ func setPagination(query url.Values, perPage, page int) {
 	}
 }
 
-func nextPage(link string) int {
+func parseNextLink(link string) (int, string) {
 	for _, part := range strings.Split(link, ",") {
 		if !strings.Contains(part, `rel="next"`) {
 			continue
@@ -489,26 +518,9 @@ func nextPage(link string) int {
 		if err != nil {
 			continue
 		}
-		page, _ := strconv.Atoi(endpoint.Query().Get("page"))
-		return page
+		query := endpoint.Query()
+		page, _ := strconv.Atoi(query.Get("page"))
+		return page, query.Get("cursor")
 	}
-	return 0
-}
-
-func nextCursor(link string) string {
-	for _, part := range strings.Split(link, ",") {
-		if !strings.Contains(part, `rel="next"`) {
-			continue
-		}
-		start := strings.Index(part, "<")
-		end := strings.Index(part, ">")
-		if start < 0 || end <= start {
-			continue
-		}
-		endpoint, err := url.Parse(part[start+1 : end])
-		if err == nil {
-			return endpoint.Query().Get("cursor")
-		}
-	}
-	return ""
+	return 0, ""
 }

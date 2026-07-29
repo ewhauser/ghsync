@@ -191,6 +191,15 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestNewHandlerRejectsEmptyWebhookSecret(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("NewHandler accepted an empty webhook secret")
+		}
+	}()
+	NewHandler(&recordingInserter{}, "", 1024, time.Second)
+}
+
 func signedRequest(
 	t *testing.T,
 	body []byte,

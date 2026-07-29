@@ -23,6 +23,7 @@ import (
 )
 
 const (
+	// MaxDebounce is C-Q2's hard event-to-cache debounce ceiling.
 	MaxDebounce                    = 15 * time.Second
 	classificationRetryBaseBackoff = time.Second
 	classificationRetryMaxBackoff  = time.Minute

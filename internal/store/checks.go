@@ -8,12 +8,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/acme/frontier/internal/outbox"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
+// ChecksMetadata returns conditional-fetch metadata for one head SHA.
 func (w *EntityWriter) ChecksMetadata(
 	ctx context.Context,
 	repo string,
@@ -37,6 +36,8 @@ func (w *EntityWriter) ChecksMetadata(
 	}, nil
 }
 
+// ApplyChecksObserved conditionally replaces a head SHA's check runs while
+// holding its observation lock.
 func (w *EntityWriter) ApplyChecksObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -58,112 +59,103 @@ func (w *EntityWriter) ApplyChecksObserved(
 		return false, err
 	}
 	var applied bool
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			_ pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			checks.SyncedAt = databaseTime
-			repo, err := queries.GetRepoByGitHubID(ctx, checks.Repository.GitHubID)
-			if err != nil {
-				return fmt.Errorf("find checks repo: %w", err)
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, queries := entity.ctx, entity.queries
+		checks.SyncedAt = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(ctx, checks.Repository.GitHubID)
+		if err != nil {
+			return fmt.Errorf("find checks repo: %w", err)
+		}
+		for index := range checks.Runs {
+			if checks.Runs[index].SemanticVersion == "" {
+				checks.Runs[index].SemanticVersion =
+					checkSemanticVersion(checks.Runs[index])
 			}
-			for index := range checks.Runs {
-				if checks.Runs[index].SemanticVersion == "" {
-					checks.Runs[index].SemanticVersion =
-						checkSemanticVersion(checks.Runs[index])
-				}
-			}
-			encoded, err := json.Marshal(checks.Runs)
-			if err != nil {
-				return fmt.Errorf("encode check runs: %w", err)
-			}
-			changed, err := queries.ReplaceCheckRuns(
+		}
+		encoded, err := json.Marshal(checks.Runs)
+		if err != nil {
+			return fmt.Errorf("encode check runs: %w", err)
+		}
+		changed, err := queries.ReplaceCheckRuns(
+			ctx,
+			dbgen.ReplaceCheckRunsParams{
+				CheckRuns:     encoded,
+				RepoID:        repo.ID,
+				HeadSha:       checks.HeadSHA,
+				SyncedAt:      timestamp(checks.SyncedAt),
+				LastCheckedAt: timestamp(checks.SyncedAt),
+				Etag:          checks.ETag,
+				SyncSource:    string(checks.Source),
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("replace check runs: %w", err)
+		}
+		if err := queries.TouchCheckRunsCheckedAt(
+			ctx,
+			dbgen.TouchCheckRunsCheckedAtParams{
+				CheckedAt: timestamp(checks.SyncedAt),
+				Etag:      checks.ETag,
+				RepoID:    repo.ID,
+				HeadSha:   checks.HeadSHA,
+			},
+		); err != nil {
+			return fmt.Errorf("touch check runs: %w", err)
+		}
+		if err := queries.AppendAcceptedCheckHistory(
+			ctx,
+			dbgen.AppendAcceptedCheckHistoryParams{
+				RepoID:     repo.ID,
+				HeadSha:    checks.HeadSHA,
+				SyncedAt:   timestamp(checks.SyncedAt),
+				Etag:       checks.ETag,
+				SyncSource: string(checks.Source),
+				CheckRuns:  encoded,
+			},
+		); err != nil {
+			return fmt.Errorf("append accepted check history: %w", err)
+		}
+		if len(changed) > 0 {
+			scopes, err := queries.ListPRScopesByHeadSHA(
 				ctx,
-				dbgen.ReplaceCheckRunsParams{
-					CheckRuns:     encoded,
-					RepoID:        repo.ID,
-					HeadSha:       checks.HeadSHA,
-					SyncedAt:      timestamp(checks.SyncedAt),
-					LastCheckedAt: timestamp(checks.SyncedAt),
-					Etag:          checks.ETag,
-					SyncSource:    string(checks.Source),
+				dbgen.ListPRScopesByHeadSHAParams{
+					RepoGhID: checks.Repository.GitHubID,
+					HeadSha:  checks.HeadSHA,
 				},
 			)
 			if err != nil {
-				return fmt.Errorf("replace check runs: %w", err)
+				return fmt.Errorf("resolve check scopes: %w", err)
 			}
-			if err := queries.TouchCheckRunsCheckedAt(
-				ctx,
-				dbgen.TouchCheckRunsCheckedAtParams{
-					CheckedAt: timestamp(checks.SyncedAt),
-					Etag:      checks.ETag,
-					RepoID:    repo.ID,
-					HeadSha:   checks.HeadSHA,
-				},
-			); err != nil {
-				return fmt.Errorf("touch check runs: %w", err)
-			}
-			if err := queries.AppendAcceptedCheckHistory(
-				ctx,
-				dbgen.AppendAcceptedCheckHistoryParams{
-					RepoID:     repo.ID,
-					HeadSha:    checks.HeadSHA,
-					SyncedAt:   timestamp(checks.SyncedAt),
-					Etag:       checks.ETag,
-					SyncSource: string(checks.Source),
-					CheckRuns:  encoded,
-				},
-			); err != nil {
-				return fmt.Errorf("append accepted check history: %w", err)
-			}
-			if len(changed) > 0 {
-				scopes, err := queries.ListPRScopesByHeadSHA(
-					ctx,
-					dbgen.ListPRScopesByHeadSHAParams{
-						RepoGhID: checks.Repository.GitHubID,
-						HeadSha:  checks.HeadSHA,
-					},
+			scopeKeys := make([]string, 0, len(scopes))
+			for _, scope := range scopes {
+				repository := RepositoryRecord{
+					InstallationID: scope.InstallationID,
+					GitHubID:       scope.RepoGhID,
+				}
+				scopeKeys = append(
+					scopeKeys,
+					derivationScope(
+						repository,
+						int(scope.Number),
+						intPointer(scope.StackNumber),
+					),
 				)
-				if err != nil {
-					return fmt.Errorf("resolve check scopes: %w", err)
-				}
-				scopeKeys := make([]string, 0, len(scopes))
-				for _, scope := range scopes {
-					repository := RepositoryRecord{
-						InstallationID: scope.InstallationID,
-						GitHubID:       scope.RepoGhID,
-					}
-					scopeKeys = append(
-						scopeKeys,
-						derivationScope(
-							repository,
-							int(scope.Number),
-							intPointer(scope.StackNumber),
-						),
-					)
-				}
-				if err := w.markAndEmit(
-					ctx,
-					queries,
-					uniqueStrings(scopeKeys...),
-					outbox.ChecksChangedKind,
-					key,
-					checks.SyncedAt,
-				); err != nil {
-					return err
-				}
 			}
+			if err := w.markAndEmit(
+				ctx,
+				queries,
+				uniqueStrings(scopeKeys...),
+				outbox.ChecksChangedKind,
+				key,
+				checks.SyncedAt,
+			); err != nil {
+				return err
+			}
+		}
 
-			applied = len(changed) > 0
-			return nil
-		},
-	)
+		applied = len(changed) > 0
+		return nil
+	})
 	if err != nil {
 		return false, fmt.Errorf("apply checks: %w", err)
 	}
@@ -171,6 +163,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 	return applied, nil
 }
 
+// TouchChecks records a successful unchanged check-runs observation.
 func (w *EntityWriter) TouchChecks(
 	ctx context.Context,
 	observation *Observation,
@@ -185,38 +178,29 @@ func (w *EntityWriter) TouchChecks(
 	if err := requireObservation(observation, key); err != nil {
 		return err
 	}
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			_ pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			checkedAt = databaseTime
-			repo, err := queries.GetRepoByGitHubID(
-				ctx,
-				repository.GitHubID,
-			)
-			if err != nil {
-				return fmt.Errorf("find checks repository: %w", err)
-			}
-			if err := queries.TouchCheckRunsCheckedAt(
-				ctx,
-				dbgen.TouchCheckRunsCheckedAtParams{
-					CheckedAt: timestamp(checkedAt),
-					Etag:      etag,
-					RepoID:    repo.ID,
-					HeadSha:   headSHA,
-				},
-			); err != nil {
-				return fmt.Errorf("touch checks checked_at: %w", err)
-			}
-			return nil
-		},
-	)
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, queries := entity.ctx, entity.queries
+		checkedAt = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(
+			ctx,
+			repository.GitHubID,
+		)
+		if err != nil {
+			return fmt.Errorf("find checks repository: %w", err)
+		}
+		if err := queries.TouchCheckRunsCheckedAt(
+			ctx,
+			dbgen.TouchCheckRunsCheckedAtParams{
+				CheckedAt: timestamp(checkedAt),
+				Etag:      etag,
+				RepoID:    repo.ID,
+				HeadSha:   headSHA,
+			},
+		); err != nil {
+			return fmt.Errorf("touch checks checked_at: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("touch checks: %w", err)
 	}

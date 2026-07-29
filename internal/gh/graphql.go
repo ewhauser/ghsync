@@ -13,17 +13,22 @@ import (
 )
 
 const defaultGraphQLResponseBytes = 10 << 20
+
+// MaxPullRequestBatch is GitHub's nodes-per-gang cap used by the coordinator.
 const MaxPullRequestBatch = 25
 
+// GraphQLClient executes budget-gated installation GraphQL calls.
 type GraphQLClient struct {
 	client           client
 	maxResponseBytes int64
 }
 
+// GraphQLClientOptions bounds response buffering.
 type GraphQLClientOptions struct {
 	MaxResponseBytes int64
 }
 
+// NewGraphQLClient validates dependencies and constructs a GraphQL client.
 func NewGraphQLClient(
 	baseURL string,
 	gate budget.Doer,
@@ -44,6 +49,7 @@ func NewGraphQLClient(
 	}, nil
 }
 
+// GraphQLError is one GitHub GraphQL error entry.
 type GraphQLError struct {
 	Type       string         `json:"type"`
 	Message    string         `json:"message"`
@@ -51,8 +57,10 @@ type GraphQLError struct {
 	Extensions map[string]any `json:"extensions"`
 }
 
+// GraphQLErrors implements error for a non-empty GraphQL error list.
 type GraphQLErrors []GraphQLError
 
+// Error reports the first GraphQL error message.
 func (e GraphQLErrors) Error() string {
 	if len(e) == 0 {
 		return "GitHub GraphQL error"
@@ -60,6 +68,7 @@ func (e GraphQLErrors) Error() string {
 	return "GitHub GraphQL: " + e[0].Message
 }
 
+// GraphQLResponse carries authoritative point accounting and GraphQL errors.
 type GraphQLResponse struct {
 	RateLimit budget.GraphQLRate
 	Errors    []GraphQLError
@@ -93,11 +102,13 @@ type PullRequestNode struct {
 	} `json:"reviewThreads"`
 }
 
+// PageInfo is GraphQL connection pagination metadata.
 type PageInfo struct {
 	HasNextPage bool    `json:"hasNextPage"`
 	EndCursor   *string `json:"endCursor"`
 }
 
+// RepositoryNode is the cache-relevant repository GraphQL shape.
 type RepositoryNode struct {
 	ID               string    `json:"id"`
 	DatabaseID       int64     `json:"databaseId"`
@@ -116,6 +127,7 @@ type RepositoryNode struct {
 	} `json:"owner"`
 }
 
+// ReviewThreadNode is one review-thread connection node.
 type ReviewThreadNode struct {
 	ID         string `json:"id"`
 	IsResolved bool   `json:"isResolved"`
@@ -128,6 +140,7 @@ type ReviewThreadNode struct {
 	} `json:"comments"`
 }
 
+// ReviewCommentNode is one review-comment connection node.
 type ReviewCommentNode struct {
 	ID        string    `json:"id"`
 	Body      string    `json:"body"`

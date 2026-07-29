@@ -706,7 +706,7 @@ func TestTailRepeatedListenerTerminationReachesMaxBackoffAndRecovers(
 func TestTailPersistentListenerPoolExhaustionPollsThenRecovers(
 	t *testing.T,
 ) {
-	pool, clientPool := streamTestDatabaseWithClientPool(t, 1)
+	pool, clientPool := streamTestDatabaseWithClientPool(t, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	streamName := uniqueStreamName("listener-pool")
@@ -737,16 +737,28 @@ func TestTailPersistentListenerPoolExhaustionPollsThenRecovers(
 			context.Background(),
 			time.Second,
 		)
-		conn, err := clientPool.Acquire(acquireCtx)
-		stopAcquire()
-		if err != nil {
-			hookErr <- fmt.Errorf(
-				"occupy listener pool: %w",
-				err,
-			)
-			return
+		connections := make([]*pgxpool.Conn, 0, 2)
+		for range 2 {
+			conn, err := clientPool.Acquire(acquireCtx)
+			if err != nil {
+				stopAcquire()
+				for _, acquired := range connections {
+					acquired.Release()
+				}
+				hookErr <- fmt.Errorf(
+					"occupy listener pool: %w",
+					err,
+				)
+				return
+			}
+			connections = append(connections, conn)
 		}
-		time.AfterFunc(30*time.Millisecond, conn.Release)
+		stopAcquire()
+		time.AfterFunc(30*time.Millisecond, func() {
+			for _, conn := range connections {
+				conn.Release()
+			}
+		})
 	}
 	client.testHooks.listenerRetry = func(
 		err error,
@@ -930,6 +942,271 @@ func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
 	}
 	if count := tableCount(t, pool, table); count != len(sequences) {
 		t.Fatalf("committed applications = %d, want %d", count, len(sequences))
+	}
+}
+
+func TestBootstrapTailOverlapConvergesWithoutLostOrDoubleAppliedEffect(
+	t *testing.T,
+) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("bootstrap-overlap")
+	consumer := uniqueStreamName("consumer")
+	identity := uniqueStreamName("work-item")
+	client := newTestClient(t, pool, 10)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+
+	// Publish W before the state/event transaction commits. Bootstrap will
+	// subsequently read the stale W while its later cache read sees the state
+	// associated with seq > W: the documented at-least-once overlap.
+	published, err := watermarker.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	projection := testTableName("overlap_projection")
+	applied := testTableName("overlap_applied")
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (
+		    identity_key text PRIMARY KEY,
+		    payload jsonb NOT NULL
+		);
+		CREATE TABLE %s (seq bigint PRIMARY KEY);
+	`, projection, applied)); err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Exec(
+		context.Background(),
+		"DROP TABLE "+projection+", "+applied,
+	) //nolint:errcheck
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO work_items (
+		    scope_key, identity_key, org_id, payload, updated_at
+		)
+		VALUES ($1, $2, 1, '{"state":"overlap"}', clock_timestamp())
+	`, "pr:1:1:1", identity); err != nil {
+		t.Fatal(err)
+	}
+	overlapSeq := insertTestEvent(
+		t,
+		ctx,
+		tx,
+		streamName,
+		identity,
+		time.Now(),
+	)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if overlapSeq <= published.SafeSeq {
+		t.Fatalf(
+			"overlap seq = %d, want greater than published W %d",
+			overlapSeq,
+			published.SafeSeq,
+		)
+	}
+
+	snapshot, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close() //nolint:errcheck
+	if snapshot.SafeSeq != published.SafeSeq {
+		t.Fatalf(
+			"Bootstrap SafeSeq = %d, want published W %d",
+			snapshot.SafeSeq,
+			published.SafeSeq,
+		)
+	}
+	if _, err := snapshot.Tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s (identity_key, payload)
+		SELECT identity_key, payload
+		FROM work_items
+		WHERE identity_key = $1
+	`, projection), identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count := tableCount(t, pool, projection); count != 1 {
+		t.Fatalf("snapshot projection rows = %d, want 1", count)
+	}
+	if cursor := readCursor(t, pool, consumer, streamName); cursor !=
+		published.SafeSeq {
+		t.Fatalf(
+			"cursor after overlap Bootstrap = %d, want W %d",
+			cursor,
+			published.SafeSeq,
+		)
+	}
+
+	advanceThrough(t, ctx, watermarker, overlapSeq)
+	var handled atomic.Int32
+	tailCtx, stopTail := context.WithCancel(ctx)
+	tailErr := make(chan error, 1)
+	go func() {
+		tailErr <- client.Tail(
+			tailCtx,
+			consumer,
+			streamName,
+			func(ctx context.Context, tx pgx.Tx, event Event) error {
+				handled.Add(1)
+				if _, err := tx.Exec(
+					ctx,
+					"INSERT INTO "+applied+" (seq) VALUES ($1)",
+					event.Seq,
+				); err != nil {
+					return err
+				}
+				_, err := tx.Exec(ctx, fmt.Sprintf(`
+					INSERT INTO %s (identity_key, payload)
+					SELECT identity_key, payload
+					FROM work_items
+					WHERE identity_key = $1
+					ON CONFLICT (identity_key) DO UPDATE
+					SET payload = EXCLUDED.payload
+				`, projection), event.EntityKey)
+				return err
+			},
+		)
+	}()
+	waitForCursor(t, pool, consumer, streamName, overlapSeq)
+	stopTail()
+	if err := <-tailErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("overlap Tail exit = %v", err)
+	}
+	if got := handled.Load(); got != 1 {
+		t.Fatalf("overlap event handler calls = %d, want 1", got)
+	}
+	if count := tableCount(t, pool, applied); count != 1 {
+		t.Fatalf("applied overlap sequences = %d, want 1", count)
+	}
+	if count := tableCount(t, pool, projection); count != 1 {
+		t.Fatalf(
+			"stable-key projection rows = %d, want no duplicate effect",
+			count,
+		)
+	}
+	var payload string
+	if err := pool.QueryRow(
+		ctx,
+		"SELECT payload::text FROM "+projection+" WHERE identity_key = $1",
+		identity,
+	).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload, `"state": "overlap"`) {
+		t.Fatalf("projection payload = %s, want overlap state", payload)
+	}
+}
+
+func TestConcurrentTailersReturnTypedCursorContention(t *testing.T) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("cursor-contention")
+	consumer := uniqueStreamName("consumer")
+	first := newTestClient(t, pool, 10)
+	second := newTestClient(t, pool, 10)
+	snapshot, err := first.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	seq := insertCommittedEvent(
+		t, ctx, pool, streamName, "contended", time.Now(),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	advanceThrough(t, ctx, watermarker, seq)
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	firstCtx, stopFirst := context.WithCancel(ctx)
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- first.Tail(
+			firstCtx,
+			consumer,
+			streamName,
+			func(context.Context, pgx.Tx, Event) error {
+				firstOnce.Do(func() { close(firstEntered) })
+				<-releaseFirst
+				return nil
+			},
+		)
+	}()
+	<-firstEntered
+
+	secondStarted := make(chan struct{})
+	var secondOnce sync.Once
+	second.testHooks.afterEnsureCursor = func() {
+		secondOnce.Do(func() { close(secondStarted) })
+	}
+	secondErr := make(chan error, 1)
+	go func() {
+		secondErr <- second.Tail(
+			ctx,
+			consumer,
+			streamName,
+			func(context.Context, pgx.Tx, Event) error {
+				return errors.New("second tailer handled an event")
+			},
+		)
+	}()
+	<-secondStarted
+	waitForBlockedCursorLock(t, pool)
+	close(releaseFirst)
+
+	select {
+	case err := <-secondErr:
+		var contention *ErrCursorContention
+		if !errors.As(err, &contention) {
+			t.Fatalf(
+				"second Tail error = %T %v, want *ErrCursorContention",
+				err,
+				err,
+			)
+		}
+		if contention.Consumer != consumer ||
+			contention.Stream != streamName {
+			t.Fatalf(
+				"contention = %q/%q, want %q/%q",
+				contention.Consumer,
+				contention.Stream,
+				consumer,
+				streamName,
+			)
+		}
+		if !IsRetryable(err) {
+			t.Fatalf("typed contention is not retryable: %v", err)
+		}
+		var postgresError *pgconn.PgError
+		if !errors.As(err, &postgresError) ||
+			postgresError.Code != "40001" {
+			t.Fatalf(
+				"contention cause = %#v, want PostgreSQL 40001",
+				postgresError,
+			)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	waitForCursor(t, pool, consumer, streamName, seq)
+	stopFirst()
+	if err := <-firstErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Tail exit = %v", err)
 	}
 }
 
@@ -1256,6 +1533,34 @@ func waitForCursor(
 	)
 }
 
+func waitForBlockedCursorLock(
+	t *testing.T,
+	pool *pgxpool.Pool,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var blocked bool
+		if err := pool.QueryRow(context.Background(), `
+			SELECT EXISTS (
+			    SELECT 1
+			    FROM pg_stat_activity
+			    WHERE pid <> pg_backend_pid()
+			      AND datname = current_database()
+			      AND wait_event_type = 'Lock'
+			      AND query LIKE '%FROM consumer_cursors%'
+			)
+		`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("second Tail did not block on the consumer cursor row")
+}
+
 func tableCount(t *testing.T, pool *pgxpool.Pool, table string) int {
 	t.Helper()
 	var count int
@@ -1282,6 +1587,40 @@ func streamTestDatabase(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(database.Close)
 	return database.Pool
+}
+
+func streamTestDatabaseWithClientPool(
+	t *testing.T,
+	maxConns int32,
+) (*pgxpool.Pool, *pgxpool.Pool) {
+	t.Helper()
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, err := testdb.Open(ctx, url, "streamclientpool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+
+	config, err := pgxpool.ParseConfig(database.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.MaxConns = maxConns
+	config.MinConns = 0
+	clientPool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(clientPool.Close)
+	if err := clientPool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return database.Pool, clientPool
 }
 
 func uniqueStreamName(prefix string) string {

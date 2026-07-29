@@ -14,6 +14,7 @@ import (
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
+// StackMetadata returns conditional-fetch metadata for one stack.
 func (w *EntityWriter) StackMetadata(
 	ctx context.Context,
 	repo string,
@@ -38,6 +39,7 @@ func (w *EntityWriter) StackMetadata(
 	}, nil
 }
 
+// ApplyStack conditionally applies a direct stack observation.
 func (w *EntityWriter) ApplyStack(
 	ctx context.Context,
 	stack StackRecord,
@@ -45,6 +47,8 @@ func (w *EntityWriter) ApplyStack(
 	return w.applyStack(ctx, nil, stack, nil)
 }
 
+// ApplyStackObserved conditionally applies a stack while holding its
+// observation lock.
 func (w *EntityWriter) ApplyStackObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -91,128 +95,119 @@ func (w *EntityWriter) applyStack(
 		stack.Number,
 	)
 	var result ApplyStackResult
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			tx pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			stack.SyncedAt = databaseTime
-			repo, err := queries.GetRepoByGitHubID(ctx, stack.Repository.GitHubID)
-			if err != nil {
-				return fmt.Errorf("find stack repository: %w", err)
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, tx, queries := entity.ctx, entity.tx, entity.queries
+		stack.SyncedAt = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(ctx, stack.Repository.GitHubID)
+		if err != nil {
+			return fmt.Errorf("find stack repository: %w", err)
+		}
+		var oldEntries []StackEntry
+		old, oldErr := queries.GetStackByIdentity(
+			ctx,
+			dbgen.GetStackByIdentityParams{
+				RepoGhID:    stack.Repository.GitHubID,
+				StackNumber: int32(stack.Number),
+			},
+		)
+		if oldErr == nil {
+			if err := json.Unmarshal(old.Entries, &oldEntries); err != nil {
+				return fmt.Errorf("decode cached stack entries: %w", err)
 			}
-			var oldEntries []StackEntry
-			old, oldErr := queries.GetStackByIdentity(
-				ctx,
-				dbgen.GetStackByIdentityParams{
-					RepoGhID:    stack.Repository.GitHubID,
-					StackNumber: int32(stack.Number),
-				},
-			)
-			if oldErr == nil {
-				if err := json.Unmarshal(old.Entries, &oldEntries); err != nil {
-					return fmt.Errorf("decode cached stack entries: %w", err)
+		} else if !errors.Is(oldErr, pgx.ErrNoRows) {
+			return fmt.Errorf("read prior stack: %w", oldErr)
+		}
+		entries, err := json.Marshal(stack.Entries)
+		if err != nil {
+			return fmt.Errorf("encode stack entries: %w", err)
+		}
+		_, upsertErr := queries.UpsertStackWriteIfNewer(
+			ctx,
+			dbgen.UpsertStackWriteIfNewerParams{
+				RepoID:               repo.ID,
+				GhID:                 nullableInt8(stack.GitHubID),
+				NodeID:               stack.NodeID,
+				StackNumber:          int32(stack.Number),
+				BaseRef:              stack.BaseRef,
+				BaseSha:              stack.BaseSHA,
+				Open:                 stack.Open,
+				Entries:              entries,
+				GhUpdatedAt:          timestamp(stack.GitHubUpdatedAt),
+				HeadSha:              stackHeadSHA(stack.Entries, stack.BaseSHA),
+				SyncedAt:             timestamp(stack.SyncedAt),
+				LastCheckedAt:        timestamp(stack.SyncedAt),
+				Etag:                 stack.ETag,
+				SyncSource:           string(stack.Source),
+				DisplayWindowSeconds: int32(displayWindow / time.Second),
+			},
+		)
+		if upsertErr != nil && !errors.Is(upsertErr, pgx.ErrNoRows) {
+			return fmt.Errorf("upsert stack: %w", upsertErr)
+		}
+		if err := queries.TouchStackCheckedAt(
+			ctx,
+			dbgen.TouchStackCheckedAtParams{
+				CheckedAt:   timestamp(stack.SyncedAt),
+				RepoID:      repo.ID,
+				StackNumber: int32(stack.Number),
+				Etag:        stack.ETag,
+			},
+		); err != nil {
+			return fmt.Errorf("touch stack: %w", err)
+		}
+		result = ApplyStackResult{}
+		if upsertErr == nil {
+			result = stackMembershipDiff(oldEntries, stack.Entries)
+			result.Applied = true
+			candidates := uniqueInts(append(
+				append(append([]int(nil), result.JoinedPRs...), result.LeftPRs...),
+				result.MovedPRs...,
+			)...)
+			if len(candidates) > 0 {
+				numbers := make([]int32, 0, len(candidates))
+				for _, number := range candidates {
+					numbers = append(numbers, int32(number))
 				}
-			} else if !errors.Is(oldErr, pgx.ErrNoRows) {
-				return fmt.Errorf("read prior stack: %w", oldErr)
-			}
-			entries, err := json.Marshal(stack.Entries)
-			if err != nil {
-				return fmt.Errorf("encode stack entries: %w", err)
-			}
-			_, upsertErr := queries.UpsertStackWriteIfNewer(
-				ctx,
-				dbgen.UpsertStackWriteIfNewerParams{
-					RepoID:               repo.ID,
-					GhID:                 nullableInt8(stack.GitHubID),
-					NodeID:               stack.NodeID,
-					StackNumber:          int32(stack.Number),
-					BaseRef:              stack.BaseRef,
-					BaseSha:              stack.BaseSHA,
-					Open:                 stack.Open,
-					Entries:              entries,
-					GhUpdatedAt:          timestamp(stack.GitHubUpdatedAt),
-					HeadSha:              stackHeadSHA(stack.Entries, stack.BaseSHA),
-					SyncedAt:             timestamp(stack.SyncedAt),
-					LastCheckedAt:        timestamp(stack.SyncedAt),
-					Etag:                 stack.ETag,
-					SyncSource:           string(stack.Source),
-					DisplayWindowSeconds: int32(displayWindow / time.Second),
-				},
-			)
-			if upsertErr != nil && !errors.Is(upsertErr, pgx.ErrNoRows) {
-				return fmt.Errorf("upsert stack: %w", upsertErr)
-			}
-			if err := queries.TouchStackCheckedAt(
-				ctx,
-				dbgen.TouchStackCheckedAtParams{
-					CheckedAt:   timestamp(stack.SyncedAt),
-					RepoID:      repo.ID,
-					StackNumber: int32(stack.Number),
-					Etag:        stack.ETag,
-				},
-			); err != nil {
-				return fmt.Errorf("touch stack: %w", err)
-			}
-			result = ApplyStackResult{}
-			if upsertErr == nil {
-				result = stackMembershipDiff(oldEntries, stack.Entries)
-				result.Applied = true
-				candidates := uniqueInts(append(
-					append(append([]int(nil), result.JoinedPRs...), result.LeftPRs...),
-					result.MovedPRs...,
-				)...)
-				if len(candidates) > 0 {
-					numbers := make([]int32, 0, len(candidates))
-					for _, number := range candidates {
-						numbers = append(numbers, int32(number))
-					}
-					memberships, err := queries.ListCachedPRMemberships(
-						ctx,
-						dbgen.ListCachedPRMembershipsParams{
-							RepoID:    repo.ID,
-							PrNumbers: numbers,
-						},
+				memberships, err := queries.ListCachedPRMemberships(
+					ctx,
+					dbgen.ListCachedPRMembershipsParams{
+						RepoID:    repo.ID,
+						PrNumbers: numbers,
+					},
+				)
+				if err != nil {
+					return fmt.Errorf(
+						"read prior PR memberships: %w", err,
 					)
-					if err != nil {
-						return fmt.Errorf(
-							"read prior PR memberships: %w", err,
-						)
-					}
-					result.PriorStackByPR = make(map[int]int)
-					for _, membership := range memberships {
-						if membership.StackNumber.Valid &&
-							int(membership.StackNumber.Int32) != stack.Number {
-							result.PriorStackByPR[int(membership.Number)] =
-								int(membership.StackNumber.Int32)
-						}
-					}
 				}
-				if err := w.markAndEmit(
-					ctx, queries, []string{key}, outbox.StackChangedKind, key, stack.SyncedAt,
-				); err != nil {
-					return err
-				}
-			}
-			if hook != nil {
-				if txHook := hook(result); txHook != nil {
-					if err := txHook(ctx, tx); err != nil {
-						return fmt.Errorf(
-							"run stack transaction hook: %w",
-							err,
-						)
+				result.PriorStackByPR = make(map[int]int)
+				for _, membership := range memberships {
+					if membership.StackNumber.Valid &&
+						int(membership.StackNumber.Int32) != stack.Number {
+						result.PriorStackByPR[int(membership.Number)] =
+							int(membership.StackNumber.Int32)
 					}
 				}
 			}
+			if err := w.markAndEmit(
+				ctx, queries, []string{key}, outbox.StackChangedKind, key, stack.SyncedAt,
+			); err != nil {
+				return err
+			}
+		}
+		if hook != nil {
+			if txHook := hook(result); txHook != nil {
+				if err := txHook(ctx, tx); err != nil {
+					return fmt.Errorf(
+						"run stack transaction hook: %w",
+						err,
+					)
+				}
+			}
+		}
 
-			return nil
-		},
-	)
+		return nil
+	})
 	if err != nil {
 		return ApplyStackResult{}, fmt.Errorf("apply stack: %w", err)
 	}
@@ -220,6 +215,7 @@ func (w *EntityWriter) applyStack(
 	return result, nil
 }
 
+// TouchStack records a successful unchanged stack observation.
 func (w *EntityWriter) TouchStack(
 	ctx context.Context,
 	observation *Observation,
@@ -234,44 +230,37 @@ func (w *EntityWriter) TouchStack(
 	if err := requireObservation(observation, key); err != nil {
 		return err
 	}
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			_ pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			checkedAt = databaseTime
-			repo, err := queries.GetRepoByGitHubID(
-				ctx,
-				repository.GitHubID,
-			)
-			if err != nil {
-				return fmt.Errorf("find stack repository: %w", err)
-			}
-			if err := queries.TouchStackCheckedAt(
-				ctx,
-				dbgen.TouchStackCheckedAtParams{
-					CheckedAt:   timestamp(checkedAt),
-					RepoID:      repo.ID,
-					StackNumber: int32(number),
-					Etag:        etag,
-				},
-			); err != nil {
-				return fmt.Errorf("touch stack checked_at: %w", err)
-			}
-			return nil
-		},
-	)
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, queries := entity.ctx, entity.queries
+		checkedAt = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(
+			ctx,
+			repository.GitHubID,
+		)
+		if err != nil {
+			return fmt.Errorf("find stack repository: %w", err)
+		}
+		if err := queries.TouchStackCheckedAt(
+			ctx,
+			dbgen.TouchStackCheckedAtParams{
+				CheckedAt:   timestamp(checkedAt),
+				RepoID:      repo.ID,
+				StackNumber: int32(number),
+				Etag:        etag,
+			},
+		); err != nil {
+			return fmt.Errorf("touch stack checked_at: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("touch stack: %w", err)
 	}
 	return nil
 }
 
+// TombstoneStackObserved conditionally tombstones a stack while holding its
+// observation lock.
 func (w *EntityWriter) TombstoneStackObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -291,80 +280,71 @@ func (w *EntityWriter) TombstoneStackObserved(
 		return ApplyStackResult{}, err
 	}
 	var result ApplyStackResult
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			tx pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			at = databaseTime
-			repo, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
-			if err != nil {
-				return fmt.Errorf("find tombstone repo: %w", err)
-			}
-			old, err := queries.GetStackByIdentity(
-				ctx,
-				dbgen.GetStackByIdentityParams{
-					RepoGhID:    repository.GitHubID,
-					StackNumber: int32(number),
-				},
-			)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
-			if err != nil {
-				return fmt.Errorf("read tombstoned stack: %w", err)
-			}
-			var entries []StackEntry
-			if err := json.Unmarshal(old.Entries, &entries); err != nil {
-				return fmt.Errorf(
-					"decode tombstoned stack entries: %w", err,
-				)
-			}
-			_, tombstoneErr := queries.TombstoneStack(
-				ctx,
-				dbgen.TombstoneStackParams{
-					TombstonedAt: timestamp(at),
-					SyncedAt:     timestamp(at),
-					SyncSource:   string(source),
-					RepoID:       repo.ID,
-					StackNumber:  int32(number),
-				},
-			)
-			if tombstoneErr != nil && !errors.Is(tombstoneErr, pgx.ErrNoRows) {
-				return fmt.Errorf("tombstone stack: %w", tombstoneErr)
-			}
-			result = ApplyStackResult{}
-			if tombstoneErr == nil {
-				result = ApplyStackResult{
-					Applied:  true,
-					LeftPRs:  entryNumbers(entries),
-					MovedPRs: nil,
-				}
-				if err := w.markAndEmit(
-					ctx, queries, []string{key}, outbox.StackTombstonedKind, key, at,
-				); err != nil {
-					return err
-				}
-			}
-			if hook != nil {
-				if txHook := hook(result); txHook != nil {
-					if err := txHook(ctx, tx); err != nil {
-						return fmt.Errorf(
-							"run stack tombstone hook: %w",
-							err,
-						)
-					}
-				}
-			}
-
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, tx, queries := entity.ctx, entity.tx, entity.queries
+		at = entity.databaseTime
+		repo, err := queries.GetRepoByGitHubID(ctx, repository.GitHubID)
+		if err != nil {
+			return fmt.Errorf("find tombstone repo: %w", err)
+		}
+		old, err := queries.GetStackByIdentity(
+			ctx,
+			dbgen.GetStackByIdentityParams{
+				RepoGhID:    repository.GitHubID,
+				StackNumber: int32(number),
+			},
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
-		},
-	)
+		}
+		if err != nil {
+			return fmt.Errorf("read tombstoned stack: %w", err)
+		}
+		var entries []StackEntry
+		if err := json.Unmarshal(old.Entries, &entries); err != nil {
+			return fmt.Errorf(
+				"decode tombstoned stack entries: %w", err,
+			)
+		}
+		_, tombstoneErr := queries.TombstoneStack(
+			ctx,
+			dbgen.TombstoneStackParams{
+				TombstonedAt: timestamp(at),
+				SyncedAt:     timestamp(at),
+				SyncSource:   string(source),
+				RepoID:       repo.ID,
+				StackNumber:  int32(number),
+			},
+		)
+		if tombstoneErr != nil && !errors.Is(tombstoneErr, pgx.ErrNoRows) {
+			return fmt.Errorf("tombstone stack: %w", tombstoneErr)
+		}
+		result = ApplyStackResult{}
+		if tombstoneErr == nil {
+			result = ApplyStackResult{
+				Applied:  true,
+				LeftPRs:  entryNumbers(entries),
+				MovedPRs: nil,
+			}
+			if err := w.markAndEmit(
+				ctx, queries, []string{key}, outbox.StackTombstonedKind, key, at,
+			); err != nil {
+				return err
+			}
+		}
+		if hook != nil {
+			if txHook := hook(result); txHook != nil {
+				if err := txHook(ctx, tx); err != nil {
+					return fmt.Errorf(
+						"run stack tombstone hook: %w",
+						err,
+					)
+				}
+			}
+		}
+
+		return nil
+	})
 	if err != nil {
 		return ApplyStackResult{}, fmt.Errorf("tombstone stack: %w", err)
 	}

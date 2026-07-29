@@ -195,25 +195,30 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 	reportedStarvation := false
 	var admitted *admission
 	for {
-		wait, waitUntil, changed, starvation, next, err := g.tryAdmit(
+		decision := g.tryAdmit(
 			ctx,
 			class,
 			req.resource,
 		)
-		if err != nil {
-			return nil, err
+		if decision.err != nil {
+			return nil, decision.err
 		}
-		if !wait {
-			admitted = next
+		if !decision.wait {
+			admitted = decision.admitted
 			break
 		}
-		if starvation != nil && !reportedStarvation {
+		if decision.starvation != nil && !reportedStarvation {
 			reportedStarvation = true
 			if g.onStarvation != nil {
-				g.onStarvation(*starvation)
+				g.onStarvation(*decision.starvation)
 			}
 		}
-		if err := waitForChange(ctx, g.clock, changed, waitUntil); err != nil {
+		if err := waitForChange(
+			ctx,
+			g.clock,
+			decision.changed,
+			decision.waitUntil,
+		); err != nil {
 			return nil, err
 		}
 	}
@@ -332,11 +337,20 @@ func usableBody(resp *http.Response) bool {
 	return resp != nil && resp.Body != nil && resp.Body != http.NoBody
 }
 
+type admissionDecision struct {
+	wait       bool
+	waitUntil  time.Time
+	changed    <-chan struct{}
+	starvation *Starvation
+	admitted   *admission
+	err        error
+}
+
 func (g *Gate) tryAdmit(
 	ctx context.Context,
 	class Class,
 	resource Resource,
-) (bool, time.Time, <-chan struct{}, *Starvation, *admission, error) {
+) admissionDecision {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -350,14 +364,18 @@ func (g *Gate) tryAdmit(
 		g.signalLocked()
 	}
 	if g.unavailable != nil {
-		return false, time.Time{}, nil, nil, nil, g.unavailable
+		return admissionDecision{err: g.unavailable}
 	}
 	if now.Before(g.backoffUntil) {
-		return true, g.backoffUntil, g.changed, nil, nil, nil
+		return admissionDecision{
+			wait:      true,
+			waitUntil: g.backoffUntil,
+			changed:   g.changed,
+		}
 	}
 	if g.inFlight >= g.maxConcurrent {
 		// A zero deadline means "wait for a state-change notification".
-		return true, time.Time{}, g.changed, nil, nil, nil
+		return admissionDecision{wait: true, changed: g.changed}
 	}
 
 	cost := g.estimateLocked(resource)
@@ -368,13 +386,19 @@ func (g *Gate) tryAdmit(
 			floor := g.floorFor(class)
 			floorRemaining := int64(math.Ceil(float64(state.Limit) * floor))
 			if afterReservation < 0 || (floor > 0 && afterReservation < floorRemaining) {
-				return true, state.ResetAt, g.changed, &Starvation{
-					Class:     class,
-					Resource:  resource,
-					Remaining: state.Remaining - g.reservedLocked(resource),
-					Limit:     state.Limit,
-					ResetAt:   state.ResetAt,
-				}, nil, nil
+				return admissionDecision{
+					wait:      true,
+					waitUntil: state.ResetAt,
+					changed:   g.changed,
+					starvation: &Starvation{
+						Class:    class,
+						Resource: resource,
+						Remaining: state.Remaining -
+							g.reservedLocked(resource),
+						Limit:   state.Limit,
+						ResetAt: state.ResetAt,
+					},
+				}
 			}
 		}
 	}
@@ -392,7 +416,7 @@ func (g *Gate) tryAdmit(
 	g.inFlight++
 	g.addReservationLocked(resource, cost)
 	g.admissions[entry.id] = entry
-	return false, time.Time{}, nil, nil, entry, nil
+	return admissionDecision{admitted: entry}
 }
 
 func waitForChange(

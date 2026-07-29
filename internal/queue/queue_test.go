@@ -15,6 +15,22 @@ import (
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
+type noopArgs struct{}
+
+func (noopArgs) Kind() string { return "noop" }
+
+type noopWorker struct {
+	river.WorkerDefaults[noopArgs]
+}
+
+func (*noopWorker) Work(context.Context, *river.Job[noopArgs]) error {
+	return nil
+}
+
+func registerNoopWorker(workers *river.Workers) {
+	river.AddWorker(workers, &noopWorker{})
+}
+
 func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -32,7 +48,7 @@ func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	client, err := NewClient(pool)
+	client, err := NewClient(pool, WithWorkerRegistrar(registerNoopWorker))
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -56,7 +72,7 @@ func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 
 	jobIDs := make(map[int64]string, 3)
 	for _, queueName := range []string{QueueInteractive, QueueEvent, QueueSweep} {
-		result, err := client.Insert(ctx, NoopArgs{}, &river.InsertOpts{Queue: queueName})
+		result, err := client.Insert(ctx, noopArgs{}, &river.InsertOpts{Queue: queueName})
 		if err != nil {
 			t.Fatalf("insert %s job: %v", queueName, err)
 		}
@@ -111,13 +127,14 @@ func TestExplicitQueueSelectionDoesNotPollUnownedQueues(t *testing.T) {
 		pool,
 		WithQueues(QueueDrift),
 		WithoutRefreshWorkers(),
+		WithWorkerRegistrar(registerNoopWorker),
 	)
 	if err != nil {
 		t.Fatalf("new isolated client: %v", err)
 	}
 	owned, err := client.Insert(
 		ctx,
-		NoopArgs{},
+		noopArgs{},
 		&river.InsertOpts{Queue: QueueDrift},
 	)
 	if err != nil {
@@ -125,7 +142,7 @@ func TestExplicitQueueSelectionDoesNotPollUnownedQueues(t *testing.T) {
 	}
 	unowned, err := client.Insert(
 		ctx,
-		NoopArgs{},
+		noopArgs{},
 		&river.InsertOpts{Queue: QueueSweep},
 	)
 	if err != nil {

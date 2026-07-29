@@ -13,9 +13,12 @@ import (
 type Class string
 
 const (
+	// Interactive is user-requested work and has no reserved-floor deduction.
 	Interactive Class = "interactive"
-	Event       Class = "event"
-	Sweep       Class = "sweep"
+	// Event is webhook-originated work protected from sweep exhaustion.
+	Event Class = "event"
+	// Sweep is background reconciliation work.
+	Sweep Class = "sweep"
 )
 
 func (c Class) valid() bool {
@@ -26,7 +29,9 @@ func (c Class) valid() bool {
 type Resource string
 
 const (
-	REST    Resource = "rest"
+	// REST is GitHub's installation REST request budget.
+	REST Resource = "rest"
+	// GraphQL is GitHub's installation GraphQL point budget.
 	GraphQL Resource = "graphql"
 
 	// Auth is the App-JWT installation-token exchange. It passes through the
@@ -62,10 +67,12 @@ type Request struct {
 	beforeSend  func(context.Context, *http.Request) error
 }
 
+// NewRESTRequest wraps one REST request for admission.
 func NewRESTRequest(req *http.Request) *Request {
 	return &Request{httpRequest: req, resource: REST}
 }
 
+// NewGraphQLRequest wraps one GraphQL request and its rate observer.
 func NewGraphQLRequest(req *http.Request, observer GraphQLRateObserver) *Request {
 	return &Request{
 		httpRequest: req,
@@ -74,6 +81,7 @@ func NewGraphQLRequest(req *http.Request, observer GraphQLRateObserver) *Request
 	}
 }
 
+// NewAuthRequest wraps one App-JWT installation-token exchange.
 func NewAuthRequest(req *http.Request) *Request {
 	return &Request{httpRequest: req, resource: Auth}
 }
@@ -148,6 +156,8 @@ type RequestObservation struct {
 type RequestHook func(RequestObservation)
 
 var (
-	ErrClosed    = fmt.Errorf("GitHub budget gate is closed")
+	// ErrClosed reports admission attempted after Gate.Close.
+	ErrClosed = fmt.Errorf("GitHub budget gate is closed")
+	// ErrLeaseLost reports proven loss or expiry of the budget lease.
 	ErrLeaseLost = fmt.Errorf("GitHub budget gate lease lost")
 )

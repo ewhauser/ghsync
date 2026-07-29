@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,22 @@ func TestNewEnforcesDebounceHardCap(t *testing.T) {
 	base.Debounce = MaxDebounce + time.Nanosecond
 	if _, err := New(pool, riverClient, base); err == nil {
 		t.Fatal("debounce above hard cap accepted")
+	}
+}
+
+func TestNewRejectsEmptyClassifier(t *testing.T) {
+	_, err := New(
+		new(pgxpool.Pool),
+		new(river.Client[pgx.Tx]),
+		Config{
+			BatchSize:    1,
+			MaxAttempts:  1,
+			Debounce:     time.Millisecond,
+			PollInterval: time.Millisecond,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "classifier") {
+		t.Fatalf("empty classifier error = %v", err)
 	}
 }
 

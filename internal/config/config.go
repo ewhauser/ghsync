@@ -57,6 +57,7 @@ const (
 	defaultDeriverDirtyCap       = 500
 )
 
+// Config is frontier-syncd's validated environment-derived runtime surface.
 type Config struct {
 	// DatabaseURL is the Postgres connection string (DATABASE_URL).
 	DatabaseURL string
@@ -129,35 +130,52 @@ type Config struct {
 	SweepRepositoryListPeriod  time.Duration
 	SweepPageSize              int
 
+	// GapHealPeriod controls delivery-gap scan scheduling.
 	GapHealPeriod time.Duration
-	GapWindow     time.Duration
-	GapPageSize   int
-	GapMaxPages   int
+	// GapWindow is the delivery history inspected by one healing run.
+	GapWindow time.Duration
+	// GapPageSize and GapMaxPages bound deliveries API work per run.
+	GapPageSize int
+	GapMaxPages int
 
-	DriftPeriod     time.Duration
+	// DriftPeriod controls semantic-drift scan scheduling.
+	DriftPeriod time.Duration
+	// DriftSampleSize bounds entities sampled per scan.
 	DriftSampleSize int
 	// DriftPageSize independently bounds drift pagination
 	// (DRIFT_PAGE_SIZE).
-	DriftPageSize          int
+	DriftPageSize int
+	// DriftResolvedRetention controls resolved-finding retention.
 	DriftResolvedRetention time.Duration
 
-	RetentionPeriod    time.Duration
-	RetentionAge       time.Duration
+	// RetentionPeriod controls bulky webhook/check-history pruning.
+	RetentionPeriod time.Duration
+	// RetentionAge is the minimum retained age.
+	RetentionAge time.Duration
+	// RetentionBatchSize bounds deletes per transaction.
 	RetentionBatchSize int
 
 	// M5 C-S/C-D maintenance settings.
-	WatermarkRefresh  time.Duration
+	// WatermarkRefresh controls leader step cadence.
+	WatermarkRefresh time.Duration
+	// WatermarkLeaseTTL bounds standby takeover time.
 	WatermarkLeaseTTL time.Duration
 	// WatermarkFenceTimeout bounds the exclusive writer-fence wait
 	// (STREAM_WATERMARK_FENCE_LOCK_TIMEOUT).
 	WatermarkFenceTimeout time.Duration
+	// StreamRetentionPeriod controls change-event pruning.
 	StreamRetentionPeriod time.Duration
-	StreamRetentionAge    time.Duration
-	StreamRetentionBatch  int
-	DeriverPollInterval   time.Duration
-	DeriverDirtyCap       int
+	// StreamRetentionAge is the minimum public event retention.
+	StreamRetentionAge time.Duration
+	// StreamRetentionBatch bounds event deletes per transaction.
+	StreamRetentionBatch int
+	// DeriverPollInterval bounds dirty-set poll fallback latency.
+	DeriverPollInterval time.Duration
+	// DeriverDirtyCap bounds scopes claimed per derivation pass.
+	DeriverDirtyCap int
 }
 
+// FromEnv parses and cross-validates frontier-syncd environment variables.
 func FromEnv() (Config, error) {
 	cfg := Config{
 		DatabaseURL:                os.Getenv("DATABASE_URL"),
@@ -420,6 +438,7 @@ func (c Config) RequireWebhookSecret() error {
 	return nil
 }
 
+// RequireFetchCredentials validates the credentials required by fetch roles.
 func (c Config) RequireFetchCredentials() error {
 	if c.GitHubInstallationID <= 0 || c.GitHubOrgID <= 0 {
 		return fmt.Errorf(

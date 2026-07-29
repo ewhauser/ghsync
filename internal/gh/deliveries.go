@@ -26,6 +26,7 @@ type AppHookDelivery struct {
 	RepositoryID   int64     `json:"repository_id"`
 }
 
+// ListAppHookDeliveriesOptions controls newest-first delivery pagination.
 type ListAppHookDeliveriesOptions struct {
 	PerPage int
 	Cursor  string
@@ -35,9 +36,9 @@ type ListAppHookDeliveriesOptions struct {
 // JWT for /app/hook/deliveries and rejects installation access tokens.
 type DeliveriesClient struct {
 	client client
-	rest   RESTClient
 }
 
+// NewDeliveriesClient constructs an App-JWT-authenticated deliveries client.
 func NewDeliveriesClient(
 	baseURL string,
 	gate budget.Doer,
@@ -47,12 +48,10 @@ func NewDeliveriesClient(
 	if err != nil {
 		return nil, err
 	}
-	return &DeliveriesClient{
-		client: common,
-		rest:   RESTClient{client: common},
-	}, nil
+	return &DeliveriesClient{client: common}, nil
 }
 
+// ListAppHookDeliveries fetches deliveries newest first.
 func (c *DeliveriesClient) ListAppHookDeliveries(
 	ctx context.Context,
 	options ListAppHookDeliveriesOptions,
@@ -66,7 +65,7 @@ func (c *DeliveriesClient) ListAppHookDeliveries(
 		query.Set("cursor", options.Cursor)
 	}
 	var deliveries []AppHookDelivery
-	response, err := c.rest.getJSON(
+	response, err := c.client.getJSON(
 		ctx,
 		budget.Sweep,
 		"app/hook/deliveries",
@@ -77,6 +76,7 @@ func (c *DeliveriesClient) ListAppHookDeliveries(
 	return deliveries, response, err
 }
 
+// RedeliverAppHookDelivery requests a new attempt for one delivery.
 func (c *DeliveriesClient) RedeliverAppHookDelivery(
 	ctx context.Context,
 	deliveryID int64,

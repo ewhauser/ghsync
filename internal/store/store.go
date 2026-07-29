@@ -11,6 +11,8 @@ import (
 
 const defaultIdleInTransactionSessionTimeout = 30 * time.Second
 
+// Connect opens and verifies a Postgres pool with the cache durability
+// invariants enabled.
 func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
+// Repository resolves a current repository record by full name or alias.
 func (w *EntityWriter) Repository(
 	ctx context.Context,
 	fullName string,
@@ -23,6 +24,7 @@ func (w *EntityWriter) Repository(
 	return repositoryFromRow(repo), nil
 }
 
+// ApplyRepository conditionally applies a direct repository observation.
 func (w *EntityWriter) ApplyRepository(
 	ctx context.Context,
 	repository RepositoryRecord,
@@ -33,6 +35,8 @@ func (w *EntityWriter) ApplyRepository(
 	return w.applyRepository(ctx, nil, repository, source, etag, observedAt)
 }
 
+// ApplyRepositoryObserved conditionally applies a repository while holding its
+// observation lock.
 func (w *EntityWriter) ApplyRepositoryObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -65,29 +69,20 @@ func (w *EntityWriter) applyRepository(
 ) (bool, error) {
 	key := RepositoryEntityKey(repository.InstallationID, repository.GitHubID)
 	var applied bool
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			_ pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			observedAt = databaseTime
-			var err error
-			_, applied, err = w.applyRepositoryTx(
-				ctx,
-				queries,
-				repository,
-				source,
-				etag,
-				observedAt,
-			)
-			return err
-		},
-	)
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, queries := entity.ctx, entity.queries
+		observedAt = entity.databaseTime
+		var err error
+		_, applied, err = w.applyRepositoryTx(
+			ctx,
+			queries,
+			repository,
+			source,
+			etag,
+			observedAt,
+		)
+		return err
+	})
 	if err != nil {
 		return false, fmt.Errorf("apply repository: %w", err)
 	}
@@ -120,67 +115,58 @@ func (w *EntityWriter) TombstoneRepositoryObserved(
 		return false, err
 	}
 	var applied bool
-	err := w.withEntityTx(
-		ctx,
-		observation,
-		key,
-		func(
-			ctx context.Context,
-			_ pgx.Tx,
-			queries *dbgen.Queries,
-			databaseTime time.Time,
-		) error {
-			at = databaseTime
-			current, err := queries.GetRepoByGitHubID(
-				ctx,
-				repository.GitHubID,
+	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
+		ctx, queries := entity.ctx, entity.queries
+		at = entity.databaseTime
+		current, err := queries.GetRepoByGitHubID(
+			ctx,
+			repository.GitHubID,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read tombstoned repository: %w", err)
+		}
+		scopes, err := queries.ListRepositoryDerivationScopes(
+			ctx,
+			current.ID,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"resolve repository tombstone scopes: %w",
+				err,
 			)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
-			if err != nil {
-				return fmt.Errorf("read tombstoned repository: %w", err)
-			}
-			scopes, err := queries.ListRepositoryDerivationScopes(
-				ctx,
-				current.ID,
+		}
+		_, tombstoneErr := queries.TombstoneRepository(
+			ctx,
+			dbgen.TombstoneRepositoryParams{
+				TombstonedAt: timestamp(at),
+				SyncedAt:     timestamp(at),
+				SyncSource:   string(source),
+				GhID:         repository.GitHubID,
+			},
+		)
+		if tombstoneErr != nil &&
+			!errors.Is(tombstoneErr, pgx.ErrNoRows) {
+			return fmt.Errorf(
+				"tombstone repository: %w",
+				tombstoneErr,
 			)
-			if err != nil {
-				return fmt.Errorf(
-					"resolve repository tombstone scopes: %w",
-					err,
-				)
-			}
-			_, tombstoneErr := queries.TombstoneRepository(
-				ctx,
-				dbgen.TombstoneRepositoryParams{
-					TombstonedAt: timestamp(at),
-					SyncedAt:     timestamp(at),
-					SyncSource:   string(source),
-					GhID:         repository.GitHubID,
-				},
-			)
-			if tombstoneErr != nil &&
-				!errors.Is(tombstoneErr, pgx.ErrNoRows) {
-				return fmt.Errorf(
-					"tombstone repository: %w",
-					tombstoneErr,
-				)
-			}
-			applied = tombstoneErr == nil
-			if !applied {
-				return nil
-			}
-			return w.markAndEmit(
-				ctx,
-				queries,
-				scopes,
-				outbox.RepositoryTombstonedKind,
-				key,
-				at,
-			)
-		},
-	)
+		}
+		applied = tombstoneErr == nil
+		if !applied {
+			return nil
+		}
+		return w.markAndEmit(
+			ctx,
+			queries,
+			scopes,
+			outbox.RepositoryTombstonedKind,
+			key,
+			at,
+		)
+	})
 	if err != nil {
 		return false, fmt.Errorf("tombstone repository: %w", err)
 	}

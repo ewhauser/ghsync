@@ -352,6 +352,7 @@ func run(ctx context.Context, cfg config) error {
 	restartTimer := time.NewTimer(cfg.duration / 2)
 	defer restartTimer.Stop()
 	var emission emissionResult
+loadLoop:
 	for {
 		select {
 		case <-ctx.Done():
@@ -369,7 +370,7 @@ func run(ctx context.Context, cfg config) error {
 			if emission.err != nil {
 				return emission.err
 			}
-			goto drain
+			break loadLoop
 		case <-scrapeTicker.C:
 			if err := streamConsumer.check(); err != nil {
 				return err
@@ -388,7 +389,6 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 
-drain:
 	if err := streamConsumer.check(); err != nil {
 		return err
 	}

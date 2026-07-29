@@ -226,9 +226,21 @@ func TestRepositoryRenameKeepsAliasesImmutableEventsAndDirtyScopes(
 	); err != nil {
 		t.Fatal(err)
 	}
+	checksObservation, err := writer.BeginObservation(
+		context.Background(),
+		store.ChecksEntityKey(
+			oldRepository.InstallationID,
+			oldRepository.GitHubID,
+			pull.HeadSHA,
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checksObservation.Close() //nolint:errcheck
 	changed, err := writer.ApplyChecksObserved(
 		context.Background(),
-		nil,
+		checksObservation,
 		store.ChecksRecord{
 			// Model a queued job carrying the pre-rename alias. Dirty-scope
 			// resolution must use immutable GitHub identity, not this name.

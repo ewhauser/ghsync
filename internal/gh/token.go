@@ -22,6 +22,7 @@ import (
 
 const defaultTokenRefreshBefore = time.Minute
 
+// InstallationTokenOptions configures App-to-installation token exchange.
 type InstallationTokenOptions struct {
 	BaseURL        string
 	AppID          int64
@@ -52,6 +53,8 @@ type InstallationTokens struct {
 	renewals  singleflight.Group
 }
 
+// NewInstallationTokens validates App credentials and constructs a cached
+// installation-token provider.
 func NewInstallationTokens(
 	gate budget.Doer,
 	options InstallationTokenOptions,
@@ -110,6 +113,7 @@ type AppTokens struct {
 	clock  interface{ Now() time.Time }
 }
 
+// NewAppTokens constructs an App-JWT provider for App-only endpoints.
 func NewAppTokens(
 	appID int64,
 	privateKeyPEM []byte,
@@ -131,6 +135,7 @@ func NewAppTokens(
 	}, nil
 }
 
+// Token signs a fresh short-lived App JWT.
 func (m *AppTokens) Token(_ context.Context) (string, error) {
 	now := m.clock.Now()
 	claims := &jwt.RegisteredClaims{
@@ -145,6 +150,7 @@ func (m *AppTokens) Token(_ context.Context) (string, error) {
 	return token, nil
 }
 
+// Token returns a cached installation token or performs one shared renewal.
 func (m *InstallationTokens) Token(ctx context.Context) (string, error) {
 	if token, ok := m.cached(); ok {
 		return token, nil
@@ -254,6 +260,7 @@ func (m *InstallationTokens) authorizeApp(
 	return nil
 }
 
+// Expiry returns the cached installation-token expiry, or zero before renewal.
 func (m *InstallationTokens) Expiry() time.Time {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -477,10 +477,13 @@ func (g *Gate) Close(ctx context.Context) error {
 	return g.lease.closeErr
 }
 
+// NewPostgresLeaseStore constructs a Postgres-backed lease store.
 func NewPostgresLeaseStore(pool *pgxpool.Pool) *PostgresLeaseStore {
 	return &PostgresLeaseStore{pool: pool}
 }
 
+// Acquire obtains or steals an expired installation lease and returns its
+// authoritative persisted snapshot.
 func (s *PostgresLeaseStore) Acquire(
 	ctx context.Context,
 	installationID int64,
@@ -564,6 +567,7 @@ func setLeaseTransactionTimeouts(
 	return nil
 }
 
+// Renew extends a lease only when token still proves ownership.
 func (s *PostgresLeaseStore) Renew(
 	ctx context.Context,
 	installationID int64,
@@ -588,6 +592,7 @@ func (s *PostgresLeaseStore) Renew(
 	return until, ok, err
 }
 
+// Save persists one budget snapshot only for the active owner.
 func (s *PostgresLeaseStore) Save(
 	ctx context.Context,
 	installationID int64,
@@ -616,6 +621,7 @@ func (s *PostgresLeaseStore) Save(
 	return affected == 2, nil
 }
 
+// SaveBackoff immediately persists a secondary-limit deadline.
 func (s *PostgresLeaseStore) SaveBackoff(
 	ctx context.Context,
 	installationID int64,
@@ -636,6 +642,7 @@ func (s *PostgresLeaseStore) SaveBackoff(
 	return affected == 2, nil
 }
 
+// Release clears an installation lease only for the active owner.
 func (s *PostgresLeaseStore) Release(
 	ctx context.Context,
 	installationID int64,
