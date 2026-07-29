@@ -435,15 +435,19 @@ func (c *RESTClient) getJSON(
 		budget.NewRESTRequest(req).BeforeSend(c.client.authorize),
 	)
 	if err != nil {
-		if gated != nil && gated.HTTP != nil {
-			gated.HTTP.Body.Close()
+		if gated != nil {
+			_ = closeResponseBody(gated.HTTP)
 		}
 		return nil, err
 	}
 	resp := gated.HTTP
+	responseETag := resp.Header.Get("ETag")
+	if resp.StatusCode == http.StatusNotModified && responseETag == "" {
+		responseETag = req.Header.Get("If-None-Match")
+	}
 	meta := &RESTResponse{
 		StatusCode: resp.StatusCode,
-		ETag:       resp.Header.Get("ETag"),
+		ETag:       responseETag,
 		NextPage:   nextPage(resp.Header.Get("Link")),
 		NextCursor: nextCursor(resp.Header.Get("Link")),
 	}

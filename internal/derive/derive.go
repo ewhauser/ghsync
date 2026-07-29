@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/acme/frontier/internal/opsstate"
 	"github.com/acme/frontier/internal/outbox"
 )
 
@@ -22,6 +24,7 @@ const (
 	defaultDirtyCap     = 500
 	defaultPollInterval = 500 * time.Millisecond
 	dirtyNotifyChannel  = "frontier_derivation_dirty"
+	deriverOperation    = "dirty_sets"
 )
 
 // Deriver is the pure C-D1 seam. Implementations may inspect only Snapshot
@@ -50,7 +53,8 @@ type Snapshot struct {
 }
 
 // ScopeSnapshot contains a dirty scope and its cache rows encoded as one
-// stable JSON document for the pure deriver.
+// stable JSON document for the pure deriver. Data contains only live cache
+// rows; a loose-PR scope never contains a PR currently owned by a stack.
 type ScopeSnapshot struct {
 	ScopeKey string
 	OrgID    int64
@@ -85,11 +89,12 @@ func PullRequestIdentity(repositoryGitHubID int64, pullNumber int) string {
 
 // Options configures the dirty-set loop.
 type Options struct {
-	Pool         *pgxpool.Pool
-	Deriver      Deriver
-	DirtyCap     int
-	PollInterval time.Duration
-	Observer     Observer
+	Pool           *pgxpool.Pool
+	Deriver        Deriver
+	DirtyCap       int
+	PollInterval   time.Duration
+	Observer       Observer
+	InstallationID int64
 }
 
 // Observer is M6's C-P5 pass-duration seam.
@@ -103,12 +108,13 @@ func (noopObserver) DeriverPass(context.Context, int, time.Duration, error) {}
 
 // Service drains dirty scopes and applies each derivation batch atomically.
 type Service struct {
-	pool         *pgxpool.Pool
-	deriver      Deriver
-	loader       SnapshotLoader
-	dirtyCap     int
-	pollInterval time.Duration
-	observer     Observer
+	pool           *pgxpool.Pool
+	deriver        Deriver
+	loader         SnapshotLoader
+	dirtyCap       int
+	pollInterval   time.Duration
+	observer       Observer
+	installationID int64
 }
 
 // New constructs a C-D2/C-P5 derivation service. NoopDeriver is wired when no
@@ -135,14 +141,37 @@ func New(options Options) (*Service, error) {
 	if options.Observer == nil {
 		options.Observer = noopObserver{}
 	}
+	installationID, err := resolveInstallationID(options.InstallationID)
+	if err != nil {
+		return nil, err
+	}
 	return &Service{
-		pool:         options.Pool,
-		deriver:      options.Deriver,
-		loader:       SnapshotLoader{},
-		dirtyCap:     options.DirtyCap,
-		pollInterval: options.PollInterval,
-		observer:     options.Observer,
+		pool:           options.Pool,
+		deriver:        options.Deriver,
+		loader:         SnapshotLoader{},
+		dirtyCap:       options.DirtyCap,
+		pollInterval:   options.PollInterval,
+		observer:       options.Observer,
+		installationID: installationID,
 	}, nil
+}
+
+func resolveInstallationID(configured int64) (int64, error) {
+	if configured > 0 {
+		return configured, nil
+	}
+	if configured < 0 {
+		return 0, fmt.Errorf("deriver installation ID must be positive")
+	}
+	raw := strings.TrimSpace(os.Getenv("GITHUB_INSTALLATION_ID"))
+	if raw == "" {
+		return 0, fmt.Errorf("deriver installation ID is required")
+	}
+	installationID, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || installationID <= 0 {
+		return 0, fmt.Errorf("deriver installation ID must be positive")
+	}
+	return installationID, nil
 }
 
 // RunOnce claims the entire currently available dirty set up to DirtyCap,
@@ -193,6 +222,9 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("scan derivation dirty set: %w", err)
 	}
 	if len(scopeKeys) == 0 {
+		if err := s.recordHeartbeat(ctx, tx, 0); err != nil {
+			return 0, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return 0, fmt.Errorf("commit empty derivation pass: %w", err)
 		}
@@ -330,10 +362,31 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 	`, scopeKeys); err != nil {
 		return 0, fmt.Errorf("clear derived dirty set: %w", err)
 	}
+	if err := s.recordHeartbeat(ctx, tx, int64(len(scopeKeys))); err != nil {
+		return 0, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit derivation pass: %w", err)
 	}
 	return len(scopeKeys), nil
+}
+
+func (s *Service) recordHeartbeat(
+	ctx context.Context,
+	tx pgx.Tx,
+	samples int64,
+) error {
+	if err := opsstate.RecordSuccessN(
+		ctx,
+		tx,
+		s.installationID,
+		"deriver",
+		deriverOperation,
+		samples,
+	); err != nil {
+		return fmt.Errorf("record deriver pass heartbeat: %w", err)
+	}
+	return nil
 }
 
 // Run drains full batches immediately, then uses dirty-set NOTIFY as a latency

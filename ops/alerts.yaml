@@ -150,20 +150,76 @@ groups:
           constraint: C-R2
           summary: A resumable sweep cannot finish inside its period or is unobservable
           description: Inspect its durable cursor, durable completion heartbeat, queue latency, and GitHub budget.
-      - alert: FrontierSweepPassMissing
+      - alert: FrontierStackSweepPassMissing
         expr: >-
-          frontier_c_o4_last_operation_success_age_seconds{component="sweep"} < 0
-          or frontier_c_o4_last_operation_success_age_seconds{component="sweep"} > 86400
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep"} < 0
-          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep"} > 86400
-          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep"})
-          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep"})
+          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"} > 675
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"} > 675
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="stacks"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="stacks"})
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-R2
-          summary: A durable sweep completion is missing or stale
-          description: Every expected sweep kind must commit successful passes.
+          summary: The durable stack sweep completion is missing or stale
+          description: Stack sweeps run every 3m45s and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
+      - alert: FrontierPullRequestSweepPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"} > 1350
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"} > 1350
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="pull_requests"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="pull_requests"})
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          constraint: C-R2
+          summary: The durable pull-request sweep completion is missing or stale
+          description: Pull-request sweeps run every 7m30s and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
+      - alert: FrontierRepoRulesSweepPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"} > 8100
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"} > 8100
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repo_rules"})
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          constraint: C-R2
+          summary: The durable repo-rules sweep completion is missing or stale
+          description: Repo-rules sweeps run every 45m and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
+      - alert: FrontierRepositorySweepPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"} > 8100
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"} > 8100
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="repositories"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="repositories"})
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          constraint: C-R2
+          summary: The durable repository sweep completion is missing or stale
+          description: Repository sweeps run every 45m and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
+      - alert: FrontierClosedSweepPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"} > 194400
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"} < 0
+          or frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"} > 194400
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"})
+          or absent(frontier_c_o4_last_operation_sample_age_seconds{component="sweep",operation="closed_tracked"})
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          constraint: C-R2
+          summary: The durable closed-entity sweep completion is missing or stale
+          description: Closed-entity sweeps run every 18h and must complete within three cadences; the heartbeat also covers zero-row classes whose staleness series are absent.
       - alert: FrontierDriftOpen
         expr: >-
           frontier_c_o3_drift_findings{state="open",entity_kind="all"} > 0
@@ -266,6 +322,17 @@ groups:
           constraint: C-P5
           summary: Derivation dirty backlog exceeds one batch or is unobservable
           description: Deriver passes are not draining dirty scopes at the configured cap.
+      - alert: FrontierDeriverPassMissing
+        expr: >-
+          frontier_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"} < 0
+          or frontier_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"} > 30
+          or absent(frontier_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"})
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          constraint: C-P5
+          summary: The durable deriver pass heartbeat is missing or stale
+          description: Every dirty-set pass records success in its derivation transaction, including an idle pass with no dirty scopes.
       - alert: FrontierRequiredRoleAbsent
         expr: >-
           absent(frontier_c_o4_role_enabled{role="metrics"})

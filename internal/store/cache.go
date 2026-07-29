@@ -195,6 +195,7 @@ type PullRequestHook func(ApplyPullRequestResult) TransactionHook
 type StackHook func(ApplyStackResult) TransactionHook
 
 type PullRequestApply struct {
+	Context     context.Context
 	Record      PullRequestRecord
 	Observation *Observation
 	Hook        PullRequestHook
@@ -924,8 +925,12 @@ func (w *EntityWriter) ApplyPullRequestBatch(
 			apply.Record.Repository.GitHubID,
 			apply.Record.Number,
 		)
+		applyCtx := apply.Context
+		if applyCtx == nil {
+			applyCtx = ctx
+		}
 		result, err := w.applyPullRequest(
-			ctx, apply.Observation, apply.Record, apply.Hook,
+			applyCtx, apply.Observation, apply.Record, apply.Hook,
 		)
 		outcomes[key] = PullRequestApplyOutcome{Result: result, Err: err}
 	}

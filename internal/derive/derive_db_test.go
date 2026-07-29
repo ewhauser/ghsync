@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/acme/frontier/internal/outbox"
@@ -26,9 +27,10 @@ func TestNoopDeriverEndToEnd(t *testing.T) {
 	defer cancel()
 	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "noop")
 	service, err := New(Options{
-		Pool:     pool,
-		Deriver:  NoopDeriver{},
-		DirtyCap: 10_000,
+		Pool:           pool,
+		Deriver:        NoopDeriver{},
+		DirtyCap:       10_000,
+		InstallationID: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +60,29 @@ func TestNoopDeriverEndToEnd(t *testing.T) {
 	if items != 0 {
 		t.Fatalf("NoopDeriver wrote %d work items", items)
 	}
+
+	if claimed, err := service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	} else if claimed != 0 {
+		t.Fatalf("idle pass claimed %d scopes, want 0", claimed)
+	}
+	var successes, samples int64
+	if err := pool.QueryRow(ctx, `
+		SELECT success_count, sample_count
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'deriver'
+		  AND operation = 'dirty_sets'
+	`).Scan(&successes, &samples); err != nil {
+		t.Fatal(err)
+	}
+	if successes != 2 || samples < 1 {
+		t.Fatalf(
+			"deriver heartbeat successes/samples = %d/%d, want 2/at least 1",
+			successes,
+			samples,
+		)
+	}
 }
 
 func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
@@ -68,7 +93,8 @@ func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
 	entered := make(chan Snapshot, 1)
 	release := make(chan struct{})
 	service, err := New(Options{
-		Pool: pool,
+		Pool:           pool,
+		InstallationID: 1,
 		Deriver: blockingDeriver{
 			entered: entered,
 			release: release,
@@ -146,7 +172,8 @@ func TestFencedDirtyMarkWithConcurrentWatermarkerDoesNotStall(t *testing.T) {
 	entered := make(chan Snapshot, 1)
 	release := make(chan struct{})
 	service, err := New(Options{
-		Pool: pool,
+		Pool:           pool,
+		InstallationID: 1,
 		Deriver: blockingDeriver{
 			entered: entered,
 			release: release,
@@ -348,7 +375,8 @@ func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "work-item")
 	identity := PullRequestIdentity(repositoryID, 42)
 	service, err := New(Options{
-		Pool: pool,
+		Pool:           pool,
+		InstallationID: 1,
 		Deriver: fixedDeriver{item: &WorkItem{
 			IdentityKey: identity,
 			OrgID:       1,
@@ -412,7 +440,8 @@ func TestScopeReconciliationRemovesPriorWorkItemAndEmitsReference(
 	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "remove")
 	identity := PullRequestIdentity(repositoryID, 42)
 	service, err := New(Options{
-		Pool: pool,
+		Pool:           pool,
+		InstallationID: 1,
 		Deriver: fixedDeriver{item: &WorkItem{
 			IdentityKey: identity,
 			OrgID:       1,
@@ -469,7 +498,8 @@ func TestDeriverRejectsIdentityNotOwnedByClaimedScope(t *testing.T) {
 	defer cancel()
 	scope, _ := insertLoosePullScope(t, ctx, pool, "identity")
 	service, err := New(Options{
-		Pool: pool,
+		Pool:           pool,
+		InstallationID: 1,
 		Deriver: fixedDeriver{item: &WorkItem{
 			IdentityKey: "arbitrary",
 			OrgID:       1,
@@ -491,6 +521,159 @@ func TestDeriverRejectsIdentityNotOwnedByClaimedScope(t *testing.T) {
 	}
 	if dirty != 1 {
 		t.Fatalf("invalid result cleared dirty scope: count=%d", dirty)
+	}
+}
+
+func TestScopeSnapshotContainsOnlyLiveScopeOwnedRows(t *testing.T) {
+	pool := deriveDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	looseScope, repositoryID := insertLoosePullScope(
+		t,
+		ctx,
+		pool,
+		"snapshot-filter",
+	)
+	var localRepoID int64
+	if err := pool.QueryRow(ctx, `
+		SELECT id FROM repos WHERE gh_id = $1
+	`, repositoryID).Scan(&localRepoID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	batch := &pgx.Batch{}
+	batch.Queue(`
+		UPDATE pull_requests
+		SET stack_number = 7, stack_position = 1
+		WHERE repo_id = $1 AND number = 42
+	`, localRepoID)
+	batch.Queue(`
+		INSERT INTO pull_requests (
+		    repo_id, gh_id, node_id, number, title, state, draft,
+		    author_login, head_ref, head_sha, base_ref, base_sha,
+		    review_decision, mergeable_state, stack_number, stack_position,
+		    gh_updated_at, synced_at, last_checked_at, etag, sync_source,
+		    tombstoned_at
+		)
+		VALUES (
+		    $1, $2, $3, 43, 'tombstoned PR', 'open', false,
+		    'tester', 'tombstoned', 'tombstoned-head', 'main', 'base-sha',
+		    '', '', 7, 2, $4, $4, $4, '', 'manual', $4
+		)
+	`,
+		localRepoID,
+		repositoryID*100+43,
+		fmt.Sprintf("PR_%d_43", repositoryID),
+		now,
+	)
+	batch.Queue(`
+		INSERT INTO stacks (
+		    repo_id, gh_id, node_id, number, base_ref, base_sha, open,
+		    entries, gh_updated_at, head_sha, synced_at, last_checked_at, etag,
+		    sync_source, tombstoned_at
+		)
+		VALUES (
+		    $1, $2, $3, 7, 'main', 'base-sha', true, '[]', $4,
+		    'head', $4, $4, '', 'manual', $4
+		)
+	`,
+		localRepoID,
+		repositoryID*100+7,
+		fmt.Sprintf("S_%d_7", repositoryID),
+		now,
+	)
+	batch.Queue(`
+		INSERT INTO repo_rules (
+		    repo_id, rule_key, rule, gh_updated_at, head_sha, synced_at,
+		    last_checked_at, etag, sync_source, tombstoned_at
+		)
+		VALUES (
+		    $1, 'tombstoned', '{}', $2, 'head', $2, $2, '', 'manual', $2
+		)
+	`, localRepoID, now)
+	batch.Queue(`
+		INSERT INTO review_threads (
+		    id, repo_id, pr_number, head_sha, synced_at, last_checked_at,
+		    sync_source, tombstoned_at
+		)
+		VALUES ($1, $2, 42, $3, $4, $4, 'manual', $4)
+	`,
+		fmt.Sprintf("thread-%d", repositoryID),
+		localRepoID,
+		fmt.Sprintf("head-%d", repositoryID),
+		now,
+	)
+	batch.Queue(`
+		INSERT INTO check_runs (
+		    gh_id, repo_id, node_id, name, status, head_sha, synced_at,
+		    last_checked_at, sync_source, tombstoned_at
+		)
+		VALUES (
+		    $1, $2, $3, 'tombstoned', 'completed', $4, $5, $5,
+		    'manual', $5
+		)
+	`,
+		repositoryID*100+99,
+		localRepoID,
+		fmt.Sprintf("CR_%d", repositoryID),
+		fmt.Sprintf("head-%d", repositoryID),
+		now,
+	)
+	results := pool.SendBatch(ctx, batch)
+	if err := results.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background()) //nolint:errcheck
+	stackScope := fmt.Sprintf("stack:1:%d:7", repositoryID)
+	snapshot, err := (SnapshotLoader{}).Load(
+		ctx,
+		tx,
+		[]string{looseScope, stackScope},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Scopes) != 2 {
+		t.Fatalf("snapshot scopes = %d, want 2", len(snapshot.Scopes))
+	}
+	type snapshotData struct {
+		Stack        json.RawMessage   `json:"stack"`
+		RepoRules    []json.RawMessage `json:"repo_rules"`
+		PullRequests []struct {
+			Number int `json:"number"`
+		} `json:"pull_requests"`
+		ReviewThreads []json.RawMessage `json:"review_threads"`
+		CheckRuns     []json.RawMessage `json:"check_runs"`
+	}
+	decoded := make(map[string]snapshotData, len(snapshot.Scopes))
+	for _, scope := range snapshot.Scopes {
+		var data snapshotData
+		if err := json.Unmarshal(scope.Data, &data); err != nil {
+			t.Fatalf("decode %s snapshot: %v", scope.ScopeKey, err)
+		}
+		decoded[scope.ScopeKey] = data
+	}
+	if got := decoded[looseScope].PullRequests; len(got) != 0 {
+		t.Fatalf("loose scope contains stack-owned PRs: %+v", got)
+	}
+	stackData := decoded[stackScope]
+	if len(stackData.PullRequests) != 1 ||
+		stackData.PullRequests[0].Number != 42 {
+		t.Fatalf(
+			"stack scope pull requests = %+v, want only live PR 42",
+			stackData.PullRequests,
+		)
+	}
+	if string(stackData.Stack) != "null" ||
+		len(stackData.RepoRules) != 0 ||
+		len(stackData.ReviewThreads) != 0 ||
+		len(stackData.CheckRuns) != 0 {
+		t.Fatalf("snapshot retained tombstoned rows: %+v", stackData)
 	}
 }
 

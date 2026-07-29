@@ -3,7 +3,9 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +16,6 @@ import (
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store/dbgen"
-	streammaint "github.com/acme/frontier/internal/stream"
 )
 
 type RuntimeOptions struct {
@@ -29,6 +30,7 @@ type RuntimeOptions struct {
 	ClosedStaleness    time.Duration
 	RepositoryPeriod   time.Duration
 	StreamRetentionAge time.Duration
+	DeriverDirtyCap    int
 }
 
 type ratioCounts struct {
@@ -113,6 +115,23 @@ func NewRuntime(options RuntimeOptions) (*Runtime, error) {
 	}
 	if options.StreamRetentionAge <= 0 {
 		return nil, fmt.Errorf("stream retention metrics bound must be positive")
+	}
+	if options.DeriverDirtyCap == 0 {
+		options.DeriverDirtyCap = 500
+		if raw := strings.TrimSpace(os.Getenv("DERIVER_DIRTY_CAP")); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil || value <= 0 {
+				return nil, fmt.Errorf(
+					"deriver dirty cap metrics bound must be positive",
+				)
+			}
+			options.DeriverDirtyCap = value
+		}
+	}
+	if options.DeriverDirtyCap < 0 {
+		return nil, fmt.Errorf(
+			"deriver dirty cap metrics bound must be positive",
+		)
 	}
 	return &Runtime{
 		options: options,
@@ -276,7 +295,6 @@ func (r *Runtime) BudgetStarvation(starvation budget.Starvation) {
 func (r *Runtime) DispatchBatch(
 	ctx context.Context,
 	count int,
-	_ int,
 ) {
 	r.dispatchBatches.Record(ctx, int64(count))
 }
@@ -411,9 +429,9 @@ func (r *Runtime) PrunerDelete(
 
 func (r *Runtime) WatermarkStep(
 	ctx context.Context,
-	progress streammaint.WatermarkProgress,
+	advanced bool,
 ) {
-	if progress.Advanced {
+	if advanced {
 		r.watermarkAdvances.Add(ctx, 1)
 	}
 }
@@ -437,13 +455,13 @@ func (r *Runtime) DeriverPass(
 	))
 }
 
-func batchLabel(count int, _ RuntimeOptions) string {
+func batchLabel(count int, options RuntimeOptions) string {
 	switch {
 	case count == 0:
 		return "empty"
-	case count < 100:
+	case count < options.DeriverDirtyCap:
 		return "partial"
 	default:
-		return "large"
+		return "capped"
 	}
 }

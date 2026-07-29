@@ -428,8 +428,8 @@ func (c *GraphQLClient) Call(
 		).BeforeSend(c.client.authorize),
 	)
 	if err != nil {
-		if gated != nil && gated.HTTP != nil {
-			gated.HTTP.Body.Close()
+		if gated != nil {
+			_ = closeResponseBody(gated.HTTP)
 		}
 		return nil, err
 	}

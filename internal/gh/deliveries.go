@@ -98,8 +98,8 @@ func (c *DeliveriesClient) RedeliverAppHookDelivery(
 		budget.NewRESTRequest(req).BeforeSend(c.client.authorize),
 	)
 	if err != nil {
-		if gated != nil && gated.HTTP != nil {
-			gated.HTTP.Body.Close()
+		if gated != nil {
+			_ = closeResponseBody(gated.HTTP)
 		}
 		return err
 	}

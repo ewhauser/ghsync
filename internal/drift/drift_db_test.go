@@ -66,7 +66,7 @@ func newReadyDriftHarness(t *testing.T) *driftHarness {
 	rest, err := gh.NewRESTClient(
 		server.URL,
 		gate,
-		gh.StaticToken("token"),
+		gh.StaticToken("fake-installation-drift"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func newReadyDriftHarness(t *testing.T) *driftHarness {
 	graphQL, err := gh.NewGraphQLClient(
 		server.URL,
 		gate,
-		gh.StaticToken("token"),
+		gh.StaticToken("fake-installation-drift"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -348,7 +348,7 @@ func TestDetectRecordsZeroSampleHeartbeat(t *testing.T) {
 	rest, err := gh.NewRESTClient(
 		server.URL,
 		gate,
-		gh.StaticToken("token"),
+		gh.StaticToken("fake-installation-drift"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -356,7 +356,7 @@ func TestDetectRecordsZeroSampleHeartbeat(t *testing.T) {
 	graphQL, err := gh.NewGraphQLClient(
 		server.URL,
 		gate,
-		gh.StaticToken("token"),
+		gh.StaticToken("fake-installation-drift"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -419,7 +419,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	rest, err := gh.NewRESTClient(
 		server.URL,
 		gate,
-		gh.StaticToken("token"),
+		gh.StaticToken("fake-installation-drift"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +427,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	graphQL, err := gh.NewGraphQLClient(
 		server.URL,
 		gate,
-		gh.StaticToken("token"),
+		gh.StaticToken("fake-installation-drift"),
 	)
 	if err != nil {
 		t.Fatal(err)

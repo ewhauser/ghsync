@@ -2,6 +2,112 @@ package fakegithub
 
 import "time"
 
+func cloneFixture(source Fixture) Fixture {
+	clone := source
+	clone.Repositories = append([]Repository(nil), source.Repositories...)
+	clone.RepoRules = make([]RepositoryRule, len(source.RepoRules))
+	for index, rule := range source.RepoRules {
+		clone.RepoRules[index] = rule
+		clone.RepoRules[index].UpdatedAt = cloneTime(rule.UpdatedAt)
+		clone.RepoRules[index].Rules = make([]map[string]any, len(rule.Rules))
+		for ruleIndex, value := range rule.Rules {
+			clone.RepoRules[index].Rules[ruleIndex] = cloneStringMap(value)
+		}
+	}
+	clone.Stacks = make([]Stack, len(source.Stacks))
+	for index, stack := range source.Stacks {
+		clone.Stacks[index] = stack
+		clone.Stacks[index].PullRequests = append(
+			[]StackPullRequest(nil),
+			stack.PullRequests...,
+		)
+		for pullIndex := range clone.Stacks[index].PullRequests {
+			pull := &clone.Stacks[index].PullRequests[pullIndex]
+			pull.MergedAt = cloneTime(pull.MergedAt)
+		}
+	}
+	clone.PullRequests = make([]PullRequest, len(source.PullRequests))
+	for index, pull := range source.PullRequests {
+		clone.PullRequests[index] = pull
+		if pull.Stack != nil {
+			stack := *pull.Stack
+			clone.PullRequests[index].Stack = &stack
+		}
+		clone.PullRequests[index].ReviewThreads = make(
+			[]ReviewThread,
+			len(pull.ReviewThreads),
+		)
+		for threadIndex, thread := range pull.ReviewThreads {
+			clone.PullRequests[index].ReviewThreads[threadIndex] = thread
+			clone.PullRequests[index].ReviewThreads[threadIndex].Line = cloneInt(
+				thread.Line,
+			)
+			clone.PullRequests[index].ReviewThreads[threadIndex].Comments = append(
+				[]ReviewComment(nil),
+				thread.Comments...,
+			)
+		}
+	}
+	clone.CheckRuns = append([]CheckRun(nil), source.CheckRuns...)
+	for index := range clone.CheckRuns {
+		clone.CheckRuns[index].StartedAt = cloneTime(
+			clone.CheckRuns[index].StartedAt,
+		)
+		clone.CheckRuns[index].CompletedAt = cloneTime(
+			clone.CheckRuns[index].CompletedAt,
+		)
+	}
+	return clone
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneInt(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneStringMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		clone[key] = cloneFixtureValue(value)
+	}
+	return clone
+}
+
+func cloneFixtureValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return cloneStringMap(value)
+	case []map[string]any:
+		clone := make([]map[string]any, len(value))
+		for index, item := range value {
+			clone[index] = cloneStringMap(item)
+		}
+		return clone
+	case []any:
+		clone := make([]any, len(value))
+		for index, item := range value {
+			clone[index] = cloneFixtureValue(item)
+		}
+		return clone
+	default:
+		return value
+	}
+}
+
 // DefaultFixture is a canned repo modeled on the S-142 scenario from the
 // product prototype: a five-layer stack with one merged layer.
 func DefaultFixture() Fixture {

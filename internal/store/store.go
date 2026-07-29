@@ -4,9 +4,12 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const defaultIdleInTransactionSessionTimeout = 30 * time.Second
 
 func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
@@ -20,6 +23,12 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	// WAL. Override role/database defaults as a startup parameter for every
 	// pooled connection.
 	cfg.ConnConfig.RuntimeParams["synchronous_commit"] = "on"
+	// Bound abandoned writer transactions at the pool boundary. DATABASE_URL
+	// may override the default with PostgreSQL's
+	// idle_in_transaction_session_timeout runtime parameter.
+	if _, configured := cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"]; !configured {
+		cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = defaultIdleInTransactionSessionTimeout.String()
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)

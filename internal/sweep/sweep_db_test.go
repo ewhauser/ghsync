@@ -1,6 +1,10 @@
 package sweep
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -179,10 +183,15 @@ func newSweepHarness(
 	pool := sweepTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	now := time.Now().UTC().Truncate(time.Second)
+	appKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fake := fakegithub.New(
 		fixture,
 		sweepTestSecret,
 		fakegithub.WithNow(func() time.Time { return now }),
+		fakegithub.WithAppAuthentication(99, &appKey.PublicKey),
 	)
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
@@ -190,7 +199,7 @@ func newSweepHarness(
 	rest, err := gh.NewRESTClient(
 		server.URL,
 		gate,
-		gh.StaticToken("installation-token"),
+		gh.StaticToken("fake-installation-sweep"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -198,15 +207,23 @@ func newSweepHarness(
 	graphQL, err := gh.NewGraphQLClient(
 		server.URL,
 		gate,
-		gh.StaticToken("installation-token"),
+		gh.StaticToken("fake-installation-sweep"),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(appKey),
+	})
+	appTokens, err := gh.NewAppTokens(99, appPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
 	deliveries, err := gh.NewDeliveriesClient(
 		server.URL,
 		gate,
-		gh.StaticToken("app-jwt"),
+		appTokens,
 	)
 	if err != nil {
 		t.Fatal(err)

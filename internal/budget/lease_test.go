@@ -3,10 +3,12 @@ package budget
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,6 +115,132 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 		t.Fatalf("stale owner save = %v, %v", saved, err)
 	}
 	if err := leases.Release(ctx, installationID, "owner-b"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresLeaseConcurrentStealHasExactlyOneWinner(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := store.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := store.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	installationID := time.Now().UnixNano()
+	t.Cleanup(func() {
+		_, _ = pool.Exec(
+			context.Background(),
+			`DELETE FROM installation_budgets WHERE installation_id = $1`,
+			installationID,
+		)
+	})
+	leases := NewPostgresLeaseStore(pool)
+	if _, _, acquired, err := leases.Acquire(
+		ctx,
+		installationID,
+		"expired-owner",
+		time.Minute,
+	); err != nil || !acquired {
+		t.Fatalf("seed acquire = %v, %v", acquired, err)
+	}
+	if _, err := pool.Exec(
+		ctx,
+		`UPDATE installation_budgets
+		 SET lease_until = now() - interval '1 second'
+		 WHERE installation_id = $1`,
+		installationID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	const contenders = 24
+	type outcome struct {
+		token    string
+		acquired bool
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, contenders)
+	var workers sync.WaitGroup
+	for contender := range contenders {
+		token := fmt.Sprintf("steal-contender-%d", contender)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			_, _, acquired, acquireErr := leases.Acquire(
+				ctx,
+				installationID,
+				token,
+				time.Minute,
+			)
+			results <- outcome{
+				token:    token,
+				acquired: acquired,
+				err:      acquireErr,
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	var winner string
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("%s acquire: %v", result.token, result.err)
+		}
+		if !result.acquired {
+			continue
+		}
+		if winner != "" {
+			t.Fatalf("multiple lease-steal winners: %q and %q", winner, result.token)
+		}
+		winner = result.token
+	}
+	if winner == "" {
+		t.Fatal("concurrent lease steal had no winner")
+	}
+
+	rows, err := pool.Query(
+		ctx,
+		`SELECT DISTINCT lease_owner
+		 FROM installation_budgets
+		 WHERE installation_id = $1`,
+		installationID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var persisted []string
+	for rows.Next() {
+		var token string
+		if err := rows.Scan(&token); err != nil {
+			t.Fatal(err)
+		}
+		persisted = append(persisted, token)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 || persisted[0] != winner {
+		t.Fatalf(
+			"persisted lease tokens = %q, winner %q",
+			persisted,
+			winner,
+		)
+	}
+	if err := leases.Release(ctx, installationID, winner); err != nil {
 		t.Fatal(err)
 	}
 }

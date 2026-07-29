@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -285,12 +285,11 @@ func (h *Handler) BackfillRepoPage(
 		)
 
 	case "pull_requests":
-		// Bound discovery at the newest PR present when the scan starts, then
-		// repeat an immutable created_at ordering until a complete pass adds no
-		// identifiers. The high-water excludes concurrent creations, while the
-		// overlap pass recovers rows shifted across pages by concurrent state
-		// changes. Reconciliation picks up creations above the high-water.
-		highPulls, _, err := h.rest.ListPulls(
+		page, _, _, err := decodePullBackfillCursor(args.Page)
+		if err != nil {
+			return err
+		}
+		pulls, response, err := h.rest.ListPulls(
 			ctx,
 			class,
 			owner,
@@ -298,78 +297,19 @@ func (h *Handler) BackfillRepoPage(
 			gh.ListPullsOptions{
 				State:     "open",
 				Sort:      "created",
-				Direction: "desc",
-				PerPage:   1,
-				Page:      1,
+				Direction: "asc",
+				PerPage:   h.backfillPageSize,
+				Page:      page,
 			},
 			"",
 		)
 		if err != nil {
-			return fmt.Errorf("read pull request high-water: %w", err)
+			return fmt.Errorf(
+				"backfill pull requests page %d: %w",
+				page,
+				err,
+			)
 		}
-		seen := make(map[int]gh.PullRequest)
-		etags := make(map[int]string)
-		childQueue := cursor.QueueName
-		if len(highPulls) > 0 {
-			highWater := highPulls[0].GetNumber()
-			for {
-				added := 0
-				page := 1
-				for {
-					pageClass := class
-					if page > 1 {
-						pageClass = budget.Sweep
-						childQueue = queue.QueueSweep
-					}
-					pagePulls, response, err := h.rest.ListPulls(
-						ctx,
-						pageClass,
-						owner,
-						repoName,
-						gh.ListPullsOptions{
-							State:     "open",
-							Sort:      "created",
-							Direction: "asc",
-							PerPage:   h.backfillPageSize,
-							Page:      page,
-						},
-						"",
-					)
-					if err != nil {
-						return fmt.Errorf(
-							"backfill pull requests page %d: %w",
-							page,
-							err,
-						)
-					}
-					for _, pull := range pagePulls {
-						number := pull.GetNumber()
-						if number > highWater {
-							continue
-						}
-						if _, exists := seen[number]; !exists {
-							added++
-						}
-						seen[number] = pull
-						etags[number] = response.ETag
-					}
-					if response.NextPage == 0 {
-						break
-					}
-					page = response.NextPage
-				}
-				if added == 0 {
-					break
-				}
-			}
-		}
-		pulls := make([]gh.PullRequest, 0, len(seen))
-		for _, pull := range seen {
-			pulls = append(pulls, pull)
-		}
-		sort.Slice(pulls, func(i, j int) bool {
-			return pulls[i].GetNumber() < pulls[j].GetNumber()
-		})
 		repository, err := h.ensureRepository(
 			ctx,
 			class,
@@ -380,6 +320,10 @@ func (h *Handler) BackfillRepoPage(
 			return err
 		}
 		if len(pulls) > 0 {
+			etags := make(map[int]string, len(pulls))
+			for _, pull := range pulls {
+				etags[pull.GetNumber()] = response.ETag
+			}
 			records := pullRecordsFromList(
 				repository,
 				pulls,
@@ -412,12 +356,10 @@ func (h *Handler) BackfillRepoPage(
 				),
 			})
 		}
-		return h.advanceBackfill(
+		return h.advancePullRequestBackfill(
 			ctx,
 			args,
-			"waiting",
-			1,
-			childQueue,
+			response.NextPage,
 			specs,
 		)
 
@@ -456,6 +398,270 @@ func (h *Handler) BackfillRepoPage(
 	default:
 		return fmt.Errorf("unsupported backfill phase %q", args.Phase)
 	}
+}
+
+// The existing backfill cursor has one positive integer. Pull-request scans
+// need the next API page, the number of identifiers added in the current
+// overlap pass, and an alternating pass bit. Page stores a reversible encoding
+// of that state. The bit prevents a one-page pass from enqueueing identical
+// River args while its preceding page-1 job is still running. This keeps crash
+// recovery authoritative in backfill_cursors without a process-local seen set.
+func encodePullBackfillCursor(
+	page int,
+	passNewCount int,
+	alternatePass bool,
+) (int, error) {
+	if page <= 0 || passNewCount < 0 {
+		return 0, fmt.Errorf(
+			"invalid pull request backfill cursor page=%d pass_new_count=%d",
+			page,
+			passNewCount,
+		)
+	}
+	x := int64(page - 1)
+	y := int64(passNewCount)
+	diagonal := x + y
+	paired := diagonal*(diagonal+1)/2 + y
+	encoded := paired*2 + 1
+	if alternatePass {
+		encoded++
+	}
+	const maxInt32 = int64(1<<31 - 1)
+	if encoded > maxInt32 {
+		return 0, fmt.Errorf(
+			"pull request backfill cursor exceeds PostgreSQL integer range",
+		)
+	}
+	return int(encoded), nil
+}
+
+func decodePullBackfillCursor(encoded int) (int, int, bool, error) {
+	if encoded <= 0 {
+		return 0, 0, false, fmt.Errorf(
+			"invalid pull request backfill cursor %d",
+			encoded,
+		)
+	}
+	raw := int64(encoded - 1)
+	alternatePass := raw%2 == 1
+	paired := raw / 2
+	diagonal := int64(
+		(math.Sqrt(float64(8*paired+1)) - 1) / 2,
+	)
+	for diagonal*(diagonal+1)/2 > paired {
+		diagonal--
+	}
+	for (diagonal+1)*(diagonal+2)/2 <= paired {
+		diagonal++
+	}
+	offset := paired - diagonal*(diagonal+1)/2
+	page := int(diagonal-offset) + 1
+	passNewCount := int(offset)
+	roundTrip, err := encodePullBackfillCursor(
+		page,
+		passNewCount,
+		alternatePass,
+	)
+	if err != nil || roundTrip != encoded {
+		return 0, 0, false, fmt.Errorf(
+			"invalid pull request backfill cursor %d",
+			encoded,
+		)
+	}
+	return page, passNewCount, alternatePass, nil
+}
+
+func (h *Handler) advancePullRequestBackfill(
+	ctx context.Context,
+	args queue.BackfillRepoPageArgs,
+	nextAPIPage int,
+	specs []queue.RefreshSpec,
+) error {
+	client := h.riverClient(ctx)
+	if client == nil {
+		return fmt.Errorf("River client missing from backfill context")
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin pull request backfill advance: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	queries := dbgen.New(tx)
+	cursor, err := queries.GetBackfillCursorForUpdate(
+		ctx,
+		dbgen.GetBackfillCursorForUpdateParams{
+			InstallationID: args.InstallationID,
+			RepoFullName:   args.RepoFullName,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("lock pull request backfill cursor: %w", err)
+	}
+	if cursor.Phase != args.Phase || int(cursor.Page) != args.Page {
+		return tx.Commit(ctx)
+	}
+	_, passNewCount, alternatePass, err := decodePullBackfillCursor(
+		int(cursor.Page),
+	)
+	if err != nil {
+		return err
+	}
+	unseen, err := unseenBackfillSpecs(ctx, tx, args, specs)
+	if err != nil {
+		return err
+	}
+	passNewCount += len(unseen)
+	generations, err := queue.InsertRefreshesTxReturning(
+		ctx,
+		tx,
+		client,
+		unseen,
+		cursor.QueueName,
+	)
+	if err != nil {
+		return err
+	}
+	if err := persistBackfillChildren(ctx, queries, args, generations); err != nil {
+		return err
+	}
+
+	nextPhase := "pull_requests"
+	nextQueue := queue.QueueSweep
+	nextCursor := 1
+	switch {
+	case nextAPIPage != 0:
+		nextCursor, err = encodePullBackfillCursor(
+			nextAPIPage,
+			passNewCount,
+			alternatePass,
+		)
+	case passNewCount > 0:
+		nextCursor, err = encodePullBackfillCursor(
+			1,
+			0,
+			!alternatePass,
+		)
+	default:
+		nextPhase = "waiting"
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := queries.AdvanceBackfillCursor(
+		ctx,
+		dbgen.AdvanceBackfillCursorParams{
+			NextPhase:      nextPhase,
+			NextPage:       int32(nextCursor),
+			QueueName:      nextQueue,
+			InstallationID: args.InstallationID,
+			RepoFullName:   args.RepoFullName,
+			ExpectedPhase:  args.Phase,
+			ExpectedPage:   int32(args.Page),
+		},
+	); err != nil {
+		return fmt.Errorf("advance pull request backfill cursor: %w", err)
+	}
+	if _, err := client.InsertTx(
+		ctx,
+		tx,
+		queue.NewBackfillRepoPageArgs(
+			args.InstallationID,
+			args.RepoFullName,
+			nextPhase,
+			nextCursor,
+		),
+		queue.NewBackfillInsertOptsForQueue(nextQueue),
+	); err != nil {
+		return fmt.Errorf("insert next pull request backfill page: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit pull request backfill advance: %w", err)
+	}
+	return nil
+}
+
+func unseenBackfillSpecs(
+	ctx context.Context,
+	tx pgx.Tx,
+	args queue.BackfillRepoPageArgs,
+	specs []queue.RefreshSpec,
+) ([]queue.RefreshSpec, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		keys = append(keys, spec.Key)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT refresh_key
+		FROM backfill_children
+		WHERE installation_id = $1
+		  AND repo_full_name = $2
+		  AND kind = $3
+		  AND refresh_key = ANY($4::text[])
+	`, args.InstallationID, args.RepoFullName, queue.KindRefreshPR, keys)
+	if err != nil {
+		return nil, fmt.Errorf("read seen pull request backfill keys: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{}, len(specs))
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("scan seen pull request backfill key: %w", err)
+		}
+		seen[key] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read seen pull request backfill keys: %w", err)
+	}
+	unseen := make([]queue.RefreshSpec, 0, len(specs))
+	for _, spec := range specs {
+		if _, exists := seen[spec.Key]; !exists {
+			unseen = append(unseen, spec)
+		}
+	}
+	return unseen, nil
+}
+
+func persistBackfillChildren(
+	ctx context.Context,
+	queries *dbgen.Queries,
+	args queue.BackfillRepoPageArgs,
+	generations []queue.RefreshGeneration,
+) error {
+	if len(generations) == 0 {
+		return nil
+	}
+	type child struct {
+		Kind             string `json:"kind"`
+		RefreshKey       string `json:"refresh_key"`
+		TargetGeneration int64  `json:"target_generation"`
+	}
+	children := make([]child, 0, len(generations))
+	for _, generation := range generations {
+		children = append(children, child{
+			Kind:             generation.Spec.Kind,
+			RefreshKey:       generation.Spec.Key,
+			TargetGeneration: generation.Generation,
+		})
+	}
+	encoded, err := json.Marshal(children)
+	if err != nil {
+		return fmt.Errorf("encode backfill children: %w", err)
+	}
+	if err := queries.UpsertBackfillChildren(
+		ctx,
+		dbgen.UpsertBackfillChildrenParams{
+			Children:       encoded,
+			InstallationID: args.InstallationID,
+			RepoFullName:   args.RepoFullName,
+		},
+	); err != nil {
+		return fmt.Errorf("persist backfill children: %w", err)
+	}
+	return nil
 }
 
 func (h *Handler) advanceBackfill(

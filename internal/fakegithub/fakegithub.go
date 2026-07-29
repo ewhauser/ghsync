@@ -218,6 +218,7 @@ type RateLimitStep struct {
 	Limit      int64
 	Remaining  int64
 	ResetAt    time.Time
+	Cost       int64
 	StatusCode int
 	RetryAfter time.Duration
 	Secondary  bool
@@ -228,7 +229,7 @@ type Option func(*Server)
 
 func WithFixture(fixture Fixture) Option {
 	return func(s *Server) {
-		s.fixture = fixture
+		s.fixture = cloneFixture(fixture)
 	}
 }
 
@@ -325,6 +326,7 @@ type Server struct {
 	responseDelay  time.Duration
 	active         int
 	maxActive      int
+	tokenMaxActive int
 	tokenTTL       time.Duration
 	tokenRequests  int
 	authorizations []string
@@ -347,7 +349,7 @@ type Server struct {
 func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 	resetAt := nextRateReset(time.Now())
 	s := &Server{
-		fixture:       fixture,
+		fixture:       cloneFixture(fixture),
 		webhookSecret: []byte(webhookSecret),
 		restBudget: rateBudget{
 			limit:     15000, // GHEC installation REST budget
@@ -426,12 +428,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/app/installations/") {
-		s.mux.ServeHTTP(w, r)
-		return
-	}
-
-	delay := s.beginRequest()
+	delay := s.beginRequest(r.URL.Path)
 	defer s.endRequest()
 	if delay > 0 {
 		timer := time.NewTimer(delay)
@@ -443,39 +440,78 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Installation-token exchanges use GitHub's separate App rate bucket, but
+	// they still share the fake's request-concurrency accounting.
+	if strings.HasPrefix(r.URL.Path, "/app/installations/") {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+
 	resource := "core"
 	if r.URL.Path == "/graphql" {
 		resource = "graphql"
 	}
+	if strings.HasPrefix(r.URL.Path, "/app/hook/deliveries") {
+		if !s.validateAppAuthorization(w, r) {
+			return
+		}
+	} else if !validateInstallationAuthorization(w, r) {
+		return
+	}
 	s.mu.Lock()
 	s.authorizations = append(s.authorizations, r.Header.Get("Authorization"))
 	s.mu.Unlock()
-	rate, scripted, allowed, status, retryAfter, secondary := s.nextRate(resource, 1)
-	setRateHeaders(w.Header(), rate)
-	if scripted {
+	rate := s.nextRate(resource, 1)
+	setRateHeaders(w.Header(), rate.snapshot)
+	if rate.scripted {
 		r = r.WithContext(context.WithValue(r.Context(), scriptedRateKey{}, true))
 	}
-	if status == http.StatusForbidden || status == http.StatusTooManyRequests {
-		if retryAfter > 0 {
+	r = r.WithContext(context.WithValue(r.Context(), rateCostKey{}, rate.cost))
+	if rate.status == http.StatusForbidden ||
+		rate.status == http.StatusTooManyRequests {
+		if rate.retryAfter > 0 {
 			w.Header().Set(
 				"Retry-After",
-				strconv.FormatInt(int64((retryAfter+time.Second-1)/time.Second), 10),
+				strconv.FormatInt(
+					int64((rate.retryAfter+time.Second-1)/time.Second),
+					10,
+				),
 			)
 		}
-		if secondary || retryAfter > 0 {
-			writeSecondaryRateLimitExceeded(w, status, resource, rate)
+		if rate.secondary || rate.retryAfter > 0 {
+			writeSecondaryRateLimitExceeded(
+				w,
+				rate.status,
+				resource,
+				rate.snapshot,
+				rate.cost,
+			)
 		} else if resource == "graphql" {
-			writeGraphQLRateLimitExceeded(w, rate, status)
+			writeGraphQLRateLimitExceeded(
+				w,
+				rate.snapshot,
+				rate.status,
+				rate.cost,
+			)
 		} else {
-			writeRESTRateLimitExceeded(w, rate, status)
+			writeRESTRateLimitExceeded(w, rate.snapshot, rate.status)
 		}
 		return
 	}
-	if !allowed {
+	if !rate.allowed {
 		if resource == "graphql" {
-			writeGraphQLRateLimitExceeded(w, rate, http.StatusOK)
+			writeGraphQLRateLimitExceeded(
+				w,
+				rate.snapshot,
+				http.StatusOK,
+				rate.cost,
+			)
 		} else {
-			writeRESTRateLimitExceeded(w, rate, http.StatusForbidden)
+			writeRESTRateLimitExceeded(
+				w,
+				rate.snapshot,
+				http.StatusForbidden,
+			)
 		}
 		return
 	}
@@ -653,7 +689,7 @@ func (s *Server) NotModifiedCount(method, path string) int {
 func (s *Server) SetFixture(fixture Fixture) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.fixture = fixture
+	s.fixture = cloneFixture(fixture)
 }
 
 // RedeliveryRequests reports the delivery IDs requested through the fake
@@ -691,6 +727,22 @@ func (s *Server) MaxConcurrent() int {
 	return s.maxActive
 }
 
+// Concurrent reports requests currently inside the fake's concurrency
+// accounting. Tests use it only to establish deterministic burst boundaries.
+func (s *Server) Concurrent() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active
+}
+
+// TokenMaxConcurrent reports the highest active-request count observed while
+// an installation-token exchange was active.
+func (s *Server) TokenMaxConcurrent() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tokenMaxActive
+}
+
 func (s *Server) TokenRequests() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -705,7 +757,7 @@ func (s *Server) Authorizations() []string {
 
 func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, bool) {
 	s.mu.Lock()
-	fx := s.fixture
+	fx := cloneFixture(s.fixture)
 	s.mu.Unlock()
 	if r.PathValue("owner") != fx.Owner || r.PathValue("repo") != fx.Repo {
 		http.NotFound(w, r)
@@ -727,10 +779,10 @@ func (s *Server) listInstallationRepositories(
 	r *http.Request,
 ) {
 	s.mu.Lock()
-	configured := s.fixture.Repositories
-	repositories := append([]Repository(nil), configured...)
-	if configured == nil {
-		repositories = []Repository{s.fixture.Repository}
+	fx := cloneFixture(s.fixture)
+	repositories := fx.Repositories
+	if repositories == nil {
+		repositories = []Repository{fx.Repository}
 	}
 	s.mu.Unlock()
 	sort.SliceStable(repositories, func(i, j int) bool {
@@ -856,9 +908,13 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	budget := s.snapshot("graphql")
+	cost, _ := r.Context().Value(rateCostKey{}).(int64)
+	if cost <= 0 {
+		cost = 1
+	}
 	data := map[string]any{
 		"rateLimit": map[string]any{
-			"cost":      1,
+			"cost":      cost,
 			"limit":     budget.limit,
 			"remaining": budget.remaining,
 			"resetAt":   budget.resetAt.Format(time.RFC3339),
@@ -866,7 +922,7 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	s.mu.Lock()
-	fx := s.fixture
+	fx := cloneFixture(s.fixture)
 	s.mu.Unlock()
 	var ids []string
 	if raw := request.Variables["ids"]; len(raw) > 0 {
@@ -1118,12 +1174,40 @@ func (s *Server) installationToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid GitHub API headers", http.StatusBadRequest)
 		return
 	}
+	if !s.validateAppAuthorization(w, r) {
+		return
+	}
+	installationID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || installationID <= 0 {
+		http.Error(w, "bad installation ID", http.StatusBadRequest)
+		return
+	}
+	now := s.now()
+	s.mu.Lock()
+	s.tokenRequests++
+	requestNumber := s.tokenRequests
+	ttl := s.tokenTTL
+	s.mu.Unlock()
+	writeJSONStatus(w, http.StatusCreated, map[string]any{
+		"token": fmt.Sprintf(
+			"fake-installation-%d-token-%d",
+			installationID,
+			requestNumber,
+		),
+		"expires_at": now.Add(ttl).UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) validateAppAuthorization(
+	w http.ResponseWriter,
+	r *http.Request,
+) bool {
 	const bearer = "Bearer "
 	rawAuthorization := r.Header.Get("Authorization")
 	if !strings.HasPrefix(rawAuthorization, bearer) ||
 		s.appPublicKey == nil || s.appID <= 0 {
 		http.Error(w, "valid App JWT required", http.StatusUnauthorized)
-		return
+		return false
 	}
 	auth := strings.TrimPrefix(rawAuthorization, bearer)
 	claims := &fakeAppClaims{}
@@ -1146,26 +1230,27 @@ func (s *Server) installationToken(w http.ResponseWriter, r *http.Request) {
 		!claims.ExpiresAt.Time.After(now) ||
 		claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time) > 10*time.Minute {
 		http.Error(w, "valid App JWT required", http.StatusUnauthorized)
-		return
+		return false
 	}
-	installationID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || installationID <= 0 {
-		http.Error(w, "bad installation ID", http.StatusBadRequest)
-		return
+	return true
+}
+
+func validateInstallationAuthorization(
+	w http.ResponseWriter,
+	r *http.Request,
+) bool {
+	if !strings.HasPrefix(
+		r.Header.Get("Authorization"),
+		"Bearer fake-installation-",
+	) {
+		http.Error(
+			w,
+			"valid installation bearer required",
+			http.StatusUnauthorized,
+		)
+		return false
 	}
-	s.mu.Lock()
-	s.tokenRequests++
-	requestNumber := s.tokenRequests
-	ttl := s.tokenTTL
-	s.mu.Unlock()
-	writeJSONStatus(w, http.StatusCreated, map[string]any{
-		"token": fmt.Sprintf(
-			"fake-installation-%d-token-%d",
-			installationID,
-			requestNumber,
-		),
-		"expires_at": now.Add(ttl).UTC().Format(time.RFC3339Nano),
-	})
+	return true
 }
 
 func (s *Server) listAppHookDeliveries(
@@ -1459,10 +1544,17 @@ func (s *Server) consume(resource string, cost int64) (rateSnapshot, bool) {
 	return budget.snapshot(), true
 }
 
-func (s *Server) nextRate(
-	resource string,
-	cost int64,
-) (rateSnapshot, bool, bool, int, time.Duration, bool) {
+type rateOutcome struct {
+	snapshot   rateSnapshot
+	scripted   bool
+	allowed    bool
+	status     int
+	retryAfter time.Duration
+	secondary  bool
+	cost       int64
+}
+
+func (s *Server) nextRate(resource string, defaultCost int64) rateOutcome {
 	s.mu.Lock()
 	var steps []RateLimitStep
 	var index *int
@@ -1476,6 +1568,10 @@ func (s *Server) nextRate(
 	if *index < len(steps) {
 		step := steps[*index]
 		*index++
+		cost := step.Cost
+		if cost <= 0 {
+			cost = defaultCost
+		}
 		budget := s.budget(resource)
 		budget.resetIfExpired(time.Now())
 		if step.Limit <= 0 {
@@ -1489,11 +1585,23 @@ func (s *Server) nextRate(
 		budget.resetAt = step.ResetAt
 		snapshot := budget.snapshot()
 		s.mu.Unlock()
-		return snapshot, true, true, step.StatusCode, step.RetryAfter, step.Secondary
+		return rateOutcome{
+			snapshot:   snapshot,
+			scripted:   true,
+			allowed:    true,
+			status:     step.StatusCode,
+			retryAfter: step.RetryAfter,
+			secondary:  step.Secondary,
+			cost:       cost,
+		}
 	}
 	s.mu.Unlock()
-	snapshot, allowed := s.consume(resource, cost)
-	return snapshot, false, allowed, 0, 0, false
+	snapshot, allowed := s.consume(resource, defaultCost)
+	return rateOutcome{
+		snapshot: snapshot,
+		allowed:  allowed,
+		cost:     defaultCost,
+	}
 }
 
 func (s *Server) snapshot(resource string) rateSnapshot {
@@ -1532,11 +1640,14 @@ func nextRateReset(now time.Time) time.Time {
 	return now.UTC().Truncate(time.Hour).Add(time.Hour)
 }
 
-func (s *Server) beginRequest() time.Duration {
+func (s *Server) beginRequest(path string) time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.active++
 	s.maxActive = max(s.maxActive, s.active)
+	if strings.HasPrefix(path, "/app/installations/") {
+		s.tokenMaxActive = max(s.tokenMaxActive, s.active)
+	}
 	return s.responseDelay
 }
 
@@ -1547,6 +1658,7 @@ func (s *Server) endRequest() {
 }
 
 type scriptedRateKey struct{}
+type rateCostKey struct{}
 
 func (s *Server) writeConditionalJSON(
 	w http.ResponseWriter,
@@ -1611,13 +1723,18 @@ func writeRESTRateLimitExceeded(
 	}
 }
 
-func writeGraphQLRateLimitExceeded(w http.ResponseWriter, budget rateSnapshot, status int) {
+func writeGraphQLRateLimitExceeded(
+	w http.ResponseWriter,
+	budget rateSnapshot,
+	status int,
+	cost int64,
+) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"data": map[string]any{
 			"rateLimit": map[string]any{
-				"cost":      1,
+				"cost":      cost,
 				"limit":     budget.limit,
 				"remaining": budget.remaining,
 				"resetAt":   budget.resetAt.Format(time.RFC3339),
@@ -1638,6 +1755,7 @@ func writeSecondaryRateLimitExceeded(
 	status int,
 	resource string,
 	budget rateSnapshot,
+	cost int64,
 ) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1645,7 +1763,7 @@ func writeSecondaryRateLimitExceeded(
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"data": map[string]any{
 				"rateLimit": map[string]any{
-					"cost":      1,
+					"cost":      cost,
 					"limit":     budget.limit,
 					"remaining": budget.remaining,
 					"resetAt":   budget.resetAt.Format(time.RFC3339),

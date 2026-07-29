@@ -101,6 +101,29 @@ func TestRetryAfterDeadline(t *testing.T) {
 	}
 }
 
+func TestObserveSecondaryLimitAcceptsHTTPDateRetryAfter(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	gate := New(nil, Options{Clock: clock})
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{
+			"Retry-After": []string{
+				now.Add(3 * time.Second).Format(http.TimeFormat),
+			},
+		},
+		Body: http.NoBody,
+	}
+	if err := gate.observeSecondaryLimit(context.Background(), response); err != nil {
+		t.Fatal(err)
+	}
+	if got := gate.Snapshot().BackoffUntil; !got.Equal(
+		now.Add(3 * time.Second),
+	) {
+		t.Fatalf("HTTP-date secondary-limit deadline = %v", got)
+	}
+}
+
 func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
 	var active atomic.Int64
 	var maxActive atomic.Int64

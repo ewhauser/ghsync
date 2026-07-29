@@ -1,15 +1,20 @@
 package fetch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +28,7 @@ import (
 	"github.com/acme/frontier/internal/fakegithub"
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/ingress"
+	"github.com/acme/frontier/internal/pipeline"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
@@ -483,6 +489,232 @@ func TestCoordinatorReturnsPerKeyWriterErrors(t *testing.T) {
 	}
 	if healthy.Title != "healthy sibling applied" {
 		t.Fatalf("healthy sibling row = %+v", healthy)
+	}
+}
+
+func TestCoordinatorStampsEveryGangedItemEventContext(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		50*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	numbers := []int{4812, 4815, 4816}
+	for _, number := range numbers {
+		if err := handler.ResolveStackMembership(
+			context.Background(),
+			queue.RefreshRequest{
+				Args: queue.NewResolveStackMembershipArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", number),
+				).RefreshArgs,
+				Queue: queue.QueueEvent,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index := range fixture.PullRequests {
+		for _, number := range numbers {
+			if fixture.PullRequests[index].Number == number {
+				fixture.PullRequests[index].Title += " ganged latency"
+			}
+		}
+	}
+	fake.SetFixture(fixture)
+	baseline := fake.RequestCount(http.MethodPost, "/graphql")
+	eventContexts := make([]context.Context, len(numbers))
+	results := make(chan error, len(numbers))
+	start := make(chan struct{})
+	for index, number := range numbers {
+		eventContexts[index] = pipeline.WithEvent(
+			context.Background(),
+			time.Now().Add(-time.Duration(index+1)*time.Second),
+		)
+		ctx := eventContexts[index]
+		number := number
+		go func() {
+			<-start
+			results <- handler.RefreshPR(ctx, queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", number),
+				).RefreshArgs,
+				Queue: queue.QueueEvent,
+			})
+		}()
+	}
+	close(start)
+	for range numbers {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamps := make(map[time.Time]struct{}, len(eventContexts))
+	for index, eventCtx := range eventContexts {
+		stamp := pipeline.CacheCommittedAt(eventCtx)
+		if stamp.IsZero() {
+			t.Fatalf("ganged item %d has no cache commit stamp", index)
+		}
+		stamps[stamp] = struct{}{}
+	}
+	if len(stamps) != len(eventContexts) {
+		t.Fatalf(
+			"ganged cache commit stamps = %d, want %d distinct item stamps",
+			len(stamps),
+			len(eventContexts),
+		)
+	}
+	if got := fake.RequestCount(
+		http.MethodPost,
+		"/graphql",
+	) - baseline; got != 1 {
+		t.Fatalf("coordinator GraphQL batches = %d, want 1", got)
+	}
+}
+
+func TestCoordinatorIsolatesReviewThreadTransportFailure(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	targetThread := fixture.PullRequests[1].ReviewThreads[0].ID
+	comments := make([]fakegithub.ReviewComment, 101)
+	for index := range comments {
+		comments[index] = fakegithub.ReviewComment{
+			ID:          fmt.Sprintf("comment-%03d", index),
+			Body:        fmt.Sprintf("comment %d", index),
+			UpdatedAt:   fixture.PullRequests[1].UpdatedAt,
+			AuthorLogin: "reviewer",
+		}
+	}
+	fixture.PullRequests[1].ReviewThreads[0].Comments = comments
+	var injected atomic.Int64
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/graphql" {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				var request struct {
+					Query     string                     `json:"query"`
+					Variables map[string]json.RawMessage `json:"variables"`
+				}
+				if err := json.Unmarshal(body, &request); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				var nodeID string
+				_ = json.Unmarshal(request.Variables["id"], &nodeID)
+				if strings.Contains(
+					request.Query,
+					"FrontierReviewThreadCommentsPage",
+				) && nodeID == targetThread {
+					injected.Add(1)
+					http.Error(
+						w,
+						"injected review-thread transport failure",
+						http.StatusBadGateway,
+					)
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	fake, server, handler, riverClient := newDirectHandlerWithMiddleware(
+		t,
+		pool,
+		fixture,
+		50*time.Millisecond,
+		100,
+		middleware,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	for _, number := range []int{4812, 4815} {
+		if err := handler.ResolveStackMembership(
+			ctx,
+			queue.RefreshRequest{
+				Args: queue.NewResolveStackMembershipArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", number),
+				).RefreshArgs,
+				Queue: queue.QueueEvent,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture.PullRequests[1].Title = "poison transport update"
+	fixture.PullRequests[2].Title = "healthy transport sibling"
+	fake.SetFixture(fixture)
+	type refreshResult struct {
+		number int
+		err    error
+	}
+	results := make(chan refreshResult, 2)
+	start := make(chan struct{})
+	for _, number := range []int{4812, 4815} {
+		number := number
+		go func() {
+			<-start
+			err := handler.RefreshPR(ctx, queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", number),
+				).RefreshArgs,
+				Queue: queue.QueueEvent,
+			})
+			results <- refreshResult{number: number, err: err}
+		}()
+	}
+	close(start)
+	outcomes := make(map[int]error, 2)
+	for range 2 {
+		result := <-results
+		outcomes[result.number] = result.err
+	}
+	if outcomes[4812] == nil {
+		t.Fatal("transport-poisoned PR unexpectedly succeeded")
+	}
+	if outcomes[4815] != nil {
+		t.Fatalf("healthy sibling failed: %v", outcomes[4815])
+	}
+	if injected.Load() < 2 {
+		t.Fatalf(
+			"injected transport failures = %d, want batch and isolated attempts",
+			injected.Load(),
+		)
+	}
+	healthy, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4815,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healthy.Title != "healthy transport sibling" {
+		t.Fatalf("healthy sibling row = %+v", healthy)
+	}
+	poisoned, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poisoned.Title == "poison transport update" {
+		t.Fatalf("transport-poisoned row was committed: %+v", poisoned)
 	}
 }
 
@@ -1203,9 +1435,9 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 	if got := fake.RequestCount(
 		http.MethodGet,
 		"/repos/acme/monolith/pulls",
-	); got != 5 {
+	); got != 4 {
 		t.Fatalf(
-			"PR list fetches = %d, want high-water plus two overlap passes",
+			"PR list fetches = %d, want two durable overlap passes",
 			got,
 		)
 	}
@@ -1408,11 +1640,231 @@ func TestBackfillStableCreatedSnapshotSurvivesMidScanUpdate(t *testing.T) {
 	if got := fake.RequestCount(
 		http.MethodGet,
 		"/repos/acme/monolith/pulls",
-	); got != 5 {
+	); got != 4 {
 		t.Fatalf(
-			"pull list calls = %d, want high-water plus two overlap passes",
+			"pull list calls = %d, want two durable overlap passes",
 			got,
 		)
+	}
+}
+
+func TestBackfillCancelMidScanResumesFromDurablePage(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	var pagesMu sync.Mutex
+	var pages []int
+	cancelPageTwo := make(chan context.CancelFunc, 1)
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet &&
+				r.URL.Path == "/repos/acme/monolith/pulls" {
+				page, err := strconv.Atoi(r.URL.Query().Get("page"))
+				if err != nil {
+					http.Error(w, "invalid page", http.StatusBadRequest)
+					return
+				}
+				pagesMu.Lock()
+				pages = append(pages, page)
+				pagesMu.Unlock()
+				if page == 2 {
+					select {
+					case cancel := <-cancelPageTwo:
+						cancel()
+						<-r.Context().Done()
+						return
+					default:
+					}
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	fake, server, handler, riverClient := newDirectHandlerWithMiddleware(
+		t,
+		pool,
+		fakegithub.DefaultFixture(),
+		10*time.Millisecond,
+		2,
+		middleware,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	if _, err := StartBackfill(
+		ctx,
+		pool,
+		riverClient,
+		1,
+		"acme/monolith",
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range []queue.BackfillRepoPageArgs{
+		queue.NewBackfillRepoPageArgs(
+			1,
+			"acme/monolith",
+			"repository",
+			1,
+		),
+		queue.NewBackfillRepoPageArgs(
+			1,
+			"acme/monolith",
+			"stacks",
+			1,
+		),
+		queue.NewBackfillRepoPageArgs(
+			1,
+			"acme/monolith",
+			"pull_requests",
+			1,
+		),
+	} {
+		if err := handler.BackfillRepoPage(ctx, args); err != nil {
+			t.Fatal(err)
+		}
+	}
+	midScan, err := dbgen.New(pool).GetBackfillCursor(
+		ctx,
+		dbgen.GetBackfillCursorParams{
+			InstallationID: 1,
+			RepoFullName:   "acme/monolith",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiPage, passNewCount, _, err := decodePullBackfillCursor(
+		int(midScan.Page),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if midScan.Phase != "pull_requests" ||
+		apiPage != 2 ||
+		passNewCount != 2 {
+		t.Fatalf(
+			"mid-scan cursor = %+v decoded page=%d pass_new_count=%d",
+			midScan,
+			apiPage,
+			passNewCount,
+		)
+	}
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancelPageTwo <- cancel
+	err = handler.BackfillRepoPage(
+		cancelCtx,
+		queue.NewBackfillRepoPageArgs(
+			1,
+			"acme/monolith",
+			"pull_requests",
+			int(midScan.Page),
+		),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled mid-scan page error = %v", err)
+	}
+	afterCancel, err := dbgen.New(pool).GetBackfillCursor(
+		ctx,
+		dbgen.GetBackfillCursorParams{
+			InstallationID: 1,
+			RepoFullName:   "acme/monolith",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterCancel.Page != midScan.Page ||
+		afterCancel.Phase != midScan.Phase {
+		t.Fatalf(
+			"cancel changed durable cursor: before=%+v after=%+v",
+			midScan,
+			afterCancel,
+		)
+	}
+	events, unsubscribe := riverClient.Subscribe(
+		river.EventKindJobCancelled,
+		river.EventKindJobCompleted,
+		river.EventKindJobFailed,
+		river.EventKindJobSnoozed,
+	)
+	defer unsubscribe()
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	if err := riverClient.Start(runCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	}()
+	var completed dbgen.BackfillCursor
+	for {
+		completed, err = dbgen.New(pool).GetBackfillCursor(
+			t.Context(),
+			dbgen.GetBackfillCursorParams{
+				InstallationID: 1,
+				RepoFullName:   "acme/monolith",
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if completed.Phase == "done" {
+			break
+		}
+		select {
+		case <-events:
+		case <-t.Context().Done():
+			t.Fatalf("resumed backfill did not complete: %+v", completed)
+		}
+	}
+	pagesMu.Lock()
+	gotPages := append([]int(nil), pages...)
+	pagesMu.Unlock()
+	wantPages := []int{1, 2, 2, 1, 2}
+	if !reflect.DeepEqual(gotPages, wantPages) {
+		t.Fatalf(
+			"pull page requests after restart = %v, want %v",
+			gotPages,
+			wantPages,
+		)
+	}
+	if got := fake.RequestCount(
+		http.MethodGet,
+		"/repos/acme/monolith/pulls",
+	); got != 4 {
+		t.Fatalf("successful pull page requests = %d, want 4", got)
+	}
+}
+
+func TestPipelineWaitIdleIncludesKeylessBackfillJobs(t *testing.T) {
+	harness := newPipelineHarness(t, "acme/keyless-idle")
+	defer harness.close()
+	if _, err := StartBackfill(
+		t.Context(),
+		harness.pool,
+		harness.river,
+		1,
+		harness.repo,
+	); err != nil {
+		t.Fatal(err)
+	}
+	harness.waitIdle()
+	cursor, err := dbgen.New(harness.pool).GetBackfillCursor(
+		t.Context(),
+		dbgen.GetBackfillCursorParams{
+			InstallationID: 1,
+			RepoFullName:   harness.repo,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Phase != "done" || !cursor.CompletedAt.Valid {
+		t.Fatalf("waitIdle returned before keyless backfill completed: %+v", cursor)
 	}
 }
 
@@ -1552,7 +2004,7 @@ func newPipelineHarness(t *testing.T, repo string) *pipelineHarness {
 	rest, err := gh.NewRESTClient(
 		fakeServer.URL,
 		gate,
-		gh.StaticToken("test-token"),
+		gh.StaticToken("fake-installation-fetch"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1560,7 +2012,7 @@ func newPipelineHarness(t *testing.T, repo string) *pipelineHarness {
 	graphQL, err := gh.NewGraphQLClient(
 		fakeServer.URL,
 		gate,
-		gh.StaticToken("test-token"),
+		gh.StaticToken("fake-installation-fetch"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1648,29 +2100,43 @@ func (h *pipelineHarness) dispatchAll() {
 
 func (h *pipelineHarness) waitIdle() {
 	h.t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
+	events, unsubscribe := h.river.Subscribe(
+		river.EventKindJobCancelled,
+		river.EventKindJobCompleted,
+		river.EventKindJobFailed,
+		river.EventKindJobSnoozed,
+	)
+	defer unsubscribe()
+	for {
 		var count int
-		if err := h.pool.QueryRow(context.Background(), `
+		if err := h.pool.QueryRow(h.t.Context(), `
 			SELECT count(*)
 			FROM river_job
 			WHERE state IN ('available', 'pending', 'retryable', 'running', 'scheduled')
-			  AND args->>'key' LIKE $1
-		`, "%:"+h.repo+":%").Scan(&count); err != nil {
+		`).Scan(&count); err != nil {
 			h.t.Fatal(err)
 		}
 		if count == 0 {
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		select {
+		case <-events:
+		case <-h.t.Context().Done():
+			var states string
+			_ = h.pool.QueryRow(context.Background(), `
+				SELECT string_agg(
+					kind || ':' || state,
+					', ' ORDER BY kind, state
+				)
+				FROM river_job
+				WHERE state IN (
+					'available', 'pending', 'retryable',
+					'running', 'scheduled'
+				)
+			`).Scan(&states)
+			h.t.Fatalf("pipeline did not quiesce: %s", states)
+		}
 	}
-	var states string
-	_ = h.pool.QueryRow(context.Background(), `
-		SELECT string_agg(kind || ':' || state, ', ' ORDER BY kind, state)
-		FROM river_job
-		WHERE args->>'key' LIKE $1
-	`, "%:"+h.repo+":%").Scan(&states)
-	h.t.Fatalf("pipeline did not quiesce: %s", states)
 }
 
 func (h *pipelineHarness) close() {
@@ -1837,14 +2303,43 @@ func newDirectHandler(
 	*Handler,
 	*river.Client[pgx.Tx],
 ) {
+	return newDirectHandlerWithMiddleware(
+		t,
+		pool,
+		fixture,
+		batchWindow,
+		pageSize,
+		nil,
+		fakeOptions...,
+	)
+}
+
+func newDirectHandlerWithMiddleware(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	fixture fakegithub.Fixture,
+	batchWindow time.Duration,
+	pageSize int,
+	middleware func(http.Handler) http.Handler,
+	fakeOptions ...fakegithub.Option,
+) (
+	*fakegithub.Server,
+	*httptest.Server,
+	*Handler,
+	*river.Client[pgx.Tx],
+) {
 	t.Helper()
 	fake := fakegithub.New(fixture, fetchTestSecret, fakeOptions...)
-	server := httptest.NewServer(fake)
+	var serverHandler http.Handler = fake
+	if middleware != nil {
+		serverHandler = middleware(serverHandler)
+	}
+	server := httptest.NewServer(serverHandler)
 	gate := budget.New(server.Client(), budget.Options{})
 	rest, err := gh.NewRESTClient(
 		server.URL,
 		gate,
-		gh.StaticToken("test-token"),
+		gh.StaticToken("fake-installation-fetch"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1852,7 +2347,7 @@ func newDirectHandler(
 	graphQL, err := gh.NewGraphQLClient(
 		server.URL,
 		gate,
-		gh.StaticToken("test-token"),
+		gh.StaticToken("fake-installation-fetch"),
 	)
 	if err != nil {
 		t.Fatal(err)

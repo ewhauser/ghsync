@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -22,6 +23,8 @@ const (
 	maxListenerBackoff  = 5 * time.Second
 	notificationChannel = "frontier_change_events"
 )
+
+var errCursorFirstTouchRace = errors.New("consumer cursor first-touch race")
 
 // Config controls paging and the correctness-preserving poll fallback.
 type Config struct {
@@ -100,8 +103,10 @@ type Client struct {
 }
 
 type clientTestHooks struct {
-	afterHorizon      func()
-	listenerConnected func(uint32)
+	afterHorizon          func()
+	afterEnsureCursor     func()
+	cursorFirstTouchRetry func()
+	listenerConnected     func(uint32)
 }
 
 // New validates configuration and constructs a reference stream client.
@@ -216,6 +221,12 @@ func (c *Client) Tail(
 		delivered, err := c.deliverPage(
 			ctx, consumer, stream, handler,
 		)
+		if errors.Is(err, errCursorFirstTouchRace) {
+			if hook := c.testHooks.cursorFirstTouchRetry; hook != nil {
+				hook()
+			}
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -332,7 +343,13 @@ func (c *Client) deliverPage(
 		VALUES ($1, $2, 0, clock_timestamp())
 		ON CONFLICT (consumer, stream) DO NOTHING
 	`, consumer, stream); err != nil {
+		if isSerializationFailure(err) {
+			return 0, errCursorFirstTouchRace
+		}
 		return 0, fmt.Errorf("ensure consumer cursor: %w", err)
+	}
+	if hook := c.testHooks.afterEnsureCursor; hook != nil {
+		hook()
 	}
 	var cursor int64
 	if err := tx.QueryRow(ctx, `
@@ -340,7 +357,12 @@ func (c *Client) deliverPage(
 		FROM consumer_cursors
 		WHERE consumer = $1 AND stream = $2
 		FOR UPDATE
-	`, consumer, stream).Scan(&cursor); err != nil {
+	`, consumer, stream).Scan(&cursor); errors.Is(err, pgx.ErrNoRows) {
+		// REPEATABLE READ can observe a concurrent INSERT's uniqueness conflict
+		// without seeing the newly committed row in this transaction snapshot.
+		// Tail retries in a new snapshot; no handler or cursor effects exist yet.
+		return 0, errCursorFirstTouchRace
+	} else if err != nil {
 		return 0, fmt.Errorf("lock consumer cursor: %w", err)
 	}
 	var prunedThrough int64
@@ -425,6 +447,12 @@ func (c *Client) deliverPage(
 		return 0, fmt.Errorf("commit stream page: %w", err)
 	}
 	return len(events), nil
+}
+
+func isSerializationFailure(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) &&
+		postgresError.Code == "40001"
 }
 
 func validateIdentity(consumer string, stream string) error {

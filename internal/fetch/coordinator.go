@@ -37,6 +37,18 @@ type pullBatchResult struct {
 	err     error
 }
 
+type pullApplyContext struct {
+	context.Context
+	values context.Context
+}
+
+func (c pullApplyContext) Value(key any) any {
+	if value := c.values.Value(key); value != nil {
+		return value
+	}
+	return c.Context.Value(key)
+}
+
 type pullBatchKey struct {
 	class  budget.Class
 	source store.SyncSource
@@ -221,15 +233,7 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	for _, item := range active {
 		ids = append(ids, item.nodeID)
 	}
-	nodes, _, err := c.graphQL.BatchPullRequests(
-		callCtx,
-		batch.items[0].class,
-		ids,
-	)
-	if err != nil {
-		c.finishAll(batch, nil, err)
-		return
-	}
+	nodes, nodeErrors := c.fetchPullRequestNodes(callCtx, active, ids)
 
 	repositoryFailures := make(map[int64]error)
 	applies := make([]store.PullRequestApply, 0, len(active))
@@ -237,6 +241,10 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	repositoryApplied := make(map[int64]bool)
 	for index, node := range nodes {
 		item := active[index]
+		if nodeErr := nodeErrors[index]; nodeErr != nil {
+			results[item] = pullBatchResult{err: nodeErr}
+			continue
+		}
 		if node == nil {
 			results[item] = pullBatchResult{
 				err: fmt.Errorf(
@@ -280,6 +288,10 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			record.Number,
 		)
 		applies = append(applies, store.PullRequestApply{
+			Context: pullApplyContext{
+				Context: callCtx,
+				values:  item.ctx,
+			},
 			Record:      record,
 			Observation: itemObservations[item],
 			Hook:        item.hook(record.Repository.FullName),
@@ -295,6 +307,49 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		}
 	}
 	c.finishAll(batch, results, nil)
+}
+
+func (c *prCoordinator) fetchPullRequestNodes(
+	ctx context.Context,
+	items []*pullBatchItem,
+	ids []string,
+) ([]*gh.PullRequestNode, map[int]error) {
+	nodes, _, batchErr := c.graphQL.BatchPullRequests(
+		ctx,
+		items[0].class,
+		ids,
+	)
+	if batchErr == nil {
+		return nodes, nil
+	}
+	nodes = make([]*gh.PullRequestNode, len(items))
+	nodeErrors := make(map[int]error, len(items))
+	if len(items) == 1 {
+		nodeErrors[0] = batchErr
+		return nodes, nodeErrors
+	}
+	// BatchPullRequests completes review-thread connections after the nodes()
+	// response. If one connection fails, retrying each node independently
+	// recovers already returned healthy nodes and confines a persistent
+	// completion failure to its owning PR.
+	for index, item := range items {
+		isolated, _, err := c.graphQL.BatchPullRequests(
+			ctx,
+			item.class,
+			[]string{ids[index]},
+		)
+		if err != nil {
+			nodeErrors[index] = fmt.Errorf(
+				"GraphQL PR batch failed (%v); isolate node %q: %w",
+				batchErr,
+				ids[index],
+				err,
+			)
+			continue
+		}
+		nodes[index] = isolated[0]
+	}
+	return nodes, nodeErrors
 }
 
 func (c *prCoordinator) finishAll(

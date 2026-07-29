@@ -48,13 +48,18 @@ func (SnapshotLoader) Load(
 		    JOIN repos
 		      ON repos.installation_id = requested.installation_id
 		     AND repos.gh_id = requested.repo_id
+		     AND repos.tombstoned_at IS NULL
 		    JOIN pull_requests ON pull_requests.repo_id = repos.id
-		    WHERE (
-		        requested.kind = 'stack'
-		        AND pull_requests.stack_number = requested.number
-		    ) OR (
-		        requested.kind = 'pr'
-		        AND pull_requests.number = requested.number
+		    WHERE pull_requests.tombstoned_at IS NULL
+		      AND (
+		          (
+		              requested.kind = 'stack'
+		              AND pull_requests.stack_number = requested.number
+		          ) OR (
+		              requested.kind = 'pr'
+		              AND pull_requests.number = requested.number
+		              AND pull_requests.stack_number IS NULL
+		          )
 		    )
 		)
 		SELECT requested.scope_key,
@@ -72,6 +77,7 @@ func (SnapshotLoader) Load(
 		                                ORDER BY repo_rules.rule_key)
 		               FROM repo_rules
 		               WHERE repo_rules.repo_id = repos.id
+		                 AND repo_rules.tombstoned_at IS NULL
 		           ), '[]'::jsonb),
 		           'stack', (
 		               SELECT to_jsonb(stacks)
@@ -79,6 +85,7 @@ func (SnapshotLoader) Load(
 		               WHERE requested.kind = 'stack'
 		                 AND stacks.repo_id = repos.id
 		                 AND stacks.number = requested.number
+		                 AND stacks.tombstoned_at IS NULL
 		           ),
 		           'pull_requests', COALESCE((
 		               SELECT jsonb_agg(to_jsonb(selected_prs)
@@ -92,6 +99,7 @@ func (SnapshotLoader) Load(
 		                                ORDER BY review_threads.id)
 		               FROM review_threads
 		               WHERE review_threads.repo_id = repos.id
+		                 AND review_threads.tombstoned_at IS NULL
 		                 AND EXISTS (
 		                     SELECT 1
 		                     FROM selected_prs
@@ -106,6 +114,7 @@ func (SnapshotLoader) Load(
 		                                ORDER BY check_runs.gh_id)
 		               FROM check_runs
 		               WHERE check_runs.repo_id = repos.id
+		                 AND check_runs.tombstoned_at IS NULL
 		                 AND EXISTS (
 		                     SELECT 1
 		                     FROM selected_prs
@@ -120,6 +129,7 @@ func (SnapshotLoader) Load(
 		LEFT JOIN repos
 		  ON repos.installation_id = requested.installation_id
 		 AND repos.gh_id = requested.repo_id
+		 AND repos.tombstoned_at IS NULL
 		ORDER BY requested.scope_key
 	`, encoded)
 	if err != nil {

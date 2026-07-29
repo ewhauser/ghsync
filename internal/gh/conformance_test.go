@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/acme/frontier/internal/budget"
+	"github.com/acme/frontier/internal/clocktest"
 	"github.com/acme/frontier/internal/fakegithub"
 	"github.com/acme/frontier/internal/gh"
 )
@@ -98,8 +101,70 @@ func TestSecondaryLimitClosesGateGloballyForRetryAfter(t *testing.T) {
 		result <- callErr
 	}()
 	clock.Advance(time.Second)
-	if err := <-result; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Retry-After waiter did not wake after the deadline")
+	}
+}
+
+func TestTooManyRequestsSecondaryLimitClosesGateEndToEnd(t *testing.T) {
+	clock := newManualClock(time.Now())
+	server, baseURL := startFake(t,
+		fakegithub.WithRESTRateSteps(fakegithub.RateLimitStep{
+			Limit:      100,
+			Remaining:  80,
+			ResetAt:    clock.Now().Add(time.Hour),
+			StatusCode: http.StatusTooManyRequests,
+			RetryAfter: 2 * time.Second,
+			Secondary:  true,
+		}),
+	)
+	gate := budget.New(server.Client(), budget.Options{Clock: clock})
+	rest := newRESTClient(t, baseURL, gate)
+	graphQL := newGraphQLClient(t, baseURL, gate)
+
+	_, _, err := rest.ListStacks(
+		context.Background(),
+		budget.Interactive,
+		"acme",
+		"monolith",
+		gh.ListStacksOptions{},
+		"",
+	)
+	var httpErr *gh.HTTPError
+	if !errors.As(err, &httpErr) ||
+		httpErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("secondary-limit error = %v", err)
+	}
+	if got := gate.Snapshot().BackoffUntil; !got.Equal(
+		clock.Now().Add(2 * time.Second),
+	) {
+		t.Fatalf("429 backoff deadline = %v", got)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := graphQL.Call(
+			context.Background(),
+			budget.Interactive,
+			`query { rateLimit { cost limit remaining resetAt } }`,
+			nil,
+			nil,
+		)
+		result <- callErr
+	}()
+	clock.Advance(2 * time.Second)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("429 Retry-After waiter did not wake")
 	}
 }
 
@@ -249,6 +314,78 @@ func TestRESTAndGraphQLBudgetsAreIndependent(t *testing.T) {
 	cancel()
 	if err := <-restResult; !errors.Is(err, context.Canceled) {
 		t.Fatalf("exhausted REST error = %v, want context canceled", err)
+	}
+}
+
+func TestGraphQLFloorAdmissionUsesScriptedDivergentCosts(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	server, baseURL := startFake(t,
+		fakegithub.WithGraphQLRateSteps(
+			fakegithub.RateLimitStep{
+				Limit: 100, Remaining: 40, ResetAt: reset, Cost: 7,
+			},
+			fakegithub.RateLimitStep{
+				Limit: 100, Remaining: 20, ResetAt: reset, Cost: 23,
+			},
+		),
+	)
+	starved := make(chan budget.Starvation, 1)
+	gate := budget.New(server.Client(), budget.Options{
+		GraphQLPointEstimate: 1,
+		OnStarvation: func(value budget.Starvation) {
+			starved <- value
+		},
+	})
+	client := newGraphQLClient(t, baseURL, gate)
+	for index, wantCost := range []int64{7, 23} {
+		response, err := client.Call(
+			context.Background(),
+			budget.Interactive,
+			`query { rateLimit { cost limit remaining resetAt } }`,
+			nil,
+			nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.RateLimit.Cost != wantCost {
+			t.Fatalf(
+				"GraphQL response %d cost = %d, want %d",
+				index,
+				response.RateLimit.Cost,
+				wantCost,
+			)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Call(
+			ctx,
+			budget.Sweep,
+			`query { rateLimit { cost limit remaining resetAt } }`,
+			nil,
+			nil,
+		)
+		result <- err
+	}()
+	select {
+	case starvation := <-starved:
+		if starvation.Resource != budget.GraphQL ||
+			starvation.Remaining != 20 ||
+			starvation.Limit != 100 {
+			t.Fatalf("GraphQL floor starvation = %+v", starvation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GraphQL sweep did not queue at the 20% floor")
+	}
+	if got := server.handler.RequestCount(http.MethodPost, "/graphql"); got != 2 {
+		t.Fatalf("floor-blocked GraphQL request count = %d, want 2", got)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("floor-blocked GraphQL error = %v", err)
 	}
 }
 
@@ -438,6 +575,158 @@ func TestInstallationTokenCachingAndSingleFlightRenewal(t *testing.T) {
 	}
 }
 
+func TestConcurrencyCeilingIncludesRenewalDuringBurst(t *testing.T) {
+	clock := newManualClock(time.Now())
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, baseURL := startFake(t,
+		fakegithub.WithRateLimits(1_000, 1_000),
+		fakegithub.WithResponseDelay(150*time.Millisecond),
+		fakegithub.WithInstallationTokenTTL(400*time.Millisecond),
+		fakegithub.WithAppAuthentication(99, &key.PublicKey),
+		fakegithub.WithNow(clock.Now),
+	)
+	gate := budget.New(server.Client(), budget.Options{
+		Clock:         clock,
+		MaxConcurrent: 3,
+	})
+	tokens, err := gh.NewInstallationTokens(gate, gh.InstallationTokenOptions{
+		BaseURL:        baseURL,
+		AppID:          99,
+		InstallationID: 1234,
+		PrivateKey:     key,
+		RefreshBefore:  150 * time.Millisecond,
+		Clock:          clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tokens.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(300 * time.Millisecond)
+	client, err := gh.NewRESTClient(baseURL, gate, tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errs := make(chan error, 18)
+	var workers sync.WaitGroup
+	call := func() {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			_, _, callErr := client.ListStacks(
+				context.Background(),
+				budget.Interactive,
+				"acme",
+				"monolith",
+				gh.ListStacksOptions{},
+				"",
+			)
+			errs <- callErr
+		}()
+	}
+	call()
+	call()
+	deadline := time.After(time.Second)
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for server.Concurrent() != 2 {
+		select {
+		case <-deadline:
+			t.Fatalf(
+				"initial requests did not overlap: active=%d",
+				server.Concurrent(),
+			)
+		case <-poll.C:
+		}
+	}
+	// Expire the token only after the first wave is inside the fake. One of the
+	// queued calls must renew while that wave is still active.
+	clock.Advance(300 * time.Millisecond)
+	for range 16 {
+		call()
+	}
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := server.TokenRequests(); got < 2 {
+		t.Fatalf(
+			"token exchanges during burst = %d, want an initial exchange and renewal",
+			got,
+		)
+	}
+	if got := server.MaxConcurrent(); got != 3 {
+		t.Fatalf(
+			"fake GitHub max concurrency including renewal = %d, want 3",
+			got,
+		)
+	}
+	if got := server.TokenMaxConcurrent(); got != 3 {
+		t.Fatalf(
+			"active requests when mid-burst renewal entered fake = %d, want 3",
+			got,
+		)
+	}
+}
+
+func TestDeliveriesRequireAppJWTAndAcceptAppTokens(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, baseURL := startFake(
+		t,
+		fakegithub.WithAppAuthentication(99, &key.PublicKey),
+	)
+	gate := budget.New(server.Client(), budget.Options{})
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+	appTokens, err := gh.NewAppTokens(99, privateKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := gh.NewDeliveriesClient(baseURL, gate, appTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := deliveries.ListAppHookDeliveries(
+		context.Background(),
+		gh.ListAppHookDeliveriesOptions{},
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongTokens, err := gh.NewDeliveriesClient(
+		baseURL,
+		gate,
+		gh.StaticToken("fake-installation-wrong-kind"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = wrongTokens.ListAppHookDeliveries(
+		context.Background(),
+		gh.ListAppHookDeliveriesOptions{},
+		"",
+	)
+	var httpErr *gh.HTTPError
+	if !errors.As(err, &httpErr) ||
+		httpErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("installation token on App endpoint = %v", err)
+	}
+}
+
 func TestQueuedRequestRefreshesTokenAfterAdmissionWithoutNestedDeadlock(t *testing.T) {
 	clock := newManualClock(time.Now())
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -558,73 +847,8 @@ func TestGraphQLResponseSizeLimitFailsClosed(t *testing.T) {
 	}
 }
 
-type manualClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers map[*manualTimer]struct{}
-}
-
-type manualTimer struct {
-	clock  *manualClock
-	when   time.Time
-	ch     chan time.Time
-	active bool
-}
-
-func newManualClock(now time.Time) *manualClock {
-	return &manualClock{
-		now:    now,
-		timers: make(map[*manualTimer]struct{}),
-	}
-}
-
-func (c *manualClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *manualClock) NewTimer(delay time.Duration) budget.Timer {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	timer := &manualTimer{
-		clock:  c,
-		when:   c.now.Add(delay),
-		ch:     make(chan time.Time, 1),
-		active: true,
-	}
-	c.timers[timer] = struct{}{}
-	return timer
-}
-
-func (c *manualClock) Advance(by time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(by)
-	now := c.now
-	var ready []*manualTimer
-	for timer := range c.timers {
-		if timer.active && !timer.when.After(now) {
-			timer.active = false
-			ready = append(ready, timer)
-		}
-	}
-	c.mu.Unlock()
-	for _, timer := range ready {
-		timer.ch <- now
-	}
-}
-
-func (t *manualTimer) C() <-chan time.Time {
-	return t.ch
-}
-
-func (t *manualTimer) Stop() bool {
-	t.clock.mu.Lock()
-	defer t.clock.mu.Unlock()
-	wasActive := t.active
-	t.active = false
-	delete(t.clock.timers, t)
-	return wasActive
+func newManualClock(now time.Time) *clocktest.Manual {
+	return clocktest.New(now)
 }
 
 func assertQueued(
@@ -654,6 +878,14 @@ func (s *runningFake) MaxConcurrent() int {
 	return s.handler.MaxConcurrent()
 }
 
+func (s *runningFake) Concurrent() int {
+	return s.handler.Concurrent()
+}
+
+func (s *runningFake) TokenMaxConcurrent() int {
+	return s.handler.TokenMaxConcurrent()
+}
+
 func (s *runningFake) Remaining() int64 {
 	return s.handler.Remaining()
 }
@@ -681,7 +913,11 @@ func newRESTClient(
 	gate budget.Doer,
 ) *gh.RESTClient {
 	t.Helper()
-	client, err := gh.NewRESTClient(baseURL, gate, gh.StaticToken("test-token"))
+	client, err := gh.NewRESTClient(
+		baseURL,
+		gate,
+		gh.StaticToken("fake-installation-test"),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +930,11 @@ func newGraphQLClient(
 	gate budget.Doer,
 ) *gh.GraphQLClient {
 	t.Helper()
-	client, err := gh.NewGraphQLClient(baseURL, gate, gh.StaticToken("test-token"))
+	client, err := gh.NewGraphQLClient(
+		baseURL,
+		gate,
+		gh.StaticToken("fake-installation-test"),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

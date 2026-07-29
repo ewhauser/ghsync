@@ -374,7 +374,7 @@ func serve(args []string) error {
 				RefreshInterval: cfg.WatermarkRefresh,
 				LeaseTTL:        cfg.WatermarkLeaseTTL,
 				Owner:           owner,
-				Observer:        runtimeMetrics,
+				Observer:        watermarkMetricsAdapter{runtime: runtimeMetrics},
 				InstallationID:  cfg.GitHubInstallationID,
 			},
 		)
@@ -934,4 +934,19 @@ func uniqueStrings(values []string) []string {
 		result = append(result, value)
 	}
 	return result
+}
+
+// watermarkMetricsAdapter bridges the stream package's rich WatermarkProgress
+// observer to the metrics runtime's plain-value signature, preserving the
+// metrics package's independence from internal/stream (Opus review C6) without
+// widening the stream interface.
+type watermarkMetricsAdapter struct {
+	runtime *frontiermetrics.Runtime
+}
+
+func (a watermarkMetricsAdapter) WatermarkStep(
+	ctx context.Context,
+	progress streammaint.WatermarkProgress,
+) {
+	a.runtime.WatermarkStep(ctx, progress.Advanced)
 }

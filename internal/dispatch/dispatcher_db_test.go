@@ -730,7 +730,7 @@ type recordingDispatchObserver struct {
 	unmatchedEvents []string
 }
 
-func (*recordingDispatchObserver) DispatchBatch(context.Context, int, int) {}
+func (*recordingDispatchObserver) DispatchBatch(context.Context, int) {}
 
 func (observer *recordingDispatchObserver) DispatchUnmatchedEvent(
 	_ context.Context,

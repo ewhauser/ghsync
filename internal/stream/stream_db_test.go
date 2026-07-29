@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -137,6 +138,251 @@ func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
 	}
 	if got := <-progress; got.SafeSeq < seq {
 		t.Fatalf("safe seq = %d, want at least %d", got.SafeSeq, seq)
+	}
+}
+
+func TestWatermarkerBoundsFenceWaitRetriesAndAdvancesAfterWriterTermination(
+	t *testing.T,
+) {
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	target := insertStreamEvent(
+		t,
+		ctx,
+		pool,
+		fmt.Sprintf("bounded-fence-%d", time.Now().UnixNano()),
+	)
+	writer, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback(context.Background()) //nolint:errcheck
+	if err := outbox.AcquireWriterFence(ctx, writer); err != nil {
+		t.Fatal(err)
+	}
+	var writerPID int32
+	if err := writer.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(
+		&writerPID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	observer := &watermarkProgressRecorder{
+		steps: make(chan WatermarkProgress, 16),
+	}
+	watermarker, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval:  20 * time.Millisecond,
+		LeaseTTL:         time.Second,
+		FenceLockTimeout: 40 * time.Millisecond,
+		Owner: fmt.Sprintf(
+			"bounded-fence-%d",
+			time.Now().UnixNano(),
+		),
+		Observer: observer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	runErr := make(chan error, 1)
+	startedAt := time.Now()
+	go func() { runErr <- watermarker.Run(runCtx) }()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		select {
+		case progress := <-observer.steps:
+			if !progress.FenceTimedOut {
+				t.Fatalf(
+					"blocked fence progress = %+v, want timeout outcome",
+					progress,
+				)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("watermarker fence acquisition was not bounded and retried")
+		}
+	}
+	if elapsed := time.Since(startedAt); elapsed >= time.Second {
+		t.Fatalf("two bounded fence attempts took %s", elapsed)
+	}
+
+	var terminated bool
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT pg_terminate_backend($1)`,
+		writerPID,
+	).Scan(&terminated); err != nil {
+		t.Fatal(err)
+	}
+	if !terminated {
+		t.Fatalf("writer backend %d was not terminated", writerPID)
+	}
+
+	for {
+		select {
+		case progress := <-observer.steps:
+			if progress.Advanced && progress.SafeSeq >= target {
+				stop()
+				if err := <-runErr; err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf(
+				"watermarker did not advance through %d after writer termination",
+				target,
+			)
+		}
+	}
+}
+
+func TestWatermarkNoopSkipsPublicationAndThrottlesHeartbeat(t *testing.T) {
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	watermarker, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval: 10 * time.Millisecond,
+		LeaseTTL:        time.Second,
+		Owner:           fmt.Sprintf("noop-%d", time.Now().UnixNano()),
+		InstallationID:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	if progress, err := watermarker.Step(ctx); err != nil {
+		t.Fatal(err)
+	} else if progress.Advanced {
+		t.Fatalf("idle step unexpectedly advanced: %+v", progress)
+	}
+
+	var updatedAt, firstLease time.Time
+	var firstHeartbeats int64
+	if err := pool.QueryRow(ctx, `
+		SELECT watermark.updated_at, watermark.lease_until,
+		       heartbeat.success_count
+		FROM stream_watermark AS watermark
+		JOIN operation_heartbeats AS heartbeat
+		  ON heartbeat.installation_id = 1
+		 AND heartbeat.component = 'watermarker'
+		 AND heartbeat.operation = 'entities'
+		WHERE watermark.singleton
+	`).Scan(&updatedAt, &firstLease, &firstHeartbeats); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 5 {
+		time.Sleep(10 * time.Millisecond)
+		if progress, err := watermarker.Step(ctx); err != nil {
+			t.Fatal(err)
+		} else if progress.Advanced {
+			t.Fatalf("idle step unexpectedly advanced: %+v", progress)
+		}
+	}
+	var finalUpdatedAt, finalLease time.Time
+	var finalHeartbeats int64
+	if err := pool.QueryRow(ctx, `
+		SELECT watermark.updated_at, watermark.lease_until,
+		       heartbeat.success_count
+		FROM stream_watermark AS watermark
+		JOIN operation_heartbeats AS heartbeat
+		  ON heartbeat.installation_id = 1
+		 AND heartbeat.component = 'watermarker'
+		 AND heartbeat.operation = 'entities'
+		WHERE watermark.singleton
+	`).Scan(
+		&finalUpdatedAt,
+		&finalLease,
+		&finalHeartbeats,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !finalUpdatedAt.Equal(updatedAt) {
+		t.Fatalf(
+			"idle watermark publication changed updated_at from %s to %s",
+			updatedAt,
+			finalUpdatedAt,
+		)
+	}
+	if !finalLease.After(firstLease) {
+		t.Fatalf("idle lease was not renewed: %s -> %s", firstLease, finalLease)
+	}
+	if finalHeartbeats != firstHeartbeats {
+		t.Fatalf(
+			"heartbeat count changed inside one second: %d -> %d",
+			firstHeartbeats,
+			finalHeartbeats,
+		)
+	}
+
+	time.Sleep(watermarkHeartbeatInterval)
+	if _, err := watermarker.Step(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var renewedHeartbeats int64
+	if err := pool.QueryRow(ctx, `
+		SELECT success_count
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'watermarker'
+		  AND operation = 'entities'
+	`).Scan(&renewedHeartbeats); err != nil {
+		t.Fatal(err)
+	}
+	if renewedHeartbeats != firstHeartbeats+1 {
+		t.Fatalf(
+			"heartbeat count after one second = %d, want %d",
+			renewedHeartbeats,
+			firstHeartbeats+1,
+		)
+	}
+}
+
+func TestChangeEventInsertRequiresWriterFence(t *testing.T) {
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO change_events (stream, kind, entity_key, payload)
+		VALUES ('fence-guard', 'test.changed', 'bare', '{"version":1}')
+	`)
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) ||
+		postgresError.Code != "55000" ||
+		!strings.Contains(postgresError.Message, "shared writer fence") {
+		t.Fatalf("bare change-event insert error = %v", err)
+	}
+
+	if _, err := insertStreamEventWithKey(
+		ctx,
+		pool,
+		"fence-guard",
+		"fenced",
+	); err != nil {
+		t.Fatalf("fenced change-event insert: %v", err)
+	}
+}
+
+func TestStorePoolBoundsIdleInTransactionSessions(t *testing.T) {
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var bounded bool
+	if err := pool.QueryRow(ctx, `
+		SELECT current_setting('idle_in_transaction_session_timeout')::interval
+		           > interval '0 seconds'
+		   AND current_setting('idle_in_transaction_session_timeout')::interval
+		           <= interval '5 minutes'
+	`).Scan(&bounded); err != nil {
+		t.Fatal(err)
+	}
+	if !bounded {
+		t.Fatal("pool idle-in-transaction timeout is disabled or unbounded")
 	}
 }
 
@@ -296,7 +542,8 @@ func testRealWriterFence(t *testing.T, origin string, commit bool) {
 			t.Fatal(err)
 		}
 		service, err := derive.New(derive.Options{
-			Pool: pool,
+			Pool:           pool,
+			InstallationID: 1,
 			Deriver: fenceDeriver{
 				identity: derive.PullRequestIdentity(repositoryID, 42),
 			},
@@ -676,6 +923,17 @@ func waitSafeSequence(
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("safe watermark = %d, want at least %d", safe, target)
+}
+
+type watermarkProgressRecorder struct {
+	steps chan WatermarkProgress
+}
+
+func (r *watermarkProgressRecorder) WatermarkStep(
+	_ context.Context,
+	progress WatermarkProgress,
+) {
+	r.steps <- progress
 }
 
 func streamDatabase(t *testing.T) *pgxpool.Pool {

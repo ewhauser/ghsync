@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -28,6 +30,7 @@ import (
 	"github.com/acme/frontier/internal/fakegithub"
 	"github.com/acme/frontier/internal/ingress"
 	frontiermetrics "github.com/acme/frontier/internal/metrics"
+	"github.com/acme/frontier/pkg/streamclient"
 )
 
 const (
@@ -38,6 +41,7 @@ const (
 	defaultScrapeInterval = 2 * time.Second
 	defaultDrainTimeout   = 90 * time.Second
 	emitterConcurrency    = 16
+	soakStream            = "entities"
 )
 
 type event struct {
@@ -83,6 +87,28 @@ type runState struct {
 	histogramWindows     int
 	samples              int
 	budgetSamples        int
+}
+
+type soakStreamConsumer struct {
+	parent      context.Context
+	pool        *pgxpool.Pool
+	consumer    string
+	tableSQL    string
+	initialSeq  int64
+	restartSeq  int64
+	restartRows int64
+	restarted   bool
+	cancel      context.CancelFunc
+	done        chan error
+	terminalErr error
+}
+
+type streamCounts struct {
+	total    int64
+	distinct int64
+	expected int64
+	cursor   int64
+	maxSeq   int64
 }
 
 func main() {
@@ -296,6 +322,14 @@ func run(ctx context.Context, cfg config) error {
 		cfg.multiplier,
 	)
 	runID := strconv.FormatInt(time.Now().UnixNano(), 36)
+	streamConsumer, err := newSoakStreamConsumer(ctx, pool, runID)
+	if err != nil {
+		return err
+	}
+	defer streamConsumer.cleanup()
+	if err := streamConsumer.start(); err != nil {
+		return err
+	}
 	startedAt := time.Now()
 	loadCtx, cancelLoad := context.WithDeadline(
 		ctx,
@@ -315,17 +349,31 @@ func run(ctx context.Context, cfg config) error {
 	}()
 	scrapeTicker := time.NewTicker(cfg.scrapeInterval)
 	defer scrapeTicker.Stop()
+	restartTimer := time.NewTimer(cfg.duration / 2)
+	defer restartTimer.Stop()
 	var emission emissionResult
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-restartTimer.C:
+			restartCtx, cancelRestart := context.WithTimeout(
+				ctx, 5*time.Second,
+			)
+			restartErr := streamConsumer.restart(restartCtx)
+			cancelRestart()
+			if restartErr != nil {
+				return restartErr
+			}
 		case emission = <-emittedCh:
 			if emission.err != nil {
 				return emission.err
 			}
 			goto drain
 		case <-scrapeTicker.C:
+			if err := streamConsumer.check(); err != nil {
+				return err
+			}
 			families, scrapeErr := scrape(ctx, cfg)
 			if scrapeErr != nil {
 				return scrapeErr
@@ -341,6 +389,9 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 drain:
+	if err := streamConsumer.check(); err != nil {
+		return err
+	}
 	if emission.count != target {
 		return fmt.Errorf(
 			"configured load missed: emitted %d, required %d",
@@ -349,18 +400,14 @@ drain:
 		)
 	}
 	achievedRate := float64(emission.count) / cfg.duration.Seconds()
-	requiredRate := cfg.recordedRate * cfg.multiplier
-	if achievedRate+1e-9 < requiredRate {
-		return fmt.Errorf(
-			"configured load rate missed: achieved %.3f/s, required %.3f/s",
-			achievedRate,
-			requiredRate,
-		)
-	}
+	targetRate := float64(target) / cfg.duration.Seconds()
 
 	drainDeadline := time.Now().Add(cfg.drainTimeout)
 	var final map[string]*dto.MetricFamily
 	for {
+		if err := streamConsumer.check(); err != nil {
+			return err
+		}
 		final, err = scrape(ctx, cfg)
 		if err != nil {
 			return err
@@ -380,11 +427,19 @@ drain:
 				final, "frontier_c_o4_operation_successes", "watermarker", "entities",
 			)
 		}
+		streamReady := false
 		if pipelineDrained(final) {
 			if err := assertConverged(ctx, cfg, pool); err == nil &&
 				postPopulationTrustCompleted(final, state) {
-				break
+				caughtUp, streamErr := streamConsumer.caughtUp(ctx)
+				if streamErr != nil {
+					return streamErr
+				}
+				streamReady = caughtUp
 			}
+		}
+		if streamReady {
+			break
 		}
 		if time.Now().After(drainDeadline) {
 			convergenceErr := assertConverged(ctx, cfg, pool)
@@ -422,21 +477,291 @@ drain:
 			return err
 		}
 	}
+	stopCtx, cancelStop := context.WithTimeout(ctx, 5*time.Second)
+	err = streamConsumer.stop(stopCtx)
+	cancelStop()
+	if err != nil {
+		return err
+	}
+	counts, err := streamConsumer.assertFinal(ctx)
+	if err != nil {
+		return err
+	}
 	if err := assertFinal(final, state); err != nil {
 		return err
 	}
 	fmt.Printf(
 		"soak %s passed: duration=%s expected=%d emitted=%d "+
-			"required_rate=%.2f/s achieved_rate=%.2f/s samples=%d\n",
+			"required_rate=%.2f/s achieved_rate=%.2f/s samples=%d "+
+			"stream_events=%d stream_restart_seq=%d\n",
 		cfg.profile,
 		cfg.duration,
 		target,
 		emission.count,
-		requiredRate,
+		targetRate,
 		achievedRate,
 		state.samples,
+		counts.total,
+		streamConsumer.restartSeq,
 	)
 	return nil
+}
+
+func newSoakStreamConsumer(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	runID string,
+) (*soakStreamConsumer, error) {
+	table := "frontier_soak_applied_" + runID
+	tableSQL := pgx.Identifier{table}.Sanitize()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE `+tableSQL+` (
+		    seq BIGINT PRIMARY KEY,
+		    applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+		)
+	`); err != nil {
+		return nil, fmt.Errorf("create soak stream applied set: %w", err)
+	}
+	consumer := &soakStreamConsumer{
+		parent:   ctx,
+		pool:     pool,
+		consumer: "frontier-soak-" + runID,
+		tableSQL: tableSQL,
+	}
+	client, err := streamclient.New(pool, streamclient.Config{
+		BatchSize:    256,
+		PollInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		consumer.cleanup()
+		return nil, fmt.Errorf("create soak stream client: %w", err)
+	}
+	snapshot, err := client.Bootstrap(ctx, consumer.consumer, soakStream)
+	if err != nil {
+		consumer.cleanup()
+		return nil, fmt.Errorf("bootstrap soak stream consumer: %w", err)
+	}
+	consumer.initialSeq = snapshot.SafeSeq
+	if err := snapshot.Tx.Commit(ctx); err != nil {
+		_ = snapshot.Tx.Rollback(context.WithoutCancel(ctx))
+		consumer.cleanup()
+		return nil, fmt.Errorf("commit soak stream bootstrap: %w", err)
+	}
+	return consumer, nil
+}
+
+func (c *soakStreamConsumer) start() error {
+	if c.cancel != nil || c.done != nil {
+		return fmt.Errorf("soak stream consumer is already running")
+	}
+	client, err := streamclient.New(c.pool, streamclient.Config{
+		BatchSize:    256,
+		PollInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		return fmt.Errorf("restart soak stream client: %w", err)
+	}
+	tailCtx, cancel := context.WithCancel(c.parent)
+	c.cancel = cancel
+	c.done = make(chan error, 1)
+	go func(done chan<- error) {
+		done <- client.Tail(
+			tailCtx,
+			c.consumer,
+			soakStream,
+			func(ctx context.Context, tx pgx.Tx, event streamclient.Event) error {
+				if _, err := tx.Exec(
+					ctx,
+					"INSERT INTO "+c.tableSQL+" (seq) VALUES ($1)",
+					event.Seq,
+				); err != nil {
+					return fmt.Errorf(
+						"apply stream seq %d exactly once: %w",
+						event.Seq,
+						err,
+					)
+				}
+				return nil
+			},
+		)
+	}(c.done)
+	return nil
+}
+
+func (c *soakStreamConsumer) check() error {
+	if c.terminalErr != nil {
+		return c.terminalErr
+	}
+	if c.done == nil {
+		return nil
+	}
+	select {
+	case err := <-c.done:
+		c.done = nil
+		c.cancel = nil
+		c.terminalErr = fmt.Errorf("soak stream consumer stopped: %w", err)
+		return c.terminalErr
+	default:
+		return nil
+	}
+}
+
+func (c *soakStreamConsumer) restart(ctx context.Context) error {
+	if c.restarted {
+		return fmt.Errorf("soak stream consumer restarted more than once")
+	}
+	if err := c.stop(ctx); err != nil {
+		return fmt.Errorf("stop soak stream consumer for restart: %w", err)
+	}
+	counts, err := c.counts(ctx)
+	if err != nil {
+		return err
+	}
+	if counts.cursor <= c.initialSeq || counts.total == 0 {
+		return fmt.Errorf(
+			"mid-soak stream restart observed no committed progress "+
+				"(initial_seq=%d cursor=%d applied=%d)",
+			c.initialSeq,
+			counts.cursor,
+			counts.total,
+		)
+	}
+	c.restartSeq = counts.cursor
+	c.restartRows = counts.total
+	c.restarted = true
+	if err := c.start(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *soakStreamConsumer) stop(ctx context.Context) error {
+	if c.cancel == nil || c.done == nil {
+		return c.check()
+	}
+	cancel := c.cancel
+	done := c.done
+	c.cancel = nil
+	c.done = nil
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("stop soak stream consumer: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *soakStreamConsumer) caughtUp(ctx context.Context) (bool, error) {
+	counts, err := c.counts(ctx)
+	if err != nil {
+		return false, err
+	}
+	return counts.total == counts.distinct &&
+		counts.total == counts.expected &&
+		counts.cursor == counts.maxSeq, nil
+}
+
+func (c *soakStreamConsumer) assertFinal(
+	ctx context.Context,
+) (streamCounts, error) {
+	if !c.restarted {
+		return streamCounts{}, fmt.Errorf(
+			"soak stream consumer never completed its mid-run restart",
+		)
+	}
+	counts, err := c.counts(ctx)
+	if err != nil {
+		return streamCounts{}, err
+	}
+	if counts.total != counts.distinct ||
+		counts.total != counts.expected {
+		return streamCounts{}, fmt.Errorf(
+			"stream exactly-once assertion failed: "+
+				"count(*)=%d count(distinct seq)=%d expected=%d",
+			counts.total,
+			counts.distinct,
+			counts.expected,
+		)
+	}
+	if counts.cursor != counts.maxSeq {
+		return streamCounts{}, fmt.Errorf(
+			"stream cursor did not reach the final entity sequence: "+
+				"cursor=%d max_seq=%d",
+			counts.cursor,
+			counts.maxSeq,
+		)
+	}
+	if c.restartSeq <= c.initialSeq ||
+		counts.cursor <= c.restartSeq ||
+		counts.total <= c.restartRows {
+		return streamCounts{}, fmt.Errorf(
+			"stream cursor did not prove durability across restart: "+
+				"initial_seq=%d restart_seq=%d final_seq=%d "+
+				"restart_rows=%d final_rows=%d",
+			c.initialSeq,
+			c.restartSeq,
+			counts.cursor,
+			c.restartRows,
+			counts.total,
+		)
+	}
+	return counts, nil
+}
+
+func (c *soakStreamConsumer) counts(ctx context.Context) (streamCounts, error) {
+	var result streamCounts
+	err := c.pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM `+c.tableSQL+`),
+		    (SELECT count(DISTINCT seq) FROM `+c.tableSQL+`),
+		    count(events.seq),
+		    COALESCE(cursor.seq, $2),
+		    COALESCE(max(events.seq), $2)
+		FROM stream_watermark AS watermark
+		LEFT JOIN change_events AS events
+		  ON events.stream = $1
+		 AND events.seq > $2
+		 AND events.seq <= watermark.safe_seq
+		LEFT JOIN consumer_cursors AS cursor
+		  ON cursor.consumer = $3
+		 AND cursor.stream = $1
+		WHERE watermark.singleton
+		GROUP BY cursor.seq
+	`, soakStream, c.initialSeq, c.consumer).Scan(
+		&result.total,
+		&result.distinct,
+		&result.expected,
+		&result.cursor,
+		&result.maxSeq,
+	)
+	if err != nil {
+		return streamCounts{}, fmt.Errorf(
+			"read soak stream applied set: %w", err,
+		)
+	}
+	return result, nil
+}
+
+func (c *soakStreamConsumer) cleanup() {
+	if c == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = c.stop(ctx)
+	if c.tableSQL != "" {
+		_, _ = c.pool.Exec(ctx, "DROP TABLE IF EXISTS "+c.tableSQL)
+	}
+	if c.consumer != "" {
+		_, _ = c.pool.Exec(ctx, `
+			DELETE FROM consumer_cursors
+			WHERE consumer = $1 AND stream = $2
+		`, c.consumer, soakStream)
+	}
 }
 
 func operationValue(
@@ -1229,6 +1554,13 @@ func metricValue(
 	family := families[name]
 	if family == nil {
 		return 0
+	}
+	if labels == nil {
+		var total float64
+		for _, item := range family.Metric {
+			total += sampleValue(item)
+		}
+		return total
 	}
 	for _, item := range family.Metric {
 		if labelsMatch(labelsOf(item), labels) {

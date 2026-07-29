@@ -1,12 +1,19 @@
 package main
 
 import (
+	"context"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+
+	"github.com/acme/frontier/internal/outbox"
+	"github.com/acme/frontier/internal/testdb"
 )
 
 func TestProfileDuration(t *testing.T) {
@@ -41,6 +48,153 @@ func TestSmokeLoadArithmeticIsExactlyTenTimesRecordedRate(t *testing.T) {
 			achieved,
 			recordedRate*multiplier,
 		)
+	}
+}
+
+func TestMetricValueWithoutLabelsSumsZeroInitAndLabeledSeries(t *testing.T) {
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(`
+# TYPE frontier_c_b3_starvations_total counter
+frontier_c_b3_starvations_total 0
+frontier_c_b3_starvations_total{class="event",resource="rest"} 3
+frontier_c_b3_starvations_total{class="sweep",resource="graphql"} 2
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := metricValue(
+		families,
+		"frontier_c_b3_starvations_total",
+		nil,
+	); got != 5 {
+		t.Fatalf("unfiltered starvation total = %v, want 5", got)
+	}
+	if got := metricValue(
+		families,
+		"frontier_c_b3_starvations_total",
+		map[string]string{"class": "event", "resource": "rest"},
+	); got != 3 {
+		t.Fatalf("labeled starvation total = %v, want 3", got)
+	}
+}
+
+func TestSoakStreamConsumerAppliesExactlyOnceAcrossRestart(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	database, err := testdb.Open(ctx, databaseURL, "soak_stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	runID := strconv.FormatInt(time.Now().UnixNano(), 36)
+	consumer, err := newSoakStreamConsumer(ctx, database.Pool, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.cleanup()
+	if err := consumer.start(); err != nil {
+		t.Fatal(err)
+	}
+
+	insertSoakStreamEvents(t, ctx, database.Pool, "before", 2)
+	waitForSoakStreamConsumer(t, ctx, consumer, 2)
+	if err := consumer.restart(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	insertSoakStreamEvents(t, ctx, database.Pool, "after", 2)
+	waitForSoakStreamConsumer(t, ctx, consumer, 4)
+	if err := consumer.stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := consumer.assertFinal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.total != 4 || counts.distinct != 4 || counts.expected != 4 {
+		t.Fatalf("stream counts after restart = %+v, want four exactly once", counts)
+	}
+}
+
+func insertSoakStreamEvents(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	prefix string,
+	count int,
+) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background()) //nolint:errcheck
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	var maxSeq int64
+	for index := range count {
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO change_events (
+			    stream, kind, entity_key, payload
+			)
+			VALUES (
+			    'entities', 'pull_request.changed', $1, '{"version":1}'
+			)
+			RETURNING seq
+		`, prefix+"-"+strconv.Itoa(index)).Scan(&maxSeq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE stream_watermark
+		SET safe_seq = GREATEST(safe_seq, $1),
+		    updated_at = clock_timestamp()
+		WHERE singleton
+	`, maxSeq); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForSoakStreamConsumer(
+	t *testing.T,
+	ctx context.Context,
+	consumer *soakStreamConsumer,
+	want int64,
+) {
+	t.Helper()
+	for {
+		if err := consumer.check(); err != nil {
+			t.Fatal(err)
+		}
+		counts, err := consumer.counts(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counts.total == want &&
+			counts.distinct == want &&
+			counts.expected == want &&
+			counts.cursor == counts.maxSeq {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf(
+				"stream consumer did not reach %d applications: %+v (%v)",
+				want,
+				counts,
+				ctx.Err(),
+			)
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 }
 

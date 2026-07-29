@@ -65,6 +65,7 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 		"FrontierDriftPassMissing",
 		"FrontierWatermarkStalled",
 		"FrontierWatermarkPassMissing",
+		"FrontierDeriverPassMissing",
 		"FrontierRequiredRoleAbsent",
 	} {
 		if !strings.Contains(expressions[alert], "absent(") {
@@ -97,6 +98,61 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 		"max by (sweep_kind)",
 	) {
 		t.Fatal("constraint comparisons are not reduced to one series per key")
+	}
+
+	for alert, expected := range map[string]struct {
+		operation string
+		threshold string
+	}{
+		"FrontierStackSweepPassMissing": {
+			operation: "stacks",
+			threshold: "> 675",
+		},
+		"FrontierPullRequestSweepPassMissing": {
+			operation: "pull_requests",
+			threshold: "> 1350",
+		},
+		"FrontierRepoRulesSweepPassMissing": {
+			operation: "repo_rules",
+			threshold: "> 8100",
+		},
+		"FrontierRepositorySweepPassMissing": {
+			operation: "repositories",
+			threshold: "> 8100",
+		},
+		"FrontierClosedSweepPassMissing": {
+			operation: "closed_tracked",
+			threshold: "> 194400",
+		},
+	} {
+		expression := expressions[alert]
+		if !strings.Contains(
+			expression,
+			`component="sweep",operation="`+expected.operation+`"`,
+		) || !strings.Contains(expression, expected.threshold) {
+			t.Fatalf(
+				"%s expression = %q, want operation %q threshold %q",
+				alert,
+				expression,
+				expected.operation,
+				expected.threshold,
+			)
+		}
+		if durations[alert] != "5m" {
+			t.Fatalf("%s for = %q, want 5m", alert, durations[alert])
+		}
+	}
+	if _, exists := expressions["FrontierSweepPassMissing"]; exists {
+		t.Fatal("aggregate 24-hour sweep pass alert still exists")
+	}
+	if !strings.Contains(
+		expressions["FrontierDeriverPassMissing"],
+		`component="deriver",operation="dirty_sets"`,
+	) || !strings.Contains(
+		expressions["FrontierDeriverPassMissing"],
+		"> 30",
+	) {
+		t.Fatal("deriver pass alert is not tied to its durable heartbeat")
 	}
 }
 

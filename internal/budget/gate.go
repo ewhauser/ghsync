@@ -376,18 +376,14 @@ func waitForChange(
 			return nil
 		}
 	}
-	delay := until.Sub(clock.Now())
-	if delay <= 0 {
-		return nil
-	}
-	timer := clock.NewTimer(delay)
-	defer timer.Stop()
+	timer, stop := clock.NewTimerAt(until)
+	defer stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-changed:
 		return nil
-	case <-timer.C():
+	case <-timer:
 		return nil
 	}
 }

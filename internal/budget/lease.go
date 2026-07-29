@@ -225,11 +225,17 @@ func (g *Gate) runLease(runtime *leaseRuntime) {
 }
 
 func (g *Gate) maintainLease(runtime *leaseRuntime) {
-	renew := runtime.clock.NewTimer(runtime.renewInterval)
-	snapshot := runtime.clock.NewTimer(runtime.snapshotEvery)
+	renew := newClockTimer(
+		runtime.clock,
+		runtime.clock.Now().Add(runtime.renewInterval),
+	)
+	snapshot := newClockTimer(
+		runtime.clock,
+		runtime.clock.Now().Add(runtime.snapshotEvery),
+	)
 	defer func() {
-		renew.Stop()
-		snapshot.Stop()
+		renew.stop()
+		snapshot.stop()
 	}()
 
 	for {
@@ -239,7 +245,7 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 				g.loseLease(fmt.Errorf("%w: %v", ErrLeaseLost, runtime.ctx.Err()))
 			}
 			return
-		case <-renew.C():
+		case <-renew.channel:
 			until, ok, err := runtime.renew()
 			switch {
 			case err != nil:
@@ -248,7 +254,7 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 				renew = resetClockTimer(
 					renew,
 					runtime.clock,
-					runtime.renewRetryDelay(),
+					runtime.clock.Now().Add(runtime.renewRetryDelay()),
 				)
 			case !ok || until.IsZero() || !runtime.clock.Now().Before(until):
 				g.loseLease(ErrLeaseLost)
@@ -257,9 +263,13 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 				runtime.confirmExpiry(until)
 				g.setLeaseUntil(until)
 				runtime.publishExpiry(until)
-				renew = resetClockTimer(renew, runtime.clock, runtime.renewInterval)
+				renew = resetClockTimer(
+					renew,
+					runtime.clock,
+					runtime.clock.Now().Add(runtime.renewInterval),
+				)
 			}
-		case <-snapshot.C():
+		case <-snapshot.channel:
 			ok, err := runtime.save(g.Snapshot())
 			if err == nil && !ok {
 				g.loseLease(ErrLeaseLost)
@@ -267,16 +277,20 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 			}
 			// Snapshot transport errors do not disprove ownership; renewal and
 			// the expiry watchdog remain the ownership authority.
-			snapshot = resetClockTimer(snapshot, runtime.clock, runtime.snapshotEvery)
+			snapshot = resetClockTimer(
+				snapshot,
+				runtime.clock,
+				runtime.clock.Now().Add(runtime.snapshotEvery),
+			)
 		}
 	}
 }
 
 func (g *Gate) watchLeaseExpiry(runtime *leaseRuntime) {
 	expiry := runtime.currentExpiry()
-	timer := runtime.clock.NewTimer(max(time.Duration(0), expiry.Sub(runtime.clock.Now())))
+	timer := newClockTimer(runtime.clock, expiry)
 	defer func() {
-		timer.Stop()
+		timer.stop()
 	}()
 
 	for {
@@ -285,21 +299,31 @@ func (g *Gate) watchLeaseExpiry(runtime *leaseRuntime) {
 			return
 		case until := <-runtime.expiryUpdates:
 			expiry = until
-			timer = resetClockTimer(
-				timer,
-				runtime.clock,
-				max(time.Duration(0), expiry.Sub(runtime.clock.Now())),
-			)
-		case <-timer.C():
+			timer = resetClockTimer(timer, runtime.clock, expiry)
+		case <-timer.channel:
 			g.loseLease(ErrLeaseLost)
 			return
 		}
 	}
 }
 
-func resetClockTimer(current Timer, clock Clock, delay time.Duration) Timer {
-	current.Stop()
-	return clock.NewTimer(max(time.Duration(0), delay))
+type clockTimer struct {
+	channel <-chan time.Time
+	stop    func() bool
+}
+
+func newClockTimer(clock Clock, deadline time.Time) clockTimer {
+	channel, stop := clock.NewTimerAt(deadline)
+	return clockTimer{channel: channel, stop: stop}
+}
+
+func resetClockTimer(
+	current clockTimer,
+	clock Clock,
+	deadline time.Time,
+) clockTimer {
+	current.stop()
+	return newClockTimer(clock, deadline)
 }
 
 func (r *leaseRuntime) renew() (time.Time, bool, error) {

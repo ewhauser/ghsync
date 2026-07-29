@@ -12,7 +12,10 @@ import (
 	"github.com/acme/frontier/internal/budget"
 )
 
-const apiVersion = "2022-11-28"
+const (
+	apiVersion               = "2022-11-28"
+	maxHTTPErrorMessageBytes = 16 << 10
+)
 
 // TokenProvider supplies an installation token without exposing it outside
 // the GitHub client layer.
@@ -92,8 +95,16 @@ func (e *HTTPError) Error() string {
 }
 
 func decodeHTTPError(resp *http.Response) error {
+	if resp == nil {
+		return &HTTPError{}
+	}
+	if resp.Body == nil {
+		return &HTTPError{StatusCode: resp.StatusCode}
+	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(
+		io.LimitReader(resp.Body, maxHTTPErrorMessageBytes),
+	)
 	if err != nil {
 		return fmt.Errorf("read GitHub error response: %w", err)
 	}
@@ -104,4 +115,11 @@ func decodeHTTPError(resp *http.Response) error {
 		payload.Message = strings.TrimSpace(string(body))
 	}
 	return &HTTPError{StatusCode: resp.StatusCode, Message: payload.Message}
+}
+
+func closeResponseBody(resp *http.Response) error {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	return resp.Body.Close()
 }

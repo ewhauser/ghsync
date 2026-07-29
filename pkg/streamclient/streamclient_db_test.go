@@ -126,6 +126,77 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 	}
 }
 
+func TestTailRetriesConcurrentCursorFirstTouchRace(t *testing.T) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("cursor-first-touch")
+	consumer := uniqueStreamName("consumer")
+	first := newTestClient(t, pool, 10)
+	second := newTestClient(t, pool, 10)
+
+	firstInserted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var blockOnce sync.Once
+	first.testHooks.afterEnsureCursor = func() {
+		blockOnce.Do(func() {
+			close(firstInserted)
+			<-releaseFirst
+		})
+	}
+	retried := make(chan struct{})
+	var retryOnce sync.Once
+	second.testHooks.cursorFirstTouchRetry = func() {
+		retryOnce.Do(func() { close(retried) })
+	}
+
+	firstCtx, stopFirst := context.WithCancel(ctx)
+	defer stopFirst()
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- first.Tail(
+			firstCtx,
+			consumer,
+			streamName,
+			func(context.Context, pgx.Tx, Event) error { return nil },
+		)
+	}()
+	<-firstInserted
+
+	secondCtx, stopSecond := context.WithCancel(ctx)
+	defer stopSecond()
+	secondErr := make(chan error, 1)
+	go func() {
+		secondErr <- second.Tail(
+			secondCtx,
+			consumer,
+			streamName,
+			func(context.Context, pgx.Tx, Event) error { return nil },
+		)
+	}()
+	// The second INSERT is now waiting on the first transaction's unique-key
+	// decision with an older REPEATABLE READ snapshot.
+	time.Sleep(50 * time.Millisecond)
+	close(releaseFirst)
+
+	select {
+	case <-retried:
+	case err := <-secondErr:
+		t.Fatalf("concurrent first-touch ended Tail instead of retrying: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Tail did not observe and retry the cursor first-touch race")
+	}
+
+	stopSecond()
+	if err := <-secondErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("second Tail exit after retry = %v", err)
+	}
+	stopFirst()
+	if err := <-firstErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Tail exit = %v", err)
+	}
+}
+
 func TestRetentionCannotDeleteBetweenHorizonCheckAndPageSnapshot(
 	t *testing.T,
 ) {

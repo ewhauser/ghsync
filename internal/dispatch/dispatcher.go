@@ -38,7 +38,7 @@ type Config struct {
 // Observer is M6's C-P2/C-I5 observability seam. Implementations run only
 // after the delivery batch and its River pointers commit.
 type Observer interface {
-	DispatchBatch(context.Context, int, int)
+	DispatchBatch(context.Context, int)
 }
 
 // UnmatchedEventObserver is an optional coverage-gap signal. Dispatcher also
@@ -51,7 +51,7 @@ type UnmatchedEventObserver interface {
 
 type noopObserver struct{}
 
-func (noopObserver) DispatchBatch(context.Context, int, int) {}
+func (noopObserver) DispatchBatch(context.Context, int) {}
 
 // Dispatcher owns the delivery → River transaction boundary (C-P2).
 type Dispatcher struct {
@@ -206,7 +206,6 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	intents := make([]Intent, 0, len(deliveries))
 	intentReceivedAt := make(map[Intent]time.Time, len(deliveries))
 	unmatchedEvents := make([]string, 0)
-	parked := 0
 	for _, delivery := range deliveries {
 		result, classifyErr := d.config.Classifier.classify(
 			delivery.Event,
@@ -216,7 +215,6 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 			status := "pending"
 			if int(delivery.Attempts) >= d.config.MaxAttempts {
 				status = "parked"
-				parked++
 			}
 			results = append(results, deliveryResult{
 				DeliveryGUID: delivery.DeliveryGuid,
@@ -290,7 +288,7 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit dispatch batch: %w", err)
 	}
-	d.config.Observer.DispatchBatch(ctx, len(deliveries), parked)
+	d.config.Observer.DispatchBatch(ctx, len(deliveries))
 	for _, event := range unmatchedEvents {
 		slog.WarnContext(
 			ctx,

@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -136,6 +137,42 @@ func TestUnknownRepoIs404(t *testing.T) {
 	}
 }
 
+func TestAPIRequiresFakeInstallationBearer(t *testing.T) {
+	fake := New(DefaultFixture(), "secret")
+	for _, request := range []struct {
+		method string
+		target string
+		body   io.Reader
+	}{
+		{
+			method: http.MethodGet,
+			target: "http://fake.test/repos/acme/monolith/stacks",
+		},
+		{
+			method: http.MethodPost,
+			target: "http://fake.test/graphql",
+			body:   strings.NewReader(`{"query":"query { rateLimit { cost } }"}`),
+		},
+	} {
+		response := serveAuthorized(
+			fake,
+			request.method,
+			request.target,
+			request.body,
+			"Bearer wrong-token-kind",
+		)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf(
+				"%s %s status = %d, want 401",
+				request.method,
+				request.target,
+				response.StatusCode,
+			)
+		}
+	}
+}
+
 func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 	fake := New(DefaultFixture(), "secret")
 	path := "/repos/acme/monolith/pulls/4812"
@@ -152,6 +189,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 	}
 	request := httptest.NewRequest(http.MethodGet, "http://fake.test"+path, nil)
 	request.Header.Set("If-None-Match", etag)
+	request.Header.Set("Authorization", "Bearer fake-installation-test")
 	recorder := httptest.NewRecorder()
 	fake.ServeHTTP(recorder, request)
 	notModified := recorder.Result()
@@ -184,6 +222,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 		nil,
 	)
 	request.Header.Set("If-None-Match", checksETag)
+	request.Header.Set("Authorization", "Bearer fake-installation-test")
 	recorder = httptest.NewRecorder()
 	fake.ServeHTTP(recorder, request)
 	notModified = recorder.Result()
@@ -316,6 +355,65 @@ func TestPullListHonorsSortDirectionAndPagination(t *testing.T) {
 	}
 	if !reflect.DeepEqual(descending, []int{4820, 4816}) {
 		t.Fatalf("descending first page = %v", descending)
+	}
+}
+
+func TestConcurrentListPullsAndSoakMutationUseIsolatedFixtureData(
+	t *testing.T,
+) {
+	fake := New(DefaultFixture(), "secret")
+	start := make(chan struct{})
+	errs := make(chan error, 9)
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			for range 250 {
+				response := serve(
+					fake,
+					http.MethodGet,
+					"http://fake.test/repos/acme/monolith/pulls?state=all",
+					nil,
+				)
+				var pulls []PullRequest
+				err := json.NewDecoder(response.Body).Decode(&pulls)
+				_ = response.Body.Close()
+				if err != nil {
+					errs <- err
+					return
+				}
+				if response.StatusCode != http.StatusOK || len(pulls) != 5 {
+					errs <- fmt.Errorf(
+						"list pulls status/count = %d/%d",
+						response.StatusCode,
+						len(pulls),
+					)
+					return
+				}
+			}
+		}()
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		<-start
+		for revision := range 2_000 {
+			fake.applySoakMutation(
+				"pull_request",
+				json.RawMessage(fmt.Sprintf(
+					`{"number":4812,"soak_revision":%d}`,
+					revision,
+				)),
+			)
+		}
+	}()
+	close(start)
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 
@@ -487,6 +585,9 @@ func TestInstallationTokenEndpointValidatesJWTAndReturnsCreated(t *testing.T) {
 	if calls := fake.TokenRequests(); calls != 1 {
 		t.Fatalf("token request count = %d, want 1", calls)
 	}
+	if got := fake.MaxConcurrent(); got != 1 {
+		t.Fatalf("token endpoint max concurrency = %d, want 1", got)
+	}
 
 	wrongKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -604,6 +705,12 @@ func TestEmitWebhookFailsOnNon2xx(t *testing.T) {
 }
 
 func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
+	now := time.Now().UTC()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appJWT := signAppJWT(t, now, "99", key)
 	var received atomic.Int32
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -616,7 +723,12 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		},
 	))
 	defer target.Close()
-	fake := New(DefaultFixture(), "secret")
+	fake := New(
+		DefaultFixture(),
+		"secret",
+		WithAppAuthentication(99, &key.PublicKey),
+		WithNow(func() time.Time { return now }),
+	)
 	for index := range 3 {
 		if _, err := fake.DropWebhook(
 			target.URL,
@@ -629,11 +741,25 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	first := serve(
+	unauthorized := serve(
 		fake,
 		http.MethodGet,
 		"http://fake.test/app/hook/deliveries?per_page=2",
 		nil,
+	)
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf(
+			"installation bearer on deliveries status = %d, want 401",
+			unauthorized.StatusCode,
+		)
+	}
+	first := serveAuthorized(
+		fake,
+		http.MethodGet,
+		"http://fake.test/app/hook/deliveries?per_page=2",
+		nil,
+		"Bearer "+appJWT,
 	)
 	defer first.Body.Close()
 	link := first.Header.Get("Link")
@@ -665,11 +791,12 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		strings.TrimPrefix(strings.Split(link, ";")[0], "<"),
 		">",
 	)
-	second := serve(
+	second := serveAuthorized(
 		fake,
 		http.MethodGet,
 		nextURL,
 		nil,
+		"Bearer "+appJWT,
 	)
 	defer second.Body.Close()
 	var remaining []HookDelivery
@@ -679,7 +806,7 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 	if len(remaining) != 1 {
 		t.Fatalf("second page deliveries = %+v", remaining)
 	}
-	redelivery := serve(
+	redelivery := serveAuthorized(
 		fake,
 		http.MethodPost,
 		fmt.Sprintf(
@@ -687,6 +814,7 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 			deliveries[0].ID,
 		),
 		nil,
+		"Bearer "+appJWT,
 	)
 	defer redelivery.Body.Close()
 	if redelivery.StatusCode != http.StatusAccepted {
@@ -739,6 +867,7 @@ func listPullRequests(
 	if err != nil {
 		return nil, 0, err
 	}
+	req.Header.Set("Authorization", "Bearer fake-installation-test")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -752,10 +881,46 @@ func listPullRequests(
 }
 
 func serve(handler http.Handler, method, target string, body io.Reader) *http.Response {
+	return serveAuthorized(
+		handler,
+		method,
+		target,
+		body,
+		"Bearer fake-installation-test",
+	)
+}
+
+func serveAuthorized(
+	handler http.Handler,
+	method string,
+	target string,
+	body io.Reader,
+	authorization string,
+) *http.Response {
 	req := httptest.NewRequest(method, target, body)
+	req.Header.Set("Authorization", authorization)
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	return recorder.Result()
+}
+
+func signAppJWT(
+	t *testing.T,
+	now time.Time,
+	issuer string,
+	privateKey *rsa.PrivateKey,
+) string {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{
+		Issuer:    issuer,
+		IssuedAt:  jwt.NewNumericDate(now.Add(-30 * time.Second)),
+		ExpiresAt: jwt.NewNumericDate(now.Add(5 * time.Minute)),
+	})
+	signed, err := token.SignedString(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
 }
 
 type handlerRoundTripper struct {

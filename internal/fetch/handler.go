@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -753,6 +754,12 @@ func stackFollowupSpecs(
 			Key:  fmt.Sprintf("stack:%s:%d", repo, oldStack),
 		})
 	}
+	sort.Slice(specs, func(i, j int) bool {
+		if specs[i].Kind != specs[j].Kind {
+			return specs[i].Kind < specs[j].Kind
+		}
+		return specs[i].Key < specs[j].Key
+	})
 	return specs
 }
 
