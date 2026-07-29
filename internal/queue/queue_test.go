@@ -10,9 +10,14 @@ import (
 
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/rivercontrib/otelriver"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 type noopArgs struct{}
@@ -104,6 +109,143 @@ func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 	stopped = true
+}
+
+func TestRiverOpenTelemetryPropagatesInsertLinkToWorker(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, err := testdb.Open(ctx, url, "river_otel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSpanProcessor(recorder),
+	)
+	plugin := otelriver.NewMiddleware(&otelriver.MiddlewareConfig{
+		EnableTracePropagation:      true,
+		EnableWorkSpanJobKindSuffix: true,
+		MeterProvider:               metricnoop.NewMeterProvider(),
+		TracerProvider:              provider,
+	})
+	client, err := NewClient(
+		database.Pool,
+		WithWorkerRegistrar(registerNoopWorker),
+		WithPlugins(plugin),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, unsubscribe := client.Subscribe(
+		river.EventKindJobCompleted,
+		river.EventKindJobFailed,
+	)
+	defer unsubscribe()
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	defer func() {
+		if stopped {
+			return
+		}
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = client.StopAndCancel(stopCtx)
+	}()
+
+	insertCtx, parent := provider.Tracer("queue-test").Start(ctx, "enqueue")
+	result, err := client.Insert(
+		insertCtx,
+		noopArgs{},
+		&river.InsertOpts{Queue: QueueEvent},
+	)
+	parent.End()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		select {
+		case event := <-events:
+			if event.Job.ID != result.Job.ID {
+				continue
+			}
+			if event.Kind == river.EventKindJobFailed {
+				t.Fatalf("traced River job %d failed", result.Job.ID)
+			}
+			goto completed
+		case <-ctx.Done():
+			t.Fatalf("waiting for traced River job: %v", ctx.Err())
+		}
+	}
+
+completed:
+	stopCtx, stopCancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer stopCancel()
+	if err := client.Stop(stopCtx); err != nil {
+		t.Fatal(err)
+	}
+	stopped = true
+
+	var metadata []byte
+	if err := database.Pool.QueryRow(
+		ctx,
+		`SELECT metadata FROM river_job WHERE id = $1`,
+		result.Job.ID,
+	).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	var metadataObject map[string]any
+	if err := json.Unmarshal(metadata, &metadataObject); err != nil {
+		t.Fatal(err)
+	}
+	if metadataObject["traceparent"] == nil {
+		t.Fatalf("River metadata has no traceparent: %s", metadata)
+	}
+
+	var insertSpan, workSpan tracetest.SpanStub
+	var foundInsert, foundWork bool
+	for _, ended := range recorder.Ended() {
+		switch ended.Name() {
+		case "river.insert_many":
+			insertSpan = tracetest.SpanStubFromReadOnlySpan(ended)
+			foundInsert = true
+		case "river.work/noop":
+			workSpan = tracetest.SpanStubFromReadOnlySpan(ended)
+			foundWork = true
+		}
+	}
+	if !foundInsert || !foundWork {
+		t.Fatalf(
+			"River spans found insert=%t work=%t",
+			foundInsert,
+			foundWork,
+		)
+	}
+	if len(workSpan.Links) != 1 {
+		t.Fatalf("worker span links = %d, want 1", len(workSpan.Links))
+	}
+	if workSpan.Links[0].SpanContext.SpanID() !=
+		insertSpan.SpanContext.SpanID() {
+		t.Fatalf(
+			"worker link span ID = %s, insert span ID = %s",
+			workSpan.Links[0].SpanContext.SpanID(),
+			insertSpan.SpanContext.SpanID(),
+		)
+	}
 }
 
 func TestExplicitQueueSelectionDoesNotPollUnownedQueues(t *testing.T) {

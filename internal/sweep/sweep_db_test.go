@@ -1178,8 +1178,12 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 		if _, err := h.pool.Exec(ctx, `
 			INSERT INTO webhook_deliveries (
 			    delivery_guid, event, raw_body, headers, received_at,
-			    status
-			) VALUES ($1, 'push', 'body', '{"x":"y"}', $2, $3)
+			    status, traceparent, tracestate
+			) VALUES (
+			    $1, 'push', 'body', '{"x":"y"}', $2, $3,
+			    '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+			    'vendor=value'
+			)
 		`, delivery.guid, delivery.at, delivery.status); err != nil {
 			t.Fatal(err)
 		}
@@ -1214,7 +1218,14 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 			history,
 		)
 	}
-	var skeletons, oldPayloads, boundaryPayloads, replayablePayloads int
+	var (
+		skeletons              int
+		oldPayloads            int
+		boundaryPayloads       int
+		replayablePayloads     int
+		oldTraceContexts       int
+		preservedTraceContexts int
+	)
 	if err := h.pool.QueryRow(ctx, `
 		SELECT count(*),
 		       count(*) FILTER (
@@ -1227,6 +1238,20 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 		           WHERE delivery_guid IN ('parked-older', 'pending-older')
 		             AND raw_body IS NOT NULL
 		             AND payload_pruned_at IS NULL
+		       ),
+		       count(*) FILTER (
+		           WHERE delivery_guid = 'older'
+		             AND (
+		                 traceparent IS NOT NULL
+		                 OR tracestate IS NOT NULL
+		             )
+		       ),
+		       count(*) FILTER (
+		           WHERE delivery_guid IN (
+		               'boundary', 'newer', 'parked-older', 'pending-older'
+		           )
+		             AND traceparent IS NOT NULL
+		             AND tracestate IS NOT NULL
 		       )
 		FROM webhook_deliveries
 		WHERE delivery_guid IN (
@@ -1237,19 +1262,25 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 		&oldPayloads,
 		&boundaryPayloads,
 		&replayablePayloads,
+		&oldTraceContexts,
+		&preservedTraceContexts,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if skeletons != 5 ||
 		oldPayloads != 0 ||
 		boundaryPayloads != 1 ||
-		replayablePayloads != 2 {
+		replayablePayloads != 2 ||
+		oldTraceContexts != 0 ||
+		preservedTraceContexts != 4 {
 		t.Fatalf(
-			"skeletons=%d old_payloads=%d boundary_payloads=%d replayable_payloads=%d",
+			"skeletons=%d old_payloads=%d boundary_payloads=%d replayable_payloads=%d old_trace_contexts=%d preserved_trace_contexts=%d",
 			skeletons,
 			oldPayloads,
 			boundaryPayloads,
 			replayablePayloads,
+			oldTraceContexts,
+			preservedTraceContexts,
 		)
 	}
 	var historyRows, changeEvents int

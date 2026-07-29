@@ -119,6 +119,13 @@ func (r *Registry) Handler() http.Handler {
 	return r.handler
 }
 
+// Provider exposes the process-local provider to instrumentation libraries
+// such as River's OpenTelemetry plugin. The provider remains registry-owned and
+// must not be shut down by callers.
+func (r *Registry) Provider() metric.MeterProvider {
+	return r.provider
+}
+
 func (r *Registry) Shutdown(ctx context.Context) error {
 	return r.provider.Shutdown(ctx)
 }

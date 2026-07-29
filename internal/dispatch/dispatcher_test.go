@@ -11,10 +11,15 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 func TestNewEnforcesDebounceHardCap(t *testing.T) {
@@ -145,6 +150,56 @@ func TestDedupeIntentsSortsGenerationKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("deduped intents = %#v, want %#v", got, want)
+	}
+}
+
+func TestAddDeliveryTraceLinksDeduplicatesValidContexts(t *testing.T) {
+	t.Parallel()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(recorder),
+	)
+	_, span := provider.Tracer("dispatch-test").Start(
+		context.Background(),
+		"dispatch",
+	)
+	traceparent := "00-0102030405060708090a0b0c0d0e0f10-0102030405060708-01"
+	addDeliveryTraceLinks(context.Background(), span, []dbgen.WebhookDelivery{
+		{
+			Event:       "push",
+			Traceparent: pgtype.Text{String: traceparent, Valid: true},
+		},
+		{
+			Event:       "push",
+			Traceparent: pgtype.Text{String: traceparent, Valid: true},
+		},
+		{
+			Event:       "issues",
+			Traceparent: pgtype.Text{String: "invalid", Valid: true},
+		},
+	})
+	span.End()
+
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("ended spans = %d, want 1", len(ended))
+	}
+	links := ended[0].Links()
+	if len(links) != 1 {
+		t.Fatalf("trace links = %d, want 1", len(links))
+	}
+	wantTraceID, err := trace.TraceIDFromHex(
+		"0102030405060708090a0b0c0d0e0f10",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if links[0].SpanContext.TraceID() != wantTraceID {
+		t.Fatalf(
+			"linked trace ID = %s, want %s",
+			links[0].SpanContext.TraceID(),
+			wantTraceID,
+		)
 	}
 }
 

@@ -887,6 +887,8 @@ WITH batch AS (
 UPDATE webhook_deliveries AS delivery
 SET raw_body = NULL,
     headers = '{}'::jsonb,
+    traceparent = NULL,
+    tracestate = NULL,
     payload_pruned_at = $1
 FROM batch
 WHERE delivery.delivery_guid = batch.delivery_guid

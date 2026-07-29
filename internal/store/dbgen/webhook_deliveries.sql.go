@@ -27,7 +27,7 @@ SET status = 'processing',
     last_error = NULL
 FROM candidates
 WHERE delivery.delivery_guid = candidates.delivery_guid
-RETURNING delivery.delivery_guid, delivery.event, delivery.raw_body, delivery.headers, delivery.received_at, delivery.status, delivery.attempts, delivery.last_error, delivery.payload_pruned_at, delivery.next_attempt_at
+RETURNING delivery.delivery_guid, delivery.event, delivery.raw_body, delivery.headers, delivery.received_at, delivery.status, delivery.attempts, delivery.last_error, delivery.payload_pruned_at, delivery.next_attempt_at, delivery.traceparent, delivery.tracestate
 `
 
 // C-P2/C-O2: claim a bounded batch without blocking another dispatcher. The
@@ -53,6 +53,8 @@ func (q *Queries) ClaimWebhookDeliveries(ctx context.Context, batchSize int32) (
 			&i.LastError,
 			&i.PayloadPrunedAt,
 			&i.NextAttemptAt,
+			&i.Traceparent,
+			&i.Tracestate,
 		); err != nil {
 			return nil, err
 		}
@@ -76,7 +78,7 @@ func (q *Queries) CountWebhookDeliveriesByStatus(ctx context.Context, status str
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at, next_attempt_at FROM webhook_deliveries WHERE delivery_guid = $1
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at, next_attempt_at, traceparent, tracestate FROM webhook_deliveries WHERE delivery_guid = $1
 `
 
 func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (WebhookDelivery, error) {
@@ -93,13 +95,29 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, deliveryGuid string) (
 		&i.LastError,
 		&i.PayloadPrunedAt,
 		&i.NextAttemptAt,
+		&i.Traceparent,
+		&i.Tracestate,
 	)
 	return i, err
 }
 
 const insertWebhookDelivery = `-- name: InsertWebhookDelivery :execrows
-INSERT INTO webhook_deliveries (delivery_guid, event, raw_body, headers)
-VALUES ($1, $2, $3, $4)
+INSERT INTO webhook_deliveries (
+    delivery_guid,
+    event,
+    raw_body,
+    headers,
+    traceparent,
+    tracestate
+)
+VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    NULLIF($5::text, ''),
+    NULLIF($6::text, '')
+)
 ON CONFLICT (delivery_guid) DO NOTHING
 `
 
@@ -108,6 +126,8 @@ type InsertWebhookDeliveryParams struct {
 	Event        string
 	RawBody      []byte
 	Headers      []byte
+	Traceparent  string
+	Tracestate   string
 }
 
 // C-I3: duplicate deliveries are free no-ops.
@@ -117,6 +137,8 @@ func (q *Queries) InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDe
 		arg.Event,
 		arg.RawBody,
 		arg.Headers,
+		arg.Traceparent,
+		arg.Tracestate,
 	)
 	if err != nil {
 		return 0, err
@@ -125,7 +147,7 @@ func (q *Queries) InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDe
 }
 
 const listParkedWebhookDeliveries = `-- name: ListParkedWebhookDeliveries :many
-SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at, next_attempt_at
+SELECT delivery_guid, event, raw_body, headers, received_at, status, attempts, last_error, payload_pruned_at, next_attempt_at, traceparent, tracestate
 FROM webhook_deliveries
 WHERE status = 'parked'
 ORDER BY received_at, delivery_guid
@@ -154,6 +176,8 @@ func (q *Queries) ListParkedWebhookDeliveries(ctx context.Context, resultLimit i
 			&i.LastError,
 			&i.PayloadPrunedAt,
 			&i.NextAttemptAt,
+			&i.Traceparent,
+			&i.Tracestate,
 		); err != nil {
 			return nil, err
 		}

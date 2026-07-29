@@ -25,6 +25,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/riverqueue/river"
+	"github.com/riverqueue/rivercontrib/otelriver"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/ewhauser/ghsync/internal/budget"
 	"github.com/ewhauser/ghsync/internal/config"
@@ -40,6 +43,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 	streammaint "github.com/ewhauser/ghsync/internal/stream"
 	"github.com/ewhauser/ghsync/internal/sweep"
+	"github.com/ewhauser/ghsync/internal/telemetry"
 )
 
 var version = "dev"
@@ -93,6 +97,17 @@ func run(args []string) error {
 	}
 }
 
+func shutdownTracing(tracing *telemetry.Tracing) {
+	shutdownCtx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+	if err := tracing.Shutdown(shutdownCtx); err != nil {
+		slog.Error("tracing shutdown failed", "error", err)
+	}
+}
+
 func backfill(args []string) error {
 	fs := flag.NewFlagSet("backfill", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -113,12 +128,38 @@ func backfill(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	tracing, err := telemetry.NewTracing(
+		ctx,
+		telemetry.TracingOptions{Version: version, Command: "backfill"},
+	)
+	if err != nil {
+		return err
+	}
+	defer shutdownTracing(tracing)
+	ctx, span := tracing.Provider().Tracer(
+		"github.com/ewhauser/ghsync/cmd/ghsyncd",
+	).Start(ctx, "ghsync.command.backfill")
+	defer span.End()
+	pool, err := store.Connect(
+		ctx,
+		cfg.DatabaseURL,
+		store.WithTracerProvider(tracing.Provider()),
+	)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
-	riverClient, err := queue.NewClient(pool)
+	riverClient, err := queue.NewClient(
+		pool,
+		queue.WithPlugins(otelriver.NewMiddleware(
+			&otelriver.MiddlewareConfig{
+				EnableTracePropagation:      true,
+				EnableWorkSpanJobKindSuffix: true,
+				MeterProvider:               metricnoop.NewMeterProvider(),
+				TracerProvider:              tracing.Provider(),
+			},
+		)),
+	)
 	if err != nil {
 		return fmt.Errorf("river client: %w", err)
 	}
@@ -215,7 +256,23 @@ func requeue(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	tracing, err := telemetry.NewTracing(
+		ctx,
+		telemetry.TracingOptions{Version: version, Command: "requeue"},
+	)
+	if err != nil {
+		return err
+	}
+	defer shutdownTracing(tracing)
+	ctx, span := tracing.Provider().Tracer(
+		"github.com/ewhauser/ghsync/cmd/ghsyncd",
+	).Start(ctx, "ghsync.command.requeue")
+	defer span.End()
+	pool, err := store.Connect(
+		ctx,
+		cfg.DatabaseURL,
+		store.WithTracerProvider(tracing.Provider()),
+	)
 	if err != nil {
 		return err
 	}
@@ -251,7 +308,23 @@ func migrate() error {
 		return err
 	}
 	ctx := context.Background()
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	tracing, err := telemetry.NewTracing(
+		ctx,
+		telemetry.TracingOptions{Version: version, Command: "migrate"},
+	)
+	if err != nil {
+		return err
+	}
+	defer shutdownTracing(tracing)
+	ctx, span := tracing.Provider().Tracer(
+		"github.com/ewhauser/ghsync/cmd/ghsyncd",
+	).Start(ctx, "ghsync.command.migrate")
+	defer span.End()
+	pool, err := store.Connect(
+		ctx,
+		cfg.DatabaseURL,
+		store.WithTracerProvider(tracing.Provider()),
+	)
 	if err != nil {
 		return err
 	}
@@ -317,7 +390,24 @@ func serve(args []string) error {
 	)
 	defer stopSignals()
 
-	pool, err := store.Connect(signalCtx, cfg.DatabaseURL)
+	tracing, err := telemetry.NewTracing(
+		signalCtx,
+		telemetry.TracingOptions{
+			Version: version,
+			Command: "serve",
+			Roles:   enabledRoles(roles),
+		},
+	)
+	if err != nil {
+		return err
+	}
+	defer shutdownTracing(tracing)
+
+	pool, err := store.Connect(
+		signalCtx,
+		cfg.DatabaseURL,
+		store.WithTracerProvider(tracing.Provider()),
+	)
 	if err != nil {
 		return err
 	}
@@ -390,12 +480,15 @@ func serve(args []string) error {
 		}()
 	}
 	if roles[roleDeriver] {
-		deriver, createErr := derive.New(derive.Options{
+		deriver, createErr := derive.New(&derive.Options{
 			Pool:         pool,
 			Deriver:      derive.NoopDeriver{},
 			DirtyCap:     cfg.DeriverDirtyCap,
 			PollInterval: cfg.DeriverPollInterval,
 			Observer:     runtimeMetrics,
+			Tracer: tracing.Provider().Tracer(
+				"github.com/ewhauser/ghsync/internal/derive",
+			),
 		})
 		if createErr != nil {
 			return createErr
@@ -414,6 +507,9 @@ func serve(args []string) error {
 				Period:    cfg.StreamRetentionPeriod,
 				BatchSize: cfg.StreamRetentionBatch,
 				OnPrune:   runtimeMetrics.PrunerDelete,
+				Tracer: tracing.Provider().Tracer(
+					"github.com/ewhauser/ghsync/internal/stream",
+				),
 			},
 		)
 		if createErr != nil {
@@ -442,9 +538,16 @@ func serve(args []string) error {
 		if hostErr != nil {
 			return fmt.Errorf("budget lease owner: %w", hostErr)
 		}
+		githubHTTPClient := &http.Client{
+			Transport: otelhttp.NewTransport(
+				http.DefaultTransport,
+				otelhttp.WithTracerProvider(tracing.Provider()),
+				otelhttp.WithPropagators(tracing.Propagator()),
+			),
+		}
 		githubGate, err = budget.NewLeased(
 			budgetCtx,
-			http.DefaultClient,
+			githubHTTPClient,
 			budget.Options{
 				MaxConcurrent:          cfg.BudgetMaxConcurrent,
 				RESTLimit:              cfg.BudgetRESTLimit,
@@ -454,6 +557,9 @@ func serve(args []string) error {
 				SecondaryLimitFallback: cfg.BudgetSecondaryFallback,
 				OnStarvation:           runtimeMetrics.BudgetStarvation,
 				OnRequest:              runtimeMetrics.BudgetRequest,
+				Tracer: tracing.Provider().Tracer(
+					"github.com/ewhauser/ghsync/internal/budget",
+				),
 			},
 			budget.NewPostgresLeaseStore(pool),
 			budget.LeaseOptions{
@@ -576,6 +682,17 @@ func serve(args []string) error {
 			}
 		}
 		var clientOptions []queue.ClientOption
+		clientOptions = append(
+			clientOptions,
+			queue.WithPlugins(otelriver.NewMiddleware(
+				&otelriver.MiddlewareConfig{
+					EnableTracePropagation:      true,
+					EnableWorkSpanJobKindSuffix: true,
+					MeterProvider:               metricRegistry.Provider(),
+					TracerProvider:              tracing.Provider(),
+				},
+			)),
+		)
 		plan := riverPlanForRoles(roles)
 		clientOptions = append(
 			clientOptions,
@@ -658,6 +775,9 @@ func serve(args []string) error {
 				PollInterval: cfg.DispatchPollInterval,
 				Classifier:   classifier,
 				Observer:     runtimeMetrics,
+				Tracer: tracing.Provider().Tracer(
+					"github.com/ewhauser/ghsync/internal/dispatch",
+				),
 			})
 			if err != nil {
 				return fmt.Errorf("dispatcher: %w", err)
@@ -678,7 +798,12 @@ func serve(args []string) error {
 			cfg.WebhookMaxBodyBytes,
 			webhookRequestTimeout,
 		)
-		webhookHandler = handler
+		webhookHandler = otelhttp.NewHandler(
+			handler,
+			"github.webhook",
+			otelhttp.WithTracerProvider(tracing.Provider()),
+			otelhttp.WithPropagators(tracing.Propagator()),
+		)
 	}
 	// C-O4 role separation: every role has health and metrics, while only an
 	// ingress role registers the externally writable webhook route.

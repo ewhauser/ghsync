@@ -6,19 +6,49 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 const defaultIdleInTransactionSessionTimeout = 30 * time.Second
 
+type connectOptions struct {
+	tracerProvider trace.TracerProvider
+}
+
+// ConnectOption customizes Postgres connectivity.
+type ConnectOption func(*connectOptions)
+
+// WithTracerProvider instruments pgx operations with the supplied provider.
+func WithTracerProvider(provider trace.TracerProvider) ConnectOption {
+	return func(options *connectOptions) {
+		options.tracerProvider = provider
+	}
+}
+
 // Connect opens and verifies a Postgres pool with the cache durability
 // invariants enabled.
-func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
+func Connect(
+	ctx context.Context,
+	databaseURL string,
+	options ...ConnectOption,
+) (*pgxpool.Pool, error) {
+	var configured connectOptions
+	for _, option := range options {
+		option(&configured)
+	}
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+	if configured.tracerProvider != nil {
+		cfg.ConnConfig.Tracer = otelpgx.NewTracer(
+			otelpgx.WithTracerProvider(configured.tracerProvider),
+			otelpgx.WithTrimSQLInSpanName(),
+		)
 	}
 	if cfg.ConnConfig.RuntimeParams == nil {
 		cfg.ConnConfig.RuntimeParams = make(map[string]string)

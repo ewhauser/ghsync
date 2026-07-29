@@ -21,8 +21,11 @@ type documentedEnvironment struct {
 type defaultLabel string
 
 const (
-	defaultNone    defaultLabel = "none"
-	defaultBuiltIn defaultLabel = "built in"
+	defaultNone            defaultLabel = "none"
+	defaultBuiltIn         defaultLabel = "built in"
+	defaultDisabled        defaultLabel = "disabled"
+	defaultEmpty           defaultLabel = "empty"
+	defaultExporterDefault defaultLabel = "exporter default"
 )
 
 func TestDeploymentReferenceMatchesConfigEnvironment(t *testing.T) {
@@ -31,6 +34,7 @@ func TestDeploymentReferenceMatchesConfigEnvironment(t *testing.T) {
 	cleared := clearedConfigEnvironmentVariables(t)
 	documented := deploymentEnvironmentVariables(t)
 	defaults := environmentDefaults()
+	externalDefaults := externalEnvironmentDefaults()
 
 	for key := range configured {
 		if _, ok := cleared[key]; !ok {
@@ -49,7 +53,10 @@ func TestDeploymentReferenceMatchesConfigEnvironment(t *testing.T) {
 		}
 	}
 	for key, item := range documented {
-		if _, ok := configured[key]; !ok {
+		if _, ok := configured[key]; ok {
+			continue
+		}
+		if _, ok := externalDefaults[key]; !ok {
 			t.Errorf(
 				"ops/DEPLOYMENT.md:%d documents unknown environment variable %s",
 				item.line,
@@ -62,8 +69,28 @@ func TestDeploymentReferenceMatchesConfigEnvironment(t *testing.T) {
 			t.Errorf("deployment default test contains stale environment variable %s", key)
 		}
 	}
+	for key := range externalDefaults {
+		if _, ok := documented[key]; !ok {
+			t.Errorf("ops/DEPLOYMENT.md omits external environment variable %s", key)
+		}
+	}
 
 	for key, want := range defaults {
+		item, ok := documented[key]
+		if !ok {
+			continue
+		}
+		if err := compareDocumentedDefault(item.defaultValue, want); err != nil {
+			t.Errorf(
+				"ops/DEPLOYMENT.md:%d %s default %q: %v",
+				item.line,
+				key,
+				item.defaultValue,
+				err,
+			)
+		}
+	}
+	for key, want := range externalDefaults {
 		item, ok := documented[key]
 		if !ok {
 			continue
@@ -234,6 +261,21 @@ func environmentDefaults() map[string]any {
 		"STREAM_RETENTION_BATCH_SIZE":         defaultStreamRetentionBatch,
 		"DERIVER_POLL_INTERVAL":               defaultDeriverPoll,
 		"DERIVER_DIRTY_CAP":                   defaultDeriverDirtyCap,
+	}
+}
+
+// externalEnvironmentDefaults covers standard environment variables consumed
+// directly by an owned dependency instead of config.FromEnv.
+func externalEnvironmentDefaults() map[string]any {
+	return map[string]any{
+		"OTEL_TRACES_EXPORTER":               defaultDisabled,
+		"OTEL_SERVICE_NAME":                  "ghsyncd",
+		"OTEL_RESOURCE_ATTRIBUTES":           defaultEmpty,
+		"OTEL_EXPORTER_OTLP_ENDPOINT":        defaultExporterDefault,
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": defaultExporterDefault,
+		"OTEL_EXPORTER_OTLP_HEADERS":         defaultEmpty,
+		"OTEL_TRACES_SAMPLER":                "parentbased_always_on",
+		"OTEL_TRACES_SAMPLER_ARG":            1,
 	}
 }
 

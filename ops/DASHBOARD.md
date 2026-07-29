@@ -66,3 +66,13 @@ Keep active alerts down the right edge. Do not split the view by daemon role:
 dedicated `metrics` role reads authoritative aggregate Postgres state; other
 roles expose local counters. Every trust panel has an absence rule, so a
 missing collector or required role is red rather than a blank success.
+
+## Trace links
+
+Link freshness, queue, budget, deriver, and stream panels to the trace backend
+with the same time window. Useful entry spans are `github.webhook`,
+`ghsync.dispatch.batch`, `river.work/<job-kind>`,
+`ghsync.github.admission`, and `ghsync.deriver.pass`. Webhook-to-dispatch and
+River insert-to-worker relationships are asynchronous span links, so trace
+queries and UI navigation must include linked spans rather than assuming one
+parent/child tree. See [`../docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md).

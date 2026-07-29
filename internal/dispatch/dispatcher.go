@@ -17,6 +17,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
@@ -38,6 +43,7 @@ type Config struct {
 	Now          func() time.Time
 	Classifier   Classifier
 	Observer     Observer
+	Tracer       trace.Tracer
 }
 
 // Observer is M6's C-P2/C-I5 observability seam. Implementations run only
@@ -96,6 +102,11 @@ func New(
 	}
 	if config.Observer == nil {
 		config.Observer = noopObserver{}
+	}
+	if config.Tracer == nil {
+		config.Tracer = noop.NewTracerProvider().Tracer(
+			"github.com/ewhauser/ghsync/internal/dispatch",
+		)
 	}
 	dispatcher := &Dispatcher{
 		pool:   pool,
@@ -188,7 +199,9 @@ func waitForDispatch(ctx context.Context, delay time.Duration) bool {
 
 // DispatchBatch claims, classifies, enqueues, and finishes one batch in one
 // pgx transaction shared by sqlc and River.
-func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
+func (d *Dispatcher) DispatchBatch(
+	ctx context.Context,
+) (count int, resultErr error) {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin dispatch batch: %w", err)
@@ -209,6 +222,22 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 		}
 		return 0, nil
 	}
+	ctx, span := d.config.Tracer.Start(
+		ctx,
+		"ghsync.dispatch.batch",
+		trace.WithAttributes(attribute.Int(
+			"ghsync.dispatch.delivery_count",
+			len(deliveries),
+		)),
+	)
+	defer func() {
+		if resultErr != nil {
+			span.RecordError(resultErr)
+			span.SetStatus(codes.Error, resultErr.Error())
+		}
+		span.End()
+	}()
+	addDeliveryTraceLinks(ctx, span, deliveries)
 	if d.afterClaim != nil {
 		d.afterClaim()
 	}
@@ -345,6 +374,52 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 		}
 	}
 	return len(deliveries), nil
+}
+
+func addDeliveryTraceLinks(
+	ctx context.Context,
+	span trace.Span,
+	deliveries []dbgen.WebhookDelivery,
+) {
+	seen := make(map[string]struct{}, len(deliveries))
+	for index := range deliveries {
+		delivery := &deliveries[index]
+		traceparent := ""
+		if delivery.Traceparent.Valid {
+			traceparent = delivery.Traceparent.String
+		}
+		tracestate := ""
+		if delivery.Tracestate.Valid {
+			tracestate = delivery.Tracestate.String
+		}
+		carrier := propagation.MapCarrier{
+			"traceparent": traceparent,
+			"tracestate":  tracestate,
+		}
+		extracted := propagation.TraceContext{}.Extract(
+			ctx,
+			carrier,
+		)
+		spanContext := trace.SpanContextFromContext(extracted)
+		if !spanContext.IsValid() {
+			continue
+		}
+		key := spanContext.TraceID().String() + ":" +
+			spanContext.SpanID().String()
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		span.AddLink(trace.Link{
+			SpanContext: spanContext,
+			Attributes: []attribute.KeyValue{
+				attribute.String(
+					"ghsync.webhook.event",
+					delivery.Event,
+				),
+			},
+		})
+	}
 }
 
 func stackSummaryMatchesCache(

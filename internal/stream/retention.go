@@ -7,6 +7,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
@@ -20,6 +24,7 @@ type RetentionOptions struct {
 	BatchSize int
 	Now       func() time.Time
 	OnPrune   func(context.Context, string, int64)
+	Tracer    trace.Tracer
 }
 
 // Retention prunes change events without consulting consumer cursors and
@@ -31,6 +36,7 @@ type Retention struct {
 	batchSize int
 	now       func() time.Time
 	onPrune   func(context.Context, string, int64)
+	tracer    trace.Tracer
 }
 
 // NewRetention validates the locked seven-day C-S7 floor.
@@ -56,6 +62,11 @@ func NewRetention(
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	if options.Tracer == nil {
+		options.Tracer = noop.NewTracerProvider().Tracer(
+			"github.com/ewhauser/ghsync/internal/stream",
+		)
+	}
 	return &Retention{
 		pool:      pool,
 		age:       options.Age,
@@ -63,14 +74,28 @@ func NewRetention(
 		batchSize: options.BatchSize,
 		now:       options.Now,
 		onPrune:   options.OnPrune,
+		tracer:    options.Tracer,
 	}, nil
 }
 
 // Prune deletes every expired event in bounded C-S7 batches and returns the
 // number removed. Cursor positions never participate in eligibility.
-func (r *Retention) Prune(ctx context.Context) (int64, error) {
+func (r *Retention) Prune(
+	ctx context.Context,
+) (total int64, resultErr error) {
+	ctx, span := r.tracer.Start(ctx, "ghsync.stream.retention")
+	defer func() {
+		span.SetAttributes(attribute.Int64(
+			"ghsync.stream.deleted_events",
+			total,
+		))
+		if resultErr != nil {
+			span.RecordError(resultErr)
+			span.SetStatus(codes.Error, resultErr.Error())
+		}
+		span.End()
+	}()
 	cutoff := r.now().UTC().Add(-r.age)
-	var total int64
 	for {
 		deleted, err := dbgen.New(r.pool).PruneChangeEvents(
 			ctx,

@@ -416,6 +416,8 @@ type WebhookDelivery struct {
 	LastError       pgtype.Text
 	PayloadPrunedAt pgtype.Timestamptz
 	NextAttemptAt   pgtype.Timestamptz
+	Traceparent     pgtype.Text
+	Tracestate      pgtype.Text
 }
 
 type WorkItem struct {

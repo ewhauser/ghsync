@@ -26,7 +26,7 @@ func TestNoopDeriverEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "noop")
-	service, err := New(Options{
+	service, err := New(&Options{
 		Pool:           pool,
 		Deriver:        NoopDeriver{},
 		DirtyCap:       10_000,
@@ -90,7 +90,7 @@ func TestRunReconnectsAfterListenerBackendTermination(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	service, err := New(Options{
+	service, err := New(&Options{
 		Pool:           pool,
 		Deriver:        NoopDeriver{},
 		DirtyCap:       10_000,
@@ -168,7 +168,7 @@ func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
 	scope, _ := insertLoosePullScope(t, ctx, pool, "survive")
 	entered := make(chan Snapshot, 1)
 	release := make(chan struct{})
-	service, err := New(Options{
+	service, err := New(&Options{
 		Pool:           pool,
 		InstallationID: 1,
 		Deriver: blockingDeriver{
@@ -249,7 +249,7 @@ func TestFencedDirtyMarkWithConcurrentWatermarkerDoesNotStall(t *testing.T) {
 	identity := PullRequestIdentity(repositoryID, 42)
 	entered := make(chan Snapshot, 1)
 	release := make(chan struct{})
-	service, err := New(Options{
+	service, err := New(&Options{
 		Pool:           pool,
 		InstallationID: 1,
 		Deriver: blockingDeriver{
@@ -452,7 +452,7 @@ func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 	defer cancel()
 	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "work-item")
 	identity := PullRequestIdentity(repositoryID, 42)
-	service, err := New(Options{
+	service, err := New(&Options{
 		Pool:           pool,
 		InstallationID: 1,
 		Deriver: fixedDeriver{item: &WorkItem{
@@ -517,7 +517,7 @@ func TestScopeReconciliationRemovesPriorWorkItemAndEmitsReference(
 	defer cancel()
 	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "remove")
 	identity := PullRequestIdentity(repositoryID, 42)
-	service, err := New(Options{
+	service, err := New(&Options{
 		Pool:           pool,
 		InstallationID: 1,
 		Deriver: fixedDeriver{item: &WorkItem{
@@ -575,7 +575,7 @@ func TestDeriverRejectsIdentityNotOwnedByClaimedScope(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	scope, _ := insertLoosePullScope(t, ctx, pool, "identity")
-	service, err := New(Options{
+	service, err := New(&Options{
 		Pool:           pool,
 		InstallationID: 1,
 		Deriver: fixedDeriver{item: &WorkItem{

@@ -12,6 +12,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 const (
@@ -44,6 +49,7 @@ type Options struct {
 	OnStarvation           StarvationHook
 	OnRequest              RequestHook
 	Clock                  Clock
+	Tracer                 trace.Tracer
 }
 
 // Gate is the C-B1 per-installation choke point. It owns admission,
@@ -71,6 +77,7 @@ type Gate struct {
 	leaseUntil             time.Time
 	onStarvation           StarvationHook
 	onRequest              RequestHook
+	tracer                 trace.Tracer
 	nextAdmissionID        uint64
 	admissions             map[uint64]*admission
 
@@ -143,6 +150,11 @@ func New(client *http.Client, options Options) *Gate { //nolint:gocritic // valu
 	if options.Clock == nil {
 		options.Clock = realClock{}
 	}
+	if options.Tracer == nil {
+		options.Tracer = noop.NewTracerProvider().Tracer(
+			"github.com/ewhauser/ghsync/internal/budget",
+		)
+	}
 	return &Gate{
 		client:                 &ownedClient,
 		clock:                  options.Clock,
@@ -157,6 +169,7 @@ func New(client *http.Client, options Options) *Gate { //nolint:gocritic // valu
 		secondaryLimitFallback: options.SecondaryLimitFallback,
 		onStarvation:           options.OnStarvation,
 		onRequest:              options.OnRequest,
+		tracer:                 options.Tracer,
 		admissions:             make(map[uint64]*admission),
 	}
 }
@@ -177,10 +190,36 @@ func New(client *http.Client, options Options) *Gate { //nolint:gocritic // valu
 // reservation so installation-token renewal cannot deadlock behind its own
 // admitted request; it inherits the outer availability/backoff decision rather
 // than performing a second admission check.
-func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, error) {
+func (g *Gate) Do(
+	ctx context.Context,
+	class Class,
+	req *Request,
+) (result *Response, err error) {
 	if err := validateDo(ctx, class, req); err != nil {
 		return nil, err
 	}
+	ctx, span := g.tracer.Start(
+		ctx,
+		"ghsync.github.admission",
+		trace.WithAttributes(
+			attribute.String("ghsync.github.class", string(class)),
+			attribute.String("ghsync.github.resource", string(req.resource)),
+		),
+	)
+	defer func() {
+		if result != nil && result.HTTP != nil {
+			span.SetAttributes(attribute.Int(
+				"http.response.status_code",
+				result.HTTP.StatusCode,
+			))
+		}
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+	admissionStarted := time.Now()
 
 	// Installation-token renewal reached from a before-send hook is already
 	// inside this gate's admitted slot. It executes sequentially in that slot,
@@ -188,6 +227,7 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 	// covered by the outer C-B6 accounting.
 	if parent, ok := ctx.Value(admissionContextKey{}).(*admission); ok &&
 		parent.gate == g && req.resource == Auth {
+		span.SetAttributes(attribute.Bool("ghsync.github.nested_auth", true))
 		return g.doAdmitted(ctx, class, req, nil)
 	}
 
@@ -223,6 +263,13 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 			return nil, err
 		}
 	}
+	span.AddEvent(
+		"admitted",
+		trace.WithAttributes(attribute.Float64(
+			"ghsync.github.admission_wait_seconds",
+			time.Since(admissionStarted).Seconds(),
+		)),
+	)
 
 	return g.doAdmitted(admittedCtx, class, req, admitted)
 }

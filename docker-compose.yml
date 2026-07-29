@@ -32,5 +32,12 @@ services:
       timeout: 2s
       retries: 15
 
+  jaeger:
+    image: jaegertracing/jaeger:2.20.0
+    profiles: ["tracing"]
+    ports:
+      - "127.0.0.1:16686:16686"
+      - "127.0.0.1:4318:4318"
+
 volumes:
   pgdata:

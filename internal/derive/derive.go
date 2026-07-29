@@ -15,6 +15,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/ewhauser/ghsync/internal/opsstate"
 	"github.com/ewhauser/ghsync/internal/outbox"
@@ -98,6 +102,7 @@ type Options struct {
 	PollInterval   time.Duration
 	Observer       Observer
 	InstallationID int64
+	Tracer         trace.Tracer
 }
 
 // Observer is M6's C-P5 pass-duration seam.
@@ -118,12 +123,16 @@ type Service struct {
 	pollInterval   time.Duration
 	observer       Observer
 	installationID int64
+	tracer         trace.Tracer
 	listenerReady  func(uint32)
 }
 
 // New constructs a C-D2/C-P5 derivation service. NoopDeriver is wired when no
 // implementation is supplied.
-func New(options Options) (*Service, error) {
+func New(options *Options) (*Service, error) {
+	if options == nil {
+		return nil, fmt.Errorf("deriver options are required")
+	}
 	if options.Pool == nil {
 		return nil, fmt.Errorf("deriver requires Postgres")
 	}
@@ -145,6 +154,11 @@ func New(options Options) (*Service, error) {
 	if options.Observer == nil {
 		options.Observer = noopObserver{}
 	}
+	if options.Tracer == nil {
+		options.Tracer = noop.NewTracerProvider().Tracer(
+			"github.com/ewhauser/ghsync/internal/derive",
+		)
+	}
 	installationID, err := resolveInstallationID(options.InstallationID)
 	if err != nil {
 		return nil, err
@@ -157,6 +171,7 @@ func New(options Options) (*Service, error) {
 		pollInterval:   options.PollInterval,
 		observer:       options.Observer,
 		installationID: installationID,
+		tracer:         options.Tracer,
 	}, nil
 }
 
@@ -188,7 +203,9 @@ func (s *Service) RunOnce(ctx context.Context) (int, error) {
 	return count, err
 }
 
-func (s *Service) runOnce(ctx context.Context) (int, error) {
+func (s *Service) runOnce(
+	ctx context.Context,
+) (count int, resultErr error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin derivation pass: %w", err)
@@ -219,6 +236,21 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 		}
 		return 0, nil
 	}
+	ctx, span := s.tracer.Start(
+		ctx,
+		"ghsync.deriver.pass",
+		trace.WithAttributes(attribute.Int(
+			"ghsync.deriver.scope_count",
+			len(scopeKeys),
+		)),
+	)
+	defer func() {
+		if resultErr != nil {
+			span.RecordError(resultErr)
+			span.SetStatus(codes.Error, resultErr.Error())
+		}
+		span.End()
+	}()
 
 	snapshot, err := s.loader.Load(ctx, tx, scopeKeys)
 	if err != nil {

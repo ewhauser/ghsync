@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivertype"
 )
 
 const (
@@ -39,6 +40,7 @@ type clientOptions struct {
 	maxWorkers            map[string]int
 	deadlineObserver      DeadlineObserver
 	refreshObserver       RefreshObserver
+	plugins               []rivertype.Plugin
 	now                   func() time.Time
 }
 
@@ -190,6 +192,13 @@ func WithPeriodicJobs(jobs ...*river.PeriodicJob) ClientOption {
 	}
 }
 
+// WithPlugins installs River plugins on inserts, workers, and internal hooks.
+func WithPlugins(plugins ...rivertype.Plugin) ClientOption {
+	return func(options *clientOptions) {
+		options.plugins = append(options.plugins, plugins...)
+	}
+}
+
 // NewClient builds a River client for the selected component queues and
 // worker registrars. Without WithQueues it owns the three priority queues:
 // interactive, event, and sweep.
@@ -246,6 +255,7 @@ func NewClient(
 	}
 	return river.NewClient(riverpgxv5.New(pool), &river.Config{
 		PeriodicJobs: configured.periodicJobs,
+		Plugins:      configured.plugins,
 		Queues:       queues,
 		Workers:      workers,
 	})

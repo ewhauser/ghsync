@@ -140,6 +140,10 @@ Every process exposes:
 Only a process with the `ingress` role exposes
 `POST /webhooks/github`.
 
+OpenTelemetry trace export is opt-in and uses OTLP/HTTP. See
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for configuration, River trace
+propagation, sampling, and local Jaeger inspection.
+
 ## Commands
 
 | Command | Description |
@@ -199,6 +203,8 @@ checks before submitting a pull request.
 
 - [`docs/SYNC_ENGINE.md`](docs/SYNC_ENGINE.md) — architecture and correctness
   constraints
+- [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) — OpenTelemetry tracing,
+  River propagation, sampling, and data-handling policy
 - [`db/CONTRACT.md`](db/CONTRACT.md) — public PostgreSQL and change-stream
   contract
 - [`ops/DEPLOYMENT.md`](ops/DEPLOYMENT.md) — deployment topology and

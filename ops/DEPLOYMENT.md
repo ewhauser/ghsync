@@ -119,6 +119,14 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 | `STREAM_RETENTION_BATCH_SIZE` | `1000` | Events per transaction. |
 | `DERIVER_POLL_INTERVAL` | `500ms` | Dirty poll fallback. |
 | `DERIVER_DIRTY_CAP` | `500` | C-P5 scopes per pass. |
+| `OTEL_TRACES_EXPORTER` | disabled | Set to `otlp` to enable OTLP/HTTP trace export; `none` disables it. |
+| `OTEL_SERVICE_NAME` | `ghsyncd` | Stable OpenTelemetry service name. |
+| `OTEL_RESOURCE_ATTRIBUTES` | empty | Resource attributes such as the deployment environment. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | exporter default | Base OTLP/HTTP collector endpoint. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | exporter default | Optional trace-specific collector endpoint. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | empty | Collector authentication headers; manage as a secret. |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | Head sampler; use `parentbased_traceidratio` in production. |
+| `OTEL_TRACES_SAMPLER_ARG` | `1` | Ratio for trace-ID ratio samplers. |
 
 Pull-request GraphQL gangs collect for `FETCH_BATCH_WINDOW` and use a fixed
 maximum batch size **K = 25**. K is constrained by the shipped GraphQL query and
@@ -136,9 +144,10 @@ ghsyncd migrate
 The command takes an advisory lock, applies River migrations first, then
 embedded ghsync files lexically. Each ghsync migration is one transaction
 recorded with a SHA-256 checksum. Changed applied bytes fail closed. Never edit
-an applied file; add a forward migration. The current artifact embeds ghsync
-migrations `0001` through `0029`; every migration already present in a target
-ledger is immutable.
+an applied file; add a forward migration. The squashed baseline is `0001`
+through `0003`; tracing adds the forward-only
+`0004_webhook_trace_context.sql` migration. Every migration already present in
+a target ledger is immutable.
 
 Verify the exact ledger before continuing:
 

@@ -724,7 +724,7 @@ func testRealWriterFence(t *testing.T, origin string, commit bool) {
 		`, scope); err != nil {
 			t.Fatal(err)
 		}
-		service, err := derive.New(derive.Options{
+		service, err := derive.New(&derive.Options{
 			Pool:           pool,
 			InstallationID: 1,
 			Deriver: fenceDeriver{

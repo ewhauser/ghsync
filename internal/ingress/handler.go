@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/otel/propagation"
+
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
@@ -125,6 +127,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// C-I1/C-I3/C-P1: exactly one durable insert. A zero row count is the
 	// expected duplicate-GUID no-op and still acknowledges with 200.
+	traceCarrier := webhookTraceCarrier(r.Context()) //nolint:contextcheck // inject the request's remote span context
 	if _, err := h.deliveries.InsertWebhookDelivery( //nolint:contextcheck // the HTTP request context is propagated directly
 		r.Context(),
 		dbgen.InsertWebhookDeliveryParams{
@@ -132,11 +135,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Event:        event,
 			RawBody:      body,
 			Headers:      headers,
+			Traceparent:  traceCarrier.Get("traceparent"),
+			Tracestate:   traceCarrier.Get("tracestate"),
 		}); err != nil {
 		http.Error(w, "store webhook delivery", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func webhookTraceCarrier(ctx context.Context) propagation.MapCarrier {
+	carrier := make(propagation.MapCarrier)
+	propagation.TraceContext{}.Inject(ctx, carrier)
+	return carrier
 }
 
 // requestEnvelope preserves the semantically relevant request metadata needed

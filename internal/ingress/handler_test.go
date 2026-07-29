@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
@@ -66,6 +68,39 @@ func TestHandlerVerifiesThenStoresRawDelivery(t *testing.T) {
 	}
 	if !store.hasDeadline {
 		t.Fatal("insert context has no request deadline")
+	}
+}
+
+func TestHandlerPersistsCurrentTraceContext(t *testing.T) {
+	t.Parallel()
+	spanContext := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: trace.TraceID{
+			0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+			0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+		},
+		SpanID:     trace.SpanID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+		TraceFlags: trace.FlagsSampled,
+		TraceState: trace.TraceState{},
+	})
+	ctx := trace.ContextWithSpanContext(t.Context(), spanContext)
+	store := &recordingInserter{rows: 1}
+	handler := NewHandler(store, "secret", 1024, time.Second)
+	request := signedRequest(t, []byte(`{}`), "secret", "traced", "push").
+		WithContext(ctx)
+	response := httptest.NewRecorder()
+
+	NewMux(handler).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", response.Code, response.Body.String())
+	}
+	const wantTraceparent = "00-0102030405060708090a0b0c0d0e0f10-0102030405060708-01"
+	if store.params.Traceparent != wantTraceparent {
+		t.Fatalf(
+			"stored traceparent = %q, want %q",
+			store.params.Traceparent,
+			wantTraceparent,
+		)
 	}
 }
 
