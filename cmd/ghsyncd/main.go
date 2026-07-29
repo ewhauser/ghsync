@@ -173,7 +173,7 @@ func parseRequeueOptions(args []string) (requeueOptions, error) {
 	if value := strings.TrimSpace(*guid); value != "" {
 		selected = append(selected, value)
 	}
-	for _, value := range strings.Split(*guids, ",") {
+	for value := range strings.SplitSeq(*guids, ",") {
 		if value = strings.TrimSpace(value); value != "" {
 			selected = append(selected, value)
 		}
@@ -542,7 +542,7 @@ func serve(args []string) error {
 		}
 		var sweepService *sweep.Service
 		if roles[roleSweep] || roles[rolePruner] {
-			sweepCfg := sweepConfig(cfg)
+			sweepCfg := sweepConfig(&cfg)
 			sweepCfg.Observer = sweep.Observers{
 				sweep.LogObserver{},
 				runtimeMetrics,
@@ -560,7 +560,7 @@ func serve(args []string) error {
 		}
 		var driftService *drift.Service
 		if roles[roleDrift] {
-			driftCfg := driftConfig(cfg)
+			driftCfg := driftConfig(&cfg)
 			driftCfg.Observer = drift.Observers{
 				drift.LogObserver{},
 				runtimeMetrics,
@@ -606,7 +606,7 @@ func serve(args []string) error {
 			clientOptions = append(
 				clientOptions,
 				queue.WithPeriodicJobs(
-					allPeriodicJobs(cfg)...,
+					allPeriodicJobs(&cfg)...,
 				),
 			)
 		}
@@ -691,7 +691,11 @@ func serve(args []string) error {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       httpReadTimeout,
 	}
-	listener, err := net.Listen("tcp", cfg.HTTPAddr)
+	listener, err := (&net.ListenConfig{}).Listen(
+		serviceCtx,
+		"tcp",
+		cfg.HTTPAddr,
+	)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
 	}
@@ -729,7 +733,7 @@ func serve(args []string) error {
 		cancelRiver()
 		if riverErr != nil {
 			slog.Warn(
-				"River graceful shutdown timed out; cancelling active work",
+				"River graceful shutdown timed out; canceling active work",
 				"error",
 				riverErr,
 			)
@@ -823,7 +827,7 @@ func riverPlanForRoles(roles map[string]bool) riverRolePlan {
 	return riverRolePlan{queues: queues}
 }
 
-func sweepConfig(cfg config.Config) sweep.Config {
+func sweepConfig(cfg *config.Config) sweep.Config {
 	return sweep.Config{
 		InstallationID:        cfg.GitHubInstallationID,
 		OpenStackMaxStaleness: cfg.SweepOpenStackMaxStaleness,
@@ -843,7 +847,7 @@ func sweepConfig(cfg config.Config) sweep.Config {
 	}
 }
 
-func driftConfig(cfg config.Config) drift.Config {
+func driftConfig(cfg *config.Config) drift.Config {
 	return drift.Config{
 		InstallationID:     cfg.GitHubInstallationID,
 		Period:             cfg.DriftPeriod,
@@ -855,10 +859,10 @@ func driftConfig(cfg config.Config) drift.Config {
 	}
 }
 
-func allPeriodicJobs(cfg config.Config) []*river.PeriodicJob {
+func allPeriodicJobs(cfg *config.Config) []*river.PeriodicJob {
 	sweepCfg := sweepConfig(cfg)
-	jobs := sweep.ReconciliationPeriodicJobs(sweepCfg)
-	jobs = append(jobs, sweep.PrunerPeriodicJobs(sweepCfg)...)
+	jobs := sweep.ReconciliationPeriodicJobs(&sweepCfg)
+	jobs = append(jobs, sweep.PrunerPeriodicJobs(&sweepCfg)...)
 	jobs = append(jobs, drift.PeriodicJobs(driftConfig(cfg))...)
 	return jobs
 }
@@ -878,7 +882,7 @@ func parseRoles(raw string) (map[string]bool, error) {
 		}, nil
 	}
 	roles := make(map[string]bool, 9)
-	for _, role := range strings.Split(raw, ",") {
+	for role := range strings.SplitSeq(raw, ",") {
 		switch role {
 		case roleIngress,
 			roleDispatch,

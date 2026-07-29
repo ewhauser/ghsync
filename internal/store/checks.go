@@ -41,7 +41,7 @@ func (w *EntityWriter) ChecksMetadata(
 func (w *EntityWriter) ApplyChecksObserved(
 	ctx context.Context,
 	observation *Observation,
-	checks ChecksRecord,
+	checks ChecksRecord, //nolint:gocritic // method normalizes a private record copy without mutating the caller
 ) (bool, error) {
 	if !checks.Source.Valid() || checks.Repository.GitHubID <= 0 ||
 		checks.HeadSHA == "" {
@@ -69,7 +69,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 		for index := range checks.Runs {
 			if checks.Runs[index].SemanticVersion == "" {
 				checks.Runs[index].SemanticVersion =
-					checkSemanticVersion(checks.Runs[index])
+					checkSemanticVersion(&checks.Runs[index])
 			}
 		}
 		encoded, err := json.Marshal(checks.Runs)
@@ -135,7 +135,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 				scopeKeys = append(
 					scopeKeys,
 					derivationScope(
-						repository,
+						&repository,
 						int(scope.Number),
 						intPointer(scope.StackNumber),
 					),
@@ -167,7 +167,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 func (w *EntityWriter) TouchChecks(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	headSHA string,
 	checkedAt time.Time,
 	etag string,
@@ -206,7 +206,7 @@ func (w *EntityWriter) TouchChecks(
 	}
 	return nil
 }
-func checkSemanticVersion(run CheckRunRecord) string {
+func checkSemanticVersion(run *CheckRunRecord) string {
 	type semanticCheck struct {
 		Status      string     `json:"status"`
 		Conclusion  string     `json:"conclusion"`

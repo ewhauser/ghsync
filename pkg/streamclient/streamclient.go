@@ -213,6 +213,12 @@ func (s *Snapshot) Commit(ctx context.Context) error {
 // pooled connection. Close is idempotent and is safe to defer immediately
 // after Bootstrap; after Commit or a direct Tx finalization it returns nil.
 func (s *Snapshot) Close() error {
+	return s.CloseContext(context.Background())
+}
+
+// CloseContext abandons an uncommitted Snapshot using a bounded cleanup
+// context derived from ctx while remaining usable after caller cancellation.
+func (s *Snapshot) CloseContext(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
@@ -227,7 +233,7 @@ func (s *Snapshot) Close() error {
 	if tx == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	err := tx.Rollback(ctx)
 	if errors.Is(err, pgx.ErrTxClosed) {
@@ -392,7 +398,7 @@ func (c *Client) Tail(
 		return fmt.Errorf("stream handler is required")
 	}
 	var listener *pgxpool.Conn
-	defer func() { releaseListener(listener) }()
+	defer func() { releaseListener(ctx, listener) }()
 	listenerBackoff := c.minBackoff
 	var nextListenerAttempt time.Time
 
@@ -474,7 +480,7 @@ func (c *Client) Tail(
 		case ctx.Err() != nil:
 			return ctx.Err()
 		default:
-			releaseListener(listener)
+			releaseListener(ctx, listener)
 			listener = nil
 			waitErr = fmt.Errorf(
 				"%w while waiting for notification: %w",
@@ -496,10 +502,7 @@ func (c *Client) Tail(
 }
 
 func (c *Client) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
-	timeout := c.pollInterval
-	if timeout > 250*time.Millisecond {
-		timeout = 250 * time.Millisecond
-	}
+	timeout := min(c.pollInterval, 250*time.Millisecond)
 	acquireCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	listener, err := c.pool.Acquire(acquireCtx)
@@ -516,11 +519,11 @@ func (c *Client) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
 	return listener, nil
 }
 
-func releaseListener(listener *pgxpool.Conn) {
+func releaseListener(ctx context.Context, listener *pgxpool.Conn) {
 	if listener == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	_, _ = listener.Exec(ctx, "UNLISTEN "+notificationChannel)
 	listener.Release()
@@ -549,7 +552,7 @@ func (c *Client) deliverPage(
 	if err != nil {
 		return 0, fmt.Errorf("begin stream page: %w", err)
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO consumer_cursors (consumer, stream, seq, updated_at)
@@ -667,6 +670,7 @@ func (c *Client) deliverPage(
 func isSerializationFailure(err error) bool {
 	var postgresError *pgconn.PgError
 	return errors.As(err, &postgresError) &&
+		postgresError != nil &&
 		postgresError.Code == "40001"
 }
 
@@ -682,7 +686,7 @@ func newCursorContention(
 	}
 }
 
-func validateIdentity(consumer string, stream string) error {
+func validateIdentity(consumer, stream string) error {
 	if strings.TrimSpace(consumer) == "" {
 		return fmt.Errorf("consumer name is required")
 	}

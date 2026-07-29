@@ -28,7 +28,7 @@ func repositoryRecordFromREST(
 }
 
 func repositoryRecordFromNode(
-	repository gh.RepositoryNode,
+	repository *gh.RepositoryNode,
 	installationID int64,
 	orgID int64,
 ) store.RepositoryRecord {
@@ -53,7 +53,7 @@ func repositoryRecordFromNode(
 }
 
 func pullRecordFromREST(
-	repository store.RepositoryRecord,
+	repository *store.RepositoryRecord,
 	pull *gh.PullRequest,
 	etag string,
 	source store.SyncSource,
@@ -71,7 +71,7 @@ func pullRecordFromREST(
 		updatedAt = pull.UpdatedAt.Time
 	}
 	return store.PullRequestRecord{
-		Repository:      repository,
+		Repository:      *repository,
 		GitHubID:        pull.GetID(),
 		NodeID:          pull.GetNodeID(),
 		Number:          pull.GetNumber(),
@@ -136,7 +136,7 @@ func pullRecordFromNode(
 	}
 	return store.PullRequestRecord{
 		Repository: repositoryRecordFromNode(
-			node.Repository,
+			&node.Repository,
 			installationID,
 			orgID,
 		),
@@ -166,7 +166,7 @@ func pullRecordFromNode(
 }
 
 func stackRecordFromREST(
-	repository store.RepositoryRecord,
+	repository *store.RepositoryRecord,
 	stack *gh.Stack,
 	etag string,
 	source store.SyncSource,
@@ -193,7 +193,7 @@ func stackRecordFromREST(
 		updatedAt = stack.CreatedAt
 	}
 	return store.StackRecord{
-		Repository:      repository,
+		Repository:      *repository,
 		GitHubID:        stack.ID,
 		NodeID:          stack.NodeID,
 		Number:          stack.Number,
@@ -209,7 +209,7 @@ func stackRecordFromREST(
 }
 
 func pullRecordsFromList(
-	repository store.RepositoryRecord,
+	repository *store.RepositoryRecord,
 	pulls []gh.PullRequest,
 	etags map[int]string,
 	source store.SyncSource,

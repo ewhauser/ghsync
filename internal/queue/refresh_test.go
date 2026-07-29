@@ -8,6 +8,7 @@ import (
 )
 
 func TestRefreshJobArgsArePointersOnly(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		args rivertype.JobArgs
 		kind string
@@ -31,6 +32,7 @@ func TestRefreshJobArgsArePointersOnly(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.kind, func(t *testing.T) {
+			t.Parallel()
 			encoded, err := json.Marshal(test.args)
 			if err != nil {
 				t.Fatal(err)
@@ -52,6 +54,7 @@ func TestRefreshJobArgsArePointersOnly(t *testing.T) {
 }
 
 func TestInstallationBackfillArgsCarryExpectedCursorOnly(t *testing.T) {
+	t.Parallel()
 	args := NewBackfillInstallationPageArgs(7, "repositories", 3)
 	encoded, err := json.Marshal(args)
 	if err != nil {
@@ -73,6 +76,7 @@ func TestInstallationBackfillArgsCarryExpectedCursorOnly(t *testing.T) {
 }
 
 func TestBackfillArgsCarryExpectedCursorOnly(t *testing.T) {
+	t.Parallel()
 	args := NewBackfillRepoPageArgs(7, "acme/monolith", "pull_requests", 3)
 	encoded, err := json.Marshal(args)
 	if err != nil {

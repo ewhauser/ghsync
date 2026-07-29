@@ -229,9 +229,7 @@ func TestConcurrencyCeiling(t *testing.T) {
 	errs := make(chan error, 18)
 	var wg sync.WaitGroup
 	for range 18 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			_, _, err := client.ListStacks(
 				context.Background(),
@@ -242,7 +240,7 @@ func TestConcurrencyCeiling(t *testing.T) {
 				"",
 			)
 			errs <- err
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -534,9 +532,7 @@ func TestInstallationTokenCachingAndSingleFlightRenewal(t *testing.T) {
 	got := make(chan string, 16)
 	var wg sync.WaitGroup
 	for range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			token, tokenErr := tokens.Token(context.Background())
 			if tokenErr != nil {
@@ -544,7 +540,7 @@ func TestInstallationTokenCachingAndSingleFlightRenewal(t *testing.T) {
 				return
 			}
 			got <- token
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -615,9 +611,7 @@ func TestConcurrencyCeilingIncludesRenewalDuringBurst(t *testing.T) {
 	errs := make(chan error, 18)
 	var workers sync.WaitGroup
 	call := func() {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		workers.Go(func() {
 			_, _, callErr := client.ListStacks(
 				context.Background(),
 				budget.Interactive,
@@ -627,7 +621,7 @@ func TestConcurrencyCeilingIncludesRenewalDuringBurst(t *testing.T) {
 				"",
 			)
 			errs <- callErr
-		}()
+		})
 	}
 	call()
 	call()

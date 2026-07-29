@@ -219,7 +219,7 @@ func TestInstallationBudgetSnapshotPreservesLaterBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 
 	installationID := -time.Now().UnixNano()
 	now := time.Now().UTC().Truncate(time.Microsecond)

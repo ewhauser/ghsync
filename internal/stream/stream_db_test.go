@@ -172,7 +172,7 @@ func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer heartbeatLock.Rollback(context.Background()) //nolint:errcheck
+	defer heartbeatLock.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if _, err := heartbeatLock.Exec(ctx, `
 		UPDATE operation_heartbeats
 		SET success_count = success_count
@@ -276,7 +276,7 @@ func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer writer.Rollback(context.Background()) //nolint:errcheck
+	defer writer.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, writer); err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	beforeFence := make(chan struct{})
 	watermarker.testBeforeFence = func() { close(beforeFence) }
 	progress := make(chan WatermarkProgress, 1)
@@ -341,7 +341,7 @@ func TestWatermarkerBoundsFenceWaitRetriesAndAdvancesAfterWriterTermination(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer writer.Rollback(context.Background()) //nolint:errcheck
+	defer writer.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, writer); err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestWatermarkerBoundsFenceWaitRetriesAndAdvancesAfterWriterTermination(
 	startedAt := time.Now()
 	go func() { runErr <- watermarker.Run(runCtx) }()
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for range 2 {
 		select {
 		case progress := <-observer.steps:
 			if !progress.FenceTimedOut {
@@ -436,7 +436,7 @@ func TestWatermarkNoopSkipsPublicationAndThrottlesHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if progress, err := watermarker.Step(ctx); err != nil {
 		t.Fatal(err)
 	} else if progress.Advanced {
@@ -756,7 +756,7 @@ func testRealWriterFence(t *testing.T, origin string, commit bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	beforeFence := make(chan struct{})
 	watermarker.testBeforeFence = func() { close(beforeFence) }
 	stepDone := make(chan error, 1)
@@ -837,7 +837,7 @@ func TestRetentionNeverPrunesAboveSafeWatermark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer smaller.Rollback(context.Background()) //nolint:errcheck
+	defer smaller.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, smaller); err != nil {
 		t.Fatal(err)
 	}
@@ -976,7 +976,7 @@ func assertOneStatementWake(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	var writerPID uint32
 	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&writerPID); err != nil {
 		t.Fatal(err)
@@ -1144,7 +1144,7 @@ func insertStreamEventWithTime(
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		return 0, err
 	}

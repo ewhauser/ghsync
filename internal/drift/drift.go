@@ -63,15 +63,15 @@ type Config struct {
 }
 
 type Observer interface {
-	Divergence(context.Context, dbgen.DriftFinding)
-	PersistentDivergence(context.Context, dbgen.DriftFinding)
+	Divergence(context.Context, *dbgen.DriftFinding)
+	PersistentDivergence(context.Context, *dbgen.DriftFinding)
 }
 
 type LogObserver struct{}
 
 func (LogObserver) Divergence(
 	_ context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	slog.Error(
 		"C-O3 semantic cache drift detected",
@@ -84,7 +84,7 @@ func (LogObserver) Divergence(
 
 func (LogObserver) PersistentDivergence(
 	_ context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	slog.Error(
 		"C-O3 semantic cache drift persisted after self-heal",
@@ -100,7 +100,7 @@ type Observers []Observer
 
 func (observers Observers) Divergence(
 	ctx context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	observer.FanOut(observers, func(item Observer) {
 		item.Divergence(ctx, finding)
@@ -109,7 +109,7 @@ func (observers Observers) Divergence(
 
 func (observers Observers) PersistentDivergence(
 	ctx context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	observer.FanOut(observers, func(item Observer) {
 		item.PersistentDivergence(ctx, finding)
@@ -134,7 +134,7 @@ type Service struct {
 	river   *river.Client[pgx.Tx]
 }
 
-func New(options Options) (*Service, error) {
+func New(options Options) (*Service, error) { //nolint:gocritic // constructor copies validated options into owned service state
 	if options.Pool == nil || options.REST == nil || options.GraphQL == nil {
 		return nil, fmt.Errorf(
 			"drift detector requires Postgres, REST, and GraphQL",
@@ -350,7 +350,8 @@ func (s *Service) Detect(
 				})
 			}
 		}
-		for _, sample := range samples {
+		for index := range samples {
+			sample := &samples[index]
 			finding, recorded, sampleSkipped, err := s.inspectSample(
 				ctx,
 				sample,
@@ -431,16 +432,16 @@ type driftSample struct {
 
 func (s *Service) inspectSample(
 	ctx context.Context,
-	sample driftSample,
+	sample *driftSample,
 ) (dbgen.DriftFinding, bool, bool, error) {
 	spec, err := refreshSpecForEntity(sample.EntityKind, sample.EntityKey)
 	if err != nil {
 		return dbgen.DriftFinding{}, false, false, err
 	}
-	if skipped, err := s.skipForOutstandingRefresh(ctx, spec); err != nil {
+	if skipped, err := s.skipForOutstandingRefresh(ctx, &spec); err != nil {
 		return dbgen.DriftFinding{}, false, false, err
 	} else if skipped {
-		s.logSkippedSample(sample.EntityKind, sample.EntityKey, spec)
+		s.logSkippedSample(sample.EntityKind, sample.EntityKey, &spec)
 		return dbgen.DriftFinding{}, false, true, nil
 	}
 	upstream, spec, err := s.fullFetch(
@@ -462,7 +463,7 @@ func (s *Service) inspectSample(
 			err,
 		)
 	}
-	defer observation.Close() //nolint:errcheck
+	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	current, err := dbgen.New(s.pool).GetCachedEntitySnapshot(
 		ctx,
 		dbgen.GetCachedEntitySnapshotParams{
@@ -492,10 +493,10 @@ func (s *Service) inspectSample(
 	// A refresh may be enqueued while the authoritative read is in progress.
 	// Recheck after locking so queued authoritative work wins over this
 	// read-only comparison.
-	if skipped, err := s.skipForOutstandingRefresh(ctx, spec); err != nil {
+	if skipped, err := s.skipForOutstandingRefresh(ctx, &spec); err != nil {
 		return dbgen.DriftFinding{}, false, false, err
 	} else if skipped {
-		s.logSkippedSample(current.EntityKind, current.EntityKey, spec)
+		s.logSkippedSample(current.EntityKind, current.EntityKey, &spec)
 		return dbgen.DriftFinding{}, false, true, nil
 	}
 	equal, diff, err := semanticDiff(
@@ -528,7 +529,7 @@ func (s *Service) inspectSample(
 	}
 	finding, first, escalated, err := s.recordAndHeal(
 		ctx,
-		driftSample{
+		&driftSample{
 			EntityKind:    current.EntityKind,
 			SourceID:      current.SourceID,
 			EntityKey:     current.EntityKey,
@@ -537,16 +538,16 @@ func (s *Service) inspectSample(
 		},
 		upstream,
 		diff,
-		spec,
+		&spec,
 	)
 	if err != nil {
 		return dbgen.DriftFinding{}, false, false, err
 	}
 	if first {
-		s.config.Observer.Divergence(ctx, finding)
+		s.config.Observer.Divergence(ctx, &finding)
 	}
 	if escalated {
-		s.config.Observer.PersistentDivergence(ctx, finding)
+		s.config.Observer.PersistentDivergence(ctx, &finding)
 	}
 	return finding, true, false, nil
 }
@@ -588,7 +589,7 @@ func refreshSpecForEntity(kind, key string) (queue.RefreshSpec, error) {
 
 func (s *Service) skipForOutstandingRefresh(
 	ctx context.Context,
-	spec queue.RefreshSpec,
+	spec *queue.RefreshSpec,
 ) (bool, error) {
 	var outstanding bool
 	if err := s.pool.QueryRow(ctx, `
@@ -621,7 +622,7 @@ func (s *Service) skipForOutstandingRefresh(
 func (s *Service) logSkippedSample(
 	entityKind string,
 	entityKey string,
-	spec queue.RefreshSpec,
+	spec *queue.RefreshSpec,
 ) {
 	slog.Info(
 		"C-O3 drift sample skipped for outstanding refresh",
@@ -634,10 +635,10 @@ func (s *Service) logSkippedSample(
 
 func (s *Service) recordAndHeal(
 	ctx context.Context,
-	sample driftSample,
+	sample *driftSample,
 	upstream []byte,
 	diff []byte,
-	spec queue.RefreshSpec,
+	spec *queue.RefreshSpec,
 ) (dbgen.DriftFinding, bool, bool, error) {
 	client := s.riverClient()
 	if client == nil {
@@ -652,11 +653,11 @@ func (s *Service) recordAndHeal(
 			err,
 		)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	now := s.config.Now().UTC()
 	// Match the upgrade backfill in migration 0011. This is a content
 	// identity for deduplication, not a security boundary.
-	hash := fmt.Sprintf("%x", md5.Sum(diff)) //nolint:gosec
+	hash := fmt.Sprintf("%x", md5.Sum(diff)) //nolint:gosec // deterministic non-security use
 	queries := dbgen.New(tx)
 	finding, err := queries.GetOpenDriftFindingByHash(
 		ctx,
@@ -759,7 +760,7 @@ func (s *Service) recordAndHeal(
 		ctx,
 		tx,
 		client,
-		[]queue.RefreshSpec{spec},
+		[]queue.RefreshSpec{*spec},
 		queue.QueueSweep,
 	)
 	if err != nil {
@@ -1084,7 +1085,8 @@ func (s *Service) fullFetch(
 			return runs[i].ID < runs[j].ID
 		})
 		semanticRuns := make([]map[string]any, 0, len(runs))
-		for _, run := range runs {
+		for index := range runs {
+			run := &runs[index]
 			semanticRuns = append(semanticRuns, map[string]any{
 				"id":          run.ID,
 				"node_id":     run.NodeID,

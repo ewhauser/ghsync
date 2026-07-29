@@ -670,7 +670,7 @@ func (m refreshDeadlineMonitor) observeRefresh(
 	if m.refreshObserver == nil {
 		return
 	}
-	m.refreshObserver.RefreshFinished(ctx, RefreshObservation{
+	m.refreshObserver.RefreshFinished(ctx, &RefreshObservation{
 		Kind:             kind,
 		Queue:            queueName,
 		EventReceivedAt:  eventReceivedAt,
@@ -796,8 +796,8 @@ func InsertRefreshesTxReturning(
 		)
 	}
 	params := make([]river.InsertManyParams, 0, len(deduped))
-	for _, spec := range deduped {
-		args, err := argsForSpec(spec)
+	for index := range deduped {
+		args, err := argsForSpec(&deduped[index])
 		if err != nil {
 			return nil, err
 		}
@@ -829,7 +829,7 @@ func InsertRefreshesTxReturning(
 	return result, nil
 }
 
-func argsForSpec(spec RefreshSpec) (rivertype.JobArgs, error) {
+func argsForSpec(spec *RefreshSpec) (rivertype.JobArgs, error) {
 	switch spec.Kind {
 	case KindRefreshPR:
 		return NewRefreshPRArgs(spec.Key), nil

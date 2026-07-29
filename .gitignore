@@ -1,5 +1,6 @@
 /ghsyncd
 /fake-github
+/custom-gcl
 *.pem
 .env
 .tools/

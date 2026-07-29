@@ -6,6 +6,7 @@ import (
 )
 
 func TestTimerRegisteredAfterDeadlineFiresImmediately(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	clock := New(now)
 	deadline := now.Add(time.Second)
@@ -23,6 +24,7 @@ func TestTimerRegisteredAfterDeadlineFiresImmediately(t *testing.T) {
 }
 
 func TestAdvanceFiresOnlyElapsedDeadlines(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	clock := New(now)
 	first, stopFirst := clock.NewTimerAt(now.Add(time.Second))

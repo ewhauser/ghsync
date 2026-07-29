@@ -117,7 +117,7 @@ func (h *Handler) RefreshRepository(
 	if err != nil {
 		return err
 	}
-	defer observation.Close() //nolint:errcheck
+	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	owner, name, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
@@ -202,7 +202,7 @@ func (h *Handler) RefreshRepoRules(
 	if err != nil {
 		return err
 	}
-	defer observation.Close() //nolint:errcheck
+	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	owner, name, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
@@ -275,11 +275,11 @@ func (h *Handler) RefreshPR(
 			ctx,
 			key,
 			metadata.NodeID,
-			metadata,
+			&metadata,
 			class,
 			source,
 			func(repo string) store.PullRequestHook {
-				return h.pullRequestHook(repo, key.Number, request.Queue)
+				return h.pullRequestHook(repo, request.Queue)
 			},
 		)
 		if err != nil {
@@ -339,7 +339,7 @@ func (h *Handler) refreshPRREST(
 	if err != nil {
 		return err
 	}
-	defer observation.Close() //nolint:errcheck
+	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	startedAt := time.Now()
 	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
@@ -366,7 +366,6 @@ func (h *Handler) refreshPRREST(
 	)
 	hook := h.pullRequestHook(
 		repository.FullName,
-		key.Number,
 		queueName,
 	)
 	if repoutil.IsNotFound(err) {
@@ -395,7 +394,7 @@ func (h *Handler) refreshPRREST(
 		)
 	}
 	record := pullRecordFromREST(
-		repository,
+		&repository,
 		pull,
 		response.ETag,
 		source,
@@ -438,7 +437,7 @@ func (h *Handler) RefreshStack(
 	if err != nil {
 		return err
 	}
-	defer observation.Close() //nolint:errcheck
+	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	startedAt := time.Now()
 	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
@@ -490,7 +489,7 @@ func (h *Handler) RefreshStack(
 		)
 	}
 	record := stackRecordFromREST(
-		repository,
+		&repository,
 		stack,
 		response.ETag,
 		source,
@@ -532,7 +531,7 @@ func (h *Handler) RefreshChecks(
 	if err != nil {
 		return err
 	}
-	defer observation.Close() //nolint:errcheck
+	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	startedAt := time.Now()
 	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
@@ -606,7 +605,8 @@ func (h *Handler) RefreshChecks(
 		page = response.NextPage
 	}
 	records := make([]store.CheckRunRecord, 0, len(all))
-	for _, run := range all {
+	for index := range all {
+		run := &all[index]
 		observed, err := json.Marshal(run)
 		if err != nil {
 			return fmt.Errorf("encode check observation: %w", err)
@@ -671,21 +671,19 @@ func (h *Handler) RefreshBranch(
 
 func (h *Handler) pullRequestHook(
 	repo string,
-	number int,
 	queueName string,
 ) store.PullRequestHook {
 	return func(result store.ApplyPullRequestResult) store.TransactionHook {
 		if !result.DomainChanged {
 			return nil
 		}
-		specs := pullRequestFollowupSpecs(repo, number, result)
+		specs := pullRequestFollowupSpecs(repo, result)
 		return h.insertFollowupsHook(specs, queueName)
 	}
 }
 
 func pullRequestFollowupSpecs(
 	repo string,
-	number int,
 	result store.ApplyPullRequestResult,
 ) []queue.RefreshSpec {
 	specs := make([]queue.RefreshSpec, 0, 3)
@@ -719,14 +717,14 @@ func (h *Handler) stackHook(
 		if !result.Applied {
 			return nil
 		}
-		specs := stackFollowupSpecs(repo, result)
+		specs := stackFollowupSpecs(repo, &result)
 		return h.insertFollowupsHook(specs, queueName)
 	}
 }
 
 func stackFollowupSpecs(
 	repo string,
-	result store.ApplyStackResult,
+	result *store.ApplyStackResult,
 ) []queue.RefreshSpec {
 	specs := make([]queue.RefreshSpec, 0)
 	seenPRs := make(map[int]struct{})
@@ -800,7 +798,7 @@ func (h *Handler) enqueue(
 	if err != nil {
 		return fmt.Errorf("begin refresh fan-out: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := queue.InsertRefreshesTx(
 		ctx,
 		tx,
@@ -839,7 +837,7 @@ func (h *Handler) ensureRepository(
 	if err != nil {
 		return store.RepositoryRecord{}, err
 	}
-	defer discovery.Close() //nolint:errcheck
+	defer discovery.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if repository, err = h.writer.Repository(ctx, fullName); err == nil {
 		return repository, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {

@@ -213,7 +213,7 @@ type StackHook func(ApplyStackResult) TransactionHook
 
 // PullRequestApply describes one independently handled batch write.
 type PullRequestApply struct {
-	Context     context.Context
+	Context     context.Context //nolint:containedctx // each batched item retains its independent cancellation and values
 	Record      PullRequestRecord
 	Observation *Observation
 	Hook        PullRequestHook
@@ -225,7 +225,7 @@ type PullRequestApplyOutcome struct {
 	Err    error
 }
 
-func validateRepository(repository RepositoryRecord, source SyncSource) error {
+func validateRepository(repository *RepositoryRecord, source SyncSource) error {
 	if !source.Valid() || repository.InstallationID <= 0 ||
 		repository.OrgID <= 0 || repository.GitHubID <= 0 ||
 		repository.Owner == "" || repository.Name == "" ||
@@ -236,8 +236,8 @@ func validateRepository(repository RepositoryRecord, source SyncSource) error {
 	return nil
 }
 
-func validatePullRequest(pull PullRequestRecord) error {
-	if err := validateRepository(pull.Repository, pull.Source); err != nil {
+func validatePullRequest(pull *PullRequestRecord) error {
+	if err := validateRepository(&pull.Repository, pull.Source); err != nil {
 		return err
 	}
 	if pull.Number <= 0 || pull.GitHubID <= 0 || pull.NodeID == "" ||
@@ -252,8 +252,8 @@ func validatePullRequest(pull PullRequestRecord) error {
 	return nil
 }
 
-func validateStack(stack StackRecord) error {
-	if err := validateRepository(stack.Repository, stack.Source); err != nil {
+func validateStack(stack *StackRecord) error {
+	if err := validateRepository(&stack.Repository, stack.Source); err != nil {
 		return err
 	}
 	if stack.Number <= 0 || stack.GitHubID <= 0 ||

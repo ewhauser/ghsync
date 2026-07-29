@@ -93,7 +93,6 @@ type runState struct {
 }
 
 type soakStreamConsumer struct {
-	parent      context.Context
 	pool        *pgxpool.Pool
 	consumer    string
 	tableSQL    string
@@ -198,10 +197,10 @@ func runMain(args []string) error {
 		drainTimeout:   *drainTimeout,
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
 	}
-	if err := validateConfig(cfg); err != nil {
+	if err := validateConfig(&cfg); err != nil {
 		return err
 	}
-	return run(context.Background(), cfg)
+	return run(context.Background(), &cfg)
 }
 
 func profileDuration(profile string, override time.Duration) (time.Duration, error) {
@@ -220,7 +219,7 @@ func profileDuration(profile string, override time.Duration) (time.Duration, err
 	}
 }
 
-func validateConfig(cfg config) error {
+func validateConfig(cfg *config) error {
 	if cfg.duration <= 0 || cfg.recordedRate <= 0 || cfg.multiplier <= 0 ||
 		cfg.scrapeInterval <= 0 || cfg.drainTimeout <= 0 {
 		return fmt.Errorf("durations and event rates must be positive")
@@ -256,7 +255,7 @@ func expectedEventCount(
 	))
 }
 
-func run(ctx context.Context, cfg config) error {
+func run(ctx context.Context, cfg *config) error {
 	events, err := loadEvents(cfg.eventsFile)
 	if err != nil {
 		return err
@@ -293,12 +292,9 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
-	initialHistogram, err := histogramState(
+	initialHistogram := histogramState(
 		initial["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
-	if err != nil {
-		return err
-	}
 	state := runState{
 		startWatermark: metricValue(
 			initial,
@@ -329,8 +325,8 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
-	defer streamConsumer.cleanup()
-	if err := streamConsumer.start(); err != nil {
+	defer streamConsumer.cleanup(ctx)
+	if err := streamConsumer.start(ctx); err != nil {
 		return err
 	}
 	startedAt := time.Now()
@@ -438,7 +434,7 @@ loadLoop:
 		) == 0
 		if pipelineDrained(final) && driftClean {
 			if err := assertConverged(ctx, cfg, pool); err == nil &&
-				postPopulationTrustCompleted(final, state) {
+				postPopulationTrustCompleted(final, &state) {
 				caughtUp, streamErr := streamConsumer.caughtUp(ctx)
 				if streamErr != nil {
 					return streamErr
@@ -478,7 +474,7 @@ loadLoop:
 					nil,
 				),
 				convergenceErr,
-				postPopulationTrustCompleted(final, state),
+				postPopulationTrustCompleted(final, &state),
 			)
 		}
 		if err := wait(ctx, cfg.scrapeInterval); err != nil {
@@ -495,7 +491,7 @@ loadLoop:
 	if err != nil {
 		return err
 	}
-	if err := assertFinal(final, state); err != nil {
+	if err := assertFinal(final, &state); err != nil {
 		return err
 	}
 	fmt.Printf(
@@ -531,7 +527,6 @@ func newSoakStreamConsumer(
 		return nil, fmt.Errorf("create soak stream applied set: %w", err)
 	}
 	consumer := &soakStreamConsumer{
-		parent:   ctx,
 		pool:     pool,
 		consumer: "ghsync-soak-" + runID,
 		tableSQL: tableSQL,
@@ -541,24 +536,24 @@ func newSoakStreamConsumer(
 		PollInterval: 100 * time.Millisecond,
 	})
 	if err != nil {
-		consumer.cleanup()
+		consumer.cleanup(ctx)
 		return nil, fmt.Errorf("create soak stream client: %w", err)
 	}
 	snapshot, err := client.Bootstrap(ctx, consumer.consumer, soakStream)
 	if err != nil {
-		consumer.cleanup()
+		consumer.cleanup(ctx)
 		return nil, fmt.Errorf("bootstrap soak stream consumer: %w", err)
 	}
 	consumer.initialSeq = snapshot.SafeSeq
 	if err := snapshot.Tx.Commit(ctx); err != nil {
 		_ = snapshot.Tx.Rollback(context.WithoutCancel(ctx))
-		consumer.cleanup()
+		consumer.cleanup(ctx)
 		return nil, fmt.Errorf("commit soak stream bootstrap: %w", err)
 	}
 	return consumer, nil
 }
 
-func (c *soakStreamConsumer) start() error {
+func (c *soakStreamConsumer) start(ctx context.Context) error {
 	if c.cancel != nil || c.done != nil {
 		return fmt.Errorf("soak stream consumer is already running")
 	}
@@ -569,7 +564,7 @@ func (c *soakStreamConsumer) start() error {
 	if err != nil {
 		return fmt.Errorf("restart soak stream client: %w", err)
 	}
-	tailCtx, cancel := context.WithCancel(c.parent)
+	tailCtx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
 	c.done = make(chan error, 1)
 	go func(done chan<- error) {
@@ -637,7 +632,7 @@ func (c *soakStreamConsumer) restart(ctx context.Context) error {
 	c.restartSeq = counts.cursor
 	c.restartRows = counts.total
 	c.restarted = true
-	if err := c.start(); err != nil {
+	if err := c.start(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -669,7 +664,7 @@ func (c *soakStreamConsumer) caughtUp(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return counts.total == counts.distinct &&
-		counts.total == counts.expected &&
+		counts.distinct == counts.expected &&
 		counts.cursor == counts.maxSeq, nil
 }
 
@@ -754,11 +749,11 @@ func (c *soakStreamConsumer) counts(ctx context.Context) (streamCounts, error) {
 	return result, nil
 }
 
-func (c *soakStreamConsumer) cleanup() {
+func (c *soakStreamConsumer) cleanup(ctx context.Context) {
 	if c == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	_ = c.stop(ctx)
 	if c.tableSQL != "" {
@@ -790,7 +785,7 @@ func operationValue(
 
 func postPopulationTrustCompleted(
 	families map[string]*dto.MetricFamily,
-	state runState,
+	state *runState,
 ) bool {
 	return state.postLoadCaptured &&
 		operationValue(
@@ -815,7 +810,7 @@ func postPopulationTrustCompleted(
 
 func waitForCacheSeed(
 	ctx context.Context,
-	cfg config,
+	cfg *config,
 	pool *pgxpool.Pool,
 ) error {
 	deadline := time.Now().Add(cfg.drainTimeout)
@@ -914,7 +909,7 @@ func emissionCount(result *emissionResult) int64 {
 
 func emitConfiguredLoad(
 	ctx context.Context,
-	cfg config,
+	cfg *config,
 	events []event,
 	runID string,
 	target int64,
@@ -925,10 +920,8 @@ func emitConfiguredLoad(
 	errs := make(chan error, emitterConcurrency)
 	var succeeded atomic.Int64
 	var workers sync.WaitGroup
-	for worker := 0; worker < emitterConcurrency; worker++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+	for range emitterConcurrency {
+		workers.Go(func() {
 			for sequence := range jobs {
 				item := events[int((sequence-1)%int64(len(events)))]
 				if err := emit(
@@ -950,7 +943,7 @@ func emitConfiguredLoad(
 				}
 				succeeded.Add(1)
 			}
-		}()
+		})
 	}
 	scheduleErr := error(nil)
 	for sequence := int64(1); sequence <= target; sequence++ {
@@ -1069,12 +1062,12 @@ func loadEvents(path string) ([]event, error) {
 
 func emit(
 	ctx context.Context,
-	cfg config,
+	cfg *config,
 	item event,
 	guid string,
 	revision int64,
 ) error {
-	var payload map[string]any
+	payload := make(map[string]any)
 	if err := json.Unmarshal(item.Payload, &payload); err != nil {
 		return fmt.Errorf("decode event payload: %w", err)
 	}
@@ -1124,9 +1117,7 @@ func waitHealthy(
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
-		request, err := http.NewRequestWithContext(
-			ctx, http.MethodGet, target, nil,
-		)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, http.NoBody)
 		if err != nil {
 			return err
 		}
@@ -1162,14 +1153,9 @@ func wait(ctx context.Context, duration time.Duration) error {
 
 func scrape(
 	ctx context.Context,
-	cfg config,
+	cfg *config,
 ) (map[string]*dto.MetricFamily, error) {
-	request, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		cfg.engineURL+ghsyncmetrics.Path,
-		nil,
-	)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.engineURL+ghsyncmetrics.Path, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -1257,12 +1243,9 @@ func assertLive(
 	if budget := families["ghsync_c_b3_budget_remaining"]; budget != nil && len(budget.Metric) > 0 {
 		state.budgetSamples++
 	}
-	current, err := histogramState(
+	current := histogramState(
 		families["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
-	if err != nil {
-		return err
-	}
 	window, err := subtractHistogram(current, state.lastHistogram)
 	if err != nil {
 		return fmt.Errorf("C-Q2 scrape-window histogram delta: %w", err)
@@ -1322,7 +1305,7 @@ func pipelineDrained(families map[string]*dto.MetricFamily) bool {
 
 func assertFinal(
 	families map[string]*dto.MetricFamily,
-	state runState,
+	state *runState,
 ) error {
 	if state.budgetSamples == 0 {
 		return fmt.Errorf("C-B3 budget metrics were never observed")
@@ -1419,15 +1402,10 @@ func assertFinal(
 
 func assertConverged(
 	ctx context.Context,
-	cfg config,
+	cfg *config,
 	pool *pgxpool.Pool,
 ) error {
-	request, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		cfg.fakeGitHubURL+fakegithub.ControlTruthPath,
-		nil,
-	)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.fakeGitHubURL+fakegithub.ControlTruthPath, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -1491,9 +1469,9 @@ func assertConverged(
 
 func histogramState(
 	family *dto.MetricFamily,
-) (histogramSnapshot, error) {
+) histogramSnapshot {
 	if family == nil {
-		return histogramSnapshot{buckets: make(map[float64]uint64)}, nil
+		return histogramSnapshot{buckets: make(map[float64]uint64)}
 	}
 	result := histogramSnapshot{buckets: make(map[float64]uint64)}
 	for _, item := range family.Metric {
@@ -1507,7 +1485,7 @@ func histogramState(
 				bucket.GetCumulativeCount()
 		}
 	}
-	return result, nil
+	return result
 }
 
 func subtractHistogram(
@@ -1554,10 +1532,7 @@ func histogramQuantile(
 	family *dto.MetricFamily,
 	quantile float64,
 ) (float64, uint64, error) {
-	snapshot, err := histogramState(family)
-	if err != nil {
-		return 0, 0, err
-	}
+	snapshot := histogramState(family)
 	value, err := histogramQuantileSnapshot(snapshot, quantile)
 	return value, snapshot.count, err
 }
@@ -1631,7 +1606,7 @@ func labelsOf(item *dto.Metric) map[string]string {
 	return labels
 }
 
-func labelsMatch(got map[string]string, want map[string]string) bool {
+func labelsMatch(got, want map[string]string) bool {
 	for key, value := range want {
 		if got[key] != value {
 			return false

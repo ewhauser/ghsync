@@ -115,7 +115,7 @@ func (s *Service) startOrResumeScope(
 	if err != nil {
 		return fmt.Errorf("begin sweep cursor kickoff: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	queries := dbgen.New(tx)
 	params := dbgen.EnsureSweepCursorParams{
 		InstallationID: s.config.InstallationID,
@@ -235,7 +235,7 @@ func (s *Service) ReconcilePage(
 		page.nextCursor = cachedPage.NextCursor
 		page.etag = cachedPage.Etag
 	}
-	return s.persistPage(ctx, args, page)
+	return s.persistPage(ctx, args, &page)
 }
 
 func (s *Service) fetchPage(
@@ -270,7 +270,8 @@ func (s *Service) fetchPage(
 			notModified: response.NotModified,
 			nextCursor:  numericNextCursor(response.NextPage),
 		}
-		for _, repository := range repositories {
+		for index := range repositories {
+			repository := &repositories[index]
 			key := "repo:" + repository.FullName + ":metadata"
 			result.keys = append(result.keys, key)
 			result.refreshSpecs = append(
@@ -320,7 +321,8 @@ func (s *Service) fetchPage(
 			notModified: response.NotModified,
 			nextCursor:  numericNextCursor(response.NextPage),
 		}
-		for _, stack := range stacks {
+		for index := range stacks {
+			stack := &stacks[index]
 			key := fmt.Sprintf(
 				"stack:%s:%d",
 				args.ScopeKey,
@@ -409,7 +411,7 @@ func (s *Service) fetchPage(
 func (s *Service) persistPage(
 	ctx context.Context,
 	args ListPageArgs,
-	page fetchedPage,
+	page *fetchedPage,
 ) error {
 	client := s.riverClient()
 	if client == nil {
@@ -423,7 +425,7 @@ func (s *Service) persistPage(
 	if err != nil {
 		return fmt.Errorf("begin sweep page commit: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	queries := dbgen.New(tx)
 	current, err := queries.GetSweepCursorForUpdate(
 		ctx,

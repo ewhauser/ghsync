@@ -35,31 +35,34 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	s.mu.Lock()
-	fx := cloneFixture(s.fixture)
+	fx := cloneFixture(&s.fixture)
 	s.mu.Unlock()
 	var ids []string
 	if raw := request.Variables["ids"]; len(raw) > 0 {
 		_ = json.Unmarshal(raw, &ids)
 	}
-	if len(ids) > 0 {
+	switch {
+	case len(ids) > 0:
 		nodes := make([]any, 0, len(ids))
 		for _, id := range ids {
 			var node any
-			for _, pull := range fx.PullRequests {
+			for index := range fx.PullRequests {
+				pull := &fx.PullRequests[index]
 				if pull.NodeID == id {
-					node = graphQLPullRequest(fx.Repository, pull)
+					node = graphQLPullRequest(&fx.Repository, pull)
 					break
 				}
 			}
 			nodes = append(nodes, node)
 		}
 		data["nodes"] = nodes
-	} else if strings.Contains(
+	case strings.Contains(
 		request.Query,
 		"GhsyncPullRequestReviewThreadsPage",
-	) {
+	):
 		id, after := graphQLCursorVariables(request.Variables)
-		for _, pull := range fx.PullRequests {
+		for index := range fx.PullRequests {
+			pull := &fx.PullRequests[index]
 			if pull.NodeID == id {
 				data["node"] = map[string]any{
 					"reviewThreads": graphQLReviewThreads(
@@ -70,13 +73,15 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-	} else if strings.Contains(
+	case strings.Contains(
 		request.Query,
 		"GhsyncReviewThreadCommentsPage",
-	) {
+	):
 		id, after := graphQLCursorVariables(request.Variables)
-		for _, pull := range fx.PullRequests {
-			for _, thread := range pull.ReviewThreads {
+		for index := range fx.PullRequests {
+			pull := &fx.PullRequests[index]
+			for threadIndex := range pull.ReviewThreads {
+				thread := &pull.ReviewThreads[threadIndex]
 				if thread.ID == id {
 					data["node"] = map[string]any{
 						"comments": graphQLReviewComments(
@@ -94,7 +99,10 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func graphQLPullRequest(repository Repository, pull PullRequest) map[string]any {
+func graphQLPullRequest(
+	repository *Repository,
+	pull *PullRequest,
+) map[string]any {
 	return map[string]any{
 		"id":             pull.NodeID,
 		"databaseId":     pull.ID,

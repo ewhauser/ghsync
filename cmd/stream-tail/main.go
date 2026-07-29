@@ -175,7 +175,7 @@ func bootstrapAndRebuild(
 		return fmt.Errorf("bootstrap stream snapshot: %w", err)
 	}
 	defer func() {
-		if closeErr := snapshot.Close(); resultErr == nil &&
+		if closeErr := snapshot.CloseContext(ctx); resultErr == nil &&
 			closeErr != nil {
 			resultErr = fmt.Errorf(
 				"close bootstrap snapshot: %w",

@@ -34,6 +34,12 @@ func (o *Observation) Key() string {
 
 // Close releases the observation's advisory lock and dedicated connection.
 func (o *Observation) Close() error {
+	return o.CloseContext(context.Background())
+}
+
+// CloseContext releases the observation using a bounded cleanup context
+// derived from ctx while remaining usable after caller cancellation.
+func (o *Observation) CloseContext(ctx context.Context) error {
 	if o == nil {
 		return nil
 	}
@@ -43,7 +49,7 @@ func (o *Observation) Close() error {
 		return nil
 	}
 	o.closed = true
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	err := dbgen.New(o.conn).ReleaseEntitySessionLock(ctx, o.key)
 	o.conn.Release()
@@ -145,6 +151,9 @@ func (w *EntityWriter) beginEntityTx(
 		}
 		return nil, err
 	}
+	if tx == nil {
+		return nil, fmt.Errorf("begin transaction returned nil transaction")
+	}
 	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		_ = tx.Rollback(ctx)
 		return nil, err
@@ -153,7 +162,7 @@ func (w *EntityWriter) beginEntityTx(
 }
 
 type entityTx struct {
-	ctx          context.Context
+	ctx          context.Context //nolint:containedctx // transaction callbacks share this exact transaction-scoped context
 	tx           pgx.Tx
 	queries      *dbgen.Queries
 	databaseTime time.Time
@@ -171,7 +180,7 @@ func (w *EntityWriter) withEntityTx(
 	if err != nil {
 		return fmt.Errorf("begin entity transaction: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 
 	databaseTime, err := databaseClock(ctx, tx)
 	if err != nil {

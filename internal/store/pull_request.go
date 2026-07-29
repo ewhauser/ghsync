@@ -47,7 +47,7 @@ func (w *EntityWriter) PullRequestMetadata(
 func (w *EntityWriter) TouchPullRequest(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	number int,
 	checkedAt time.Time,
 	etag string,
@@ -90,9 +90,9 @@ func (w *EntityWriter) TouchPullRequest(
 // ApplyPullRequest conditionally applies a direct pull-request observation.
 func (w *EntityWriter) ApplyPullRequest(
 	ctx context.Context,
-	pull PullRequestRecord,
+	pull PullRequestRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 ) (ApplyPullRequestResult, error) {
-	return w.applyPullRequest(ctx, nil, pull, nil)
+	return w.applyPullRequest(ctx, nil, &pull, nil)
 }
 
 // ApplyPullRequestObserved conditionally applies a pull request while holding
@@ -100,7 +100,7 @@ func (w *EntityWriter) ApplyPullRequest(
 func (w *EntityWriter) ApplyPullRequestObserved(
 	ctx context.Context,
 	observation *Observation,
-	pull PullRequestRecord,
+	pull PullRequestRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	hook PullRequestHook,
 ) (ApplyPullRequestResult, error) {
 	key := PullRequestEntityKey(
@@ -111,13 +111,13 @@ func (w *EntityWriter) ApplyPullRequestObserved(
 	if err := requireObservation(observation, key); err != nil {
 		return ApplyPullRequestResult{}, err
 	}
-	return w.applyPullRequest(ctx, observation, pull, hook)
+	return w.applyPullRequest(ctx, observation, &pull, hook)
 }
 
 func (w *EntityWriter) applyPullRequest(
 	ctx context.Context,
 	observation *Observation,
-	pull PullRequestRecord,
+	pull *PullRequestRecord,
 	hook PullRequestHook,
 ) (ApplyPullRequestResult, error) {
 	if err := validatePullRequest(pull); err != nil {
@@ -285,10 +285,10 @@ func (w *EntityWriter) applyPullRequest(
 		if result.Applied {
 			scopes := uniqueStrings(
 				derivationScope(
-					pull.Repository, pull.Number, result.OldStackNumber,
+					&pull.Repository, pull.Number, result.OldStackNumber,
 				),
 				derivationScope(
-					pull.Repository, pull.Number, result.NewStackNumber,
+					&pull.Repository, pull.Number, result.NewStackNumber,
 				),
 			)
 			if err := w.markAndEmit(
@@ -341,18 +341,19 @@ func (w *EntityWriter) ApplyPullRequestBatch(
 		)
 	})
 	outcomes := make(map[string]PullRequestApplyOutcome, len(sorted))
-	for _, apply := range sorted {
+	for index := range sorted {
+		apply := &sorted[index]
 		key := PullRequestEntityKey(
 			apply.Record.Repository.InstallationID,
 			apply.Record.Repository.GitHubID,
 			apply.Record.Number,
 		)
-		applyCtx := apply.Context
+		applyCtx := apply.Context //nolint:contextcheck // each batch item preserves its caller's values and cancellation
 		if applyCtx == nil {
 			applyCtx = ctx
 		}
 		result, err := w.applyPullRequest(
-			applyCtx, apply.Observation, apply.Record, apply.Hook,
+			applyCtx, apply.Observation, &apply.Record, apply.Hook,
 		)
 		outcomes[key] = PullRequestApplyOutcome{Result: result, Err: err}
 	}
@@ -364,7 +365,7 @@ func (w *EntityWriter) ApplyPullRequestBatch(
 func (w *EntityWriter) TombstonePullRequestObserved(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	number int,
 	source SyncSource,
 	at time.Time,
@@ -425,7 +426,7 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 				ctx,
 				queries,
 				[]string{derivationScope(
-					repository, number, result.OldStackNumber,
+					&repository, number, result.OldStackNumber,
 				)},
 				outbox.PullRequestTombstonedKind,
 				key,

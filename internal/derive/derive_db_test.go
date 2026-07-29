@@ -289,7 +289,7 @@ func TestFencedDirtyMarkWithConcurrentWatermarkerDoesNotStall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer observation.Close() //nolint:errcheck
+	defer observation.Close() //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	now := time.Now().UTC().Add(time.Minute)
 	writerDone := make(chan error, 1)
 	go func() {
@@ -353,7 +353,7 @@ func TestFencedDirtyMarkWithConcurrentWatermarkerDoesNotStall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	type stepResult struct {
 		progress stream.WatermarkProgress
 		err      error
@@ -706,7 +706,7 @@ func TestScopeSnapshotContainsOnlyLiveScopeOwnedRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	defer tx.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	stackScope := fmt.Sprintf("stack:1:%d:7", repositoryID)
 	snapshot, err := (SnapshotLoader{}).Load(
 		ctx,

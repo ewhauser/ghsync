@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -822,7 +823,7 @@ func (r *Runtime) observeDeriver(
 		ctx,
 		`SELECT count(*) FROM derivation_dirty`,
 	).Scan(&count); err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			count = 0
 		} else {
 			return fmt.Errorf("collect C-P5 deriver metrics: %w", err)

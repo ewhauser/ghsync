@@ -9,6 +9,7 @@ import (
 )
 
 func TestStackMembershipDiffIncludesOrderOnlyMoves(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	oldEntries := []StackEntry{
 		{Number: 1, UpdatedAt: now},
@@ -30,24 +31,26 @@ func TestStackMembershipDiffIncludesOrderOnlyMoves(t *testing.T) {
 }
 
 func TestCheckSemanticVersionIsStableAndDomainSensitive(t *testing.T) {
+	t.Parallel()
 	run := CheckRunRecord{
 		Status: "queued", DetailsURL: "https://example.test/check/1",
 	}
-	first := checkSemanticVersion(run)
-	second := checkSemanticVersion(run)
+	first := checkSemanticVersion(&run)
+	second := checkSemanticVersion(&run)
 	if first == "" || first != second {
 		t.Fatalf("stable semantic versions = %q, %q", first, second)
 	}
 	run.Status = "in_progress"
-	if changed := checkSemanticVersion(run); changed == first {
+	if changed := checkSemanticVersion(&run); changed == first {
 		t.Fatal("status transition did not change semantic version")
 	}
 }
 
 func TestObservedWritersRequireObservation(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	repository := storeTestRepository("acme/observed", 2300, at)
-	pull := storeTestPull(repository, at, "observed-head")
+	pull := storeTestPull(&repository, at, "observed-head")
 	stack := StackRecord{
 		Repository:      repository,
 		GitHubID:        7000,
@@ -153,6 +156,7 @@ func TestObservedWritersRequireObservation(t *testing.T) {
 	}
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			err := run()
 			if err == nil || !strings.Contains(err.Error(), "observation") {
 				t.Fatalf("error = %v, want required observation", err)

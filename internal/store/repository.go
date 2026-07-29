@@ -21,18 +21,18 @@ func (w *EntityWriter) Repository(
 	if err != nil {
 		return RepositoryRecord{}, fmt.Errorf("get repository by full name: %w", err)
 	}
-	return repositoryFromRow(repo), nil
+	return repositoryFromRow(&repo), nil
 }
 
 // ApplyRepository conditionally applies a direct repository observation.
 func (w *EntityWriter) ApplyRepository(
 	ctx context.Context,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	source SyncSource,
 	etag string,
 	observedAt time.Time,
 ) (bool, error) {
-	return w.applyRepository(ctx, nil, repository, source, etag, observedAt)
+	return w.applyRepository(ctx, nil, &repository, source, etag, observedAt)
 }
 
 // ApplyRepositoryObserved conditionally applies a repository while holding its
@@ -40,7 +40,7 @@ func (w *EntityWriter) ApplyRepository(
 func (w *EntityWriter) ApplyRepositoryObserved(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	source SyncSource,
 	etag string,
 	observedAt time.Time,
@@ -52,7 +52,7 @@ func (w *EntityWriter) ApplyRepositoryObserved(
 	return w.applyRepository(
 		ctx,
 		observation,
-		repository,
+		&repository,
 		source,
 		etag,
 		observedAt,
@@ -62,7 +62,7 @@ func (w *EntityWriter) ApplyRepositoryObserved(
 func (w *EntityWriter) applyRepository(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository *RepositoryRecord,
 	source SyncSource,
 	etag string,
 	observedAt time.Time,
@@ -97,7 +97,7 @@ func (w *EntityWriter) applyRepository(
 func (w *EntityWriter) TombstoneRepositoryObserved(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	source SyncSource,
 	at time.Time,
 ) (bool, error) {
@@ -177,7 +177,7 @@ func (w *EntityWriter) TombstoneRepositoryObserved(
 func (w *EntityWriter) applyRepositoryTx(
 	ctx context.Context,
 	queries *dbgen.Queries,
-	repository RepositoryRecord,
+	repository *RepositoryRecord,
 	source SyncSource,
 	etag string,
 	observedAt time.Time,
@@ -252,7 +252,7 @@ func (w *EntityWriter) applyRepositoryTx(
 	return row, true, nil
 }
 
-func repositoryFromRow(repo dbgen.Repo) RepositoryRecord {
+func repositoryFromRow(repo *dbgen.Repo) RepositoryRecord {
 	var updated time.Time
 	if repo.GhUpdatedAt.Valid {
 		updated = repo.GhUpdatedAt.Time

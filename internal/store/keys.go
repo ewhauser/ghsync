@@ -64,7 +64,7 @@ func RepoRulesEntityKey(
 }
 
 func derivationScope(
-	repository RepositoryRecord,
+	repository *RepositoryRecord,
 	number int,
 	stackNumber *int,
 ) string {

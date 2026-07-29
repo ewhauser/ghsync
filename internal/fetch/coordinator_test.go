@@ -10,6 +10,7 @@ import (
 )
 
 func TestSortedPullRequestKeysUseImmutableRepositoryIdentity(t *testing.T) {
+	t.Parallel()
 	records := []store.PullRequestRecord{
 		{
 			Repository: store.RepositoryRecord{
@@ -36,6 +37,7 @@ func TestSortedPullRequestKeysUseImmutableRepositoryIdentity(t *testing.T) {
 }
 
 func TestParseEntityKeys(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		raw  string
 		kind string
@@ -87,7 +89,8 @@ func TestParseEntityKeys(t *testing.T) {
 }
 
 func TestStackOrderOnlyChangeSchedulesMovedPRs(t *testing.T) {
-	specs := stackFollowupSpecs("acme/monolith", store.ApplyStackResult{
+	t.Parallel()
+	specs := stackFollowupSpecs("acme/monolith", &store.ApplyStackResult{
 		Applied:  true,
 		MovedPRs: []int{4812, 4815},
 	})
@@ -107,6 +110,7 @@ func TestStackOrderOnlyChangeSchedulesMovedPRs(t *testing.T) {
 }
 
 func TestStackFollowupSpecsHaveDeterministicOrder(t *testing.T) {
+	t.Parallel()
 	result := store.ApplyStackResult{
 		Applied:   true,
 		JoinedPRs: []int{9, 2},
@@ -130,8 +134,8 @@ func TestStackFollowupSpecsHaveDeterministicOrder(t *testing.T) {
 			Key:  "pr:acme/monolith:9",
 		},
 	}
-	for iteration := 0; iteration < 100; iteration++ {
-		got := stackFollowupSpecs("acme/monolith", result)
+	for iteration := range 100 {
+		got := stackFollowupSpecs("acme/monolith", &result)
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf(
 				"iteration %d stack follow-up specs = %v, want %v",
@@ -144,6 +148,7 @@ func TestStackFollowupSpecsHaveDeterministicOrder(t *testing.T) {
 }
 
 func TestPullBackfillCursorCarriesPageAndPassCount(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		page         int
 		passNewCount int

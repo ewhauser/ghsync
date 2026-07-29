@@ -26,6 +26,7 @@ const (
 )
 
 func TestDeploymentReferenceMatchesConfigEnvironment(t *testing.T) {
+	t.Parallel()
 	configured := configEnvironmentVariables(t)
 	cleared := clearedConfigEnvironmentVariables(t)
 	documented := deploymentEnvironmentVariables(t)

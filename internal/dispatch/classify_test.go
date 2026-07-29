@@ -10,6 +10,7 @@ import (
 )
 
 func TestDefaultClassifierHintCoverage(t *testing.T) {
+	t.Parallel()
 	classifier := DefaultClassifier()
 	tests := []struct {
 		name  string
@@ -180,6 +181,7 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := classifier.Classify(test.event, []byte(test.body))
 			if err != nil {
 				t.Fatal(err)
@@ -192,6 +194,7 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 }
 
 func TestLoadRulesFileFailsClosedOnSchemaAndSemanticErrors(t *testing.T) {
+	t.Parallel()
 	tests := map[string]string{
 		"unknown key": `rules:
   - event: pull_request
@@ -225,6 +228,7 @@ rules: []
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			path := filepath.Join(t.TempDir(), "rules.yaml")
 			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 				t.Fatal(err)
@@ -237,6 +241,7 @@ rules: []
 }
 
 func TestUnknownEventIsProcessedWithoutParsing(t *testing.T) {
+	t.Parallel()
 	intents, err := DefaultClassifier().Classify("mystery_event", []byte(`not-json`))
 	if err != nil {
 		t.Fatalf("unknown event returned error: %v", err)
@@ -247,6 +252,7 @@ func TestUnknownEventIsProcessedWithoutParsing(t *testing.T) {
 }
 
 func TestKnownMalformedEventFailsClassification(t *testing.T) {
+	t.Parallel()
 	if _, err := DefaultClassifier().Classify(
 		"pull_request",
 		[]byte(`not-json`),
@@ -256,6 +262,7 @@ func TestKnownMalformedEventFailsClassification(t *testing.T) {
 }
 
 func TestRuleTableControlsActions(t *testing.T) {
+	t.Parallel()
 	classifier := NewClassifier([]Rule{{
 		Event: "pull_request", Action: "opened", Target: TargetPullRequest,
 	}})

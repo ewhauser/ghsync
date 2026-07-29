@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -35,7 +36,7 @@ func TestRegistryIsolatedPrometheusExposition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer registry.Shutdown(context.Background()) //nolint:errcheck
+	defer registry.Shutdown(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	registrar := &counterRegistrar{}
 	if err := registry.Register("test", registrar); err != nil {
 		t.Fatal(err)
@@ -45,7 +46,7 @@ func TestRegistryIsolatedPrometheusExposition(t *testing.T) {
 	}
 	registrar.counter.Add(context.Background(), 2)
 
-	request := httptest.NewRequest("GET", Path, nil)
+	request := httptest.NewRequestWithContext(t.Context(), "GET", Path, http.NoBody)
 	response := httptest.NewRecorder()
 	registry.Handler().ServeHTTP(response, request)
 	if response.Code != 200 {
@@ -85,7 +86,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer eventTx.Rollback(context.Background()) //nolint:errcheck
+	defer eventTx.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, eventTx); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +212,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer registry.Shutdown(context.Background()) //nolint:errcheck
+	defer registry.Shutdown(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := registry.Register("runtime-test", runtimeMetrics); err != nil {
 		t.Fatal(err)
 	}
@@ -226,18 +227,18 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	runtimeMetrics.CacheWrite(ctx, "pull_request", true, false)
 	runtimeMetrics.CacheWrite(ctx, "pull_request", false, false)
 	receivedAt := time.Now().UTC()
-	runtimeMetrics.RefreshFinished(ctx, queue.RefreshObservation{
+	runtimeMetrics.RefreshFinished(ctx, &queue.RefreshObservation{
 		Kind:            queue.KindRefreshBranch,
 		Queue:           queue.QueueEvent,
 		EventReceivedAt: receivedAt,
 	})
-	runtimeMetrics.RefreshFinished(ctx, queue.RefreshObservation{
+	runtimeMetrics.RefreshFinished(ctx, &queue.RefreshObservation{
 		Kind:             queue.KindRefreshPR,
 		Queue:            queue.QueueEvent,
 		EventReceivedAt:  receivedAt,
 		CacheCommittedAt: receivedAt.Add(-time.Second),
 	})
-	runtimeMetrics.RefreshFinished(ctx, queue.RefreshObservation{
+	runtimeMetrics.RefreshFinished(ctx, &queue.RefreshObservation{
 		Kind:             queue.KindRefreshPR,
 		Queue:            queue.QueueEvent,
 		EventReceivedAt:  receivedAt,
@@ -247,7 +248,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	response := httptest.NewRecorder()
 	registry.Handler().ServeHTTP(
 		response,
-		httptest.NewRequest("GET", Path, nil),
+		httptest.NewRequestWithContext(t.Context(), "GET", Path, http.NoBody),
 	)
 	body, err := io.ReadAll(response.Result().Body)
 	if err != nil {
@@ -363,7 +364,7 @@ func TestBatchLabelUsesConfiguredDirtyCap(t *testing.T) {
 		{count: 7, want: "capped"},
 		{count: 8, want: "capped"},
 	} {
-		if got := batchLabel(test.count, options); got != test.want {
+		if got := batchLabel(test.count, &options); got != test.want {
 			t.Errorf(
 				"batchLabel(%d, dirty cap %d) = %q, want %q",
 				test.count,

@@ -125,10 +125,11 @@ func (s *Server) listAppHookDeliveries(
 	}
 	deliveries := s.Deliveries()
 	if beforeID > 0 {
-		filtered := deliveries[:0]
-		for _, delivery := range deliveries {
+		filtered := make([]HookDelivery, 0, len(deliveries))
+		for index := range deliveries {
+			delivery := &deliveries[index]
 			if delivery.ID < beforeID {
-				filtered = append(filtered, delivery)
+				filtered = append(filtered, *delivery)
 			}
 		}
 		deliveries = filtered
@@ -148,7 +149,7 @@ func (s *Server) listAppHookDeliveries(
 			fmt.Sprintf("<%s>; rel=\"next\"", nextURL.String()),
 		)
 	}
-	s.writeConditionalJSON(w, r, "core", page)
+	s.writeConditionalJSON(w, r, page)
 }
 
 func (s *Server) redeliverAppHookDelivery(
@@ -164,8 +165,8 @@ func (s *Server) redeliverAppHookDelivery(
 	var original *storedHookDelivery
 	for index := range s.deliveries {
 		if s.deliveries[index].ID == id {
-			copy := s.deliveries[index]
-			original = &copy
+			deliveryCopy := s.deliveries[index]
+			original = &deliveryCopy
 			break
 		}
 	}
@@ -178,10 +179,10 @@ func (s *Server) redeliverAppHookDelivery(
 		return
 	}
 	// GitHub acknowledges a redelivery request before attempting the webhook.
-	// Use a background context because the request context is cancelled as
+	// Use a background context because the request context is canceled as
 	// soon as this 202 response completes.
 	w.WriteHeader(http.StatusAccepted)
-	go func(delivery storedHookDelivery) {
+	go func(delivery storedHookDelivery) { //nolint:contextcheck // redelivery must outlive the accepted control request
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		statusCode, _ := s.sendWebhook(
@@ -204,7 +205,7 @@ func (s *Server) redeliverAppHookDelivery(
 
 func encodeDeliveryCursor(beforeID int64) string {
 	return base64.RawURLEncoding.EncodeToString(
-		[]byte(fmt.Sprintf("before:%d", beforeID)),
+		fmt.Appendf(nil, "before:%d", beforeID),
 	)
 }
 
@@ -340,7 +341,7 @@ func (s *Server) recordHookDelivery(
 	body []byte,
 	redelivery bool,
 	statusCode int,
-) int64 {
+) {
 	status := "DROPPED"
 	if statusCode >= 200 && statusCode <= 399 {
 		status = "OK"
@@ -373,5 +374,4 @@ func (s *Server) recordHookDelivery(
 		targetURL: targetURL,
 		body:      append([]byte(nil), body...),
 	})
-	return id
 }

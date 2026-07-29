@@ -17,6 +17,7 @@ import (
 )
 
 func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
+	t.Parallel()
 	metricsHandler := http.HandlerFunc(func(
 		w http.ResponseWriter,
 		_ *http.Request,
@@ -29,9 +30,9 @@ func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
 		ghsyncmetrics.Path:  http.StatusOK,
 		ingress.WebhookPath: http.StatusNotFound,
 	} {
-		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, http.NoBody)
 		if path == ingress.WebhookPath {
-			request = httptest.NewRequest(http.MethodPost, path, nil)
+			request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, http.NoBody)
 		}
 		response := httptest.NewRecorder()
 		workerMux.ServeHTTP(response, request)
@@ -49,7 +50,7 @@ func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
 	response := httptest.NewRecorder()
 	ingressMux.ServeHTTP(
 		response,
-		httptest.NewRequest(http.MethodPost, ingress.WebhookPath, nil),
+		httptest.NewRequestWithContext(t.Context(), http.MethodPost, ingress.WebhookPath, http.NoBody),
 	)
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("ingress webhook status = %d", response.Code)
@@ -57,7 +58,7 @@ func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
 	metricsResponse := httptest.NewRecorder()
 	ingressMux.ServeHTTP(
 		metricsResponse,
-		httptest.NewRequest(http.MethodGet, ghsyncmetrics.Path, nil),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, ghsyncmetrics.Path, http.NoBody),
 	)
 	if !strings.Contains(metricsResponse.Body.String(), "ghsync_c_o4_test") {
 		t.Fatal("ingress mux omitted metrics handler")
@@ -65,6 +66,7 @@ func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
 }
 
 func TestValidateRoles(t *testing.T) {
+	t.Parallel()
 	for _, roles := range []string{
 		"all",
 		"ingress",
@@ -97,6 +99,7 @@ func TestValidateRoles(t *testing.T) {
 }
 
 func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
+	t.Parallel()
 	tests := map[string][]string{
 		"dispatch": nil,
 		"fetch,sweep,drift": {
@@ -121,6 +124,7 @@ func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
 	}
 	for raw, want := range tests {
 		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
 			roles, err := parseRoles(raw)
 			if err != nil {
 				t.Fatal(err)
@@ -134,19 +138,21 @@ func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
 }
 
 func TestDriftPageSizeIsIndependentFromSweepPageSize(t *testing.T) {
+	t.Parallel()
 	cfg := config.Config{
 		SweepPageSize: 25,
 		DriftPageSize: 75,
 	}
-	if got := sweepConfig(cfg).PageSize; got != 25 {
+	if got := sweepConfig(&cfg).PageSize; got != 25 {
 		t.Fatalf("sweep page size = %d, want 25", got)
 	}
-	if got := driftConfig(cfg).PageSize; got != 75 {
+	if got := driftConfig(&cfg).PageSize; got != 75 {
 		t.Fatalf("drift page size = %d, want 75", got)
 	}
 }
 
 func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
+	t.Parallel()
 	cfg := config.Config{
 		GitHubInstallationID:       1,
 		SweepOpenStackMaxStaleness: 5 * time.Minute,
@@ -167,7 +173,7 @@ func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
 		RetentionAge:               90 * 24 * time.Hour,
 		RetentionBatchSize:         1000,
 	}
-	want := len(allPeriodicJobs(cfg))
+	want := len(allPeriodicJobs(&cfg))
 	if want == 0 {
 		t.Fatal("periodic table is empty")
 	}
@@ -184,7 +190,7 @@ func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
 			roles[roleDrift] || roles[rolePruner]
 		got := 0
 		if worksJobs {
-			got = len(allPeriodicJobs(cfg))
+			got = len(allPeriodicJobs(&cfg))
 		}
 		if got != want {
 			t.Fatalf("%s periodic jobs = %d, want %d", raw, got, want)
@@ -193,6 +199,7 @@ func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
 }
 
 func TestBadDispatcherRulesFileFailsClosed(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "bad-rules.yaml")
 	if err := os.WriteFile(path, []byte(`rules:
   - event: pull_request
@@ -208,6 +215,7 @@ func TestBadDispatcherRulesFileFailsClosed(t *testing.T) {
 }
 
 func TestParseRequeueOptions(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		args []string
 		want requeueOptions

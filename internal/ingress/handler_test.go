@@ -24,7 +24,7 @@ type recordingInserter struct {
 
 func (r *recordingInserter) InsertWebhookDelivery(
 	ctx context.Context,
-	params dbgen.InsertWebhookDeliveryParams,
+	params dbgen.InsertWebhookDeliveryParams, //nolint:gocritic // test double implements the generated value-parameter interface
 ) (int64, error) {
 	r.calls++
 	r.params = params
@@ -33,6 +33,7 @@ func (r *recordingInserter) InsertWebhookDelivery(
 }
 
 func TestHandlerVerifiesThenStoresRawDelivery(t *testing.T) {
+	t.Parallel()
 	store := &recordingInserter{rows: 1}
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	body := []byte(`not-json-at-ingress`)
@@ -69,6 +70,7 @@ func TestHandlerVerifiesThenStoresRawDelivery(t *testing.T) {
 }
 
 func TestHandlerRejectsUnverifiedWithoutStoring(t *testing.T) {
+	t.Parallel()
 	store := &recordingInserter{rows: 1}
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	request := signedRequest(
@@ -91,6 +93,7 @@ func TestHandlerRejectsUnverifiedWithoutStoring(t *testing.T) {
 }
 
 func TestHandlerAcknowledgesDuplicateGUID(t *testing.T) {
+	t.Parallel()
 	store := &recordingInserter{rows: 0}
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	response := httptest.NewRecorder()
@@ -106,6 +109,7 @@ func TestHandlerAcknowledgesDuplicateGUID(t *testing.T) {
 }
 
 func TestHandlerRejectsOversizeBeforeStoring(t *testing.T) {
+	t.Parallel()
 	store := &recordingInserter{rows: 1}
 	handler := NewHandler(store, "secret", 4, time.Second)
 	response := httptest.NewRecorder()
@@ -124,6 +128,7 @@ func TestHandlerRejectsOversizeBeforeStoring(t *testing.T) {
 }
 
 func TestHandlerRequiresDeliveryHeadersAfterVerification(t *testing.T) {
+	t.Parallel()
 	store := &recordingInserter{rows: 1}
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	request := signedRequest(t, []byte(`{}`), "secret", "", "push")
@@ -137,6 +142,7 @@ func TestHandlerRequiresDeliveryHeadersAfterVerification(t *testing.T) {
 }
 
 func TestHandlerDoesNotAcknowledgeFailedCommit(t *testing.T) {
+	t.Parallel()
 	store := &recordingInserter{err: errors.New("database unavailable")}
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	response := httptest.NewRecorder()
@@ -155,13 +161,14 @@ type deadlineInserter struct{}
 
 func (deadlineInserter) InsertWebhookDelivery(
 	ctx context.Context,
-	_ dbgen.InsertWebhookDeliveryParams,
+	_ dbgen.InsertWebhookDeliveryParams, //nolint:gocritic // test double implements the generated value-parameter interface
 ) (int64, error) {
 	<-ctx.Done()
 	return 0, ctx.Err()
 }
 
 func TestHandlerRequestDeadlineCoversInsert(t *testing.T) {
+	t.Parallel()
 	handler := NewHandler(deadlineInserter{}, "secret", 1024, 10*time.Millisecond)
 	response := httptest.NewRecorder()
 	started := time.Now()
@@ -180,8 +187,9 @@ func TestHandlerRequestDeadlineCoversInsert(t *testing.T) {
 }
 
 func TestHealth(t *testing.T) {
+	t.Parallel()
 	handler := NewHandler(&recordingInserter{}, "secret", 1024, time.Second)
-	request := httptest.NewRequest(http.MethodGet, HealthPath, nil)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, HealthPath, http.NoBody)
 	response := httptest.NewRecorder()
 
 	NewMux(handler).ServeHTTP(response, request)
@@ -192,6 +200,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestNewHandlerRejectsEmptyWebhookSecret(t *testing.T) {
+	t.Parallel()
 	defer func() {
 		if recovered := recover(); recovered == nil {
 			t.Fatal("NewHandler accepted an empty webhook secret")
@@ -208,7 +217,7 @@ func signedRequest(
 	event string,
 ) *http.Request {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodPost, WebhookPath, bytes.NewReader(body))
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, WebhookPath, bytes.NewReader(body))
 	request.Header.Set("X-Hub-Signature-256", gh.SignBody([]byte(secret), body))
 	if guid != "" {
 		request.Header.Set("X-GitHub-Delivery", guid)

@@ -80,7 +80,7 @@ type Config struct {
 // PruneHook is M6's C-R retention-deletion accounting seam.
 type PruneHook func(context.Context, string, int64)
 
-func (c Config) validate() error {
+func (c *Config) validate() error {
 	for name, value := range map[string]time.Duration{
 		"open stack staleness": c.OpenStackMaxStaleness,
 		"open PR staleness":    c.OpenPRMaxStaleness,
@@ -242,7 +242,7 @@ type Service struct {
 	river   *river.Client[pgx.Tx]
 }
 
-func New(options Options) (*Service, error) {
+func New(options Options) (*Service, error) { //nolint:gocritic // constructor normalizes a private options copy
 	if options.Pool == nil {
 		return nil, fmt.Errorf("sweep service requires Postgres")
 	}
@@ -386,8 +386,8 @@ func (s *Service) ReconciliationPeriodicJobs() []*river.PeriodicJob {
 	}
 }
 
-func ReconciliationPeriodicJobs(config Config) []*river.PeriodicJob {
-	return (&Service{config: config}).ReconciliationPeriodicJobs()
+func ReconciliationPeriodicJobs(config *Config) []*river.PeriodicJob {
+	return (&Service{config: *config}).ReconciliationPeriodicJobs()
 }
 
 func (s *Service) PrunerPeriodicJobs() []*river.PeriodicJob {
@@ -405,8 +405,8 @@ func (s *Service) PrunerPeriodicJobs() []*river.PeriodicJob {
 	}
 }
 
-func PrunerPeriodicJobs(config Config) []*river.PeriodicJob {
-	return (&Service{config: config}).PrunerPeriodicJobs()
+func PrunerPeriodicJobs(config *Config) []*river.PeriodicJob {
+	return (&Service{config: *config}).PrunerPeriodicJobs()
 }
 
 func (s *Service) kickoffPeriodic(
@@ -589,7 +589,7 @@ func (s *Service) enqueueRefreshes(
 	if err != nil {
 		return fmt.Errorf("begin stale refresh enqueue: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := queue.InsertRefreshesTx(
 		ctx,
 		tx,

@@ -15,6 +15,7 @@ import (
 )
 
 func TestGetJSONRetainsRequestETagWhen304OmitsResponseETag(t *testing.T) {
+	t.Parallel()
 	const validator = `"known-validator"`
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +48,7 @@ func TestGetJSONRetainsRequestETagWhen304OmitsResponseETag(t *testing.T) {
 }
 
 func TestDecodeHTTPErrorBoundsRetainedMessage(t *testing.T) {
+	t.Parallel()
 	response := &http.Response{
 		StatusCode: http.StatusBadGateway,
 		Body: io.NopCloser(
@@ -67,6 +69,7 @@ func TestDecodeHTTPErrorBoundsRetainedMessage(t *testing.T) {
 }
 
 func TestCloseResponseBodyAllowsBodylessResponses(t *testing.T) {
+	t.Parallel()
 	for _, response := range []*http.Response{
 		nil,
 		{},
@@ -79,6 +82,7 @@ func TestCloseResponseBodyAllowsBodylessResponses(t *testing.T) {
 }
 
 func TestClientsHandleBodylessGateErrors(t *testing.T) {
+	t.Parallel()
 	gateErr := errors.New("gate observation failed")
 	gate := bodylessErrorGate{err: gateErr}
 	rest, err := NewRESTClient("http://github.test", gate, StaticToken("unused"))

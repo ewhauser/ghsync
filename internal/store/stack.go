@@ -42,9 +42,9 @@ func (w *EntityWriter) StackMetadata(
 // ApplyStack conditionally applies a direct stack observation.
 func (w *EntityWriter) ApplyStack(
 	ctx context.Context,
-	stack StackRecord,
+	stack StackRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 ) (ApplyStackResult, error) {
-	return w.applyStack(ctx, nil, stack, nil)
+	return w.applyStack(ctx, nil, &stack, nil)
 }
 
 // ApplyStackObserved conditionally applies a stack while holding its
@@ -52,7 +52,7 @@ func (w *EntityWriter) ApplyStack(
 func (w *EntityWriter) ApplyStackObserved(
 	ctx context.Context,
 	observation *Observation,
-	stack StackRecord,
+	stack StackRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	hook StackHook,
 ) (ApplyStackResult, error) {
 	key := StackEntityKey(
@@ -63,13 +63,13 @@ func (w *EntityWriter) ApplyStackObserved(
 	if err := requireObservation(observation, key); err != nil {
 		return ApplyStackResult{}, err
 	}
-	return w.applyStack(ctx, observation, stack, hook)
+	return w.applyStack(ctx, observation, &stack, hook)
 }
 
 func (w *EntityWriter) applyStack(
 	ctx context.Context,
 	observation *Observation,
-	stack StackRecord,
+	stack *StackRecord,
 	hook StackHook,
 ) (ApplyStackResult, error) {
 	if err := validateStack(stack); err != nil {
@@ -219,7 +219,7 @@ func (w *EntityWriter) applyStack(
 func (w *EntityWriter) TouchStack(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	number int,
 	checkedAt time.Time,
 	etag string,
@@ -264,7 +264,7 @@ func (w *EntityWriter) TouchStack(
 func (w *EntityWriter) TombstoneStackObserved(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	number int,
 	source SyncSource,
 	at time.Time,

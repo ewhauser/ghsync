@@ -28,7 +28,7 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	received := make(chan *http.Request, 1)
 	target := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			received <- r.Clone(context.Background())
+			received <- r.Clone(r.Context())
 			w.WriteHeader(http.StatusOK)
 		},
 	))
@@ -36,7 +36,7 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	fakeServer := New(DefaultFixture(), "secret")
 	fake := httptest.NewServer(fakeServer)
 	defer fake.Close()
-	body := []byte(fmt.Sprintf(`{
+	body := fmt.Appendf(nil, `{
 		"target_url": %q,
 		"event": "pull_request",
 		"guid": "soak-guid",
@@ -45,12 +45,18 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 			"number": 4812,
 			"repository": {"full_name": "acme/monolith"}
 		}
-	}`, target.URL))
-	response, err := http.Post(
+	}`, target.URL)
+	request, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
 		fake.URL+ControlEmitPath,
-		"application/json",
 		bytes.NewReader(body),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +181,7 @@ func TestAPIRequiresFakeInstallationBearer(t *testing.T) {
 
 func TestAuthorizationRecordingIsBounded(t *testing.T) {
 	server := New(DefaultFixture(), "secret")
-	for index := 0; index < maxRecordedAuthorizations+10; index++ {
+	for index := range maxRecordedAuthorizations + 10 {
 		server.recordAuthorization(strconv.Itoa(index))
 	}
 	got := server.Authorizations()
@@ -206,7 +212,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 	if first.StatusCode != http.StatusOK || etag == "" {
 		t.Fatalf("first PR status=%d etag=%q", first.StatusCode, etag)
 	}
-	request := httptest.NewRequest(http.MethodGet, "http://fake.test"+path, nil)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://fake.test"+path, http.NoBody)
 	request.Header.Set("If-None-Match", etag)
 	request.Header.Set("Authorization", "Bearer fake-installation-test")
 	recorder := httptest.NewRecorder()
@@ -235,11 +241,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 		t.Fatalf("check runs = %d, want 2", len(payload.CheckRuns))
 	}
 	checksPath := "/repos/acme/monolith/commits/8f31c2d/check-runs"
-	request = httptest.NewRequest(
-		http.MethodGet,
-		"http://fake.test"+checksPath,
-		nil,
-	)
+	request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://fake.test"+checksPath, http.NoBody)
 	request.Header.Set("If-None-Match", checksETag)
 	request.Header.Set("Authorization", "Bearer fake-installation-test")
 	recorder = httptest.NewRecorder()
@@ -302,6 +304,9 @@ func TestPullsGoldenResponseDecodesThroughClientContract(t *testing.T) {
 	var extended []PullRequest
 	if err := json.Unmarshal(body, &extended); err != nil {
 		t.Fatalf("decode preview extension: %v", err)
+	}
+	if len(extended) < 2 {
+		t.Fatalf("preview extension returned %d pulls, want at least 2", len(extended))
 	}
 	if extended[1].Stack == nil || extended[1].Stack.Number != 142 {
 		t.Fatalf("stack preview extension lost: %+v", extended[1].Stack)
@@ -385,9 +390,7 @@ func TestConcurrentListPullsAndSoakMutationUseIsolatedFixtureData(
 	errs := make(chan error, 9)
 	var workers sync.WaitGroup
 	for range 8 {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		workers.Go(func() {
 			<-start
 			for range 250 {
 				response := serve(
@@ -412,11 +415,9 @@ func TestConcurrentListPullsAndSoakMutationUseIsolatedFixtureData(
 					return
 				}
 			}
-		}()
+		})
 	}
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
+	workers.Go(func() {
 		<-start
 		for revision := range 2_000 {
 			fake.applySoakMutation(
@@ -427,7 +428,7 @@ func TestConcurrentListPullsAndSoakMutationUseIsolatedFixtureData(
 				)),
 			)
 		}
-	}()
+	})
 	close(start)
 	workers.Wait()
 	close(errs)
@@ -582,7 +583,7 @@ func TestInstallationTokenEndpointValidatesJWTAndReturnsCreated(t *testing.T) {
 	}
 	call := func(appJWT string) *http.Response {
 		t.Helper()
-		req := httptest.NewRequest(
+		req := httptest.NewRequestWithContext(t.Context(),
 			http.MethodPost,
 			"http://fake.test/app/installations/1234/access_tokens",
 			strings.NewReader("{}"),
@@ -882,7 +883,7 @@ func listPullRequests(
 	endpoint string,
 	client *http.Client,
 ) ([]clientPullRequest, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -916,7 +917,12 @@ func serveAuthorized(
 	body io.Reader,
 	authorization string,
 ) *http.Response {
-	req := httptest.NewRequest(method, target, body)
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		method,
+		target,
+		body,
+	)
 	req.Header.Set("Authorization", authorization)
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)

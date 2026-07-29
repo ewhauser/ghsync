@@ -35,7 +35,7 @@ func (w *EntityWriter) RepoRulesMetadata(
 func (w *EntityWriter) ApplyRepoRulesObserved(
 	ctx context.Context,
 	observation *Observation,
-	rules RepoRulesRecord,
+	rules RepoRulesRecord, //nolint:gocritic // method normalizes a private record copy without mutating the caller
 ) (bool, error) {
 	if !rules.Source.Valid() || rules.Repository.GitHubID <= 0 ||
 		rules.SyncedAt.IsZero() {
@@ -123,7 +123,7 @@ func (w *EntityWriter) ApplyRepoRulesObserved(
 func (w *EntityWriter) TouchRepoRules(
 	ctx context.Context,
 	observation *Observation,
-	repository RepositoryRecord,
+	repository RepositoryRecord, //nolint:gocritic // public writer API snapshots caller-owned record values
 	checkedAt time.Time,
 	etag string,
 ) error {

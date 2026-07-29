@@ -25,7 +25,7 @@ func TestLeaseWatchdogFailsClosedWhileRenewalStoreCallIsStalled(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 		_, err := gate.Do(context.Background(), Interactive, NewRESTRequest(req))
 		result <- err
 	}()
@@ -42,7 +42,7 @@ func TestLeaseWatchdogFailsClosedWhileRenewalStoreCallIsStalled(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("lease watchdog did not cancel admitted request at confirmed expiry")
 	}
-	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 	if _, err := gate.Do(
 		context.Background(),
 		Interactive,
@@ -72,7 +72,7 @@ func TestCloseRenewsWhileDrainingThenSnapshotsAndReleases(t *testing.T) {
 		}, nil
 	})}
 	gate := newRuntimeLeasedGate(t, clock, store, client)
-	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 	response, err := gate.Do(context.Background(), Interactive, NewRESTRequest(req))
 	if err != nil {
 		t.Fatal(err)
@@ -125,7 +125,7 @@ func TestCloseDeadlineCancelsStragglerBeforeCleanup(t *testing.T) {
 		}, nil
 	})}
 	gate := newRuntimeLeasedGate(t, clock, store, client)
-	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 	if _, err := gate.Do(
 		context.Background(),
 		Interactive,
@@ -171,7 +171,7 @@ func TestSecondaryBackoffPersistsImmediatelyAndRestoresOnHandoff(t *testing.T) {
 		}, nil
 	})}
 	first := newRuntimeLeasedGate(t, clock, store, client)
-	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 	response, err := first.Do(
 		context.Background(),
 		Interactive,
@@ -241,7 +241,7 @@ func TestTransientSaveBackoffErrorRetriesThroughPeriodicSnapshot(t *testing.T) {
 		LeaseOptions{SnapshotInterval: 2 * time.Second},
 	)
 
-	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 	response, err := gate.Do(
 		context.Background(),
 		Interactive,
@@ -276,7 +276,7 @@ func TestTransientSaveBackoffErrorRetriesThroughPeriodicSnapshot(t *testing.T) {
 		t.Fatal("periodic snapshot did not retry backoff persistence")
 	}
 
-	req, _ = http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	req, _ = http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 	response, err = gate.Do(
 		context.Background(),
 		Interactive,
@@ -454,7 +454,7 @@ func (s *runtimeLeaseStore) Save(
 	_ context.Context,
 	_ int64,
 	_ string,
-	snapshot Snapshot,
+	snapshot Snapshot, //nolint:gocritic // test double implements LeaseStore's immutable value contract
 ) (bool, error) {
 	s.mu.Lock()
 	s.events = append(s.events, "save")

@@ -82,7 +82,6 @@ type admission struct {
 	id       uint64
 	resource Resource
 	cost     int64
-	ctx      context.Context
 	cancel   context.CancelFunc
 	once     sync.Once
 
@@ -103,7 +102,7 @@ func InsideAdmission(ctx context.Context) bool {
 
 // New constructs an in-process gate. Production callers should use
 // NewLeased; New exists for conformance tests and single-process tooling.
-func New(client *http.Client, options Options) *Gate {
+func New(client *http.Client, options Options) *Gate { //nolint:gocritic // value options are normalized into owned gate state
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -194,8 +193,9 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 
 	reportedStarvation := false
 	var admitted *admission
+	var admittedCtx context.Context
 	for {
-		decision := g.tryAdmit(
+		decision, candidateCtx := g.tryAdmit(
 			ctx,
 			class,
 			req.resource,
@@ -205,6 +205,7 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 		}
 		if !decision.wait {
 			admitted = decision.admitted
+			admittedCtx = candidateCtx
 			break
 		}
 		if decision.starvation != nil && !reportedStarvation {
@@ -223,7 +224,7 @@ func (g *Gate) Do(ctx context.Context, class Class, req *Request) (*Response, er
 		}
 	}
 
-	return g.doAdmitted(admitted.ctx, class, req, admitted)
+	return g.doAdmitted(admittedCtx, class, req, admitted)
 }
 
 func validateDo(ctx context.Context, class Class, req *Request) error {
@@ -265,9 +266,9 @@ func (g *Gate) doAdmitted(
 		}
 	}
 
-	resp, requestErr := g.client.Do(httpReq)
+	resp, requestErr := g.client.Do(httpReq) //nolint:bodyclose // response body ownership is transferred to the caller
 	var network *networkBody
-	if admitted != nil && usableBody(resp) {
+	if admitted != nil && resp != nil && usableBody(resp) {
 		network = &networkBody{ReadCloser: resp.Body}
 		resp.Body = network
 		admitted.attachBody(resp.Body)
@@ -293,19 +294,21 @@ func (g *Gate) doAdmitted(
 	}
 
 	if admitted != nil {
-		switch {
-		case !usableBody(resp):
+		if resp == nil || !usableBody(resp) {
 			admitted.finish()
-		case network.Done():
-			// Observers consumed the network body. A restored in-memory body no
-			// longer counts against C-B6.
-			admitted.finish()
-		default:
-			resp.Body = &admittedBody{
-				ReadCloser: resp.Body,
-				admission:  admitted,
+		} else {
+			switch {
+			case network != nil && network.Done():
+				// Observers consumed the network body. A restored in-memory
+				// body no longer counts against C-B6.
+				admitted.finish()
+			default:
+				resp.Body = &admittedBody{
+					ReadCloser: resp.Body,
+					admission:  admitted,
+				}
+				admitted.attachBody(resp.Body)
 			}
-			admitted.attachBody(resp.Body)
 		}
 	}
 
@@ -350,7 +353,7 @@ func (g *Gate) tryAdmit(
 	ctx context.Context,
 	class Class,
 	resource Resource,
-) admissionDecision {
+) (admissionDecision, context.Context) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -364,18 +367,18 @@ func (g *Gate) tryAdmit(
 		g.signalLocked()
 	}
 	if g.unavailable != nil {
-		return admissionDecision{err: g.unavailable}
+		return admissionDecision{err: g.unavailable}, nil
 	}
 	if now.Before(g.backoffUntil) {
 		return admissionDecision{
 			wait:      true,
 			waitUntil: g.backoffUntil,
 			changed:   g.changed,
-		}
+		}, nil
 	}
 	if g.inFlight >= g.maxConcurrent {
 		// A zero deadline means "wait for a state-change notification".
-		return admissionDecision{wait: true, changed: g.changed}
+		return admissionDecision{wait: true, changed: g.changed}, nil
 	}
 
 	cost := g.estimateLocked(resource)
@@ -398,7 +401,7 @@ func (g *Gate) tryAdmit(
 						Limit:   state.Limit,
 						ResetAt: state.ResetAt,
 					},
-				}
+				}, nil
 			}
 		}
 	}
@@ -410,13 +413,12 @@ func (g *Gate) tryAdmit(
 		id:       g.nextAdmissionID,
 		resource: resource,
 		cost:     cost,
-		ctx:      admittedCtx,
 		cancel:   cancel,
 	}
 	g.inFlight++
 	g.addReservationLocked(resource, cost)
 	g.admissions[entry.id] = entry
-	return admissionDecision{admitted: entry}
+	return admissionDecision{admitted: entry}, admittedCtx
 }
 
 func waitForChange(
@@ -773,7 +775,7 @@ func (g *Gate) Snapshot() Snapshot {
 	}
 }
 
-func (g *Gate) restore(snapshot Snapshot) {
+func (g *Gate) restore(snapshot *Snapshot) {
 	g.mu.Lock()
 	if snapshot.REST.Known {
 		g.rest = snapshot.REST

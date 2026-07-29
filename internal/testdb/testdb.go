@@ -59,13 +59,13 @@ func Open(
 	parsed.RawQuery = query.Encode()
 	pool, err := store.Connect(ctx, parsed.String())
 	if err != nil {
-		dropSchema(admin, schema)
+		dropSchema(ctx, admin, schema)
 		admin.Close()
 		return nil, err
 	}
 	if err := store.Migrate(ctx, pool); err != nil {
 		pool.Close()
-		dropSchema(admin, schema)
+		dropSchema(ctx, admin, schema)
 		admin.Close()
 		return nil, err
 	}
@@ -83,12 +83,19 @@ func (d *Database) Close() {
 		return
 	}
 	d.Pool.Close()
-	dropSchema(d.admin, d.schema)
+	dropSchema(context.Background(), d.admin, d.schema)
 	d.admin.Close()
 }
 
-func dropSchema(admin *pgxpool.Pool, schema string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func dropSchema(
+	parent context.Context,
+	admin *pgxpool.Pool,
+	schema string,
+) {
+	ctx, cancel := context.WithTimeout(
+		context.WithoutCancel(parent),
+		10*time.Second,
+	)
 	defer cancel()
 	_, _ = admin.Exec(
 		ctx,

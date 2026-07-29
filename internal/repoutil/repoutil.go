@@ -27,6 +27,7 @@ func Split(fullName string) (string, string, error) {
 func IsNotFound(err error) bool {
 	var httpError *gh.HTTPError
 	return errors.As(err, &httpError) &&
+		httpError != nil &&
 		httpError.StatusCode == http.StatusNotFound
 }
 

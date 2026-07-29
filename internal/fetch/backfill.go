@@ -114,7 +114,7 @@ func (h *Handler) advanceInstallationBackfill(
 	if err != nil {
 		return fmt.Errorf("begin installation backfill advance: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	queries := dbgen.New(tx)
 	cursor, err := queries.GetInstallationBackfillCursorForUpdate(
 		ctx,
@@ -126,7 +126,8 @@ func (h *Handler) advanceInstallationBackfill(
 	if cursor.Phase != args.Phase || int(cursor.Page) != args.Page {
 		return tx.Commit(ctx)
 	}
-	for _, repository := range repositories {
+	for index := range repositories {
+		repository := &repositories[index]
 		repoCursor, err := queries.EnsureBackfillCursor(
 			ctx,
 			dbgen.EnsureBackfillCursorParams{
@@ -256,7 +257,8 @@ func (h *Handler) BackfillRepoPage(
 			return fmt.Errorf("backfill stacks page %d: %w", args.Page, err)
 		}
 		specs := make([]queue.RefreshSpec, 0, len(stacks))
-		for _, stack := range stacks {
+		for index := range stacks {
+			stack := &stacks[index]
 			specs = append(specs, queue.RefreshSpec{
 				Kind: queue.KindRefreshStack,
 				Key: fmt.Sprintf(
@@ -326,15 +328,16 @@ func (h *Handler) BackfillRepoPage(
 				etags[pull.GetNumber()] = response.ETag
 			}
 			records := pullRecordsFromList(
-				repository,
+				&repository,
 				pulls,
 				etags,
 				source,
 				time.Now(),
 			)
 			applies := make([]store.PullRequestApply, 0, len(records))
-			for _, record := range records {
-				applies = append(applies, store.PullRequestApply{Record: record})
+			for index := range records {
+				record := &records[index]
+				applies = append(applies, store.PullRequestApply{Record: *record})
 			}
 			for key, outcome := range h.writer.ApplyPullRequestBatch(ctx, applies) {
 				if outcome.Err != nil {
@@ -486,7 +489,7 @@ func (h *Handler) advancePullRequestBackfill(
 	if err != nil {
 		return fmt.Errorf("begin pull request backfill advance: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	queries := dbgen.New(tx)
 	cursor, err := queries.GetBackfillCursorForUpdate(
 		ctx,
@@ -681,7 +684,7 @@ func (h *Handler) advanceBackfill(
 	if err != nil {
 		return fmt.Errorf("begin backfill advance: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	queries := dbgen.New(tx)
 	cursor, err := queries.GetBackfillCursorForUpdate(
 		ctx,
@@ -797,7 +800,7 @@ func StartInstallationBackfill(
 			err,
 		)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	cursor, err := dbgen.New(tx).EnsureInstallationBackfillCursor(
 		ctx,
 		installationID,
@@ -856,7 +859,7 @@ func StartBackfill(
 			err,
 		)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	cursor, err := dbgen.New(tx).EnsureBackfillCursor(
 		ctx,
 		dbgen.EnsureBackfillCursorParams{

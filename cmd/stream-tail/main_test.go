@@ -50,7 +50,7 @@ func TestStreamTailSmoke(t *testing.T) {
 
 	seq := insertCommandEvent(t, ctx, pool, streamName, "smoke")
 	watermarker := newCommandWatermarker(t, pool, consumer)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceCommandWatermark(t, ctx, watermarker, seq)
 	waitCommandCursor(t, pool, consumer, streamName, seq)
 	stopTail()
@@ -78,7 +78,7 @@ func TestStreamTailResyncSmoke(t *testing.T) {
 	streamName := fmt.Sprintf("m5-stream-tail-resync-events-%d", suffix)
 	oldSeq := insertCommandEvent(t, ctx, pool, streamName, "before-horizon")
 	watermarker := newCommandWatermarker(t, pool, consumer)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceCommandWatermark(t, ctx, watermarker, oldSeq)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO stream_horizons (
@@ -128,7 +128,7 @@ func insertCommandEvent(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		t.Fatal(err)
 	}

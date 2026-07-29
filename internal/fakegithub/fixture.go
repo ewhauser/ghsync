@@ -2,8 +2,8 @@ package fakegithub
 
 import "time"
 
-func cloneFixture(source Fixture) Fixture {
-	clone := source
+func cloneFixture(source *Fixture) Fixture {
+	clone := *source
 	clone.Repositories = append([]Repository(nil), source.Repositories...)
 	clone.RepoRules = make([]RepositoryRule, len(source.RepoRules))
 	for index, rule := range source.RepoRules {
@@ -15,8 +15,9 @@ func cloneFixture(source Fixture) Fixture {
 		}
 	}
 	clone.Stacks = make([]Stack, len(source.Stacks))
-	for index, stack := range source.Stacks {
-		clone.Stacks[index] = stack
+	for index := range source.Stacks {
+		stack := &source.Stacks[index]
+		clone.Stacks[index] = *stack
 		clone.Stacks[index].PullRequests = append(
 			[]StackPullRequest(nil),
 			stack.PullRequests...,
@@ -27,8 +28,9 @@ func cloneFixture(source Fixture) Fixture {
 		}
 	}
 	clone.PullRequests = make([]PullRequest, len(source.PullRequests))
-	for index, pull := range source.PullRequests {
-		clone.PullRequests[index] = pull
+	for index := range source.PullRequests {
+		pull := &source.PullRequests[index]
+		clone.PullRequests[index] = *pull
 		if pull.Stack != nil {
 			stack := *pull.Stack
 			clone.PullRequests[index].Stack = &stack
@@ -176,7 +178,8 @@ func DefaultFixture() Fixture {
 		)
 	}
 	stackPulls := make([]StackPullRequest, 0, len(pulls))
-	for _, pull := range pulls {
+	for index := range pulls {
+		pull := &pulls[index]
 		stackPulls = append(stackPulls, StackPullRequest{
 			Number:    pull.Number,
 			State:     pull.State,

@@ -96,8 +96,8 @@ func TestSoakStreamConsumerAppliesExactlyOnceAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer consumer.cleanup()
-	if err := consumer.start(); err != nil {
+	defer consumer.cleanup(ctx)
+	if err := consumer.start(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -133,7 +133,7 @@ func insertSoakStreamEvents(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		t.Fatal(err)
 	}
@@ -209,11 +209,11 @@ func TestValidateConfigRequiresPositiveInstallation(t *testing.T) {
 		scrapeInterval: time.Second,
 		drainTimeout:   time.Second,
 	}
-	if err := validateConfig(cfg); err == nil {
+	if err := validateConfig(&cfg); err == nil {
 		t.Fatal("soak accepted an absent installation ID")
 	}
 	cfg.installationID = 1
-	if err := validateConfig(cfg); err != nil {
+	if err := validateConfig(&cfg); err != nil {
 		t.Fatalf("valid strict soak config rejected: %v", err)
 	}
 }
@@ -271,18 +271,12 @@ ghsync_c_q2_event_to_cache_latency_seconds_count 110
 	if err != nil {
 		t.Fatal(err)
 	}
-	prior, err := histogramState(
+	prior := histogramState(
 		priorFamilies["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	current, err := histogramState(
+	current := histogramState(
 		currentFamilies["ghsync_c_q2_event_to_cache_latency_seconds"],
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
 	delta, err := subtractHistogram(current, prior)
 	if err != nil {
 		t.Fatal(err)

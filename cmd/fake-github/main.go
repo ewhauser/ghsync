@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -24,7 +25,17 @@ func main() {
 
 	if *healthcheckURL != "" {
 		client := &http.Client{Timeout: time.Second}
-		resp, err := client.Get(*healthcheckURL)
+		req, err := http.NewRequestWithContext(
+			context.Background(),
+			http.MethodGet,
+			*healthcheckURL,
+			http.NoBody,
+		)
+		if err != nil {
+			slog.Error("invalid fake-github healthcheck URL", "error", err)
+			os.Exit(1)
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			slog.Error("fake-github healthcheck failed", "error", err)
 			os.Exit(1)

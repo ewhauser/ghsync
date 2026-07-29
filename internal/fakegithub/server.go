@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,7 +103,7 @@ type Repository struct {
 }
 
 // MarshalJSON emits GitHub's nested owner shape.
-func (r Repository) MarshalJSON() ([]byte, error) {
+func (r Repository) MarshalJSON() ([]byte, error) { //nolint:gocritic // value receiver preserves json.Marshaler for repository values
 	type wireRepository Repository
 	return json.Marshal(struct {
 		wireRepository
@@ -176,7 +177,7 @@ type storedHookDelivery struct {
 }
 
 // MarshalJSON emits GitHub's nested App shape.
-func (c CheckRun) MarshalJSON() ([]byte, error) {
+func (c CheckRun) MarshalJSON() ([]byte, error) { //nolint:gocritic // value receiver preserves json.Marshaler for check-run values
 	type wireCheckRun CheckRun
 	return json.Marshal(struct {
 		wireCheckRun
@@ -217,9 +218,9 @@ type RateLimitStep struct {
 type Option func(*Server)
 
 // WithFixture replaces the initial fixture after the base server is built.
-func WithFixture(fixture Fixture) Option {
+func WithFixture(fixture Fixture) Option { //nolint:gocritic // option takes an ownership snapshot before deep cloning
 	return func(s *Server) {
-		s.fixture = cloneFixture(fixture)
+		s.fixture = cloneFixture(&fixture)
 	}
 }
 
@@ -341,10 +342,10 @@ type Server struct {
 }
 
 // New constructs a scriptable fake GitHub server.
-func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
+func New(fixture Fixture, webhookSecret string, options ...Option) *Server { //nolint:gocritic // constructor snapshots caller-owned fixture data
 	resetAt := nextRateReset(time.Now())
 	s := &Server{
-		fixture:       cloneFixture(fixture),
+		fixture:       cloneFixture(&fixture),
 		webhookSecret: []byte(webhookSecret),
 		restBudget: rateState{
 			limit:     15000, // GHEC installation REST budget
@@ -473,7 +474,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				),
 			)
 		}
-		if rate.secondary || rate.retryAfter > 0 {
+		switch {
+		case rate.secondary || rate.retryAfter > 0:
 			writeSecondaryRateLimitExceeded(
 				w,
 				rate.status,
@@ -481,15 +483,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				rate.snapshot,
 				rate.cost,
 			)
-		} else if resource == "graphql" {
+		case resource == "graphql":
 			writeGraphQLRateLimitExceeded(
 				w,
 				rate.snapshot,
 				rate.status,
 				rate.cost,
 			)
-		} else {
-			writeRESTRateLimitExceeded(w, rate.snapshot, rate.status)
+		default:
+			writeRESTRateLimitExceeded(w, rate.status)
 		}
 		return
 	}
@@ -504,7 +506,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeRESTRateLimitExceeded(
 				w,
-				rate.snapshot,
 				http.StatusForbidden,
 			)
 		}
@@ -695,10 +696,10 @@ func (s *Server) NotModifiedCount(method, path string) int {
 }
 
 // SetFixture swaps the served state; tests use this to script scenarios.
-func (s *Server) SetFixture(fixture Fixture) {
+func (s *Server) SetFixture(fixture Fixture) { //nolint:gocritic // setter snapshots caller-owned fixture data
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.fixture = cloneFixture(fixture)
+	s.fixture = cloneFixture(&fixture)
 }
 
 // RedeliveryRequests reports the delivery IDs requested through the fake
@@ -714,8 +715,9 @@ func (s *Server) Deliveries() []HookDelivery {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make([]HookDelivery, 0, len(s.deliveries))
-	for index := len(s.deliveries) - 1; index >= 0; index-- {
-		result = append(result, s.deliveries[index].HookDelivery)
+	for index := range slices.Backward(s.deliveries) {
+		v := &s.deliveries[index]
+		result = append(result, v.HookDelivery)
 	}
 	return result
 }

@@ -95,7 +95,7 @@ type Runtime struct {
 	callbackRegistration   metric.Registration
 }
 
-func NewRuntime(options RuntimeOptions) (*Runtime, error) {
+func NewRuntime(options RuntimeOptions) (*Runtime, error) { //nolint:gocritic // constructor copies validated options into owned metric state
 	if options.Pool == nil {
 		return nil, fmt.Errorf("runtime metrics require Postgres")
 	}
@@ -301,7 +301,7 @@ func (r *Runtime) DispatchBatch(
 
 func (r *Runtime) RefreshFinished(
 	ctx context.Context,
-	observation queue.RefreshObservation,
+	observation *queue.RefreshObservation,
 ) {
 	outcome := "success"
 	if observation.Err != nil {
@@ -396,7 +396,7 @@ func (r *Runtime) GapWindowIncomplete(
 
 func (r *Runtime) Divergence(
 	ctx context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	r.driftTransitions.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("entity_kind", finding.EntityKind),
@@ -406,7 +406,7 @@ func (r *Runtime) Divergence(
 
 func (r *Runtime) PersistentDivergence(
 	ctx context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	r.driftTransitions.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("entity_kind", finding.EntityKind),
@@ -451,11 +451,11 @@ func (r *Runtime) DeriverPass(
 	))
 	r.deriverPasses.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("outcome", outcome),
-		attribute.String("batch", batchLabel(count, r.options)),
+		attribute.String("batch", batchLabel(count, &r.options)),
 	))
 }
 
-func batchLabel(count int, options RuntimeOptions) string {
+func batchLabel(count int, options *RuntimeOptions) string {
 	switch {
 	case count == 0:
 		return "empty"

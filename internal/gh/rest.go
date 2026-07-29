@@ -505,7 +505,7 @@ func setPagination(query url.Values, perPage, page int) {
 }
 
 func parseNextLink(link string) (int, string) {
-	for _, part := range strings.Split(link, ",") {
+	for part := range strings.SplitSeq(link, ",") {
 		if !strings.Contains(part, `rel="next"`) {
 			continue
 		}

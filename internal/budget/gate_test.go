@@ -16,6 +16,7 @@ import (
 )
 
 func TestLeasedGatePersistsPeriodicallyNotPerRequest(t *testing.T) {
+	t.Parallel()
 	store := &countingLeaseStore{}
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		headers := make(http.Header)
@@ -49,7 +50,7 @@ func TestLeasedGatePersistsPeriodicallyNotPerRequest(t *testing.T) {
 	}
 
 	for range 2 {
-		req, err := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,6 +84,7 @@ func TestLeasedGatePersistsPeriodicallyNotPerRequest(t *testing.T) {
 }
 
 func TestRetryAfterDeadline(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	got, err := retryAfterDeadline(now, "7")
 	if err != nil {
@@ -102,6 +104,7 @@ func TestRetryAfterDeadline(t *testing.T) {
 }
 
 func TestObserveSecondaryLimitAcceptsHTTPDateRetryAfter(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	clock := newManualClock(now)
 	gate := New(nil, Options{Clock: clock})
@@ -125,6 +128,7 @@ func TestObserveSecondaryLimitAcceptsHTTPDateRetryAfter(t *testing.T) {
 }
 
 func TestGateOptionsConfigureBudgetSurface(t *testing.T) {
+	t.Parallel()
 	gate := New(nil, Options{
 		MaxConcurrent:          12,
 		RESTLimit:              12000,
@@ -144,6 +148,7 @@ func TestGateOptionsConfigureBudgetSurface(t *testing.T) {
 }
 
 func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
+	t.Parallel()
 	var active atomic.Int64
 	var maxActive atomic.Int64
 	started := make(chan struct{}, 2)
@@ -175,7 +180,7 @@ func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
 
 	gate := New(server.Client(), Options{MaxConcurrent: 1})
 	do := func() (*Response, error) {
-		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, http.NoBody)
 		if err != nil {
 			return nil, err
 		}
@@ -223,6 +228,7 @@ func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
 }
 
 func TestReservationsProtectSweepFloorDuringBurst(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	starved := make(chan Starvation, 7)
 	var calls atomic.Int64
@@ -246,7 +252,7 @@ func TestReservationsProtectSweepFloorDuringBurst(t *testing.T) {
 			starved <- value
 		},
 	})
-	gate.restore(Snapshot{REST: ResourceBudget{
+	gate.restore(&Snapshot{REST: ResourceBudget{
 		Known: true, Limit: 100, Remaining: 21, ResetAt: now.Add(time.Hour),
 	}})
 
@@ -259,7 +265,7 @@ func TestReservationsProtectSweepFloorDuringBurst(t *testing.T) {
 	results := make(chan outcome, 8)
 	for range 8 {
 		go func() {
-			req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://github.test/resource", http.NoBody)
 			response, err := gate.Do(ctx, Sweep, NewRESTRequest(req))
 			results <- outcome{response: response, err: err}
 		}()
@@ -294,6 +300,7 @@ func TestReservationsProtectSweepFloorDuringBurst(t *testing.T) {
 }
 
 func TestFloorWaitAdvancesDeterministicallyToReset(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	clock := newManualClock(now)
 	starved := make(chan Starvation, 1)
@@ -316,12 +323,12 @@ func TestFloorWaitAdvancesDeterministicallyToReset(t *testing.T) {
 			starved <- value
 		},
 	})
-	gate.restore(Snapshot{REST: ResourceBudget{
+	gate.restore(&Snapshot{REST: ResourceBudget{
 		Known: true, Limit: 100, Remaining: 20, ResetAt: now.Add(time.Hour),
 	}})
 	result := make(chan error, 1)
 	go func() {
-		req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 		response, err := gate.Do(
 			context.Background(),
 			Sweep,
@@ -347,6 +354,7 @@ func TestFloorWaitAdvancesDeterministicallyToReset(t *testing.T) {
 }
 
 func TestRateObservationsMergeByResetWindow(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	gate := New(nil, Options{Clock: newManualClock(now)})
 	headers := func(remaining int64, reset time.Time) http.Header {
@@ -381,6 +389,7 @@ func TestRateObservationsMergeByResetWindow(t *testing.T) {
 }
 
 func TestSlowOlderResponseCannotRaiseRemaining(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
@@ -409,7 +418,7 @@ func TestSlowOlderResponseCannotRaiseRemaining(t *testing.T) {
 		MaxConcurrent: 2,
 	})
 	do := func() (*Response, error) {
-		req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 		return gate.Do(context.Background(), Interactive, NewRESTRequest(req))
 	}
 	firstResult := make(chan *Response, 1)
@@ -437,6 +446,7 @@ func TestSlowOlderResponseCannotRaiseRemaining(t *testing.T) {
 }
 
 func TestHeaderlessSecondaryLimitUsesDeterministicFallback(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	clock := newManualClock(now)
 	var calls atomic.Int64
@@ -466,7 +476,7 @@ func TestHeaderlessSecondaryLimitUsesDeterministicFallback(t *testing.T) {
 		SecondaryLimitFallback: time.Minute,
 	})
 	makeRequest := func(ctx context.Context) (*Response, error) {
-		req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://github.test/resource", http.NoBody)
 		return gate.Do(ctx, Interactive, NewRESTRequest(req))
 	}
 	first, err := makeRequest(context.Background())

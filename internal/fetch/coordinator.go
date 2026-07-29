@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -21,7 +22,7 @@ const (
 )
 
 type pullBatchItem struct {
-	ctx       context.Context
+	ctx       context.Context //nolint:containedctx // queued work must retain each caller's values until the batch flushes
 	key       entityKey
 	nodeID    string
 	metadata  store.FetchMetadata
@@ -38,8 +39,8 @@ type pullBatchResult struct {
 }
 
 type pullApplyContext struct {
-	context.Context
-	values context.Context
+	context.Context                 //nolint:containedctx // batch cancellation is combined with per-item values
+	values          context.Context //nolint:containedctx // per-item values must survive shared batch transport
 }
 
 func (c pullApplyContext) Value(key any) any {
@@ -98,7 +99,7 @@ func (c *prCoordinator) submit(
 	ctx context.Context,
 	key entityKey,
 	nodeID string,
-	metadata store.FetchMetadata,
+	metadata *store.FetchMetadata,
 	class budget.Class,
 	source store.SyncSource,
 	hook func(string) store.PullRequestHook,
@@ -107,7 +108,7 @@ func (c *prCoordinator) submit(
 		ctx:       ctx,
 		key:       key,
 		nodeID:    nodeID,
-		metadata:  metadata,
+		metadata:  *metadata,
 		class:     class,
 		source:    source,
 		startedAt: time.Now(),
@@ -120,7 +121,7 @@ func (c *prCoordinator) submit(
 	if batch == nil {
 		batch = &pendingPullBatch{}
 		c.batches[batchKey] = batch
-		batch.timer = time.AfterFunc(c.window, func() {
+		batch.timer = time.AfterFunc(c.window, func() { //nolint:contextcheck // the batch owns queued caller contexts
 			c.flush(batchKey, batch)
 		})
 	}
@@ -129,7 +130,7 @@ func (c *prCoordinator) submit(
 		delete(c.batches, batchKey)
 		batch.closed = true
 		batch.timer.Stop()
-		go c.execute(batch)
+		go c.execute(batch) //nolint:contextcheck // the batch owns queued caller contexts
 	}
 	c.mu.Unlock()
 
@@ -166,8 +167,8 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	repoObservations := make(map[int64]*store.Observation)
 	var observations []*store.Observation
 	closeObservations := func() {
-		for index := len(observations) - 1; index >= 0; index-- {
-			_ = observations[index].Close()
+		for _, v := range slices.Backward(observations) {
+			_ = v.CloseContext(callCtx)
 		}
 	}
 	defer closeObservations()
@@ -179,7 +180,7 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			repoObservations[item.metadata.RepoGitHubID] = nil
 		}
 	}
-	sort.Slice(repoIDs, func(i, j int) bool { return repoIDs[i] < repoIDs[j] })
+	slices.Sort(repoIDs)
 	for _, repoID := range repoIDs {
 		observation, err := c.writer.BeginObservation(
 			callCtx,
@@ -340,7 +341,7 @@ func (c *prCoordinator) fetchPullRequestNodes(
 		)
 		if err != nil {
 			nodeErrors[index] = fmt.Errorf(
-				"GraphQL PR batch failed (%v); isolate node %q: %w",
+				"GraphQL PR batch failed (%w); isolate node %q: %w",
 				batchErr,
 				ids[index],
 				err,
@@ -383,7 +384,8 @@ func immutablePRKey(item *pullBatchItem) string {
 
 func SortedPullRequestKeys(records []store.PullRequestRecord) []string {
 	keys := make([]string, 0, len(records))
-	for _, record := range records {
+	for index := range records {
+		record := &records[index]
 		keys = append(keys, store.PullRequestEntityKey(
 			record.Repository.InstallationID,
 			record.Repository.GitHubID,

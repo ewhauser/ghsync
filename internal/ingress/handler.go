@@ -125,7 +125,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// C-I1/C-I3/C-P1: exactly one durable insert. A zero row count is the
 	// expected duplicate-GUID no-op and still acknowledges with 200.
-	if _, err := h.deliveries.InsertWebhookDelivery(
+	if _, err := h.deliveries.InsertWebhookDelivery( //nolint:contextcheck // the HTTP request context is propagated directly
 		r.Context(),
 		dbgen.InsertWebhookDeliveryParams{
 			DeliveryGuid: guid,

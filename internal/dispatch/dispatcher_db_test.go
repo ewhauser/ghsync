@@ -63,12 +63,12 @@ func TestConcurrentDispatchersLockGenerationKeysInDeterministicOrder(t *testing.
 	dispatcherA := newDispatcher(poolA, riverA)
 	dispatcherB := newDispatcher(poolB, riverB)
 
-	for iteration := 0; iteration < iterations; iteration++ {
+	for iteration := range iterations {
 		repo := fmt.Sprintf("acme/concurrent-%02d", iteration)
 		guidPrefix := fmt.Sprintf("concurrent-%02d-", iteration)
 		receivedAt := dispatchTime.Add(time.Duration(iteration) * time.Minute)
 		batch := &pgx.Batch{}
-		for index := 0; index < keyCount; index++ {
+		for index := range keyCount {
 			for _, group := range []struct {
 				name   string
 				number int
@@ -248,8 +248,8 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 	golden := loadGoldenJobs(t)
 	baseTime := time.Date(2026, 7, 28, 18, 0, 0, 0, time.UTC)
 
-	for run := 0; run < 4; run++ {
-		random := rand.New(rand.NewSource(int64(run + 100))) //nolint:gosec
+	for run := range 4 {
+		random := rand.New(rand.NewSource(int64(run + 100))) //nolint:gosec // deterministic non-security use
 		permuted := append([]recordedDelivery(nil), deliveries...)
 		random.Shuffle(len(permuted), func(i, j int) {
 			permuted[i], permuted[j] = permuted[j], permuted[i]
@@ -353,7 +353,7 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 	branches := []string{"stack/layer-1", "stack/layer-2", "stack/layer-3"}
 	stackKey := "stack:" + repo + ":142"
 
-	for index := 0; index < 20; index++ {
+	for index := range 20 {
 		branch := branches[index%len(branches)]
 		if _, err := fake.EmitWebhookWithGUID(
 			context.Background(),
@@ -379,7 +379,7 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 		Now:          func() time.Time { return now },
 		Classifier:   DefaultClassifier(),
 	})
-	for index := 0; index < 20; index++ {
+	for index := range 20 {
 		count, err := dispatcher.DispatchBatch(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -707,7 +707,7 @@ func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
 		t.Fatalf("replayed poison delivery = %+v", poison)
 	}
 
-	for index := 0; index < 101; index++ {
+	for index := range 101 {
 		guid := fmt.Sprintf("parked-family-%03d", index)
 		if _, err := pool.Exec(context.Background(), `
 			INSERT INTO webhook_deliveries (
@@ -845,7 +845,7 @@ func mustNewDispatcher(
 	t *testing.T,
 	pool *pgxpool.Pool,
 	client *river.Client[pgx.Tx],
-	config Config,
+	config Config, //nolint:gocritic // helper mirrors the constructor's value-options API
 ) *Dispatcher {
 	t.Helper()
 	dispatcher, err := New(pool, client, config)
@@ -861,7 +861,7 @@ func deliveryPayloadForRepo(
 	repo string,
 ) (map[string]any, []byte) {
 	t.Helper()
-	var decoded map[string]any
+	decoded := make(map[string]any)
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		t.Fatal(err)
 	}

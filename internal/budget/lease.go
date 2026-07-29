@@ -74,7 +74,6 @@ type leaseRuntime struct {
 	snapshotEvery  time.Duration
 	storeTimeout   time.Duration
 	clock          Clock
-	ctx            context.Context
 	cancel         context.CancelFunc
 	done           chan struct{}
 	expiryUpdates  chan time.Time
@@ -91,7 +90,7 @@ type leaseRuntime struct {
 func NewLeased(
 	ctx context.Context,
 	client *http.Client,
-	gateOptions Options,
+	gateOptions Options, //nolint:gocritic // value options are normalized before the gate owns them
 	store LeaseStore,
 	leaseOptions LeaseOptions,
 ) (*Gate, error) {
@@ -135,7 +134,7 @@ func NewLeased(
 
 	gateOptions.Clock = leaseOptions.Clock
 	gate := New(client, gateOptions)
-	gate.restore(persisted)
+	gate.restore(&persisted)
 	leaseCtx, cancel := context.WithCancel(ctx)
 	runtime := &leaseRuntime{
 		store:          store,
@@ -147,7 +146,6 @@ func NewLeased(
 		snapshotEvery:  leaseOptions.SnapshotInterval,
 		storeTimeout:   leaseOptions.StoreTimeout,
 		clock:          leaseOptions.Clock,
-		ctx:            leaseCtx,
 		cancel:         cancel,
 		done:           make(chan struct{}),
 		expiryUpdates:  make(chan time.Time, 1),
@@ -155,7 +153,7 @@ func NewLeased(
 	}
 	gate.lease = runtime
 	gate.setLeaseUntil(leaseUntil)
-	go gate.runLease(runtime)
+	go gate.runLease(leaseCtx, runtime)
 	return gate, nil
 }
 
@@ -211,22 +209,25 @@ func newLeaseToken() (string, error) {
 	return hex.EncodeToString(token[:]), nil
 }
 
-func (g *Gate) runLease(runtime *leaseRuntime) {
+func (g *Gate) runLease(ctx context.Context, runtime *leaseRuntime) {
 	var workers sync.WaitGroup
 	workers.Add(2)
 	go func() {
 		defer workers.Done()
-		g.maintainLease(runtime)
+		g.maintainLease(ctx, runtime)
 	}()
 	go func() {
 		defer workers.Done()
-		g.watchLeaseExpiry(runtime)
+		g.watchLeaseExpiry(ctx, runtime)
 	}()
 	workers.Wait()
 	close(runtime.done)
 }
 
-func (g *Gate) maintainLease(runtime *leaseRuntime) {
+func (g *Gate) maintainLease(
+	ctx context.Context,
+	runtime *leaseRuntime,
+) {
 	renew := newClockTimer(
 		runtime.clock,
 		runtime.clock.Now().Add(runtime.renewInterval),
@@ -242,13 +243,13 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 
 	for {
 		select {
-		case <-runtime.ctx.Done():
+		case <-ctx.Done():
 			if !errors.Is(g.unavailableError(), ErrClosed) {
-				g.loseLease(fmt.Errorf("%w: %v", ErrLeaseLost, runtime.ctx.Err()))
+				g.loseLease(fmt.Errorf("%w: %w", ErrLeaseLost, ctx.Err()))
 			}
 			return
 		case <-renew.channel:
-			until, ok, err := runtime.renew()
+			until, ok, err := runtime.renew(ctx)
 			switch {
 			case err != nil:
 				// A transient failure does not invent lease loss. The independent
@@ -272,7 +273,8 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 				)
 			}
 		case <-snapshot.channel:
-			ok, err := runtime.save(g.Snapshot())
+			current := g.Snapshot()
+			ok, err := runtime.save(ctx, &current)
 			if err == nil && !ok {
 				g.loseLease(ErrLeaseLost)
 				return
@@ -288,7 +290,10 @@ func (g *Gate) maintainLease(runtime *leaseRuntime) {
 	}
 }
 
-func (g *Gate) watchLeaseExpiry(runtime *leaseRuntime) {
+func (g *Gate) watchLeaseExpiry(
+	ctx context.Context,
+	runtime *leaseRuntime,
+) {
 	expiry := runtime.currentExpiry()
 	timer := newClockTimer(runtime.clock, expiry)
 	defer func() {
@@ -297,7 +302,7 @@ func (g *Gate) watchLeaseExpiry(runtime *leaseRuntime) {
 
 	for {
 		select {
-		case <-runtime.ctx.Done():
+		case <-ctx.Done():
 			return
 		case until := <-runtime.expiryUpdates:
 			expiry = until
@@ -328,16 +333,21 @@ func resetClockTimer(
 	return newClockTimer(clock, deadline)
 }
 
-func (r *leaseRuntime) renew() (time.Time, bool, error) {
-	ctx, cancel := context.WithTimeout(r.ctx, r.storeTimeout)
+func (r *leaseRuntime) renew(
+	parent context.Context,
+) (time.Time, bool, error) {
+	ctx, cancel := context.WithTimeout(parent, r.storeTimeout)
 	defer cancel()
 	return r.store.Renew(ctx, r.installationID, r.token, r.ttl)
 }
 
-func (r *leaseRuntime) save(snapshot Snapshot) (bool, error) {
-	ctx, cancel := context.WithTimeout(r.ctx, r.storeTimeout)
+func (r *leaseRuntime) save(
+	parent context.Context,
+	snapshot *Snapshot,
+) (bool, error) {
+	ctx, cancel := context.WithTimeout(parent, r.storeTimeout)
 	defer cancel()
-	return r.store.Save(ctx, r.installationID, r.token, snapshot)
+	return r.store.Save(ctx, r.installationID, r.token, *snapshot)
 }
 
 func (r *leaseRuntime) renewRetryDelay() time.Duration {
@@ -597,7 +607,7 @@ func (s *PostgresLeaseStore) Save(
 	ctx context.Context,
 	installationID int64,
 	token string,
-	snapshot Snapshot,
+	snapshot Snapshot, //nolint:gocritic // LeaseStore intentionally accepts immutable snapshot values
 ) (bool, error) {
 	restRemaining, restLimit, restReset := persistedValues(snapshot.REST)
 	graphRemaining, graphLimit, graphReset := persistedValues(snapshot.GraphQL)
@@ -688,7 +698,8 @@ func scanAcquiredBudgetRows(
 	}
 	var snapshot Snapshot
 	var expiries []pgtype.Timestamptz
-	for _, row := range rows {
+	for index := range rows {
+		row := &rows[index]
 		state := restoredBudget(row.Remaining, row.RateLimit, row.ResetAt)
 		switch Resource(row.Class) {
 		case REST:

@@ -141,7 +141,7 @@ func (w *Watermarker) Step(
 	if err != nil {
 		return WatermarkProgress{}, fmt.Errorf("begin stream watermark step: %w", err)
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if w.testBeforeFence != nil {
 		w.testBeforeFence()
 	}
@@ -240,6 +240,7 @@ func (w *Watermarker) Step(
 func isLockTimeout(err error) bool {
 	var postgresError *pgconn.PgError
 	return errors.As(err, &postgresError) &&
+		postgresError != nil &&
 		postgresError.Code == "55P03"
 }
 
@@ -249,7 +250,7 @@ func isLockTimeout(err error) bool {
 func (w *Watermarker) Run(ctx context.Context) error {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
-	defer w.release(context.Background()) //nolint:errcheck
+	defer w.release(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	for {
 		select {
 		case <-ctx.Done():

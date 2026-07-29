@@ -292,10 +292,10 @@ func (c Classifier) classify(event string, body []byte) (classification, error) 
 		}
 		matchedRules++
 		target := rule.Target
-		if rule.StackedTarget != "" && payloadStack(payload) != nil {
+		if rule.StackedTarget != "" && payloadStack(&payload) != nil {
 			target = rule.StackedTarget
 		}
-		key, emit, err := intentKey(target, event, payload)
+		key, emit, err := intentKey(target, event, &payload)
 		if err != nil {
 			return classification{}, err
 		}
@@ -326,7 +326,7 @@ func (c Classifier) classify(event string, body []byte) (classification, error) 
 func intentKey(
 	target Target,
 	event string,
-	payload payloadEnvelope,
+	payload *payloadEnvelope,
 ) (string, bool, error) {
 	repo := payload.Repository.FullName
 	if repo == "" {
@@ -394,7 +394,7 @@ type stackPointer struct {
 	Number int
 }
 
-func payloadStack(payload payloadEnvelope) *stackPointer {
+func payloadStack(payload *payloadEnvelope) *stackPointer {
 	if payload.PullRequest.Stack != nil {
 		return &stackPointer{Number: payload.PullRequest.Stack.Number}
 	}

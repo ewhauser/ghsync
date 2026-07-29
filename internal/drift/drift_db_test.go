@@ -31,19 +31,19 @@ type findingObserver struct {
 
 func (o *findingObserver) PersistentDivergence(
 	_ context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	o.mu.Lock()
-	o.persistent = append(o.persistent, finding)
+	o.persistent = append(o.persistent, *finding)
 	o.mu.Unlock()
 }
 
 func (o *findingObserver) Divergence(
 	_ context.Context,
-	finding dbgen.DriftFinding,
+	finding *dbgen.DriftFinding,
 ) {
 	o.mu.Lock()
-	o.findings = append(o.findings, finding)
+	o.findings = append(o.findings, *finding)
 	o.mu.Unlock()
 }
 
@@ -468,8 +468,7 @@ func TestStackDriftIgnoresMemberUpdatedAtChurn(t *testing.T) {
 	handler.SetRiverClient(riverClient)
 	service.SetRiverClient(riverClient)
 	ctx := context.Background()
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	runCtx := t.Context()
 	if err := riverClient.Start(runCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -625,8 +624,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	handler.SetRiverClient(riverClient)
 	service.SetRiverClient(riverClient)
 	ctx := context.Background()
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	runCtx := t.Context()
 	if err := riverClient.Start(runCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -744,7 +742,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	}
 	staleSampleFinding, recorded, skipped, err := service.inspectSample(
 		ctx,
-		driftSample{
+		&driftSample{
 			EntityKind:    current.EntityKind,
 			SourceID:      current.SourceID,
 			EntityKey:     current.EntityKey,

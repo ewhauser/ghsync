@@ -1,4 +1,8 @@
-.PHONY: build test lint gen migrate dev clean
+GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_BASE := CGO_ENABLED=0 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+CUSTOM_GCL := $(CURDIR)/custom-gcl
+
+.PHONY: build test lint custom-gcl gen migrate dev clean
 
 build:
 	go build ./...
@@ -6,10 +10,14 @@ build:
 test:
 	go test ./...
 
-lint:
-	go vet ./...
-	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint is required" >&2; exit 1; }
-	golangci-lint run ./...
+$(CUSTOM_GCL): .custom-gcl.yml
+	$(GOLANGCI_LINT_BASE) custom
+	chmod +x $(CUSTOM_GCL)
+
+custom-gcl: $(CUSTOM_GCL)
+
+lint: custom-gcl
+	./custom-gcl run ./...
 
 # Regenerate sqlc query code (internal/store/dbgen).
 gen:

@@ -43,8 +43,8 @@ func TestWriteRaceBothOrdersNewerWins(t *testing.T) {
 	for index, order := range []string{"old-new", "new-old"} {
 		repo := fmt.Sprintf("acme/write-race-%d", index)
 		repository := testRepository(repo, int64(2000+index), baseTime)
-		old := testPull(repository, baseTime, "old-head")
-		newer := testPull(repository, baseTime.Add(time.Minute), "new-head")
+		old := testPull(&repository, baseTime, "old-head")
+		newer := testPull(&repository, baseTime.Add(time.Minute), "new-head")
 		var sequence []store.PullRequestRecord
 		if order == "old-new" {
 			sequence = []store.PullRequestRecord{old, newer}
@@ -79,8 +79,8 @@ func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
 	writer := store.NewEntityWriter(pool)
 	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	repository := testRepository("acme/equal-version", 2100, updatedAt)
-	first := testPull(repository, updatedAt, "head-one")
-	second := testPull(repository, updatedAt, "head-two")
+	first := testPull(&repository, updatedAt, "head-one")
+	second := testPull(&repository, updatedAt, "head-two")
 	second.Title = "equal timestamp changed truth"
 	second.SyncedAt = first.SyncedAt.Add(time.Second)
 	if _, err := writer.ApplyPullRequest(context.Background(), first); err != nil {
@@ -158,7 +158,7 @@ func TestRepositoryRenameKeepsAliasesImmutableEventsAndDirtyScopes(
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	oldRepository := testRepository("acme/old-name", 2200, baseTime)
-	pull := testPull(oldRepository, baseTime, "rename-head")
+	pull := testPull(&oldRepository, baseTime, "rename-head")
 	if _, err := writer.ApplyPullRequest(context.Background(), pull); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestRepositoryRenameKeepsAliasesImmutableEventsAndDirtyScopes(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer checksObservation.Close() //nolint:errcheck
+	defer checksObservation.Close() //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	changed, err := writer.ApplyChecksObserved(
 		context.Background(),
 		checksObservation,
@@ -281,7 +281,7 @@ func TestTimestampLessChecksOnlyAppendAcceptedTransitions(t *testing.T) {
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	repository := testRepository("acme/check-transitions", 2300, baseTime)
-	pull := testPull(repository, baseTime, "checks-head")
+	pull := testPull(&repository, baseTime, "checks-head")
 	if _, err := writer.ApplyPullRequest(context.Background(), pull); err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestTimestampLessChecksOnlyAppendAcceptedTransitions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer observation.Close() //nolint:errcheck
+		defer observation.Close() //nolint:errcheck // deferred cleanup cannot change the primary operation result
 		changed, err := writer.ApplyChecksObserved(
 			context.Background(),
 			observation,
@@ -373,7 +373,7 @@ func TestIdenticalPR200OnlyAdvancesLastCheckedAt(t *testing.T) {
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	repository := testRepository("acme/recheck", 2400, baseTime)
-	pull := testPull(repository, baseTime, "same-head")
+	pull := testPull(&repository, baseTime, "same-head")
 	if _, err := writer.ApplyPullRequest(context.Background(), pull); err != nil {
 		t.Fatal(err)
 	}
@@ -436,8 +436,8 @@ func TestPullRequestBatchIsolatesPoisonEntity(t *testing.T) {
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	goodRepo := testRepository("acme/good-batch", 2500, baseTime)
 	badRepo := testRepository("acme/bad-batch", 2501, baseTime)
-	good := testPull(goodRepo, baseTime, "good-head")
-	bad := testPull(badRepo, baseTime, "bad-head")
+	good := testPull(&goodRepo, baseTime, "good-head")
+	bad := testPull(&badRepo, baseTime, "bad-head")
 	bad.NodeID = ""
 	outcomes := writer.ApplyPullRequestBatch(
 		context.Background(),
@@ -502,7 +502,6 @@ func TestCoordinatorReturnsPerKeyWriterErrors(t *testing.T) {
 	results := make(chan result, 2)
 	start := make(chan struct{})
 	for _, number := range []int{4812, 4815} {
-		number := number
 		go func() {
 			<-start
 			err := handler.RefreshPR(ctx, queue.RefreshRequest{
@@ -715,7 +714,6 @@ func TestCoordinatorIsolatesReviewThreadTransportFailure(t *testing.T) {
 	results := make(chan refreshResult, 2)
 	start := make(chan struct{})
 	for _, number := range []int{4812, 4815} {
-		number := number
 		go func() {
 			<-start
 			err := handler.RefreshPR(ctx, queue.RefreshRequest{
@@ -804,8 +802,8 @@ func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	pull := pullRecordFromREST(
-		repository,
-		toGHPullRequest(t, fixture.PullRequests[1]),
+		&repository,
+		toGHPullRequest(t, &fixture.PullRequests[1]),
 		`"pull"`,
 		store.SyncSourceWebhook,
 		time.Now(),
@@ -818,14 +816,13 @@ func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer observation.Close() //nolint:errcheck
+		defer observation.Close() //nolint:errcheck // deferred cleanup cannot change the primary operation result
 		_, err = handler.writer.ApplyPullRequestObserved(
 			context.Background(),
 			observation,
 			pull,
 			handler.pullRequestHook(
 				repository.FullName,
-				pull.Number,
 				queue.QueueEvent,
 			),
 		)
@@ -1427,8 +1424,7 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 	)
 	defer server.Close()
 	handler.SetRiverClient(riverClient)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := riverClient.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1553,8 +1549,7 @@ func TestInstallationBackfillEnumeratesAndWaitsForRepoChildren(t *testing.T) {
 	)
 	defer server.Close()
 	handler.SetRiverClient(riverClient)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := riverClient.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1634,8 +1629,7 @@ func TestBackfillStableCreatedSnapshotSurvivesMidScanUpdate(t *testing.T) {
 	)
 	defer server.Close()
 	handler.SetRiverClient(riverClient)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := riverClient.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1815,7 +1809,7 @@ func TestBackfillCancelMidScanResumesFromDurablePage(t *testing.T) {
 		),
 	)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled mid-scan page error = %v", err)
+		t.Fatalf("canceled mid-scan page error = %v", err)
 	}
 	afterCancel, err := dbgen.New(pool).GetBackfillCursor(
 		ctx,
@@ -1842,8 +1836,7 @@ func TestBackfillCancelMidScanResumesFromDurablePage(t *testing.T) {
 		river.EventKindJobSnoozed,
 	)
 	defer unsubscribe()
-	runCtx, stop := context.WithCancel(context.Background())
-	defer stop()
+	runCtx := t.Context()
 	if err := riverClient.Start(runCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -1925,10 +1918,10 @@ func TestPipelineWaitIdleIncludesKeylessBackfillJobs(t *testing.T) {
 
 func TestOrderIndependenceFinalCacheState(t *testing.T) {
 	want := expectedOrderCacheSnapshot()
-	for run := 0; run < 4; run++ {
+	for run := range 4 {
 		repo := "acme/order"
 		harness := newPipelineHarness(t, repo)
-		random := rand.New(rand.NewSource(int64(900 + run))) //nolint:gosec
+		random := rand.New(rand.NewSource(int64(900 + run))) //nolint:gosec // deterministic non-security use
 		events := []pipelineEvent{
 			{
 				event: "pull_request",
@@ -2018,7 +2011,7 @@ func TestStormAssertsFetchCount(t *testing.T) {
 	path := "/repos/acme/storm/stacks/142"
 	baseline := harness.fake.RequestCount(http.MethodGet, path)
 
-	for index := 0; index < 20; index++ {
+	for index := range 20 {
 		harness.emit(fmt.Sprintf("storm-%02d", index), warm)
 	}
 	harness.dispatchAll()
@@ -2352,7 +2345,7 @@ func queryJSON(
 func newDirectHandler(
 	t *testing.T,
 	pool *pgxpool.Pool,
-	fixture fakegithub.Fixture,
+	fixture fakegithub.Fixture, //nolint:gocritic // helper snapshots fixture input before the fake server clones it
 	batchWindow time.Duration,
 	pageSize int,
 	fakeOptions ...fakegithub.Option,
@@ -2376,7 +2369,7 @@ func newDirectHandler(
 func newDirectHandlerWithMiddleware(
 	t *testing.T,
 	pool *pgxpool.Pool,
-	fixture fakegithub.Fixture,
+	fixture fakegithub.Fixture, //nolint:gocritic // helper snapshots fixture input before the fake server clones it
 	batchWindow time.Duration,
 	pageSize int,
 	middleware func(http.Handler) http.Handler,
@@ -2433,7 +2426,7 @@ func newDirectHandlerWithMiddleware(
 	return fake, server, handler, riverClient
 }
 
-func fixtureForRepo(fixture fakegithub.Fixture, fullName string) fakegithub.Fixture {
+func fixtureForRepo(fixture fakegithub.Fixture, fullName string) fakegithub.Fixture { //nolint:gocritic // helper intentionally mutates and returns an isolated fixture copy
 	owner, name, _ := strings.Cut(fullName, "/")
 	fixture.Owner = owner
 	fixture.Repo = name
@@ -2466,12 +2459,12 @@ func testRepository(
 }
 
 func testPull(
-	repository store.RepositoryRecord,
+	repository *store.RepositoryRecord,
 	updatedAt time.Time,
 	headSHA string,
 ) store.PullRequestRecord {
 	return store.PullRequestRecord{
-		Repository:      repository,
+		Repository:      *repository,
 		GitHubID:        4200,
 		NodeID:          "pr-node-42",
 		Number:          42,
@@ -2494,7 +2487,7 @@ func clonePayload(t *testing.T, payload map[string]any) map[string]any {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var cloned map[string]any
+	cloned := make(map[string]any)
 	if err := json.Unmarshal(encoded, &cloned); err != nil {
 		t.Fatal(err)
 	}
@@ -2503,7 +2496,7 @@ func clonePayload(t *testing.T, payload map[string]any) map[string]any {
 
 func toGHPullRequest(
 	t *testing.T,
-	pull fakegithub.PullRequest,
+	pull *fakegithub.PullRequest,
 ) *gh.PullRequest {
 	t.Helper()
 	encoded, err := json.Marshal(pull)

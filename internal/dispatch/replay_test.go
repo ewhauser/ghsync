@@ -50,6 +50,7 @@ func loadGoldenJobs(t *testing.T) []Intent {
 }
 
 func TestRecordedReplayDecisionsAreOrderIndependent(t *testing.T) {
+	t.Parallel()
 	deliveries := loadRecordedDeliveries(t)
 	golden := loadGoldenJobs(t)
 	fileRules, err := LoadRulesFile("../../config/dispatcher-rules.yaml")
@@ -61,6 +62,7 @@ func TestRecordedReplayDecisionsAreOrderIndependent(t *testing.T) {
 		"deployed file":     NewClassifier(fileRules),
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			baseline := classifyDecisions(t, classifier, deliveries)
 			if !reflect.DeepEqual(baseline, golden) {
 				t.Fatalf(
@@ -69,9 +71,9 @@ func TestRecordedReplayDecisionsAreOrderIndependent(t *testing.T) {
 					golden,
 				)
 			}
-			for seed := int64(0); seed < 50; seed++ {
+			for seed := range int64(50) {
 				random := rand.New(
-					rand.NewSource(seed), //nolint:gosec
+					rand.NewSource(seed), //nolint:gosec // deterministic non-security use
 				)
 				permuted := append(
 					[]recordedDelivery(nil),

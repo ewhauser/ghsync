@@ -42,7 +42,7 @@ func (s *Service) pruneBatch(
 	if err != nil {
 		return 0, 0, fmt.Errorf("begin retention prune: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	queries := dbgen.New(tx)
 	payloads, err := queries.PruneWebhookDeliveryPayloadBatch(
 		ctx,

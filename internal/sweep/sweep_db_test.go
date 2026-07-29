@@ -379,8 +379,7 @@ func TestC_R1EndToEndBoundIncludesCadenceQueueAndFetch(
 	); err != nil {
 		t.Fatal(err)
 	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	runCtx := t.Context()
 	if err := riverClient.Start(runCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +673,7 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 			t.Fatal(err)
 		}
 	}
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, func() bool {
 		var stack, pull, rules time.Time
 		if err := h.pool.QueryRow(ctx, `
 			SELECT last_checked_at FROM stacks WHERE number = 142
@@ -722,7 +721,7 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, func() bool {
 		var value time.Time
 		err := h.pool.QueryRow(ctx, `
 			SELECT last_checked_at
@@ -971,7 +970,7 @@ func TestDisappearanceVerificationTombstonesPRStackAndRepository(
 			t.Fatal(err)
 		}
 	}
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, func() bool {
 		var repo, stack, pull bool
 		err := h.pool.QueryRow(ctx, `
 			SELECT
@@ -1061,7 +1060,7 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	if requests := h.fake.RedeliveryRequests(); len(requests) != 1 {
 		t.Fatalf("redelivery requests = %v, want one", requests)
 	}
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, func() bool {
 		_, err := dbgen.New(h.pool).GetWebhookDelivery(
 			context.Background(),
 			guid,
@@ -1081,7 +1080,7 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	if _, err := dispatcher.DispatchBatch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, func() bool {
 		row, err := dbgen.New(h.pool).GetPullRequestByKey(
 			context.Background(),
 			dbgen.GetPullRequestByKeyParams{
@@ -1190,7 +1189,7 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer eventTx.Rollback(context.Background()) //nolint:errcheck
+	defer eventTx.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if err := outbox.AcquireWriterFence(ctx, eventTx); err != nil {
 		t.Fatal(err)
 	}
@@ -1580,7 +1579,7 @@ func (h *sweepHarness) seedCache(
 				Source:     store.SyncSourceReconcile,
 			},
 		); err != nil {
-			observation.Close() //nolint:errcheck
+			observation.Close() //nolint:errcheck // deferred cleanup cannot change the primary operation result
 			t.Fatal(err)
 		}
 		if err := observation.Close(); err != nil {
@@ -1633,13 +1632,9 @@ func (h *sweepHarness) seedCheckHistory(
 	}
 }
 
-func waitFor(
-	t *testing.T,
-	timeout time.Duration,
-	condition func() bool,
-) {
+func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if condition() {
 			return

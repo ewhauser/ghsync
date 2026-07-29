@@ -23,7 +23,6 @@ func TestWriteRaceBothOrdersNewerWinsConcurrently(t *testing.T) {
 		{"old", "new"},
 		{"new", "old"},
 	} {
-		order := order
 		t.Run(strings.Join(order, "-then-"), func(t *testing.T) {
 			repository := storeTestRepository(
 				fmt.Sprintf("acme/write-race-%d", index),
@@ -41,9 +40,9 @@ func TestWriteRaceBothOrdersNewerWinsConcurrently(t *testing.T) {
 			}
 
 			pulls := map[string]PullRequestRecord{
-				"old": storeTestPull(repository, baseTime, "old-head"),
+				"old": storeTestPull(&repository, baseTime, "old-head"),
 				"new": storeTestPull(
-					repository,
+					&repository,
 					baseTime.Add(time.Minute),
 					"new-head",
 				),
@@ -129,8 +128,8 @@ func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
 	writer := NewEntityWriter(pool)
 	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	repository := storeTestRepository("acme/equal-version", 2100, updatedAt)
-	first := storeTestPull(repository, updatedAt, "head-one")
-	second := storeTestPull(repository, updatedAt, "head-two")
+	first := storeTestPull(&repository, updatedAt, "head-one")
+	second := storeTestPull(&repository, updatedAt, "head-two")
 	second.Title = "equal timestamp changed truth"
 	second.SyncedAt = first.SyncedAt.Add(time.Second)
 
@@ -207,7 +206,7 @@ func TestEntityKeyConstructorsMatchSQLGrammar(t *testing.T) {
 	ctx := context.Background()
 	at := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	repository := storeTestRepository("acme/key-grammar", 2200, at)
-	pull := storeTestPull(repository, at, "key-head")
+	pull := storeTestPull(&repository, at, "key-head")
 	pull.Number = 42
 	pull.GitHubID = 4200
 	pull.NodeID = "pr-node-42"
@@ -422,12 +421,12 @@ func storeTestRepository(
 }
 
 func storeTestPull(
-	repository RepositoryRecord,
+	repository *RepositoryRecord,
 	updatedAt time.Time,
 	headSHA string,
 ) PullRequestRecord {
 	return PullRequestRecord{
-		Repository:      repository,
+		Repository:      *repository,
 		GitHubID:        4200,
 		NodeID:          "pr-node-42",
 		Number:          42,

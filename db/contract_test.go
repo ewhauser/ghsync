@@ -1,6 +1,7 @@
 package db_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -176,7 +177,7 @@ func parseManifest(
 	}
 	start := "<!-- " + name + ":start -->"
 	end := "<!-- " + name + ":end -->"
-	startIndex := strings.Index(string(content), start)
+	startIndex := bytes.Index(content, []byte(start))
 	if startIndex < 0 {
 		t.Fatalf("missing %s start marker", name)
 	}
@@ -188,7 +189,7 @@ func parseManifest(
 	}
 	section = section[:endIndex]
 	var rows [][]string
-	for _, line := range strings.Split(section, "\n") {
+	for line := range strings.SplitSeq(section, "\n") {
 		if !strings.HasPrefix(line, "| `") {
 			continue
 		}

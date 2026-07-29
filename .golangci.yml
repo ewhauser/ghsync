@@ -1,1 +1,84 @@
 version: "2"
+
+formatters:
+  enable:
+    - goimports
+  exclusions:
+    paths:
+      - ^internal/store/dbgen/
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gocritic
+    - revive
+    - misspell
+    - modernize
+    - bodyclose
+    - containedctx
+    - contextcheck
+    - errorlint
+    - nilerr
+    - noctx
+    - paralleltest
+    - testifylint
+    - unconvert
+    - unparam
+    - nilaway
+
+  settings:
+    custom:
+      nilaway:
+        type: module
+        description: Static analysis tool to detect potential nil panics in Go code.
+        settings:
+          include-pkgs: github.com/ewhauser/ghsync
+
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - typeDefFirst
+        - todoCommentWithoutDetail
+        - unnamedResult
+        - initClause
+        - commentedOutCode
+
+    misspell:
+      locale: US
+
+  exclusions:
+    paths:
+      - ^internal/store/dbgen/
+    rules:
+      # These integration tests share one live Postgres and shared tables.
+      # Running them in parallel can make otherwise isolated assertions flaky.
+      - path: _db_test\.go$
+        linters:
+          - paralleltest
+      - path: ^(cmd/(soak|stream-tail)/main_test\.go|db/contract_test\.go|internal/(budget/lease|metrics/metrics|queue/queue|store/migrate)_test\.go)$
+        linters:
+          - paralleltest
+      # These suites exercise deliberate scheduling, concurrency ceilings, and
+      # embedded HTTP servers; process-level parallelism would add timing noise.
+      - path: ^internal/(budget/lease_runtime|fakegithub/fakegithub|gh/conformance)_test\.go$
+        linters:
+          - paralleltest
+      - text: "INTERNAL ERROR"
+        linters:
+          - nilaway
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

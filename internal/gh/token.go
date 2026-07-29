@@ -57,7 +57,7 @@ type InstallationTokens struct {
 // installation-token provider.
 func NewInstallationTokens(
 	gate budget.Doer,
-	options InstallationTokenOptions,
+	options InstallationTokenOptions, //nolint:gocritic // constructor normalizes a private options copy
 ) (*InstallationTokens, error) {
 	if gate == nil {
 		return nil, fmt.Errorf("GitHub budget gate is required")

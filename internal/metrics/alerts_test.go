@@ -9,6 +9,7 @@ import (
 )
 
 func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
+	t.Parallel()
 	body, err := os.ReadFile("../../ops/alerts.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +158,7 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 }
 
 func TestAlertConditionalRatioExpressionsUseGatedWindowCounts(t *testing.T) {
+	t.Parallel()
 	body, err := os.ReadFile("../../ops/alerts.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -198,6 +200,7 @@ func TestAlertConditionalRatioExpressionsUseGatedWindowCounts(t *testing.T) {
 	denominator := `sum(increase(ghsync_c_b4_conditional_requests_total{class="sweep",resource="rest"}[15m]))`
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			expr := strings.Join(strings.Fields(tc.expr), " ")
 			if !parenthesesBalanced(expr) {
 				t.Fatalf("ratio has unbalanced parentheses: %q", expr)
@@ -242,16 +245,16 @@ func TestAlertConditionalRatioExpressionsUseGatedWindowCounts(t *testing.T) {
 func promQLBlock(t *testing.T, markdown string) string {
 	t.Helper()
 	const opener = "```promql"
-	start := strings.Index(markdown, opener)
-	if start < 0 {
+	_, after, ok := strings.Cut(markdown, opener)
+	if !ok {
 		t.Fatal("dashboard has no PromQL block")
 	}
-	block := markdown[start+len(opener):]
-	end := strings.Index(block, "```")
-	if end < 0 {
+	block := after
+	before0, _, ok0 := strings.Cut(block, "```")
+	if !ok0 {
 		t.Fatal("dashboard PromQL block is not closed")
 	}
-	return block[:end]
+	return before0
 }
 
 func parenthesesBalanced(expression string) bool {

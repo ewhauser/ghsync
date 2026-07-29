@@ -154,7 +154,7 @@ type RefreshObservation struct {
 
 // RefreshObserver receives completed authoritative-fetch observations.
 type RefreshObserver interface {
-	RefreshFinished(context.Context, RefreshObservation)
+	RefreshFinished(context.Context, *RefreshObservation)
 }
 
 // WithRefreshObserver installs authoritative-fetch instrumentation.

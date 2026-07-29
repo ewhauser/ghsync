@@ -9,6 +9,7 @@ import (
 )
 
 func TestInteractiveQueueHasInteractiveSyncSource(t *testing.T) {
+	t.Parallel()
 	class, source, err := classAndSource(queue.QueueInteractive)
 	if err != nil {
 		t.Fatal(err)

@@ -192,7 +192,7 @@ func (s *Service) runOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("begin derivation pass: %w", err)
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 
 	// Q1: the writer fence is deliberately the outermost lock in this
 	// outbox-writing transaction. Taking dirty-row locks first lets a pending
@@ -396,7 +396,7 @@ func (s *Service) recordHeartbeat(
 // hint with interval polling as the correctness path.
 func (s *Service) Run(ctx context.Context) error {
 	var listener *pgxpool.Conn
-	defer func() { releaseListener(listener) }()
+	defer func() { releaseListener(ctx, listener) }()
 	listenerBackoff := minListenerBackoff
 	var nextListenerAttempt time.Time
 
@@ -444,7 +444,7 @@ func (s *Service) Run(ctx context.Context) error {
 		case ctx.Err() != nil:
 			return nil
 		default:
-			releaseListener(listener)
+			releaseListener(ctx, listener)
 			listener = nil
 			nextListenerAttempt = time.Now().Add(listenerBackoff)
 			listenerBackoff = growListenerBackoff(listenerBackoff)
@@ -455,10 +455,7 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
-	timeout := s.pollInterval
-	if timeout > 250*time.Millisecond {
-		timeout = 250 * time.Millisecond
-	}
+	timeout := min(s.pollInterval, 250*time.Millisecond)
 	acquireCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	listener, err := s.pool.Acquire(acquireCtx)
@@ -475,11 +472,11 @@ func (s *Service) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
 	return listener, nil
 }
 
-func releaseListener(listener *pgxpool.Conn) {
+func releaseListener(ctx context.Context, listener *pgxpool.Conn) {
 	if listener == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	_, _ = listener.Exec(ctx, "UNLISTEN "+dirtyNotifyChannel)
 	listener.Release()

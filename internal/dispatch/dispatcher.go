@@ -73,7 +73,7 @@ type Dispatcher struct {
 func New(
 	pool *pgxpool.Pool,
 	riverClient *river.Client[pgx.Tx],
-	config Config,
+	config Config, //nolint:gocritic // constructor copies validated options into owned dispatcher state
 ) (*Dispatcher, error) {
 	if pool == nil || riverClient == nil {
 		return nil, fmt.Errorf("dispatcher requires Postgres and River clients")
@@ -113,7 +113,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		count, err := d.dispatchBatch(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return nil //nolint:nilerr // cancellation is a graceful dispatcher shutdown
 			}
 			if !retryableDispatchError(err) {
 				return err
@@ -223,7 +223,8 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context) (int, error) {
 	intents := make([]Intent, 0, len(deliveries))
 	intentReceivedAt := make(map[Intent]time.Time, len(deliveries))
 	unmatchedEvents := make([]string, 0)
-	for _, delivery := range deliveries {
+	for index := range deliveries {
+		delivery := &deliveries[index]
 		result, classifyErr := d.config.Classifier.classify(
 			delivery.Event,
 			delivery.RawBody,

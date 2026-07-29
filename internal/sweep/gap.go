@@ -45,7 +45,8 @@ func (s *Service) HealDeliveryGaps(
 			return fmt.Errorf("list App webhook deliveries: %w", err)
 		}
 		candidates := make([]gh.AppHookDelivery, 0, len(deliveries))
-		for _, delivery := range deliveries {
+		for index := range deliveries {
+			delivery := &deliveries[index]
 			// GitHub does not contractually promise delivery-list ordering.
 			// Scan to the terminal cursor and only filter membership in the
 			// fixed time window; an old row never terminates the scan.
@@ -57,7 +58,7 @@ func (s *Service) HealDeliveryGaps(
 				continue
 			}
 			seen[delivery.GUID] = struct{}{}
-			candidates = append(candidates, delivery)
+			candidates = append(candidates, *delivery)
 		}
 		if err := s.redeliverMissing(ctx, candidates); err != nil {
 			return err
@@ -98,7 +99,7 @@ func (s *Service) loadOrStartGapWindow(
 			err,
 		)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	queries := dbgen.New(tx)
 	if _, err := queries.EnsureGapHealCursor(
 		ctx,
@@ -155,7 +156,7 @@ func (s *Service) advanceGapWindow(
 	if err != nil {
 		return fmt.Errorf("begin delivery-gap advance: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if _, err := dbgen.New(tx).AdvanceGapHealCursor(
 		ctx,
 		dbgen.AdvanceGapHealCursorParams{
@@ -236,7 +237,8 @@ func (s *Service) redeliverMissing(
 		return nil
 	}
 	guids := make([]string, 0, len(deliveries))
-	for _, delivery := range deliveries {
+	for index := range deliveries {
+		delivery := &deliveries[index]
 		guids = append(guids, delivery.GUID)
 	}
 	existing, err := dbgen.New(s.pool).ListExistingWebhookDeliveryGUIDs(
@@ -250,7 +252,8 @@ func (s *Service) redeliverMissing(
 	for _, guid := range existing {
 		present[guid] = struct{}{}
 	}
-	for _, delivery := range deliveries {
+	for index := range deliveries {
+		delivery := &deliveries[index]
 		if _, ok := present[delivery.GUID]; ok {
 			continue
 		}

@@ -173,9 +173,7 @@ func TestPostgresLeaseConcurrentStealHasExactlyOneWinner(t *testing.T) {
 	var workers sync.WaitGroup
 	for contender := range contenders {
 		token := fmt.Sprintf("steal-contender-%d", contender)
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		workers.Go(func() {
 			<-start
 			_, _, acquired, acquireErr := leases.Acquire(
 				ctx,
@@ -188,7 +186,7 @@ func TestPostgresLeaseConcurrentStealHasExactlyOneWinner(t *testing.T) {
 				acquired: acquired,
 				err:      acquireErr,
 			}
-		}()
+		})
 	}
 	close(start)
 	workers.Wait()
@@ -302,7 +300,7 @@ func TestPostgresLeaseOwnershipLossStopsRenewalAndAllowsFailover(t *testing.T) {
 	})
 
 	lostAt := time.Now()
-	req, _ := http.NewRequest(http.MethodGet, "http://github.test/resource", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://github.test/resource", http.NoBody)
 	response, err := first.Do(
 		context.Background(),
 		Interactive,

@@ -143,7 +143,6 @@ type rateCostKey struct{}
 func (s *Server) writeConditionalJSON(
 	w http.ResponseWriter,
 	r *http.Request,
-	resource string,
 	value any,
 ) {
 	body, err := json.Marshal(value)
@@ -159,7 +158,7 @@ func (s *Server) writeConditionalJSON(
 		s.notModified[r.Method+" "+r.URL.Path]++
 		s.mu.Unlock()
 		if scripted, _ := r.Context().Value(scriptedRateKey{}).(bool); !scripted {
-			rate := s.refund(resource, 1)
+			rate := s.refund("core", 1)
 			setRateHeaders(w.Header(), rate)
 		}
 		w.WriteHeader(http.StatusNotModified)
@@ -188,7 +187,6 @@ func setRateHeaders(header http.Header, budget rateState) {
 
 func writeRESTRateLimitExceeded(
 	w http.ResponseWriter,
-	budget rateState,
 	status int,
 ) {
 	w.Header().Set("Content-Type", "application/json")

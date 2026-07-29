@@ -18,6 +18,7 @@ import (
 )
 
 func TestNewEnforcesDebounceHardCap(t *testing.T) {
+	t.Parallel()
 	pool := new(pgxpool.Pool)
 	riverClient := new(river.Client[pgx.Tx])
 	base := Config{
@@ -38,6 +39,7 @@ func TestNewEnforcesDebounceHardCap(t *testing.T) {
 }
 
 func TestNewRejectsEmptyClassifier(t *testing.T) {
+	t.Parallel()
 	_, err := New(
 		new(pgxpool.Pool),
 		new(river.Client[pgx.Tx]),
@@ -54,6 +56,7 @@ func TestNewRejectsEmptyClassifier(t *testing.T) {
 }
 
 func TestRunReturnsNilOnContextCancellation(t *testing.T) {
+	t.Parallel()
 	dispatcher := newRunTestDispatcher(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	dispatcher.dispatchBatch = func(context.Context) (int, error) {
@@ -67,6 +70,7 @@ func TestRunReturnsNilOnContextCancellation(t *testing.T) {
 }
 
 func TestRunRetriesTransientError(t *testing.T) {
+	t.Parallel()
 	dispatcher := newRunTestDispatcher(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
@@ -97,6 +101,7 @@ func TestRunRetriesTransientError(t *testing.T) {
 }
 
 func TestRunReturnsFatalError(t *testing.T) {
+	t.Parallel()
 	dispatcher := newRunTestDispatcher(t)
 	fatal := errors.New("invalid dispatcher state")
 	dispatcher.dispatchBatch = func(context.Context) (int, error) {
@@ -110,8 +115,10 @@ func TestRunReturnsFatalError(t *testing.T) {
 }
 
 func TestRetryableDispatchErrorClassification(t *testing.T) {
+	t.Parallel()
 	for _, code := range []string{"40001", "40P01", "08006"} {
 		t.Run(code, func(t *testing.T) {
+			t.Parallel()
 			err := fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: code})
 			if !retryableDispatchError(err) {
 				t.Fatalf("SQLSTATE %s was not retryable", code)
@@ -124,6 +131,7 @@ func TestRetryableDispatchErrorClassification(t *testing.T) {
 }
 
 func TestDedupeIntentsSortsGenerationKeys(t *testing.T) {
+	t.Parallel()
 	got := dedupeIntents([]Intent{
 		{Kind: queue.KindRefreshStack, Key: "stack:z:2", Priority: PriorityEvent},
 		{Kind: queue.KindRefreshPR, Key: "pr:z:9", Priority: PriorityEvent},

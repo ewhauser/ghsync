@@ -423,7 +423,7 @@ func FromEnv() (Config, error) {
 
 // RequireDatabase returns an error when the configuration lacks a database
 // URL; commands that touch Postgres call this up front for a clear message.
-func (c Config) RequireDatabase() error {
+func (c Config) RequireDatabase() error { //nolint:gocritic // value receiver supports validating temporary configurations
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
@@ -431,7 +431,7 @@ func (c Config) RequireDatabase() error {
 }
 
 // RequireWebhookSecret fails closed for an ingress role with no HMAC secret.
-func (c Config) RequireWebhookSecret() error {
+func (c Config) RequireWebhookSecret() error { //nolint:gocritic // value receiver supports validating temporary configurations
 	if c.GitHubWebhookSecret == "" {
 		return fmt.Errorf("GITHUB_WEBHOOK_SECRET is required for the ingress role")
 	}
@@ -439,7 +439,7 @@ func (c Config) RequireWebhookSecret() error {
 }
 
 // RequireFetchCredentials validates the credentials required by fetch roles.
-func (c Config) RequireFetchCredentials() error {
+func (c Config) RequireFetchCredentials() error { //nolint:gocritic // value receiver supports validating temporary configurations
 	if c.GitHubInstallationID <= 0 || c.GitHubOrgID <= 0 {
 		return fmt.Errorf(
 			"GITHUB_INSTALLATION_ID and GITHUB_ORG_ID are required for fetch",

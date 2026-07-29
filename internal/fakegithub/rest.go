@@ -9,7 +9,7 @@ import (
 
 func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, bool) {
 	s.mu.Lock()
-	fx := cloneFixture(s.fixture)
+	fx := cloneFixture(&s.fixture)
 	s.mu.Unlock()
 	if r.PathValue("owner") != fx.Owner || r.PathValue("repo") != fx.Repo {
 		http.NotFound(w, r)
@@ -23,7 +23,7 @@ func (s *Server) getRepository(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.writeConditionalJSON(w, r, "core", fx.Repository)
+	s.writeConditionalJSON(w, r, fx.Repository)
 }
 
 func (s *Server) listInstallationRepositories(
@@ -31,7 +31,7 @@ func (s *Server) listInstallationRepositories(
 	r *http.Request,
 ) {
 	s.mu.Lock()
-	fx := cloneFixture(s.fixture)
+	fx := cloneFixture(&s.fixture)
 	repositories := fx.Repositories
 	if repositories == nil {
 		repositories = []Repository{fx.Repository}
@@ -41,7 +41,7 @@ func (s *Server) listInstallationRepositories(
 		return repositories[i].ID < repositories[j].ID
 	})
 	repositories = paginate(repositories, r, w)
-	s.writeConditionalJSON(w, r, "core", map[string]any{
+	s.writeConditionalJSON(w, r, map[string]any{
 		"total_count":  len(repositories),
 		"repositories": repositories,
 	})
@@ -56,7 +56,7 @@ func (s *Server) listRepositoryRules(w http.ResponseWriter, r *http.Request) {
 	sort.SliceStable(rules, func(i, j int) bool {
 		return rules[i].ID < rules[j].ID
 	})
-	s.writeConditionalJSON(w, r, "core", rules)
+	s.writeConditionalJSON(w, r, rules)
 }
 
 func (s *Server) listStacks(w http.ResponseWriter, r *http.Request) {
@@ -72,17 +72,18 @@ func (s *Server) listStacks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		stacks = nil
-		for _, stack := range fx.Stacks {
+		for index := range fx.Stacks {
+			stack := &fx.Stacks[index]
 			for _, pull := range stack.PullRequests {
 				if pull.Number == number {
-					stacks = append(stacks, stack)
+					stacks = append(stacks, *stack)
 					break
 				}
 			}
 		}
 	}
 	stacks = paginate(stacks, r, w)
-	s.writeConditionalJSON(w, r, "core", stacks)
+	s.writeConditionalJSON(w, r, stacks)
 }
 
 func (s *Server) getStack(w http.ResponseWriter, r *http.Request) {
@@ -95,9 +96,10 @@ func (s *Server) getStack(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad stack number", http.StatusBadRequest)
 		return
 	}
-	for _, stack := range fx.Stacks {
+	for index := range fx.Stacks {
+		stack := &fx.Stacks[index]
 		if stack.Number == number {
-			s.writeConditionalJSON(w, r, "core", stack)
+			s.writeConditionalJSON(w, r, stack)
 			return
 		}
 	}
@@ -111,9 +113,10 @@ func (s *Server) listPulls(w http.ResponseWriter, r *http.Request) {
 	}
 	state := r.URL.Query().Get("state")
 	pulls := make([]PullRequest, 0, len(fx.PullRequests))
-	for _, pull := range fx.PullRequests {
+	for index := range fx.PullRequests {
+		pull := &fx.PullRequests[index]
 		if state == "" || state == "all" || pull.State == state {
-			pulls = append(pulls, pull)
+			pulls = append(pulls, *pull)
 		}
 	}
 	sortBy := r.URL.Query().Get("sort")
@@ -146,7 +149,7 @@ func (s *Server) listPulls(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	pulls = paginate(pulls, r, w)
-	s.writeConditionalJSON(w, r, "core", pulls)
+	s.writeConditionalJSON(w, r, pulls)
 }
 
 func (s *Server) getPull(w http.ResponseWriter, r *http.Request) {
@@ -159,16 +162,17 @@ func (s *Server) getPull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad pull request number", http.StatusBadRequest)
 		return
 	}
-	for _, pull := range fx.PullRequests {
+	for index := range fx.PullRequests {
+		pull := &fx.PullRequests[index]
 		if pull.Number == number {
 			// GitHub's REST pull shape carries the author under user.login.
 			// Keep AuthorLogin out of the fixture's serialized list golden,
 			// but include the real field on authoritative detail fetches.
-			s.writeConditionalJSON(w, r, "core", struct {
+			s.writeConditionalJSON(w, r, struct {
 				PullRequest
 				User map[string]string `json:"user"`
 			}{
-				PullRequest: pull,
+				PullRequest: *pull,
 				User: map[string]string{
 					"login": pull.AuthorLogin,
 				},
@@ -186,13 +190,14 @@ func (s *Server) listCheckRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	headSHA := r.PathValue("sha")
 	runs := make([]CheckRun, 0)
-	for _, run := range fx.CheckRuns {
+	for index := range fx.CheckRuns {
+		run := &fx.CheckRuns[index]
 		if run.HeadSHA == headSHA {
-			runs = append(runs, run)
+			runs = append(runs, *run)
 		}
 	}
 	runs = paginate(runs, r, w)
-	s.writeConditionalJSON(w, r, "core", map[string]any{
+	s.writeConditionalJSON(w, r, map[string]any{
 		"total_count": len(runs),
 		"check_runs":  runs,
 	})
@@ -206,6 +211,9 @@ func slicesReverse[T any](values []T) {
 }
 
 func paginate[T any](values []T, r *http.Request, w http.ResponseWriter) []T {
+	if len(values) == 0 {
+		return nil
+	}
 	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if perPage <= 0 {

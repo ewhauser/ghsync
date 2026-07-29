@@ -505,7 +505,9 @@ func extractGraphQLRate(
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return budget.GraphQLRate{}, false, nil
+		// The normal response decoder reports malformed JSON with the public
+		// GraphQL response context; this observer only extracts optional rate data.
+		return budget.GraphQLRate{}, false, nil //nolint:nilerr // the primary decoder reports malformed JSON
 	}
 	if envelope.Data.RateLimit == nil {
 		return budget.GraphQLRate{}, false, nil

@@ -115,7 +115,7 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer smallTx.Rollback(context.Background()) //nolint:errcheck
+	defer smallTx.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	smallSeq := insertTestEvent(t, ctx, smallTx, streamName, "small", time.Now())
 
 	largeTx, err := pool.Begin(ctx)
@@ -131,7 +131,7 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 	}
 
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	stepDone := make(chan streammaint.WatermarkProgress, 1)
 	stepErr := make(chan error, 1)
 	go func() {
@@ -303,7 +303,7 @@ func TestSnapshotCommitPriorSeqAndIdempotentClose(t *testing.T) {
 		time.Now(),
 	)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, seq)
 
 	beforeAcquire := pool.Stat().AcquiredConns()
@@ -388,7 +388,7 @@ func TestRetentionCannotDeleteBetweenHorizonCheckAndPageSnapshot(
 		time.Now().Add(-8*24*time.Hour),
 	)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, seq)
 
 	horizonRead := make(chan struct{})
@@ -459,7 +459,7 @@ func TestWatermarkIgnoresUnrelatedWriterAndLongBootstrapSnapshot(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unrelated.Rollback(context.Background()) //nolint:errcheck
+	defer unrelated.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if _, err := unrelated.Exec(ctx, `
 		INSERT INTO consumer_cursors (consumer, stream, seq)
 		VALUES ($1, $2, 0)
@@ -475,14 +475,14 @@ func TestWatermarkIgnoresUnrelatedWriterAndLongBootstrapSnapshot(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer bootstrap.Close() //nolint:errcheck
+	defer bootstrap.Close() //nolint:errcheck // deferred cleanup cannot change the primary operation result
 
 	streamName := uniqueStreamName("liveness")
 	seq := insertCommittedEvent(
 		t, ctx, pool, streamName, "committed", time.Now(),
 	)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	stepCtx, stopStep := context.WithTimeout(ctx, time.Second)
 	defer stopStep()
 	progress, err := watermarker.Step(stepCtx)
@@ -544,7 +544,7 @@ func TestTailRecoversAfterListenerDisconnectWhilePollingContinues(
 		t, ctx, pool, streamName, "after-disconnect", time.Now(),
 	)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, seq)
 	select {
 	case got := <-delivered:
@@ -685,7 +685,7 @@ func TestTailRepeatedListenerTerminationReachesMaxBackoffAndRecovers(
 		t, ctx, pool, streamName, "after-churn", time.Now(),
 	)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, seq)
 	select {
 	case got := <-delivered:
@@ -829,7 +829,7 @@ func TestTailPersistentListenerPoolExhaustionPollsThenRecovers(
 		t, ctx, pool, streamName, "after-pool-recovery", time.Now(),
 	)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, seq)
 	select {
 	case got := <-delivered:
@@ -863,7 +863,7 @@ func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var sequences []int64
+	sequences := make([]int64, 0, 3)
 	for index := range 3 {
 		sequences = append(
 			sequences,
@@ -875,7 +875,7 @@ func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
 		)
 	}
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, sequences[len(sequences)-1])
 
 	table := testTableName("applications")
@@ -884,7 +884,7 @@ func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
 	)); err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Exec(context.Background(), "DROP TABLE "+table) //nolint:errcheck
+	defer pool.Exec(context.Background(), "DROP TABLE "+table) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	crash := errors.New("simulated tailer crash")
 	handled := 0
 	err = client.Tail(
@@ -956,7 +956,7 @@ func TestBootstrapTailOverlapConvergesWithoutLostOrDoubleAppliedEffect(
 	identity := uniqueStreamName("work-item")
 	client := newTestClient(t, pool, 10)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 
 	// Publish W before the state/event transaction commits. Bootstrap will
 	// subsequently read the stale W while its later cache read sees the state
@@ -1019,7 +1019,7 @@ func TestBootstrapTailOverlapConvergesWithoutLostOrDoubleAppliedEffect(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer snapshot.Close() //nolint:errcheck
+	defer snapshot.Close() //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if snapshot.SafeSeq != published.SafeSeq {
 		t.Fatalf(
 			"Bootstrap SafeSeq = %d, want published W %d",
@@ -1129,7 +1129,7 @@ func TestConcurrentTailersReturnTypedCursorContention(t *testing.T) {
 		t, ctx, pool, streamName, "contended", time.Now(),
 	)
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, seq)
 
 	firstEntered := make(chan struct{})
@@ -1254,7 +1254,7 @@ func TestRetentionResyncBootstrapConvergesWithoutDuplicateSeqApplication(
 		t.Fatal(err)
 	}
 	watermarker := newTestWatermarker(t, pool)
-	defer watermarker.Close(context.Background()) //nolint:errcheck
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	advanceThrough(t, ctx, watermarker, oldSeq)
 
 	retention, err := streammaint.NewRetention(

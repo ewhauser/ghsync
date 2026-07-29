@@ -342,6 +342,8 @@ func TestStreamRetentionAgeCannotShortenSevenDayPolicy(t *testing.T) {
 }
 
 func TestRequireWebhookSecret(t *testing.T) {
+	t.Parallel()
+
 	if err := (Config{}).RequireWebhookSecret(); err == nil {
 		t.Fatal("empty webhook secret accepted")
 	}
@@ -351,6 +353,8 @@ func TestRequireWebhookSecret(t *testing.T) {
 }
 
 func TestRequireFetchCredentials(t *testing.T) {
+	t.Parallel()
+
 	if err := (Config{}).RequireFetchCredentials(); err == nil {
 		t.Fatal("empty fetch credentials accepted")
 	}
