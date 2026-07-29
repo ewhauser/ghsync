@@ -127,6 +127,24 @@ JOIN repo_aliases ON repo_aliases.repo_id = repos.id
 WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
   AND pull_requests.number = sqlc.arg(pr_number);
 
+-- name: GetCheckRunsFetchMetadata :one
+-- C-B4: the first-page validator is shared by every check row in one
+-- repository/head-SHA listing. Prefer the newest observation when rows span
+-- multiple refreshes, including a fully tombstoned listing.
+SELECT repos.gh_id AS repo_gh_id, repos.installation_id,
+       repos.full_name AS repo_full_name,
+       COALESCE((
+           SELECT check_runs.etag
+           FROM check_runs
+           WHERE check_runs.repo_id = repos.id
+             AND check_runs.head_sha = sqlc.arg(head_sha)
+           ORDER BY check_runs.last_checked_at DESC, check_runs.gh_id
+           LIMIT 1
+       ), ''::text)::text AS etag
+FROM repos
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = sqlc.arg(repo_full_name);
+
 -- name: UpsertPullRequestWriteIfNewer :one
 INSERT INTO pull_requests (
     repo_id, gh_id, node_id, number, title, state, draft, author_login,
@@ -176,7 +194,10 @@ SET gh_id = EXCLUDED.gh_id,
     gh_updated_at = EXCLUDED.gh_updated_at,
     synced_at = EXCLUDED.synced_at,
     last_checked_at = EXCLUDED.last_checked_at,
-    etag = EXCLUDED.etag,
+    etag = CASE
+        WHEN EXCLUDED.etag = '' THEN pull_requests.etag
+        ELSE EXCLUDED.etag
+    END,
     sync_source = EXCLUDED.sync_source,
     tombstoned_at = NULL,
     display_until = CASE
@@ -516,7 +537,9 @@ SELECT gh_id FROM tombstoned;
 
 -- name: TouchCheckRunsCheckedAt :exec
 UPDATE check_runs
-SET last_checked_at = GREATEST(last_checked_at, sqlc.arg(checked_at))
+SET last_checked_at = GREATEST(last_checked_at, sqlc.arg(checked_at)),
+    etag = CASE WHEN sqlc.arg(etag)::text = '' THEN etag
+                ELSE sqlc.arg(etag)::text END
 WHERE repo_id = sqlc.arg(repo_id)
   AND head_sha = sqlc.arg(head_sha);
 

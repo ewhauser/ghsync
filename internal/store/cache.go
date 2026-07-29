@@ -356,6 +356,29 @@ func (w *EntityWriter) StackMetadata(
 	}, nil
 }
 
+func (w *EntityWriter) ChecksMetadata(
+	ctx context.Context,
+	repo string,
+	headSHA string,
+) (FetchMetadata, error) {
+	row, err := dbgen.New(w.pool).GetCheckRunsFetchMetadata(
+		ctx,
+		dbgen.GetCheckRunsFetchMetadataParams{
+			HeadSha:      headSHA,
+			RepoFullName: repo,
+		},
+	)
+	if err != nil {
+		return FetchMetadata{}, err
+	}
+	return FetchMetadata{
+		ETag:           row.Etag,
+		RepoGitHubID:   row.RepoGhID,
+		InstallationID: row.InstallationID,
+		RepoFullName:   row.RepoFullName,
+	}, nil
+}
+
 func (w *EntityWriter) RepoRulesMetadata(
 	ctx context.Context,
 	repo string,
@@ -1349,6 +1372,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 		ctx,
 		dbgen.TouchCheckRunsCheckedAtParams{
 			CheckedAt: timestamp(checks.SyncedAt),
+			Etag:      checks.ETag,
 			RepoID:    repo.ID,
 			HeadSha:   checks.HeadSHA,
 		},
@@ -1411,6 +1435,47 @@ func (w *EntityWriter) ApplyChecksObserved(
 	applied := len(changed) > 0
 	w.observer.CacheWrite(ctx, "checks", applied, false)
 	return applied, nil
+}
+
+func (w *EntityWriter) TouchChecks(
+	ctx context.Context,
+	observation *Observation,
+	repository RepositoryRecord,
+	headSHA string,
+	checkedAt time.Time,
+	etag string,
+) error {
+	key := ChecksEntityKey(
+		repository.InstallationID, repository.GitHubID, headSHA,
+	)
+	if err := requireObservation(observation, key); err != nil {
+		return err
+	}
+	tx, err := observation.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	checkedAt, err = databaseClock(ctx, tx)
+	if err != nil {
+		return err
+	}
+	repo, err := dbgen.New(tx).GetRepoByGitHubID(ctx, repository.GitHubID)
+	if err != nil {
+		return fmt.Errorf("find checks repository: %w", err)
+	}
+	if err := dbgen.New(tx).TouchCheckRunsCheckedAt(
+		ctx,
+		dbgen.TouchCheckRunsCheckedAtParams{
+			CheckedAt: timestamp(checkedAt),
+			Etag:      etag,
+			RepoID:    repo.ID,
+			HeadSha:   headSHA,
+		},
+	); err != nil {
+		return fmt.Errorf("touch checks checked_at: %w", err)
+	}
+	return w.commitEntityTx(ctx, tx)
 }
 
 func (w *EntityWriter) ApplyRepoRulesObserved(

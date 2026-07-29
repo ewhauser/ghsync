@@ -774,6 +774,7 @@ WITH batch AS (
     FROM webhook_deliveries AS candidate
     WHERE candidate.received_at < $2
       AND candidate.raw_body IS NOT NULL
+      AND candidate.status = 'processed'
     ORDER BY candidate.received_at, candidate.delivery_guid
     LIMIT $3
     FOR UPDATE SKIP LOCKED

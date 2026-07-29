@@ -1032,19 +1032,22 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 	ctx := context.Background()
 	cutoff := h.now.Add(-90 * 24 * time.Hour)
 	for _, delivery := range []struct {
-		guid string
-		at   time.Time
+		guid   string
+		at     time.Time
+		status string
 	}{
-		{"older", cutoff.Add(-time.Nanosecond)},
-		{"boundary", cutoff},
-		{"newer", cutoff.Add(time.Nanosecond)},
+		{"older", cutoff.Add(-time.Nanosecond), "processed"},
+		{"boundary", cutoff, "processed"},
+		{"newer", cutoff.Add(time.Nanosecond), "processed"},
+		{"parked-older", cutoff.Add(-time.Hour), "parked"},
+		{"pending-older", cutoff.Add(-time.Hour), "pending"},
 	} {
 		if _, err := h.pool.Exec(ctx, `
 			INSERT INTO webhook_deliveries (
 			    delivery_guid, event, raw_body, headers, received_at,
 			    status
-			) VALUES ($1, 'push', 'body', '{"x":"y"}', $2, 'processed')
-		`, delivery.guid, delivery.at); err != nil {
+			) VALUES ($1, 'push', 'body', '{"x":"y"}', $2, $3)
+		`, delivery.guid, delivery.at, delivery.status); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1078,7 +1081,7 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 			history,
 		)
 	}
-	var skeletons, oldPayloads, boundaryPayloads int
+	var skeletons, oldPayloads, boundaryPayloads, replayablePayloads int
 	if err := h.pool.QueryRow(ctx, `
 		SELECT count(*),
 		       count(*) FILTER (
@@ -1086,18 +1089,34 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 		       ),
 		       count(*) FILTER (
 		           WHERE delivery_guid = 'boundary' AND raw_body IS NOT NULL
+		       ),
+		       count(*) FILTER (
+		           WHERE delivery_guid IN ('parked-older', 'pending-older')
+		             AND raw_body IS NOT NULL
+		             AND payload_pruned_at IS NULL
 		       )
 		FROM webhook_deliveries
-		WHERE delivery_guid IN ('older', 'boundary', 'newer')
-	`).Scan(&skeletons, &oldPayloads, &boundaryPayloads); err != nil {
+		WHERE delivery_guid IN (
+		    'older', 'boundary', 'newer', 'parked-older', 'pending-older'
+		)
+	`).Scan(
+		&skeletons,
+		&oldPayloads,
+		&boundaryPayloads,
+		&replayablePayloads,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if skeletons != 3 || oldPayloads != 0 || boundaryPayloads != 1 {
+	if skeletons != 5 ||
+		oldPayloads != 0 ||
+		boundaryPayloads != 1 ||
+		replayablePayloads != 2 {
 		t.Fatalf(
-			"skeletons=%d old_payloads=%d boundary_payloads=%d",
+			"skeletons=%d old_payloads=%d boundary_payloads=%d replayable_payloads=%d",
 			skeletons,
 			oldPayloads,
 			boundaryPayloads,
+			replayablePayloads,
 		)
 	}
 	var historyRows, changeEvents int
@@ -1118,6 +1137,50 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 			historyRows,
 			changeEvents,
 		)
+	}
+}
+
+func TestRequeueRefusesPayloadPrunedDeliveryWithVisibleReason(t *testing.T) {
+	h := newSweepHarness(t, 100)
+	ctx := context.Background()
+	prunedAt := h.now.Add(-time.Hour)
+	if _, err := h.pool.Exec(ctx, `
+		INSERT INTO webhook_deliveries (
+		    delivery_guid, event, raw_body, headers, received_at,
+		    status, attempts, last_error, payload_pruned_at
+		) VALUES (
+		    'pruned-parked', 'push', NULL, '{}'::jsonb, $1,
+		    'parked', 4, 'original poison error', $2
+		)
+	`, h.now.Add(-100*24*time.Hour), prunedAt); err != nil {
+		t.Fatal(err)
+	}
+	requeued, err := dbgen.New(h.pool).RequeueParkedWebhookDeliveries(
+		ctx,
+		dbgen.RequeueParkedWebhookDeliveriesParams{
+			DeliveryGuids: []string{"pruned-parked"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 0 {
+		t.Fatalf("payload-pruned requeue count = %d, want 0", requeued)
+	}
+	delivery, err := dbgen.New(h.pool).GetWebhookDelivery(ctx, "pruned-parked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Status != "parked" ||
+		delivery.Attempts != 4 ||
+		!delivery.PayloadPrunedAt.Valid ||
+		!delivery.PayloadPrunedAt.Time.Equal(prunedAt) ||
+		!delivery.LastError.Valid ||
+		!strings.Contains(delivery.LastError.String, "operator requeue refused") ||
+		!strings.Contains(delivery.LastError.String, "payload unavailable") ||
+		!strings.Contains(delivery.LastError.String, "pruned at") ||
+		!strings.Contains(delivery.LastError.String, "original poison error") {
+		t.Fatalf("refused payload-pruned delivery = %+v", delivery)
 	}
 }
 

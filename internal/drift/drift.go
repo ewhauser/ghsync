@@ -31,6 +31,8 @@ import (
 
 const jobKindDetect = "drift_detect"
 
+const skippedSamplesOperation = "detector_skipped"
+
 var driftEntityKinds = []string{
 	"repository",
 	"pull_request",
@@ -239,56 +241,10 @@ func (s *Service) Detect(
 			len(driftEntityKinds),
 		)
 	}
-	var eventPipelineBusy bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT
-		    EXISTS (
-		        SELECT 1
-		        FROM webhook_deliveries
-		        WHERE status IN ('pending', 'processing')
-		    )
-		    OR EXISTS (
-		        SELECT 1
-		        FROM refresh_intent_generations
-		        WHERE completed_generation < generation
-		    )
-		    OR EXISTS (
-		        SELECT 1
-		        FROM river_job
-		        WHERE queue IN (
-		            'interactive', 'event', 'sweep', 'reconcile'
-		        )
-		          AND state IN (
-		              'available', 'pending', 'retryable',
-		              'running', 'scheduled'
-		          )
-		    )
-		    OR EXISTS (
-		        SELECT 1
-		        FROM installation_backfill_cursors
-		        WHERE phase <> 'done'
-		    )
-		    OR NOT EXISTS (
-		        SELECT 1
-		        FROM installation_backfill_cursors
-		        WHERE installation_id = $1
-		          AND phase = 'done'
-		          AND completed_at IS NOT NULL
-		    )
-		    OR EXISTS (
-		        SELECT 1
-		        FROM backfill_cursors
-		        WHERE phase <> 'done'
-		    )
-	`, args.InstallationID).Scan(&eventPipelineBusy); err != nil {
-		return nil, fmt.Errorf("check drift event-pipeline quiescence: %w", err)
-	}
-	if eventPipelineBusy {
-		return nil, nil
-	}
 	queries := dbgen.New(s.pool)
 	findings := make([]dbgen.DriftFinding, 0)
 	var inspected int64
+	var skipped int64
 	baseQuota := args.SampleSize / len(driftEntityKinds)
 	extra := args.SampleSize % len(driftEntityKinds)
 	for index, kind := range driftEntityKinds {
@@ -327,9 +283,8 @@ func (s *Service) Detect(
 				err,
 			)
 		}
-		inspected += int64(len(rows))
 		for _, row := range rows {
-			finding, recorded, err := s.inspectSample(
+			finding, recorded, sampleSkipped, err := s.inspectSample(
 				ctx,
 				driftSample{
 					EntityKind:    row.EntityKind,
@@ -342,6 +297,11 @@ func (s *Service) Detect(
 			if err != nil {
 				return nil, err
 			}
+			if sampleSkipped {
+				skipped++
+				continue
+			}
+			inspected++
 			if recorded {
 				findings = append(findings, finding)
 			}
@@ -384,6 +344,18 @@ func (s *Service) Detect(
 	); err != nil {
 		return nil, err
 	}
+	if skipped > 0 {
+		if err := opsstate.RecordSuccessN(
+			ctx,
+			s.pool,
+			args.InstallationID,
+			"drift",
+			skippedSamplesOperation,
+			skipped,
+		); err != nil {
+			return nil, err
+		}
+	}
 	return findings, nil
 }
 
@@ -398,13 +370,13 @@ type driftSample struct {
 func (s *Service) inspectSample(
 	ctx context.Context,
 	sample driftSample,
-) (dbgen.DriftFinding, bool, error) {
+) (dbgen.DriftFinding, bool, bool, error) {
 	observation, err := store.NewEntityWriter(s.pool).BeginObservation(
 		ctx,
 		sample.LockKey,
 	)
 	if err != nil {
-		return dbgen.DriftFinding{}, false, fmt.Errorf(
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"lock drift sample %s: %w",
 			sample.EntityKey,
 			err,
@@ -420,14 +392,24 @@ func (s *Service) inspectSample(
 		},
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return dbgen.DriftFinding{}, false, nil
+		return dbgen.DriftFinding{}, false, false, nil
 	}
 	if err != nil {
-		return dbgen.DriftFinding{}, false, fmt.Errorf(
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"reread locked drift sample %s: %w",
 			sample.EntityKey,
 			err,
 		)
+	}
+	spec, err := refreshSpecForEntity(current.EntityKind, current.EntityKey)
+	if err != nil {
+		return dbgen.DriftFinding{}, false, false, err
+	}
+	if skipped, err := s.skipForOutstandingRefresh(ctx, spec); err != nil {
+		return dbgen.DriftFinding{}, false, false, err
+	} else if skipped {
+		s.logSkippedSample(current.EntityKind, current.EntityKey, spec)
+		return dbgen.DriftFinding{}, false, true, nil
 	}
 	upstream, spec, err := s.fullFetch(
 		ctx,
@@ -435,14 +417,23 @@ func (s *Service) inspectSample(
 		current.EntityKey,
 	)
 	if err != nil {
-		return dbgen.DriftFinding{}, false, err
+		return dbgen.DriftFinding{}, false, false, err
+	}
+	// A refresh may be enqueued while the authoritative read is in progress.
+	// Recheck under the observation lock so a legitimate writer waiting on this
+	// comparison cannot be reported as drift.
+	if skipped, err := s.skipForOutstandingRefresh(ctx, spec); err != nil {
+		return dbgen.DriftFinding{}, false, false, err
+	} else if skipped {
+		s.logSkippedSample(current.EntityKind, current.EntityKey, spec)
+		return dbgen.DriftFinding{}, false, true, nil
 	}
 	equal, diff, err := semanticDiff(
 		current.CacheSnapshot,
 		upstream,
 	)
 	if err != nil {
-		return dbgen.DriftFinding{}, false, fmt.Errorf(
+		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"compare drift entity %s: %w",
 			current.EntityKey,
 			err,
@@ -458,12 +449,12 @@ func (s *Service) inspectSample(
 				EntityKey:      current.EntityKey,
 			},
 		); err != nil {
-			return dbgen.DriftFinding{}, false, fmt.Errorf(
+			return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 				"resolve drift findings: %w",
 				err,
 			)
 		}
-		return dbgen.DriftFinding{}, false, nil
+		return dbgen.DriftFinding{}, false, false, nil
 	}
 	finding, first, escalated, err := s.recordAndHeal(
 		ctx,
@@ -479,7 +470,7 @@ func (s *Service) inspectSample(
 		spec,
 	)
 	if err != nil {
-		return dbgen.DriftFinding{}, false, err
+		return dbgen.DriftFinding{}, false, false, err
 	}
 	if first {
 		s.config.Observer.Divergence(ctx, finding)
@@ -487,7 +478,88 @@ func (s *Service) inspectSample(
 	if escalated {
 		s.config.Observer.PersistentDivergence(ctx, finding)
 	}
-	return finding, true, nil
+	return finding, true, false, nil
+}
+
+func refreshSpecForEntity(kind, key string) (queue.RefreshSpec, error) {
+	switch kind {
+	case "repository":
+		return queue.RefreshSpec{
+			Kind: queue.KindRefreshRepository,
+			Key:  key,
+		}, nil
+	case "pull_request":
+		return queue.RefreshSpec{Kind: queue.KindRefreshPR, Key: key}, nil
+	case "stack":
+		return queue.RefreshSpec{Kind: queue.KindRefreshStack, Key: key}, nil
+	case "repo_rules":
+		return queue.RefreshSpec{
+			Kind: queue.KindRefreshRepoRules,
+			Key:  key,
+		}, nil
+	case "review_threads":
+		repo, number, err := numberedKey(key, "review_threads:")
+		if err != nil {
+			return queue.RefreshSpec{}, err
+		}
+		return queue.RefreshSpec{
+			Kind: queue.KindRefreshPR,
+			Key:  fmt.Sprintf("pr:%s:%d", repo, number),
+		}, nil
+	case "checks":
+		return queue.RefreshSpec{Kind: queue.KindRefreshChecks, Key: key}, nil
+	default:
+		return queue.RefreshSpec{}, fmt.Errorf(
+			"unsupported drift entity kind %q",
+			kind,
+		)
+	}
+}
+
+func (s *Service) skipForOutstandingRefresh(
+	ctx context.Context,
+	spec queue.RefreshSpec,
+) (bool, error) {
+	var outstanding bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+		    EXISTS (
+		        SELECT 1
+		        FROM refresh_intent_generations
+		        WHERE refresh_key = $1
+		          AND completed_generation < generation
+		    )
+		    OR EXISTS (
+		        SELECT 1
+		        FROM river_job
+		        WHERE args->>'key' = $1
+		          AND state IN (
+		              'available', 'pending', 'retryable',
+		              'running', 'scheduled'
+		          )
+		    )
+	`, spec.Key).Scan(&outstanding); err != nil {
+		return false, fmt.Errorf(
+			"check drift sample %s refresh quiescence: %w",
+			spec.Key,
+			err,
+		)
+	}
+	return outstanding, nil
+}
+
+func (s *Service) logSkippedSample(
+	entityKind string,
+	entityKey string,
+	spec queue.RefreshSpec,
+) {
+	slog.Info(
+		"C-O3 drift sample skipped for outstanding refresh",
+		"entity_kind", entityKind,
+		"entity_key", entityKey,
+		"refresh_kind", spec.Kind,
+		"refresh_key", spec.Key,
+	)
 }
 
 func (s *Service) recordAndHeal(

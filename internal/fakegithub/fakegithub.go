@@ -334,7 +334,9 @@ type Server struct {
 	mux            *http.ServeMux
 	client         *http.Client
 	requestCounts  map[string]int
+	notModified    map[string]int
 	notFound       map[string]int
+	notFoundAt     map[string]map[int]struct{}
 	requestHook    func(string, string, int, *Fixture)
 	deliveries     []storedHookDelivery
 	nextDeliveryID int64
@@ -363,7 +365,9 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server {
 		now:            time.Now,
 		client:         &http.Client{Timeout: 10 * time.Second},
 		requestCounts:  make(map[string]int),
+		notModified:    make(map[string]int),
 		notFound:       make(map[string]int),
+		notFoundAt:     make(map[string]map[int]struct{}),
 		nextDeliveryID: 1,
 		soakTruth:      make(map[int]string),
 	}
@@ -404,8 +408,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.requestHook != nil {
 		s.requestHook(r.Method, r.URL.Path, requestCount, &s.fixture)
 	}
-	if s.notFound[requestKey] > 0 {
-		s.notFound[requestKey]--
+	_, scriptedAt := s.notFoundAt[requestKey][requestCount]
+	if scriptedAt {
+		delete(s.notFoundAt[requestKey], requestCount)
+	}
+	if s.notFound[requestKey] > 0 || scriptedAt {
+		if s.notFound[requestKey] > 0 {
+			s.notFound[requestKey]--
+		}
 		s.mu.Unlock()
 		http.NotFound(w, r)
 		return
@@ -606,10 +616,37 @@ func (s *Server) ScriptNotFound(method, path string, count int) {
 	s.notFound[method+" "+path] = count
 }
 
+// ScriptNotFoundOnRequest makes one absolute request ordinal for an exact
+// method/path return 404. It allows pagination tests to fail page N without
+// failing the entry request for the listing resource.
+func (s *Server) ScriptNotFoundOnRequest(
+	method string,
+	path string,
+	requestNumber int,
+) {
+	if requestNumber <= 0 {
+		panic("not-found request number must be positive")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := method + " " + path
+	if s.notFoundAt[key] == nil {
+		s.notFoundAt[key] = make(map[int]struct{})
+	}
+	s.notFoundAt[key][requestNumber] = struct{}{}
+}
+
 func (s *Server) RequestCount(method, path string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.requestCounts[method+" "+path]
+}
+
+// NotModifiedCount reports conditional requests satisfied with a 304.
+func (s *Server) NotModifiedCount(method, path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.notModified[method+" "+path]
 }
 
 // SetFixture swaps the served state; tests use this to script scenarios.
@@ -1526,6 +1563,9 @@ func (s *Server) writeConditionalJSON(
 	etag := fmt.Sprintf(`"%x"`, sum[:16])
 	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
+		s.mu.Lock()
+		s.notModified[r.Method+" "+r.URL.Path]++
+		s.mu.Unlock()
 		if scripted, _ := r.Context().Value(scriptedRateKey{}).(bool); !scripted {
 			rate := s.refund(resource, 1)
 			setRateHeaders(w.Header(), rate)

@@ -256,6 +256,7 @@ WITH batch AS (
     FROM webhook_deliveries AS candidate
     WHERE candidate.received_at < sqlc.arg(cutoff)
       AND candidate.raw_body IS NOT NULL
+      AND candidate.status = 'processed'
     ORDER BY candidate.received_at, candidate.delivery_guid
     LIMIT sqlc.arg(batch_size)
     FOR UPDATE SKIP LOCKED

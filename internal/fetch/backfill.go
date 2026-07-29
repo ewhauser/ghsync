@@ -308,6 +308,7 @@ func (h *Handler) BackfillRepoPage(
 			return fmt.Errorf("read pull request high-water: %w", err)
 		}
 		seen := make(map[int]gh.PullRequest)
+		etags := make(map[int]string)
 		childQueue := cursor.QueueName
 		if len(highPulls) > 0 {
 			highWater := highPulls[0].GetNumber()
@@ -350,6 +351,7 @@ func (h *Handler) BackfillRepoPage(
 							added++
 						}
 						seen[number] = pull
+						etags[number] = response.ETag
 					}
 					if response.NextPage == 0 {
 						break
@@ -381,7 +383,7 @@ func (h *Handler) BackfillRepoPage(
 			records := pullRecordsFromList(
 				repository,
 				pulls,
-				"",
+				etags,
 				source,
 				time.Now(),
 			)

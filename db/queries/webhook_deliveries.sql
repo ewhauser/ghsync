@@ -51,9 +51,11 @@ LIMIT sqlc.arg(result_limit);
 
 -- name: RequeueParkedWebhookDeliveries :execrows
 -- C-I5: replay is deliberately bounded to an explicit GUID set or one
--- event/error signature. There is no unscoped "all parked" path.
-WITH candidates AS (
-    SELECT delivery_guid
+-- event/error signature. Payload-pruned deliveries remain parked and receive
+-- an explicit refusal reason; an explicit-GUID CLI replay consequently fails
+-- its selected-vs-requeued count check instead of dispatching a nil body.
+WITH selected AS MATERIALIZED (
+    SELECT delivery_guid, raw_body, payload_pruned_at
     FROM webhook_deliveries
     WHERE status = 'parked'
       AND (
@@ -77,6 +79,32 @@ WITH candidates AS (
     ORDER BY received_at, delivery_guid
     LIMIT 100
     FOR UPDATE SKIP LOCKED
+),
+refused AS (
+    UPDATE webhook_deliveries AS delivery
+    SET last_error = format(
+        'operator requeue refused at %s: payload unavailable%s; prior error: %s',
+        clock_timestamp(),
+        CASE
+            WHEN selected.payload_pruned_at IS NOT NULL
+            THEN format(' (pruned at %s)', selected.payload_pruned_at)
+            ELSE ' (raw body is null)'
+        END,
+        COALESCE(delivery.last_error, '<none>')
+    )
+    FROM selected
+    WHERE delivery.delivery_guid = selected.delivery_guid
+      AND (
+          selected.payload_pruned_at IS NOT NULL
+          OR selected.raw_body IS NULL
+      )
+    RETURNING delivery.delivery_guid
+),
+candidates AS (
+    SELECT delivery_guid
+    FROM selected
+    WHERE payload_pruned_at IS NULL
+      AND raw_body IS NOT NULL
 )
 UPDATE webhook_deliveries AS delivery
 SET status = 'pending',
@@ -88,4 +116,5 @@ SET status = 'pending',
         COALESCE(delivery.last_error, '<none>')
     )
 FROM candidates
-WHERE delivery.delivery_guid = candidates.delivery_guid;
+WHERE delivery.delivery_guid = candidates.delivery_guid
+  AND (SELECT count(*) FROM refused) >= 0;

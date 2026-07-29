@@ -538,10 +538,18 @@ func (h *Handler) RefreshChecks(
 	if err != nil {
 		return err
 	}
+	metadata, err := h.writer.ChecksMetadata(ctx, key.Repo, key.Value)
+	if err != nil {
+		return fmt.Errorf("read checks ETag: %w", err)
+	}
 	var all []gh.CheckRun
 	page := 1
-	var etag string
+	etag := metadata.ETag
 	for {
+		conditionalETag := ""
+		if page == 1 {
+			conditionalETag = etag
+		}
 		runs, response, fetchErr := h.rest.ListCheckRuns(
 			ctx,
 			class,
@@ -549,17 +557,43 @@ func (h *Handler) RefreshChecks(
 			repoName,
 			key.Value,
 			gh.ListCheckRunsOptions{PerPage: 100, Page: page},
-			"",
+			conditionalETag,
 		)
 		if isNotFound(fetchErr) {
-			all = nil
-			break
+			if page == 1 {
+				all = nil
+				etag = ""
+				break
+			}
+			return fmt.Errorf(
+				"fetch checks %s page %d: listing returned 404 after page 1",
+				requestKey(key),
+				page,
+			)
 		}
 		if fetchErr != nil {
 			return fmt.Errorf(
-				"fetch checks %s: %w",
+				"fetch checks %s page %d: %w",
 				requestKey(key),
+				page,
 				fetchErr,
+			)
+		}
+		if response.NotModified {
+			if page != 1 {
+				return fmt.Errorf(
+					"fetch checks %s page %d: unexpected 304",
+					requestKey(key),
+					page,
+				)
+			}
+			return h.writer.TouchChecks(
+				ctx,
+				observation,
+				repository,
+				key.Value,
+				startedAt,
+				etag,
 			)
 		}
 		if page == 1 {

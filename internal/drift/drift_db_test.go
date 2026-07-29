@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
 
 	"github.com/acme/frontier/internal/budget"
 	"github.com/acme/frontier/internal/fakegithub"
@@ -44,6 +45,366 @@ func (o *findingObserver) Divergence(
 	o.mu.Lock()
 	o.findings = append(o.findings, finding)
 	o.mu.Unlock()
+}
+
+type driftHarness struct {
+	pool        *pgxpool.Pool
+	fake        *fakegithub.Server
+	fixture     fakegithub.Fixture
+	service     *Service
+	riverClient *river.Client[pgx.Tx]
+}
+
+func newReadyDriftHarness(t *testing.T) *driftHarness {
+	t.Helper()
+	pool := driftTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake := fakegithub.New(fixture, "drift-secret")
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	gate := budget.New(server.Client(), budget.Options{})
+	rest, err := gh.NewRESTClient(
+		server.URL,
+		gate,
+		gh.StaticToken("token"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphQL, err := gh.NewGraphQLClient(
+		server.URL,
+		gate,
+		gh.StaticToken("token"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := fetch.New(fetch.Options{
+		Pool:           pool,
+		REST:           rest,
+		GraphQL:        graphQL,
+		InstallationID: 1,
+		OrgID:          1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(Options{
+		Pool:    pool,
+		REST:    rest,
+		GraphQL: graphQL,
+		Config: Config{
+			InstallationID:     1,
+			Period:             time.Hour,
+			SampleSize:         100,
+			PageSize:           100,
+			ResolvedRetention:  30 * 24 * time.Hour,
+			RetentionBatchSize: 100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	riverClient, err := queue.NewClient(
+		pool,
+		queue.WithRefreshHandler(handler),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.SetRiverClient(riverClient)
+	service.SetRiverClient(riverClient)
+	runCtx, cancel := context.WithCancel(context.Background())
+	if err := riverClient.Start(runCtx); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer stopCancel()
+		_ = riverClient.StopAndCancel(stopCtx)
+	})
+	ctx := context.Background()
+	for _, request := range []func() error{
+		func() error {
+			return handler.ResolveStackMembership(
+				ctx,
+				queue.RefreshRequest{
+					Args: queue.NewResolveStackMembershipArgs(
+						"pr:acme/monolith:4812",
+					).RefreshArgs,
+					Queue: queue.QueueSweep,
+				},
+			)
+		},
+		func() error {
+			return handler.RefreshPR(
+				ctx,
+				queue.RefreshRequest{
+					Args: queue.NewRefreshPRArgs(
+						"pr:acme/monolith:4812",
+					).RefreshArgs,
+					Queue: queue.QueueSweep,
+				},
+			)
+		},
+		func() error {
+			return handler.RefreshStack(
+				ctx,
+				queue.RefreshRequest{
+					Args: queue.NewRefreshStackArgs(
+						"stack:acme/monolith:142",
+					).RefreshArgs,
+					Queue: queue.QueueSweep,
+				},
+			)
+		},
+		func() error {
+			return handler.RefreshChecks(
+				ctx,
+				queue.RefreshRequest{
+					Args: queue.NewRefreshChecksArgs(
+						"checks:acme/monolith:8f31c2d",
+					).RefreshArgs,
+					Queue: queue.QueueSweep,
+				},
+			)
+		},
+		func() error {
+			return handler.RefreshRepoRules(
+				ctx,
+				queue.RefreshRequest{
+					Args: queue.NewRefreshRepoRulesArgs(
+						"repo_rules:acme/monolith:rules",
+					).RefreshArgs,
+					Queue: queue.QueueSweep,
+				},
+			)
+		},
+	} {
+		if err := request(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForCacheProducers(t, pool)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO installation_backfill_cursors (
+		    installation_id, phase, page, completed_at
+		) VALUES (1, 'done', 1, clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+	return &driftHarness{
+		pool:        pool,
+		fake:        fake,
+		fixture:     fixture,
+		service:     service,
+		riverClient: riverClient,
+	}
+}
+
+func (h *driftHarness) divergePullRequest() {
+	h.fixture.PullRequests[1].Title = "mutated behind cache"
+	h.fixture.PullRequests[1].UpdatedAt = h.fixture.PullRequests[1].
+		UpdatedAt.Add(time.Minute)
+	h.fake.SetFixture(h.fixture)
+}
+
+func TestDetectSamplesWithUnrelatedBusySweepQueue(t *testing.T) {
+	harness := newReadyDriftHarness(t)
+	harness.divergePullRequest()
+	ctx := context.Background()
+	job, err := harness.riverClient.Insert(
+		ctx,
+		queue.NewRefreshPRArgs("pr:acme/unrelated:9999"),
+		queue.NewRefreshInsertOptsForQueue(
+			queue.QueueSweep,
+			time.Now().Add(time.Hour),
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 ||
+		findings[0].EntityKey != "pr:acme/monolith:4812" {
+		t.Fatalf(
+			"drift findings with unrelated queued sweep = %+v, want PR divergence",
+			findings,
+		)
+	}
+	var jobState string
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT state FROM river_job WHERE id = $1
+	`, job.Job.ID).Scan(&jobState); err != nil {
+		t.Fatal(err)
+	}
+	if jobState != "scheduled" {
+		t.Fatalf("unrelated sweep job state = %q, want scheduled", jobState)
+	}
+	var successes, samples int64
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT success_count, sample_count
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'drift'
+		  AND operation = 'detector'
+	`).Scan(&successes, &samples); err != nil {
+		t.Fatal(err)
+	}
+	if successes != 1 || samples == 0 {
+		t.Fatalf(
+			"busy-queue heartbeat successes=%d samples=%d, want one sampled pass",
+			successes,
+			samples,
+		)
+	}
+}
+
+func TestDetectSkipsSampleWithOutstandingGeneration(t *testing.T) {
+	harness := newReadyDriftHarness(t)
+	harness.divergePullRequest()
+	ctx := context.Background()
+	if _, err := harness.pool.Exec(ctx, `
+		INSERT INTO refresh_intent_generations (
+		    kind, refresh_key, generation, completed_generation
+		) VALUES ('refresh_pr', 'pr:acme/monolith:4812', 1, 0)
+		ON CONFLICT (kind, refresh_key) DO UPDATE
+		SET generation = refresh_intent_generations.generation + 1
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf(
+			"findings with sampled-key refresh outstanding = %+v, want none",
+			findings,
+		)
+	}
+	var findingCount int64
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM drift_findings
+		WHERE entity_key = 'pr:acme/monolith:4812'
+	`).Scan(&findingCount); err != nil {
+		t.Fatal(err)
+	}
+	if findingCount != 0 {
+		t.Fatalf("false PR drift findings = %d, want 0", findingCount)
+	}
+	var successes, inspected, skipped int64
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT success_count, sample_count
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'drift'
+		  AND operation = 'detector'
+	`).Scan(&successes, &inspected); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT sample_count
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'drift'
+		  AND operation = $1
+	`, skippedSamplesOperation).Scan(&skipped); err != nil {
+		t.Fatal(err)
+	}
+	if successes != 1 || inspected == 0 || skipped == 0 {
+		t.Fatalf(
+			"same-key heartbeat successes=%d inspected=%d skipped=%d",
+			successes,
+			inspected,
+			skipped,
+		)
+	}
+}
+
+func TestDetectRecordsZeroSampleHeartbeat(t *testing.T) {
+	pool := driftTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	server := httptest.NewServer(fakegithub.New(fixture, "drift-secret"))
+	defer server.Close()
+	gate := budget.New(server.Client(), budget.Options{})
+	rest, err := gh.NewRESTClient(
+		server.URL,
+		gate,
+		gh.StaticToken("token"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphQL, err := gh.NewGraphQLClient(
+		server.URL,
+		gate,
+		gh.StaticToken("token"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(Options{
+		Pool:    pool,
+		REST:    rest,
+		GraphQL: graphQL,
+		Config: Config{
+			InstallationID:     1,
+			Period:             time.Hour,
+			SampleSize:         len(driftEntityKinds),
+			PageSize:           100,
+			ResolvedRetention:  30 * 24 * time.Hour,
+			RetentionBatchSize: 100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Detect(
+		context.Background(),
+		DetectArgs{
+			InstallationID: 1,
+			SampleSize:     len(driftEntityKinds),
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	var successes, samples int64
+	var sampledAt bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT success_count, sample_count, last_sample_at IS NOT NULL
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'drift'
+		  AND operation = 'detector'
+	`).Scan(&successes, &samples, &sampledAt); err != nil {
+		t.Fatal(err)
+	}
+	if successes != 1 || samples != 0 || sampledAt {
+		t.Fatalf(
+			"zero-sample heartbeat successes=%d samples=%d sampled_at=%v",
+			successes,
+			samples,
+			sampledAt,
+		)
+	}
 }
 
 func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
@@ -187,18 +548,22 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	} else if len(findings) != 0 {
 		t.Fatalf("pre-backfill drift findings = %d, want 0", len(findings))
 	}
-	var preseedHeartbeats int64
+	var preseedHeartbeats, preseedSamples int64
 	if err := pool.QueryRow(ctx, `
-		SELECT count(*)
+		SELECT count(*), COALESCE(sum(sample_count), 0)
 		FROM operation_heartbeats
 		WHERE installation_id = 1
 		  AND component = 'drift'
 		  AND operation = 'detector'
-	`).Scan(&preseedHeartbeats); err != nil {
+	`).Scan(&preseedHeartbeats, &preseedSamples); err != nil {
 		t.Fatal(err)
 	}
-	if preseedHeartbeats != 0 {
-		t.Fatal("pre-backfill drift skip was recorded as a successful pass")
+	if preseedHeartbeats != 1 || preseedSamples == 0 {
+		t.Fatalf(
+			"pre-backfill drift heartbeat rows=%d samples=%d, want one sampled pass",
+			preseedHeartbeats,
+			preseedSamples,
+		)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO installation_backfill_cursors (
@@ -222,7 +587,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	if err != nil {
 		t.Fatal(err)
 	}
-	staleSampleFinding, recorded, err := service.inspectSample(
+	staleSampleFinding, recorded, skipped, err := service.inspectSample(
 		ctx,
 		driftSample{
 			EntityKind:    current.EntityKind,
@@ -234,6 +599,9 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if skipped {
+		t.Fatal("stale sample was unexpectedly skipped")
 	}
 	if recorded {
 		t.Fatalf(

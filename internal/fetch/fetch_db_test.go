@@ -860,6 +860,274 @@ func TestRepositoryRulesLockedCASDirtyEventAndConditionalRecheck(t *testing.T) {
 	}
 }
 
+func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	prKey := "pr:acme/monolith:4812"
+	resolveRequest := queue.RefreshRequest{
+		Args:  queue.NewResolveStackMembershipArgs(prKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+	beforeGraphQL, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeGraphQL.Etag == "" {
+		t.Fatal("REST PR refresh stored an empty ETag")
+	}
+	if err := handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args:  queue.NewRefreshPRArgs(prKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	afterGraphQL, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGraphQL.Etag != beforeGraphQL.Etag {
+		t.Fatalf(
+			"GraphQL gang changed PR ETag %q -> %q",
+			beforeGraphQL.Etag,
+			afterGraphQL.Etag,
+		)
+	}
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+	prPath := "/repos/acme/monolith/pulls/4812"
+	if got := fake.NotModifiedCount(http.MethodGet, prPath); got != 1 {
+		t.Fatalf("conditional PR 304s = %d, want 1", got)
+	}
+
+	checksKey := "checks:acme/monolith:8f31c2d"
+	checksRequest := queue.RefreshRequest{
+		Args:  queue.NewRefreshChecksArgs(checksKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.RefreshChecks(ctx, checksRequest); err != nil {
+		t.Fatal(err)
+	}
+	var runCount, emptyETags, historyBefore, eventsBefore int
+	var syncedBefore, checkedBefore time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE etag = ''),
+		       max(synced_at),
+		       max(last_checked_at)
+		FROM check_runs
+		WHERE head_sha = '8f31c2d'
+	`).Scan(
+		&runCount,
+		&emptyETags,
+		&syncedBefore,
+		&checkedBefore,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if runCount != 2 || emptyETags != 0 {
+		t.Fatalf(
+			"stored checks rows=%d empty_etags=%d, want 2/0",
+			runCount,
+			emptyETags,
+		)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM check_history WHERE head_sha = '8f31c2d'
+	`).Scan(&historyBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM change_events
+		WHERE kind = 'checks.changed'
+		  AND entity_key = 'checks:1:1001:8f31c2d'
+	`).Scan(&eventsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.RefreshChecks(ctx, checksRequest); err != nil {
+		t.Fatal(err)
+	}
+	checksPath := "/repos/acme/monolith/commits/8f31c2d/check-runs"
+	if got := fake.NotModifiedCount(http.MethodGet, checksPath); got != 1 {
+		t.Fatalf("conditional checks 304s = %d, want 1", got)
+	}
+	var historyAfter, eventsAfter, tombstoned int
+	var syncedAfter, checkedAfter time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT max(synced_at),
+		       max(last_checked_at),
+		       count(*) FILTER (WHERE tombstoned_at IS NOT NULL)
+		FROM check_runs
+		WHERE head_sha = '8f31c2d'
+	`).Scan(&syncedAfter, &checkedAfter, &tombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM check_history WHERE head_sha = '8f31c2d'
+	`).Scan(&historyAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM change_events
+		WHERE kind = 'checks.changed'
+		  AND entity_key = 'checks:1:1001:8f31c2d'
+	`).Scan(&eventsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !syncedAfter.Equal(syncedBefore) ||
+		!checkedAfter.After(checkedBefore) ||
+		historyAfter != historyBefore ||
+		eventsAfter != eventsBefore ||
+		tombstoned != 0 {
+		t.Fatalf(
+			"checks 304 synced=%s->%s checked=%s->%s history=%d->%d events=%d->%d tombstoned=%d",
+			syncedBefore,
+			syncedAfter,
+			checkedBefore,
+			checkedAfter,
+			historyBefore,
+			historyAfter,
+			eventsBefore,
+			eventsAfter,
+			tombstoned,
+		)
+	}
+}
+
+func TestChecksMidPagination404DoesNotReplaceOrTombstone(t *testing.T) {
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	template := fixture.CheckRuns[0]
+	fixture.CheckRuns = make([]fakegithub.CheckRun, 101)
+	for index := range fixture.CheckRuns {
+		run := template
+		run.ID = int64(100_000 + index)
+		run.NodeID = fmt.Sprintf("CR_page_%03d", index)
+		run.Name = fmt.Sprintf("check-%03d", index)
+		fixture.CheckRuns[index] = run
+	}
+	fake, server, handler, _ := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	ctx := context.Background()
+	request := queue.RefreshRequest{
+		Args: queue.NewRefreshChecksArgs(
+			"checks:acme/monolith:8f31c2d",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.RefreshChecks(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	path := "/repos/acme/monolith/commits/8f31c2d/check-runs"
+	baseline := fake.RequestCount(http.MethodGet, path)
+	if baseline != 2 {
+		t.Fatalf("initial checks pages = %d, want 2", baseline)
+	}
+	fixture.CheckRuns[0].Status = "in_progress"
+	fixture.CheckRuns[0].Conclusion = ""
+	fixture.CheckRuns[0].CompletedAt = nil
+	fake.SetFixture(fixture)
+	fake.ScriptNotFoundOnRequest(
+		http.MethodGet,
+		path,
+		baseline+2,
+	)
+	err := handler.RefreshChecks(ctx, request)
+	if err == nil ||
+		!strings.Contains(err.Error(), "page 2") ||
+		!strings.Contains(err.Error(), "404") {
+		t.Fatalf("mid-pagination 404 error = %v", err)
+	}
+	var total, live, tombstoned, history int
+	var firstStatus string
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE tombstoned_at IS NULL),
+		       count(*) FILTER (WHERE tombstoned_at IS NOT NULL)
+		FROM check_runs
+		WHERE head_sha = '8f31c2d'
+	`).Scan(&total, &live, &tombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT status FROM check_runs WHERE gh_id = 100000
+	`).Scan(&firstStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM check_history WHERE head_sha = '8f31c2d'
+	`).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if total != 101 ||
+		live != 101 ||
+		tombstoned != 0 ||
+		firstStatus != "completed" ||
+		history != 101 {
+		t.Fatalf(
+			"post-404 checks total/live/tombstoned=%d/%d/%d first_status=%q history=%d",
+			total,
+			live,
+			tombstoned,
+			firstStatus,
+			history,
+		)
+	}
+
+	fake.ScriptNotFoundOnRequest(
+		http.MethodGet,
+		path,
+		fake.RequestCount(http.MethodGet, path)+1,
+	)
+	if err := handler.RefreshChecks(ctx, request); err != nil {
+		t.Fatalf("entry-listing 404: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE tombstoned_at IS NOT NULL)
+		FROM check_runs
+		WHERE head_sha = '8f31c2d'
+	`).Scan(&tombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if tombstoned != 101 {
+		t.Fatalf(
+			"entry-listing 404 tombstoned %d checks, want 101",
+			tombstoned,
+		)
+	}
+}
+
 func TestBackfillResumesFromDurableCursor(t *testing.T) {
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
@@ -955,6 +1223,22 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 	}
 	if refreshes != 5 {
 		t.Fatalf("backfill refresh jobs = %d, want 1 stack + 4 open PRs", refreshes)
+	}
+	var backfilledPRs, emptyPRETags int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE pull_requests.etag = '')
+		FROM pull_requests
+		JOIN repos ON repos.id = pull_requests.repo_id
+		WHERE repos.full_name = 'acme/monolith'
+	`).Scan(&backfilledPRs, &emptyPRETags); err != nil {
+		t.Fatal(err)
+	}
+	if backfilledPRs != 5 || emptyPRETags != 0 {
+		t.Fatalf(
+			"backfilled PR rows/empty ETags = %d/%d, want 5/0",
+			backfilledPRs,
+			emptyPRETags,
+		)
 	}
 	var pendingChildren int
 	if err := pool.QueryRow(ctx, `

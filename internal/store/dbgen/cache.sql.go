@@ -83,6 +83,49 @@ func (q *Queries) AppendAcceptedCheckHistory(ctx context.Context, arg AppendAcce
 	return err
 }
 
+const getCheckRunsFetchMetadata = `-- name: GetCheckRunsFetchMetadata :one
+SELECT repos.gh_id AS repo_gh_id, repos.installation_id,
+       repos.full_name AS repo_full_name,
+       COALESCE((
+           SELECT check_runs.etag
+           FROM check_runs
+           WHERE check_runs.repo_id = repos.id
+             AND check_runs.head_sha = $1
+           ORDER BY check_runs.last_checked_at DESC, check_runs.gh_id
+           LIMIT 1
+       ), ''::text)::text AS etag
+FROM repos
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+WHERE repo_aliases.full_name = $2
+`
+
+type GetCheckRunsFetchMetadataParams struct {
+	HeadSha      string
+	RepoFullName string
+}
+
+type GetCheckRunsFetchMetadataRow struct {
+	RepoGhID       int64
+	InstallationID int64
+	RepoFullName   string
+	Etag           string
+}
+
+// C-B4: the first-page validator is shared by every check row in one
+// repository/head-SHA listing. Prefer the newest observation when rows span
+// multiple refreshes, including a fully tombstoned listing.
+func (q *Queries) GetCheckRunsFetchMetadata(ctx context.Context, arg GetCheckRunsFetchMetadataParams) (GetCheckRunsFetchMetadataRow, error) {
+	row := q.db.QueryRow(ctx, getCheckRunsFetchMetadata, arg.HeadSha, arg.RepoFullName)
+	var i GetCheckRunsFetchMetadataRow
+	err := row.Scan(
+		&i.RepoGhID,
+		&i.InstallationID,
+		&i.RepoFullName,
+		&i.Etag,
+	)
+	return i, err
+}
+
 const getPullRequestByIdentity = `-- name: GetPullRequestByIdentity :one
 SELECT pull_requests.id, pull_requests.repo_id, pull_requests.gh_id, pull_requests.node_id, pull_requests.number, pull_requests.title, pull_requests.state, pull_requests.draft, pull_requests.author_login, pull_requests.head_ref, pull_requests.head_sha, pull_requests.base_ref, pull_requests.base_sha, pull_requests.review_decision, pull_requests.mergeable_state, pull_requests.stack_number, pull_requests.stack_position, pull_requests.gh_updated_at, pull_requests.synced_at, pull_requests.etag, pull_requests.sync_source, pull_requests.tombstoned_at, pull_requests.last_checked_at, pull_requests.display_until, repos.full_name AS repo_full_name
 FROM pull_requests
@@ -1323,19 +1366,27 @@ func (q *Queries) TombstoneStack(ctx context.Context, arg TombstoneStackParams) 
 
 const touchCheckRunsCheckedAt = `-- name: TouchCheckRunsCheckedAt :exec
 UPDATE check_runs
-SET last_checked_at = GREATEST(last_checked_at, $1)
-WHERE repo_id = $2
-  AND head_sha = $3
+SET last_checked_at = GREATEST(last_checked_at, $1),
+    etag = CASE WHEN $2::text = '' THEN etag
+                ELSE $2::text END
+WHERE repo_id = $3
+  AND head_sha = $4
 `
 
 type TouchCheckRunsCheckedAtParams struct {
 	CheckedAt pgtype.Timestamptz
+	Etag      string
 	RepoID    int64
 	HeadSha   string
 }
 
 func (q *Queries) TouchCheckRunsCheckedAt(ctx context.Context, arg TouchCheckRunsCheckedAtParams) error {
-	_, err := q.db.Exec(ctx, touchCheckRunsCheckedAt, arg.CheckedAt, arg.RepoID, arg.HeadSha)
+	_, err := q.db.Exec(ctx, touchCheckRunsCheckedAt,
+		arg.CheckedAt,
+		arg.Etag,
+		arg.RepoID,
+		arg.HeadSha,
+	)
 	return err
 }
 
@@ -1493,7 +1544,10 @@ SET gh_id = EXCLUDED.gh_id,
     gh_updated_at = EXCLUDED.gh_updated_at,
     synced_at = EXCLUDED.synced_at,
     last_checked_at = EXCLUDED.last_checked_at,
-    etag = EXCLUDED.etag,
+    etag = CASE
+        WHEN EXCLUDED.etag = '' THEN pull_requests.etag
+        ELSE EXCLUDED.etag
+    END,
     sync_source = EXCLUDED.sync_source,
     tombstoned_at = NULL,
     display_until = CASE

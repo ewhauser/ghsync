@@ -167,6 +167,7 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 		nil,
 	)
 	defer checks.Body.Close()
+	checksETag := checks.Header.Get("ETag")
 	var payload struct {
 		CheckRuns []CheckRun `json:"check_runs"`
 	}
@@ -175,6 +176,25 @@ func TestSinglePullETagChecksAndScripted404(t *testing.T) {
 	}
 	if len(payload.CheckRuns) != 2 {
 		t.Fatalf("check runs = %d, want 2", len(payload.CheckRuns))
+	}
+	checksPath := "/repos/acme/monolith/commits/8f31c2d/check-runs"
+	request = httptest.NewRequest(
+		http.MethodGet,
+		"http://fake.test"+checksPath,
+		nil,
+	)
+	request.Header.Set("If-None-Match", checksETag)
+	recorder = httptest.NewRecorder()
+	fake.ServeHTTP(recorder, request)
+	notModified = recorder.Result()
+	notModified.Body.Close()
+	if notModified.StatusCode != http.StatusNotModified ||
+		fake.NotModifiedCount(http.MethodGet, checksPath) != 1 {
+		t.Fatalf(
+			"conditional checks status=%d count=%d, want 304/1",
+			notModified.StatusCode,
+			fake.NotModifiedCount(http.MethodGet, checksPath),
+		)
 	}
 
 	fake.ScriptNotFound(http.MethodGet, path, 1)

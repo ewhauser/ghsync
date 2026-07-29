@@ -159,6 +159,7 @@ func pullRecordFromNode(
 		GitHubUpdatedAt: node.UpdatedAt,
 		ReviewThreads:   threads,
 		ThreadsKnown:    true,
+		ETag:            item.metadata.ETag,
 		SyncedAt:        item.startedAt,
 		Source:          item.source,
 	}
@@ -210,12 +211,16 @@ func stackRecordFromREST(
 func pullRecordsFromList(
 	repository store.RepositoryRecord,
 	pulls []gh.PullRequest,
-	etag string,
+	etags map[int]string,
 	source store.SyncSource,
 	syncedAt time.Time,
 ) []store.PullRequestRecord {
 	records := make([]store.PullRequestRecord, 0, len(pulls))
 	for index := range pulls {
+		etag := ""
+		if etags != nil {
+			etag = etags[pulls[index].GetNumber()]
+		}
 		records = append(
 			records,
 			pullRecordFromREST(
