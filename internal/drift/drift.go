@@ -239,6 +239,36 @@ func (s *Service) Detect(
 			len(driftEntityKinds),
 		)
 	}
+	// C-O3 measures divergence of a SETTLED cache. While installation
+	// backfill is still seeding, half-populated entities legitimately
+	// differ from upstream; sampling then records noise findings that
+	// outlive the seed (observed as instant soak failures on slow CI
+	// runners). Skip the pass — with a heartbeat — until backfill is done.
+	var backfillDone bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM installation_backfill_cursors
+			WHERE installation_id = $1
+			  AND phase = 'done'
+			  AND completed_at IS NOT NULL
+		)
+	`, args.InstallationID).Scan(&backfillDone); err != nil {
+		return nil, fmt.Errorf("check backfill completion: %w", err)
+	}
+	if !backfillDone {
+		if err := opsstate.RecordSuccessN(
+			ctx,
+			s.pool,
+			args.InstallationID,
+			"drift",
+			"detector_skipped",
+			1,
+		); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 	queries := dbgen.New(s.pool)
 	findings := make([]dbgen.DriftFinding, 0)
 	var inspected int64

@@ -195,6 +195,7 @@ func newReadyDriftHarness(t *testing.T) *driftHarness {
 		INSERT INTO installation_backfill_cursors (
 		    installation_id, phase, page, completed_at
 		) VALUES (1, 'done', 1, clock_timestamp())
+		ON CONFLICT (installation_id) DO NOTHING
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -569,6 +570,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 		INSERT INTO installation_backfill_cursors (
 		    installation_id, phase, page, completed_at
 		) VALUES (1, 'done', 1, clock_timestamp())
+		ON CONFLICT (installation_id) DO NOTHING
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -918,5 +920,13 @@ func driftTestDatabase(t *testing.T) *pgxpool.Pool {
 		}
 		admin.Close()
 	})
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO installation_backfill_cursors (
+		    installation_id, phase, page, completed_at
+		) VALUES (1, 'done', 1, clock_timestamp())
+		ON CONFLICT (installation_id) DO NOTHING
+	`); err != nil {
+		t.Fatal(err)
+	}
 	return pool
 }
