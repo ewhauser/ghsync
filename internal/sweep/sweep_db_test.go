@@ -23,6 +23,7 @@ import (
 	"github.com/acme/frontier/internal/fetch"
 	"github.com/acme/frontier/internal/gh"
 	"github.com/acme/frontier/internal/ingress"
+	"github.com/acme/frontier/internal/outbox"
 	"github.com/acme/frontier/internal/queue"
 	"github.com/acme/frontier/internal/store"
 	"github.com/acme/frontier/internal/store/dbgen"
@@ -1048,11 +1049,22 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 		}
 	}
 	h.seedCheckHistory(t, cutoff)
-	if _, err := h.pool.Exec(ctx, `
-		INSERT INTO change_events (
-		    stream, kind, entity_key, occurred_at, payload
-		) VALUES ('entities', 'old', 'old', $1, '{}')
-	`, cutoff.Add(-time.Hour)); err != nil {
+	eventTx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eventTx.Rollback(context.Background()) //nolint:errcheck
+	if err := outbox.AcquireWriterFence(ctx, eventTx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eventTx.Exec(ctx, `
+			INSERT INTO change_events (
+			    stream, kind, entity_key, occurred_at, payload
+			) VALUES ('entities', 'old', 'old', $1, '{}')
+		`, cutoff.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := eventTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	payloads, history, err := h.service.Prune(ctx)

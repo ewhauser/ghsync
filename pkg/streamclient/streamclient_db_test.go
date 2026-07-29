@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,8 +14,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/store"
+	"github.com/acme/frontier/internal/outbox"
 	streammaint "github.com/acme/frontier/internal/stream"
+	"github.com/acme/frontier/internal/testdb"
 )
 
 var streamTestID atomic.Int64
@@ -58,28 +60,23 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 
 	watermarker := newTestWatermarker(t, pool)
 	defer watermarker.Close(context.Background()) //nolint:errcheck
-	for range 4 {
+	stepDone := make(chan streammaint.WatermarkProgress, 1)
+	stepErr := make(chan error, 1)
+	go func() {
 		progress, err := watermarker.Step(ctx)
-		if err != nil {
-			if errors.Is(err, streammaint.ErrLeaseHeld) {
-				time.Sleep(20 * time.Millisecond)
-				continue
-			}
-			t.Fatal(err)
-		}
-		if progress.SafeSeq >= largeSeq {
-			t.Fatalf(
-				"C-S2 watermark crossed delayed seq: safe=%d delayed=%d",
-				progress.SafeSeq,
-				smallSeq,
-			)
-		}
-	}
+		stepDone <- progress
+		stepErr <- err
+	}()
 
 	tailCtx, stopTail := context.WithCancel(ctx)
 	defer stopTail()
 	delivered := make(chan int64, 4)
 	tailErr := make(chan error, 1)
+	pageAttempted := make(chan struct{})
+	var pageAttemptOnce sync.Once
+	client.testHooks.afterHorizon = func() {
+		pageAttemptOnce.Do(func() { close(pageAttempted) })
+	}
 	go func() {
 		tailErr <- client.Tail(
 			tailCtx,
@@ -91,7 +88,7 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 			},
 		)
 	}()
-	time.Sleep(75 * time.Millisecond)
+	<-pageAttempted
 	select {
 	case seq := <-delivered:
 		t.Fatalf("tailer exposed seq %d while smaller seq was in-flight", seq)
@@ -104,7 +101,16 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 	if err := smallTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	advanceThrough(t, ctx, watermarker, largeSeq)
+	if err := <-stepErr; err != nil {
+		t.Fatal(err)
+	}
+	if progress := <-stepDone; progress.SafeSeq < largeSeq {
+		t.Fatalf(
+			"watermark after writer fence = %d, want at least %d",
+			progress.SafeSeq,
+			largeSeq,
+		)
+	}
 	waitForCursor(t, pool, consumer, streamName, largeSeq)
 	stopTail()
 	err = <-tailErr
@@ -117,6 +123,198 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 	}
 	if len(got) != 2 || got[0] != smallSeq || got[1] != largeSeq {
 		t.Fatalf("delivered = %v, want [%d %d]", got, smallSeq, largeSeq)
+	}
+}
+
+func TestRetentionCannotDeleteBetweenHorizonCheckAndPageSnapshot(
+	t *testing.T,
+) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("retention-snapshot")
+	consumer := uniqueStreamName("consumer")
+	client := newTestClient(t, pool, 10)
+	seq := insertCommittedEvent(
+		t,
+		ctx,
+		pool,
+		streamName,
+		"old",
+		time.Now().Add(-8*24*time.Hour),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	advanceThrough(t, ctx, watermarker, seq)
+
+	horizonRead := make(chan struct{})
+	releasePage := make(chan struct{})
+	var hookOnce sync.Once
+	client.testHooks.afterHorizon = func() {
+		hookOnce.Do(func() {
+			close(horizonRead)
+			<-releasePage
+		})
+	}
+	delivered := make(chan int64, 1)
+	pageResult := make(chan int, 1)
+	pageErr := make(chan error, 1)
+	go func() {
+		count, err := client.deliverPage(
+			ctx,
+			consumer,
+			streamName,
+			func(_ context.Context, _ pgx.Tx, event Event) error {
+				delivered <- event.Seq
+				return nil
+			},
+		)
+		pageResult <- count
+		pageErr <- err
+	}()
+	<-horizonRead
+
+	retention, err := streammaint.NewRetention(
+		pool,
+		streammaint.RetentionOptions{
+			Age:       7 * 24 * time.Hour,
+			Period:    time.Hour,
+			BatchSize: 10,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := retention.Prune(ctx); err != nil || deleted != 1 {
+		t.Fatalf("interleaved retention deleted=%d err=%v", deleted, err)
+	}
+	close(releasePage)
+	if err := <-pageErr; err != nil {
+		t.Fatal(err)
+	}
+	if count := <-pageResult; count != 1 {
+		t.Fatalf("snapshot page delivered %d events, want 1", count)
+	}
+	if got := <-delivered; got != seq {
+		t.Fatalf("snapshot page delivered seq %d, want %d", got, seq)
+	}
+	if cursor := readCursor(t, pool, consumer, streamName); cursor != seq {
+		t.Fatalf("cursor = %d, want delivered seq %d", cursor, seq)
+	}
+}
+
+func TestWatermarkIgnoresUnrelatedWriterAndLongBootstrapSnapshot(
+	t *testing.T,
+) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := newTestClient(t, pool, 10)
+
+	unrelated, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unrelated.Rollback(context.Background()) //nolint:errcheck
+	if _, err := unrelated.Exec(ctx, `
+		INSERT INTO consumer_cursors (consumer, stream, seq)
+		VALUES ($1, $2, 0)
+	`, uniqueStreamName("unrelated"), uniqueStreamName("unrelated")); err != nil {
+		t.Fatal(err)
+	}
+
+	bootstrap, err := client.Bootstrap(
+		ctx,
+		uniqueStreamName("bootstrap-consumer"),
+		uniqueStreamName("bootstrap-stream"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bootstrap.Tx.Rollback(context.Background()) //nolint:errcheck
+
+	streamName := uniqueStreamName("liveness")
+	seq := insertCommittedEvent(
+		t, ctx, pool, streamName, "committed", time.Now(),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	stepCtx, stopStep := context.WithTimeout(ctx, time.Second)
+	defer stopStep()
+	progress, err := watermarker.Step(stepCtx)
+	if err != nil {
+		t.Fatalf("watermark blocked on unrelated transaction/snapshot: %v", err)
+	}
+	if progress.SafeSeq < seq {
+		t.Fatalf("safe seq = %d, want at least %d", progress.SafeSeq, seq)
+	}
+}
+
+func TestTailRecoversAfterListenerDisconnectWhilePollingContinues(
+	t *testing.T,
+) {
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("listener")
+	consumer := uniqueStreamName("consumer")
+	client := newTestClient(t, pool, 10)
+	snapshot, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	listeners := make(chan uint32, 4)
+	client.testHooks.listenerConnected = func(pid uint32) { listeners <- pid }
+	tailCtx, stopTail := context.WithCancel(ctx)
+	tailErr := make(chan error, 1)
+	delivered := make(chan int64, 1)
+	go func() {
+		tailErr <- client.Tail(
+			tailCtx,
+			consumer,
+			streamName,
+			func(_ context.Context, _ pgx.Tx, event Event) error {
+				delivered <- event.Seq
+				return nil
+			},
+		)
+	}()
+	listenerPID := <-listeners
+	var terminated bool
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT pg_terminate_backend($1)`,
+		listenerPID,
+	).Scan(&terminated); err != nil {
+		t.Fatal(err)
+	}
+	if !terminated {
+		t.Fatalf("listener backend %d was not terminated", listenerPID)
+	}
+
+	seq := insertCommittedEvent(
+		t, ctx, pool, streamName, "after-disconnect", time.Now(),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck
+	advanceThrough(t, ctx, watermarker, seq)
+	select {
+	case got := <-delivered:
+		if got != seq {
+			t.Fatalf("delivered seq = %d, want %d", got, seq)
+		}
+	case err := <-tailErr:
+		t.Fatalf("tail stopped after listener disconnect: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	stopTail()
+	if err := <-tailErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("tail exit = %v", err)
 	}
 }
 
@@ -241,9 +439,11 @@ func TestRetentionResyncBootstrapConvergesWithoutDuplicateSeqApplication(
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO work_items (identity_key, org_id, payload, updated_at)
-		VALUES ($1, 1, '{"state":1}', clock_timestamp())
-	`, identity); err != nil {
+		INSERT INTO work_items (
+		    scope_key, identity_key, org_id, payload, updated_at
+		)
+		VALUES ($1, $2, 1, '{"state":1}', clock_timestamp())
+	`, "pr:1:1:1", identity); err != nil {
 		t.Fatal(err)
 	}
 	oldSeq := insertTestEvent(
@@ -471,6 +671,9 @@ func insertTestEvent(
 	occurredAt time.Time,
 ) int64 {
 	t.Helper()
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO change_events (
@@ -545,16 +748,12 @@ func streamTestDatabase(t *testing.T) *pgxpool.Pool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, url)
+	database, err := testdb.Open(ctx, url, "streamclient")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Migrate(ctx, pool); err != nil {
-		pool.Close()
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	t.Cleanup(database.Close)
+	return database.Pool
 }
 
 func uniqueStreamName(prefix string) string {

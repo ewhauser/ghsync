@@ -14,28 +14,34 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/acme/frontier/internal/outbox"
 )
 
 const (
 	defaultDirtyCap     = 500
 	defaultPollInterval = 500 * time.Millisecond
 	dirtyNotifyChannel  = "frontier_derivation_dirty"
-	workItemsStream     = "work_items"
-	workItemChangedKind = "work_item.changed"
 )
 
 // Deriver is the pure C-D1 seam. Implementations may inspect only Snapshot
 // and must perform no I/O.
 type Deriver interface {
-	Derive(Snapshot) []WorkItem
+	Derive(Snapshot) []ScopeResult
 }
 
 // NoopDeriver is the default M5 implementation. It proves the drain loop and
 // leaves classification to the future derivation project.
 type NoopDeriver struct{}
 
-// Derive returns no work items and performs no I/O.
-func (NoopDeriver) Derive(Snapshot) []WorkItem { return nil }
+// Derive returns one empty, scope-owned result per input and performs no I/O.
+func (NoopDeriver) Derive(snapshot Snapshot) []ScopeResult {
+	results := make([]ScopeResult, 0, len(snapshot.Scopes))
+	for _, scope := range snapshot.Scopes {
+		results = append(results, ScopeResult{ScopeKey: scope.ScopeKey})
+	}
+	return results
+}
 
 // Snapshot is one snapshot-consistent cache view for an entire claimed dirty
 // set (C-D2/C-P5).
@@ -59,17 +65,22 @@ type WorkItem struct {
 	Payload     json.RawMessage `json:"payload"`
 }
 
+// ScopeResult is the complete derived output owned by one claimed C-D2 scope.
+// Returning an empty WorkItems set removes every prior item for that scope.
+type ScopeResult struct {
+	ScopeKey  string     `json:"scope_key"`
+	WorkItems []WorkItem `json:"work_items"`
+}
+
 // StackIdentity returns the stable C-D3 identity for a repository stack.
-func StackIdentity(repositoryID int64, stackNumber int) string {
-	return "repo:" + strconv.FormatInt(repositoryID, 10) +
-		":stack:" + strconv.Itoa(stackNumber)
+func StackIdentity(repositoryGitHubID int64, stackNumber int) string {
+	return outbox.StackWorkItemKey(repositoryGitHubID, stackNumber)
 }
 
 // PullRequestIdentity returns the stable C-D3 identity for a loose pull
 // request.
-func PullRequestIdentity(repositoryID int64, pullNumber int) string {
-	return "repo:" + strconv.FormatInt(repositoryID, 10) +
-		":pr:" + strconv.Itoa(pullNumber)
+func PullRequestIdentity(repositoryGitHubID int64, pullNumber int) string {
+	return outbox.PullRequestWorkItemKey(repositoryGitHubID, pullNumber)
 }
 
 // Options configures the dirty-set loop.
@@ -163,11 +174,9 @@ func (s *Service) RunOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	items := s.deriver.Derive(snapshot)
-	if items == nil {
-		items = []WorkItem{}
-	}
-	if err := validateWorkItems(items); err != nil {
+	results := s.deriver.Derive(snapshot)
+	items, err := validateScopeResults(snapshot, results)
+	if err != nil {
 		return 0, err
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -177,44 +186,86 @@ func (s *Service) RunOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("encode derived work items: %w", err)
 	}
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+		return 0, err
+	}
 
-	// C-P5: every changed work item and its reference event are set-at-a-time
-	// inside the same dirty-batch transaction.
+	// C-P5: each claimed scope's complete prior set is reconciled with the
+	// returned set. Changed and removed references share this transaction.
 	if _, err := tx.Exec(ctx, `
-		WITH input AS (
-		    SELECT identity_key, org_id, payload
-		    FROM jsonb_to_recordset($1::jsonb) AS item(
-		        identity_key text,
-		        org_id bigint,
-		        payload jsonb
-		    )
-		),
-		upserted AS (
-		    INSERT INTO work_items (
-		        identity_key, org_id, payload, updated_at
-		    )
-		    SELECT identity_key, org_id, payload, clock_timestamp()
-		    FROM input
-		    ON CONFLICT (identity_key) DO UPDATE
-		    SET org_id = EXCLUDED.org_id,
-		        payload = EXCLUDED.payload,
-		        updated_at = EXCLUDED.updated_at
-		    WHERE ROW(work_items.org_id, work_items.payload)
-		        IS DISTINCT FROM
-		        ROW(EXCLUDED.org_id, EXCLUDED.payload)
-		    RETURNING identity_key
-		)
-		INSERT INTO change_events (
-		    stream, kind, entity_key, occurred_at, payload
-		)
-		SELECT $2, $3, identity_key, clock_timestamp(),
-		       jsonb_build_object(
-		           'version', 1,
-		           'identity_key', identity_key
-		       )
-		FROM upserted
-		ORDER BY identity_key
-	`, encoded, workItemsStream, workItemChangedKind); err != nil {
+			WITH claimed(scope_key) AS (
+			    SELECT unnest($1::text[])
+			),
+			input AS (
+			    SELECT scope_key, identity_key, org_id, payload
+			    FROM jsonb_to_recordset($2::jsonb) AS item(
+			        scope_key text,
+			        identity_key text,
+			        org_id bigint,
+			        payload jsonb
+			    )
+			),
+			upserted AS (
+			    INSERT INTO work_items (
+			        scope_key, identity_key, org_id, payload, updated_at
+			    )
+			    SELECT scope_key, identity_key, org_id, payload,
+			           clock_timestamp()
+			    FROM input
+			    ON CONFLICT (identity_key) DO UPDATE
+			    SET scope_key = EXCLUDED.scope_key,
+			        org_id = EXCLUDED.org_id,
+			        payload = EXCLUDED.payload,
+			        updated_at = EXCLUDED.updated_at
+			    WHERE ROW(
+			            work_items.scope_key,
+			            work_items.org_id,
+			            work_items.payload
+			        )
+			        IS DISTINCT FROM
+			        ROW(
+			            EXCLUDED.scope_key,
+			            EXCLUDED.org_id,
+			            EXCLUDED.payload
+			        )
+			    RETURNING scope_key, identity_key
+			),
+			removed AS (
+			    DELETE FROM work_items AS prior
+			    USING claimed
+			    WHERE prior.scope_key = claimed.scope_key
+			      AND NOT EXISTS (
+			          SELECT 1
+			          FROM input
+			          WHERE input.identity_key = prior.identity_key
+			      )
+			    RETURNING prior.scope_key, prior.identity_key
+			),
+			events AS (
+			    SELECT scope_key, identity_key, $4::text AS kind
+			    FROM upserted
+			    UNION ALL
+			    SELECT scope_key, identity_key, $5::text AS kind
+			    FROM removed
+			)
+			INSERT INTO change_events (
+			    stream, kind, entity_key, occurred_at, payload
+			)
+			SELECT $3, kind, identity_key, clock_timestamp(),
+			       jsonb_build_object(
+			           'version', 1,
+			           'identity_key', identity_key,
+			           'scope_key', scope_key
+			       )
+			FROM events
+			ORDER BY identity_key, kind
+		`,
+		scopeKeys,
+		encoded,
+		outbox.WorkItemsStream,
+		outbox.WorkItemChangedKind,
+		outbox.WorkItemRemovedKind,
+	); err != nil {
 		return 0, fmt.Errorf("apply derived work-item batch: %w", err)
 	}
 
@@ -270,33 +321,99 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
-func validateWorkItems(items []WorkItem) error {
-	seen := make(map[string]struct{}, len(items))
-	for _, item := range items {
-		if item.IdentityKey == "" {
-			return fmt.Errorf("derived work item identity is required")
-		}
-		if item.OrgID <= 0 {
-			return fmt.Errorf(
-				"derived work item %q has invalid org ID",
-				item.IdentityKey,
-			)
-		}
-		if len(item.Payload) == 0 || !json.Valid(item.Payload) {
-			return fmt.Errorf(
-				"derived work item %q has invalid JSON payload",
-				item.IdentityKey,
-			)
-		}
-		if _, duplicate := seen[item.IdentityKey]; duplicate {
-			return fmt.Errorf(
-				"deriver returned duplicate identity %q",
-				item.IdentityKey,
-			)
-		}
-		seen[item.IdentityKey] = struct{}{}
+type ownedWorkItem struct {
+	ScopeKey    string          `json:"scope_key"`
+	IdentityKey string          `json:"identity_key"`
+	OrgID       int64           `json:"org_id"`
+	Payload     json.RawMessage `json:"payload"`
+}
+
+func validateScopeResults(
+	snapshot Snapshot,
+	results []ScopeResult,
+) ([]ownedWorkItem, error) {
+	claimed := make(map[string]ScopeSnapshot, len(snapshot.Scopes))
+	for _, scope := range snapshot.Scopes {
+		claimed[scope.ScopeKey] = scope
 	}
-	return nil
+	seenScopes := make(map[string]struct{}, len(results))
+	seenItems := make(map[string]struct{})
+	items := make([]ownedWorkItem, 0)
+	for _, result := range results {
+		scope, ok := claimed[result.ScopeKey]
+		if !ok {
+			return nil, fmt.Errorf(
+				"deriver returned unclaimed scope %q", result.ScopeKey,
+			)
+		}
+		if _, duplicate := seenScopes[result.ScopeKey]; duplicate {
+			return nil, fmt.Errorf(
+				"deriver returned duplicate scope %q", result.ScopeKey,
+			)
+		}
+		seenScopes[result.ScopeKey] = struct{}{}
+		parsed, err := parseScope(result.ScopeKey)
+		if err != nil {
+			return nil, err
+		}
+		expectedIdentity := identityForScope(parsed)
+		for _, item := range result.WorkItems {
+			if item.IdentityKey == "" {
+				return nil, fmt.Errorf("derived work item identity is required")
+			}
+			if item.IdentityKey != expectedIdentity {
+				return nil, fmt.Errorf(
+					"derived work item identity %q is not owned by scope %q; want %q",
+					item.IdentityKey,
+					result.ScopeKey,
+					expectedIdentity,
+				)
+			}
+			if item.OrgID <= 0 || item.OrgID != scope.OrgID {
+				return nil, fmt.Errorf(
+					"derived work item %q has org ID %d, scope %q owns org %d",
+					item.IdentityKey,
+					item.OrgID,
+					result.ScopeKey,
+					scope.OrgID,
+				)
+			}
+			if len(item.Payload) == 0 || !json.Valid(item.Payload) {
+				return nil, fmt.Errorf(
+					"derived work item %q has invalid JSON payload",
+					item.IdentityKey,
+				)
+			}
+			if _, duplicate := seenItems[item.IdentityKey]; duplicate {
+				return nil, fmt.Errorf(
+					"deriver returned duplicate identity %q",
+					item.IdentityKey,
+				)
+			}
+			seenItems[item.IdentityKey] = struct{}{}
+			items = append(items, ownedWorkItem{
+				ScopeKey:    result.ScopeKey,
+				IdentityKey: item.IdentityKey,
+				OrgID:       item.OrgID,
+				Payload:     item.Payload,
+			})
+		}
+	}
+	for scopeKey := range claimed {
+		if _, ok := seenScopes[scopeKey]; !ok {
+			return nil, fmt.Errorf(
+				"deriver omitted claimed scope %q", scopeKey,
+			)
+		}
+	}
+	return items, nil
+}
+
+func identityForScope(scope parsedScope) string {
+	if scope.Kind == "stack" {
+		return StackIdentity(scope.RepositoryID, scope.Number)
+	}
+	return PullRequestIdentity(scope.RepositoryID, scope.Number)
 }
 
 type parsedScope struct {

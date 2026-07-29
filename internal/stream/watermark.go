@@ -12,6 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/acme/frontier/internal/outbox"
 )
 
 const (
@@ -36,13 +38,14 @@ type WatermarkProgress struct {
 	Advanced     bool
 }
 
-// Watermarker advances stream_watermark.safe_seq only after PostgreSQL proves
-// that every transaction old enough to own a captured sequence has finished.
+// Watermarker advances stream_watermark.safe_seq while holding the exclusive
+// side of the outbox writer fence.
 type Watermarker struct {
 	pool            *pgxpool.Pool
 	refreshInterval time.Duration
 	leaseTTL        time.Duration
 	token           string
+	testBeforeFence func()
 }
 
 // NewWatermarker constructs a leader-coordinated C-S2 watermarker.
@@ -80,89 +83,68 @@ func NewWatermarker(
 	}, nil
 }
 
-// Step renews or acquires the singleton lease, promotes a proven candidate,
-// and captures the next candidate. It is exposed for deterministic C-S2 tests
-// and operational probes; normal callers use Run.
+// Step renews or acquires the singleton lease, waits for all registered outbox
+// writers, and publishes the greatest committed sequence. Read-only snapshots
+// and unrelated transactions do not participate in this fence.
 func (w *Watermarker) Step(
 	ctx context.Context,
 ) (WatermarkProgress, error) {
 	if err := w.acquireOrRenew(ctx); err != nil {
 		return WatermarkProgress{}, err
 	}
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return WatermarkProgress{}, fmt.Errorf("begin stream watermark step: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
+	if w.testBeforeFence != nil {
+		w.testBeforeFence()
+	}
+	if err := outbox.AcquireWatermarkFence(ctx, tx); err != nil {
+		return WatermarkProgress{}, err
+	}
 
-	var advancedSeq int64
-	advanced := false
-	err := w.pool.QueryRow(ctx, `
+	var prior, target int64
+	if err := tx.QueryRow(ctx, `
+		SELECT watermark.safe_seq, COALESCE(max(events.seq), 0)
+		FROM stream_watermark AS watermark
+		LEFT JOIN change_events AS events ON true
+		WHERE watermark.singleton
+		GROUP BY watermark.safe_seq
+	`).Scan(&prior, &target); err != nil {
+		return WatermarkProgress{}, fmt.Errorf(
+			"read committed change-event maximum: %w", err,
+		)
+	}
+
+	var safe int64
+	if err := tx.QueryRow(ctx, `
 		UPDATE stream_watermark
-		SET safe_seq = candidate_seq,
+		SET safe_seq = GREATEST(safe_seq, $2),
 		    candidate_seq = NULL,
 		    candidate_xid = NULL,
 		    updated_at = clock_timestamp()
 		WHERE singleton
 		  AND lease_token = $1
 		  AND lease_until > clock_timestamp()
-		  AND candidate_xid IS NOT NULL
-		  -- C-S2: pg_snapshot_xmin is the lowest still-in-flight XID.
-		  -- 0013 guarantees every seq in candidate_seq was allocated only
-		  -- after its writer acquired an older XID.
-		  AND candidate_xid < pg_snapshot_xmin(pg_current_snapshot())
 		RETURNING safe_seq
-	`, w.token).Scan(&advancedSeq)
-	switch {
-	case err == nil:
-		advanced = true
-	case errors.Is(err, pgx.ErrNoRows):
-	default:
-		return WatermarkProgress{}, fmt.Errorf(
-			"promote stream watermark: %w", err,
-		)
-	}
-
-	// Capture target sequence before assigning the candidate transaction XID.
-	// frontier_next_change_event_seq does the inverse in writers (XID first,
-	// then sequence), which creates a sound happens-before barrier (C-S2).
-	var target int64
-	if err := w.pool.QueryRow(ctx, `
-		SELECT CASE WHEN is_called THEN last_value ELSE 0 END
-		FROM change_events_seq_seq
-	`).Scan(&target); err != nil {
-		return WatermarkProgress{}, fmt.Errorf(
-			"read change-event sequence: %w", err,
-		)
-	}
-	if _, err := w.pool.Exec(ctx, `
-		UPDATE stream_watermark
-		SET candidate_seq = $2,
-		    candidate_xid = pg_current_xact_id()
-		WHERE singleton
-		  AND lease_token = $1
-		  AND lease_until > clock_timestamp()
-		  AND candidate_xid IS NULL
-	`, w.token, target); err != nil {
-		return WatermarkProgress{}, fmt.Errorf(
-			"capture stream watermark candidate: %w", err,
-		)
-	}
-
-	var progress WatermarkProgress
-	var candidate *int64
-	if err := w.pool.QueryRow(ctx, `
-		SELECT safe_seq, candidate_seq
-		FROM stream_watermark
-		WHERE singleton
-		  AND lease_token = $1
-		  AND lease_until > clock_timestamp()
-	`, w.token).Scan(&progress.SafeSeq, &candidate); err != nil {
+	`, w.token, target).Scan(&safe); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return WatermarkProgress{}, ErrLeaseHeld
 		}
 		return WatermarkProgress{}, fmt.Errorf(
-			"read stream watermark: %w", err,
+			"publish stream watermark: %w", err,
 		)
 	}
-	progress.CandidateSeq = candidate
-	progress.Advanced = advanced && progress.SafeSeq == advancedSeq
-	return progress, nil
+	if err := tx.Commit(ctx); err != nil {
+		return WatermarkProgress{}, fmt.Errorf(
+			"commit stream watermark: %w", err,
+		)
+	}
+	return WatermarkProgress{
+		SafeSeq:  safe,
+		Advanced: safe > prior,
+	}, nil
 }
 
 // Run maintains the watermark at approximately RefreshInterval. Standby
@@ -188,7 +170,7 @@ func (w *Watermarker) Run(ctx context.Context) error {
 }
 
 // Close releases this runtime's singleton lease. It does not alter the safe
-// watermark or a pending candidate.
+// watermark.
 func (w *Watermarker) Close(ctx context.Context) error {
 	return w.release(ctx)
 }

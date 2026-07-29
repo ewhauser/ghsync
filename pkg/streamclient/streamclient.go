@@ -18,6 +18,8 @@ import (
 const (
 	defaultBatchSize    = 256
 	defaultPollInterval = 500 * time.Millisecond
+	minListenerBackoff  = 100 * time.Millisecond
+	maxListenerBackoff  = 5 * time.Second
 	notificationChannel = "frontier_change_events"
 )
 
@@ -94,6 +96,12 @@ type Client struct {
 	pool         *pgxpool.Pool
 	batchSize    int
 	pollInterval time.Duration
+	testHooks    clientTestHooks
+}
+
+type clientTestHooks struct {
+	afterHorizon      func()
+	listenerConnected func(uint32)
 }
 
 // New validates configuration and constructs a reference stream client.
@@ -184,7 +192,7 @@ func (c *Client) Bootstrap(
 
 // Tail continuously pages events with seq > cursor AND seq <= safe_seq,
 // invokes handler inside the cursor transaction, and waits using
-// LISTEN/NOTIFY plus a polling fallback. Migration 0013's after-insert trigger
+// LISTEN/NOTIFY plus a polling fallback. Migration 0014's after-insert trigger
 // emits frontier_change_events notifications at commit; correctness never
 // depends on receiving one (C-S2/C-S5/C-P6).
 func (c *Client) Tail(
@@ -199,17 +207,10 @@ func (c *Client) Tail(
 	if handler == nil {
 		return fmt.Errorf("stream handler is required")
 	}
-	listener, err := c.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire stream listener: %w", err)
-	}
-	defer listener.Release()
-	if _, err := listener.Exec(
-		ctx,
-		"LISTEN "+notificationChannel,
-	); err != nil {
-		return fmt.Errorf("listen for change events: %w", err)
-	}
+	var listener *pgxpool.Conn
+	defer func() { releaseListener(listener) }()
+	listenerBackoff := minListenerBackoff
+	var nextListenerAttempt time.Time
 
 	for {
 		delivered, err := c.deliverPage(
@@ -219,6 +220,37 @@ func (c *Client) Tail(
 			return err
 		}
 		if delivered == c.batchSize {
+			continue
+		}
+
+		if listener == nil &&
+			!time.Now().Before(nextListenerAttempt) {
+			listener, err = c.acquireListener(ctx)
+			if err == nil {
+				listenerBackoff = minListenerBackoff
+				if hook := c.testHooks.listenerConnected; hook != nil {
+					hook(listener.Conn().PgConn().PID())
+				}
+			} else {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				nextListenerAttempt = time.Now().Add(listenerBackoff)
+				listenerBackoff = growBackoff(listenerBackoff)
+			}
+		}
+
+		if listener == nil {
+			timer := time.NewTimer(c.pollInterval)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ctx.Err()
+			case <-timer.C:
+				// Poll fallback remains active while LISTEN reconnects.
+			}
 			continue
 		}
 
@@ -232,9 +264,53 @@ func (c *Client) Tail(
 		case ctx.Err() != nil:
 			return ctx.Err()
 		default:
-			return fmt.Errorf("wait for change-event notification: %w", waitErr)
+			releaseListener(listener)
+			listener = nil
+			nextListenerAttempt = time.Now().Add(listenerBackoff)
+			listenerBackoff = growBackoff(listenerBackoff)
+			// A failed LISTEN connection only loses the latency hint. The next
+			// loop performs another correctness-path page poll immediately.
 		}
 	}
+}
+
+func (c *Client) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
+	timeout := c.pollInterval
+	if timeout > 250*time.Millisecond {
+		timeout = 250 * time.Millisecond
+	}
+	acquireCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	listener, err := c.pool.Acquire(acquireCtx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := listener.Exec(
+		acquireCtx,
+		"LISTEN "+notificationChannel,
+	); err != nil {
+		listener.Release()
+		return nil, err
+	}
+	return listener, nil
+}
+
+func releaseListener(listener *pgxpool.Conn) {
+	if listener == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = listener.Exec(ctx, "UNLISTEN "+notificationChannel)
+	listener.Release()
+}
+
+func growBackoff(current time.Duration) time.Duration {
+	current *= 2
+	if current > maxListenerBackoff {
+		return maxListenerBackoff
+	}
+	return current
 }
 
 func (c *Client) deliverPage(
@@ -243,7 +319,9 @@ func (c *Client) deliverPage(
 	stream string,
 	handler Handler,
 ) (int, error) {
-	tx, err := c.pool.Begin(ctx)
+	tx, err := c.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead,
+	})
 	if err != nil {
 		return 0, fmt.Errorf("begin stream page: %w", err)
 	}
@@ -282,6 +360,9 @@ func (c *Client) deliverPage(
 			Cursor:        cursor,
 			PrunedThrough: prunedThrough,
 		}
+	}
+	if hook := c.testHooks.afterHorizon; hook != nil {
+		hook()
 	}
 
 	var safeSeq int64

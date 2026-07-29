@@ -250,10 +250,15 @@ consumer.
 - **C-S2 — Gap-free tailing.** `BIGSERIAL` allocates in *begin* order but
   rows appear in *commit* order — a tailer reading `seq > cursor` can skip an
   event whose smaller seq commits later. Tailers therefore only read below a
-  **visibility watermark** (leader-maintained from the oldest in-flight
-  transaction snapshot, refreshed ~100ms). No consumer may ever observe a
-  gap that later fills; this is the constraint that makes cursors
-  trustworthy, and it gets its own test (§9).
+  **visibility watermark**. (Mechanism amended during M5 review: the original
+  oldest-in-flight-snapshot/xmin fence lets ANY long transaction — including
+  our own Bootstrap snapshots — stall the watermark. The implemented protocol
+  is a shared/exclusive advisory fence: every outbox-writing transaction
+  holds a shared advisory lock; the watermarker's momentary exclusive
+  acquisition proves no writer is in flight, at which point
+  max(committed seq) is safe. Read-only snapshots never take the fence.)
+  No consumer may ever observe a gap that later fills; this is the
+  constraint that makes cursors trustworthy, and it gets its own test (§9).
 - **C-S3 — Snapshot-then-stream bootstrap.** A consumer's contract is:
   snapshot at watermark W, then deltas with seq > W, resuming by cursor after
   disconnect — exactly-once per cursor (same contract C-D4 gives

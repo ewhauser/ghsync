@@ -327,4 +327,5 @@ type WorkItem struct {
 	OrgID       int64
 	Payload     []byte
 	UpdatedAt   pgtype.Timestamptz
+	ScopeKey    string
 }

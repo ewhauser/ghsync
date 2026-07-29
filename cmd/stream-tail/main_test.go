@@ -10,8 +10,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/store"
+	"github.com/acme/frontier/internal/outbox"
 	streammaint "github.com/acme/frontier/internal/stream"
+	"github.com/acme/frontier/internal/testdb"
 )
 
 func TestStreamTailSmoke(t *testing.T) {
@@ -21,14 +22,13 @@ func TestStreamTailSmoke(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, url)
+	database, err := testdb.Open(ctx, url, "streamtail")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
+	defer database.Close()
+	pool := database.Pool
+	url = database.URL
 
 	suffix := time.Now().UnixNano()
 	consumer := fmt.Sprintf("m5-stream-tail-%d", suffix)
@@ -48,14 +48,25 @@ func TestStreamTailSmoke(t *testing.T) {
 	}()
 	waitCommandCursor(t, pool, consumer, streamName, -1)
 
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background()) //nolint:errcheck
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
 	var seq int64
-	if err := pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO change_events (
 		    stream, kind, entity_key, payload
 		)
 		VALUES ($1, 'smoke.changed', 'smoke', '{"version":1}')
 		RETURNING seq
 	`, streamName).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	watermarker, err := streammaint.NewWatermarker(

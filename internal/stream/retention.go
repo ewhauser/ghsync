@@ -67,13 +67,17 @@ func (r *Retention) Prune(ctx context.Context) (int64, error) {
 	var total int64
 	for {
 		tag, err := r.pool.Exec(ctx, `
-			WITH doomed AS MATERIALIZED (
-			    SELECT seq, stream
-			    FROM change_events
-			    WHERE occurred_at < $1
-			    ORDER BY occurred_at, seq
-			    LIMIT $2
-			    FOR UPDATE SKIP LOCKED
+				WITH doomed AS MATERIALIZED (
+				    SELECT events.seq, events.stream
+				    FROM change_events AS events
+				    CROSS JOIN stream_watermark AS watermark
+				    WHERE events.occurred_at < $1
+				      -- C-S2/C-S7: never publish a pruned horizon above the
+				      -- greatest sequence consumers were allowed to observe.
+				      AND events.seq <= watermark.safe_seq
+				    ORDER BY events.occurred_at, events.seq
+				    LIMIT $2
+				    FOR UPDATE OF events SKIP LOCKED
 			),
 			advanced AS (
 			    INSERT INTO stream_horizons (

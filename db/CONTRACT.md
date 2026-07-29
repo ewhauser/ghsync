@@ -1,94 +1,239 @@
 # Frontier Postgres delivery contract
 
-Contract version: **v1**, introduced by migration `0013`.
+Contract version: **v1**, introduced by migration `0013` and extended
+additively by migrations `0014`–`0019`.
 
 Postgres is the Frontier sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
 `pkg/streamclient`. The Go package is the reference implementation; consumers
-should not reproduce the watermark, cursor, or resync algorithms themselves.
+must not reproduce the watermark, cursor, retention, or resync algorithms.
 
-## Public read model
+## Public v1 schema
 
-The following tables are public, additive-only read surfaces:
+The manifest below is normative and is checked against a freshly migrated
+Postgres schema. `Nullable` describes SQL nullability, not whether a text or
+JSON value may be empty.
 
-| Table | Meaning |
-| --- | --- |
-| `repos` | Installed GitHub repositories. |
-| `repo_rules` | Repository rules keyed by `(repo_id, rule_key)`. |
-| `stacks` | GitHub stack snapshots keyed by repository and stack number. |
-| `pull_requests` | Pull request snapshots, including stack membership. |
-| `review_threads` | Review-thread snapshots keyed by GitHub node ID. |
-| `check_runs` | Current check-run snapshots. |
-| `check_history` | Accepted historical check transitions; retained for at least 90 days. |
-| `work_items` | Minimal derived output keyed by stable `identity_key`. M5’s default no-op deriver leaves it empty. |
+<!-- v1-schema:start -->
+| Table | Column | PostgreSQL type | Nullable | Key or join role |
+| --- | --- | --- | --- | --- |
+| `repos` | `id` | `bigint` | no | primary key; local join key |
+| `repos` | `installation_id` | `bigint` | no | external scope key |
+| `repos` | `org_id` | `bigint` | no | organization filter |
+| `repos` | `gh_id` | `bigint` | no | unique GitHub repository identity |
+| `repos` | `node_id` | `text` | no | GitHub GraphQL identity |
+| `repos` | `owner` | `text` | no | current owner |
+| `repos` | `name` | `text` | no | current repository name |
+| `repos` | `full_name` | `text` | no | current owner/name |
+| `repos` | `default_branch` | `text` | no | — |
+| `repos` | `archived` | `boolean` | no | — |
+| `repos` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
+| `repos` | `head_sha` | `text` | no | default-branch head |
+| `repos` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `repos` | `etag` | `text` | no | HTTP validator |
+| `repos` | `sync_source` | `text` | no | provenance enum |
+| `repos` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
+| `repos` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `repo_rules` | `repo_id` | `bigint` | no | primary key part; references repos.id |
+| `repo_rules` | `rule_key` | `text` | no | primary key part |
+| `repo_rules` | `rule` | `jsonb` | no | current rule document |
+| `repo_rules` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
+| `repo_rules` | `head_sha` | `text` | no | repository head used for observation |
+| `repo_rules` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `repo_rules` | `etag` | `text` | no | HTTP validator |
+| `repo_rules` | `sync_source` | `text` | no | provenance enum |
+| `repo_rules` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
+| `repo_rules` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `stacks` | `id` | `bigint` | no | primary key; local join key |
+| `stacks` | `repo_id` | `bigint` | no | references repos.id; unique with number |
+| `stacks` | `gh_id` | `bigint` | yes | GitHub stack identity where supplied |
+| `stacks` | `node_id` | `text` | no | GitHub GraphQL identity where supplied |
+| `stacks` | `number` | `integer` | no | repository-local stack number |
+| `stacks` | `base_ref` | `text` | no | — |
+| `stacks` | `base_sha` | `text` | no | — |
+| `stacks` | `open` | `boolean` | no | — |
+| `stacks` | `entries` | `jsonb` | no | ordered stack-entry references |
+| `stacks` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
+| `stacks` | `head_sha` | `text` | no | stack head |
+| `stacks` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `stacks` | `etag` | `text` | no | HTTP validator |
+| `stacks` | `sync_source` | `text` | no | provenance enum |
+| `stacks` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
+| `stacks` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `pull_requests` | `id` | `bigint` | no | primary key; local join key |
+| `pull_requests` | `repo_id` | `bigint` | no | references repos.id; unique with number |
+| `pull_requests` | `gh_id` | `bigint` | yes | GitHub pull-request identity |
+| `pull_requests` | `node_id` | `text` | no | GitHub GraphQL identity |
+| `pull_requests` | `number` | `integer` | no | repository-local PR number |
+| `pull_requests` | `title` | `text` | no | — |
+| `pull_requests` | `state` | `text` | no | — |
+| `pull_requests` | `draft` | `boolean` | no | — |
+| `pull_requests` | `author_login` | `text` | no | — |
+| `pull_requests` | `head_ref` | `text` | no | — |
+| `pull_requests` | `head_sha` | `text` | no | check-run join input |
+| `pull_requests` | `base_ref` | `text` | no | — |
+| `pull_requests` | `base_sha` | `text` | no | — |
+| `pull_requests` | `review_decision` | `text` | no | — |
+| `pull_requests` | `mergeable_state` | `text` | no | — |
+| `pull_requests` | `stack_number` | `integer` | yes | null means loose PR |
+| `pull_requests` | `stack_position` | `integer` | yes | null exactly when stack_number is null |
+| `pull_requests` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
+| `pull_requests` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `pull_requests` | `etag` | `text` | no | HTTP validator |
+| `pull_requests` | `sync_source` | `text` | no | provenance enum |
+| `pull_requests` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
+| `pull_requests` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `review_threads` | `id` | `text` | no | primary key; GitHub thread node ID |
+| `review_threads` | `repo_id` | `bigint` | no | references repos.id |
+| `review_threads` | `pr_number` | `integer` | no | references pull_requests(repo_id,number) |
+| `review_threads` | `is_resolved` | `boolean` | no | — |
+| `review_threads` | `is_outdated` | `boolean` | no | — |
+| `review_threads` | `path` | `text` | no | — |
+| `review_threads` | `line` | `integer` | yes | — |
+| `review_threads` | `comments` | `jsonb` | no | ordered comment references |
+| `review_threads` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
+| `review_threads` | `head_sha` | `text` | no | observed PR head |
+| `review_threads` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `review_threads` | `etag` | `text` | no | HTTP validator |
+| `review_threads` | `sync_source` | `text` | no | provenance enum |
+| `review_threads` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
+| `review_threads` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `check_runs` | `gh_id` | `bigint` | no | primary key; GitHub check-run identity |
+| `check_runs` | `repo_id` | `bigint` | no | references repos.id |
+| `check_runs` | `node_id` | `text` | no | GitHub GraphQL identity |
+| `check_runs` | `name` | `text` | no | — |
+| `check_runs` | `status` | `text` | no | — |
+| `check_runs` | `conclusion` | `text` | no | — |
+| `check_runs` | `details_url` | `text` | no | — |
+| `check_runs` | `app_slug` | `text` | no | — |
+| `check_runs` | `started_at` | `timestamp with time zone` | yes | — |
+| `check_runs` | `completed_at` | `timestamp with time zone` | yes | — |
+| `check_runs` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
+| `check_runs` | `head_sha` | `text` | no | PR lookup input |
+| `check_runs` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `check_runs` | `etag` | `text` | no | HTTP validator |
+| `check_runs` | `sync_source` | `text` | no | provenance enum |
+| `check_runs` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
+| `check_runs` | `semantic_version` | `text` | no | write-if-newer input |
+| `check_runs` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `check_history` | `id` | `bigint` | no | primary key |
+| `check_history` | `check_run_gh_id` | `bigint` | no | references check_runs.gh_id |
+| `check_history` | `repo_id` | `bigint` | no | references repos.id |
+| `check_history` | `name` | `text` | no | — |
+| `check_history` | `status` | `text` | no | — |
+| `check_history` | `conclusion` | `text` | no | — |
+| `check_history` | `observed` | `jsonb` | no | accepted check observation |
+| `check_history` | `gh_updated_at` | `timestamp with time zone` | yes | source version |
+| `check_history` | `head_sha` | `text` | no | — |
+| `check_history` | `synced_at` | `timestamp with time zone` | no | accepted transition time |
+| `check_history` | `etag` | `text` | no | HTTP validator |
+| `check_history` | `sync_source` | `text` | no | provenance enum |
+| `check_history` | `tombstoned_at` | `timestamp with time zone` | yes | retained provenance |
+| `check_history` | `semantic_version` | `text` | no | accepted semantic version |
+| `work_items` | `identity_key` | `text` | no | primary key; stable domain identity |
+| `work_items` | `org_id` | `bigint` | no | organization filter |
+| `work_items` | `payload` | `jsonb` | no | current derived value |
+| `work_items` | `updated_at` | `timestamp with time zone` | no | materialization change time |
+| `work_items` | `scope_key` | `text` | no | owning C-D2 derivation scope |
+| `change_events` | `seq` | `bigint` | no | primary key; global event order |
+| `change_events` | `stream` | `text` | no | entities or work_items |
+| `change_events` | `kind` | `text` | no | event variant below |
+| `change_events` | `entity_key` | `text` | no | immutable lookup reference |
+| `change_events` | `occurred_at` | `timestamp with time zone` | no | source transaction event time |
+| `change_events` | `payload` | `jsonb` | no | versioned reference payload |
+| `stream_watermark` | `singleton` | `boolean` | no | primary key; always true |
+| `stream_watermark` | `safe_seq` | `bigint` | no | greatest safe consumer sequence |
+| `stream_watermark` | `updated_at` | `timestamp with time zone` | no | last publication time |
+| `consumer_cursors` | `consumer` | `text` | no | primary key part |
+| `consumer_cursors` | `stream` | `text` | no | primary key part |
+| `consumer_cursors` | `seq` | `bigint` | no | last transactionally applied event |
+| `consumer_cursors` | `updated_at` | `timestamp with time zone` | no | last cursor change |
+| `stream_horizons` | `stream` | `text` | no | primary key |
+| `stream_horizons` | `pruned_through_seq` | `bigint` | no | greatest removed sequence |
+| `stream_horizons` | `updated_at` | `timestamp with time zone` | no | last horizon change |
+<!-- v1-schema:end -->
 
-Use an explicit transaction when rows from more than one table must agree.
-`REPEATABLE READ` gives one cache snapshot. Foreign keys use Frontier’s local
-surrogate IDs for joins; durable external references use GitHub IDs plus
-repository/PR/stack numbers.
+Use a `REPEATABLE READ` transaction when rows from more than one public table
+must agree. Foreign keys use local surrogate IDs; durable external references
+use GitHub IDs plus repository-local numbers.
 
-### Provenance and freshness
+### Provenance, freshness, and tombstones
 
-Mirror tables carry:
+`sync_source` is one of `webhook`, `reconcile`, `backfill`, or `manual`.
+`synced_at` records the last accepted domain change; `last_checked_at` records
+the last authoritative validation, including 304 and identical responses. Do
+not use `synced_at` as the freshness check after an unchanged response.
 
-- `synced_at`: when the stored domain snapshot last changed.
-- `last_checked_at`: when GitHub last authoritatively validated the entity,
-  including an unchanged response. `check_history` is append-only history and
-  does not use this column.
-- `etag`: the last authoritative HTTP validator where one exists.
-- `sync_source`: `webhook`, `reconcile`, `backfill`, or `manual`.
-- `gh_updated_at`, `head_sha`, and/or `semantic_version`: monotonic
-  write-if-newer inputs appropriate to that entity.
+A non-null `tombstoned_at` means a mirror row is retained history and is not
+live. Normal live reads include `tombstoned_at IS NULL`. A later authoritative
+observation may resurrect the row through the monotonic writer.
+`check_history` is append-only transition history retained for at least 90
+days. Other tombstoned mirror skeletons have no v1 expiry.
 
-Do not interpret `synced_at` as a freshness check after a 304. Use
-`last_checked_at`.
+## Event-kind and entity-key grammar
 
-### Tombstones
+This manifest is normative and schema-tested against the constants and key
+constructors used by the entity writer and deriver.
 
-Synced entities are not hard-deleted on the write path. A non-null
-`tombstoned_at` means the entity is retained history and is not live. Normal
-live queries must include `tombstoned_at IS NULL`. A later authoritative
-observation can resurrect a tombstone through the same monotonic writer.
+<!-- v1-events:start -->
+| Stream | Kind | Entity-key grammar | Public lookup target | Required payload |
+| --- | --- | --- | --- | --- |
+| `entities` | `repository.changed` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
+| `entities` | `repository.tombstoned` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
+| `entities` | `pull_request.changed` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
+| `entities` | `pull_request.tombstoned` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
+| `entities` | `stack.changed` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
+| `entities` | `stack.tombstoned` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
+| `entities` | `checks.changed` | `checks:{installation_id}:{repo_gh_id}:{head_sha}` | `check_runs(repos.installation_id,repos.gh_id,head_sha)` | `{"version":1}` |
+| `entities` | `repo_rules.changed` | `repo_rules:{installation_id}:{repo_gh_id}` | `repo_rules(repos.installation_id,repos.gh_id)` | `{"version":1}` |
+| `work_items` | `work_item.changed` | `repo:{repo_gh_id}:{work_item_kind}:{number}` | `work_items(identity_key)` | `{"version":1,"identity_key":"<entity_key>","scope_key":"<owning_scope>"}` |
+| `work_items` | `work_item.removed` | `repo:{repo_gh_id}:{work_item_kind}:{number}` | `work_items(identity_key), absent after removal` | `{"version":1,"identity_key":"<entity_key>","scope_key":"<owning_scope>"}` |
+<!-- v1-events:end -->
 
-`check_history` is separately retention-bound. Tombstoned mirror skeletons are
-not part of stream retention and remain available until a future, explicitly
-documented retention policy says otherwise.
+Every braced numeric field is a positive base-10 integer with no delimiter.
+`head_sha` is the authoritative Git object ID. `work_item_kind` is exactly
+`stack` or `pr`. The owning scopes are
+`stack:{installation_id}:{repo_gh_id}:{stack_number}` and
+`pr:{installation_id}:{repo_gh_id}:{pr_number}`. A deriver must return exactly
+one complete result set for every claimed scope; an empty result removes that
+scope’s prior work item and emits `work_item.removed`.
 
-## Change-event envelope
+Payloads are references, never row images or patches. The JSON shown above is
+the complete required v1 shape; additive fields are allowed. Consumers fetch
+current state from the lookup target, ignore unknown kinds and fields, and use
+`seq` as the idempotency key for external effects.
 
-`change_events` is the append-only C-S1/C-S6 outbox:
+## Writer fence and visibility watermark
 
-```text
-seq          BIGINT       global total order
-stream       TEXT         entities | work_items (unknown future values allowed)
-kind         TEXT         additive event variant
-entity_key   TEXT         immutable entity reference
-occurred_at  TIMESTAMPTZ  source transaction event time
-payload      JSONB        versioned reference metadata
+Every transaction that inserts `change_events` has a mandatory obligation:
+before allocating its first sequence, it calls the shared internal helper that
+takes:
+
+```sql
+SELECT pg_advisory_xact_lock_shared(5076242250190120306);
 ```
 
-`payload` is a reference, not a row image. Version 1 payloads contain at least
-`{"version": 1}` and may repeat the stable identity. On an `entities` event,
-fetch current state from the public read model. Consumers must ignore unknown
-kinds, streams, and payload fields.
+The value is the ASCII bytes for `Frontier` interpreted as a signed `BIGINT`;
+clients pass it as a parameter. All internal entity-writer and deriver paths use
+`internal/outbox.AcquireWriterFence`. A new internal writer may not bypass it.
 
-`outbox_txid` is internal watermark evidence and is not part of the public
-envelope. Events are inserted in the same transaction as the corresponding
-cache or work-item mutation.
+The watermarker briefly takes the exclusive transaction lock on that same key.
+Once acquired, every earlier participating writer has committed or rolled
+back, and no new writer can allocate a sequence. In that transaction the
+watermarker publishes `max(change_events.seq)` and immediately commits,
+releasing the fence. Unrelated transactions and read-only or Bootstrap
+snapshots never take the fence and cannot stall watermark progress.
 
-The database trigger `change_events_notify` calls
-`pg_notify('frontier_change_events', stream)` after inserts. PostgreSQL
-delivers that notification only after commit. It is a wake-up optimization:
-polling by sequence is always the correctness path.
+`change_events.outbox_txid` and
+`stream_watermark.{candidate_seq,candidate_xid,lease_token,lease_until}` are
+private compatibility/coordination columns. The candidate/XID columns are
+retained from applied migration `0013` but are no longer the safety proof.
 
-## Watermark, cursor, and delivery rules
-
-`stream_watermark.safe_seq` is the greatest sequence below which no older
-in-flight outbox transaction can later reveal an unseen row. Its candidate and
-lease columns are private maintenance state.
+## Cursor paging and snapshot then stream
 
 For `(consumer, stream)`, `consumer_cursors.seq` is the last event whose
-handler effects committed. A correct page is always:
+handler effects committed. A page transaction uses `REPEATABLE READ`, locks
+the cursor row, checks the pruned horizon, reads `safe_seq`, and selects:
 
 ```sql
 SELECT seq, stream, kind, entity_key, occurred_at, payload
@@ -100,80 +245,45 @@ ORDER BY seq
 LIMIT $batch_size;
 ```
 
-The consumer cursor row is locked while applying a page. Handler database
-effects and the cursor advance commit in one transaction. If the transaction
-fails or the process crashes, neither commits and the page is delivered again.
-This is exactly-once **per durable cursor for transactional database effects**.
-External I/O needs its own idempotency key, normally `seq`.
+Horizon validation and the event selection must share that one snapshot so
+retention cannot delete unseen events between them. Handler database effects
+and cursor advancement commit in the same transaction. A rollback applies
+neither. External I/O requires its own `seq`-keyed idempotency.
 
-Consumers must never:
+Bootstrap begins `REPEATABLE READ`, locks the cursor, reads watermark **W**,
+replaces the consumer projection from public cache rows, sets the cursor to
+**W**, and commits. Tailing resumes at `seq > W`. The snapshot can already
+contain state referenced by a later event, so consumers apply by stable key,
+not as patches.
 
-- read above `safe_seq`;
-- derive safety from `max(seq)` or the sequence’s `last_value`;
-- advance a cursor before handler effects commit;
-- rely on `LISTEN/NOTIFY` without polling;
-- delete change events based on cursor positions.
-
-## Snapshot then stream
-
-Bootstrap is:
-
-1. Begin a repeatable-read transaction.
-2. Lock `(consumer, stream)` in `consumer_cursors`.
-3. Read `stream_watermark.safe_seq` as **W**.
-4. Read the cache snapshot and replace the consumer’s projection.
-5. Set the cursor to **W** and commit the snapshot and cursor together.
-6. Tail events with `seq > W`, bounded by subsequent safe watermarks.
-
-`streamclient.Client.Bootstrap` performs steps 1–3 and stages the cursor
-update; the caller reads through the returned transaction and commits it.
-`streamclient.Client.Tail` performs the remaining cursor-safe paging.
-
-The watermark can conservatively lag cache visibility. Therefore a reference
-event after W can point at state already present in the snapshot. Applying
-events by stable entity reference and sequence is required; event payloads are
-not patches.
+`LISTEN frontier_change_events` and its statement-level constant-payload
+notification lower latency only. `pkg/streamclient` continues polling during a
+listener failure and reconnects with bounded backoff.
 
 ## Retention and RESYNC_REQUIRED
 
-Change events are retained for **at least seven days**, configurable upward.
-Pruning uses bounded batches and never waits for consumers. In the same
-transaction as each delete, `stream_horizons.pruned_through_seq` records the
-greatest removed sequence for each affected stream.
+Events are retained for at least seven days. Pruning is bounded, independent
+of consumer cursors, and restricted to `seq <= stream_watermark.safe_seq`.
+Each delete transaction advances the affected `stream_horizons` rows, so
+`pruned_through_seq` can never exceed the safe watermark.
 
-Before delivering, compare the cursor with that stream’s pruned horizon:
+Before delivery:
 
-- `cursor >= pruned_through_seq`: normal tailing may continue.
-- `cursor < pruned_through_seq`: stop and return `RESYNC_REQUIRED`.
+- `cursor >= pruned_through_seq`: continue normally.
+- `cursor < pruned_through_seq`: return `RESYNC_REQUIRED`.
 
-There is no silent gap and no “start from the oldest remaining row” fallback.
-On `streamclient.ErrResyncRequired`, discard or replace the local projection,
-run `Bootstrap`, commit the new snapshot, and resume `Tail`.
+There is no silent gap and no fallback to the oldest remaining row. On
+`streamclient.ErrResyncRequired`, replace the projection through Bootstrap and
+resume Tail.
 
-`stream_horizons` is public protocol state but consumers should normally reach
-it only through `streamclient`.
+## Evolution and private state
 
-## Evolution policy
+Public v1 evolution is additive: columns, streams, event kinds, and JSON fields
+may be added; existing names, types, meanings, and identity grammars are not
+changed or removed. A breaking change requires a versioned replacement and a
+migration period.
 
-Public v1 surfaces evolve additively:
-
-- columns, event kinds, streams, and JSON fields may be added;
-- existing meanings, identities, or types are not changed in place;
-- public columns and tables are not renamed or removed;
-- event payloads remain references rather than internal row images;
-- consumers ignore fields and variants they do not understand.
-
-A breaking change requires a new versioned surface and a migration period.
-
-## Private engine tables
-
-All other tables and views are implementation details. This includes
-`webhook_deliveries`, `installation_budgets`,
-`refresh_intent_generations`, `repo_aliases`, `repo_rule_sync_state`,
-`derivation_dirty`, every backfill/sweep/gap/drift cursor or finding table,
-`drift_entities`, River-owned tables, and `schema_migrations`.
-
-Private tables may change without consumer compatibility guarantees.
-`stream_watermark.candidate_*`, its lease fields, and
-`change_events.outbox_txid` are likewise private columns on otherwise public
-protocol tables.
+All unlisted tables are private, including webhook, budget, queue, alias,
+backfill, sweep, delivery-gap, drift, and `derivation_dirty` state, River
+tables, and `schema_migrations`. Private state has no consumer compatibility
+guarantee.

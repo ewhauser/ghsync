@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/acme/frontier/internal/outbox"
 	"github.com/acme/frontier/internal/store/dbgen"
 )
 
@@ -382,6 +383,9 @@ func (w *EntityWriter) ApplyRepository(
 	if err := queries.AcquireEntityAdvisoryLock(ctx, key); err != nil {
 		return false, fmt.Errorf("lock repository: %w", err)
 	}
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+		return false, err
+	}
 	_, applied, err := w.applyRepositoryTx(
 		ctx, queries, repository, source, etag, observedAt,
 	)
@@ -414,6 +418,9 @@ func (w *EntityWriter) ApplyRepositoryObserved(
 		return false, fmt.Errorf("begin observed repository write: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+		return false, err
+	}
 	_, applied, err := w.applyRepositoryTx(
 		ctx, dbgen.New(tx), repository, source, etag, observedAt,
 	)
@@ -482,7 +489,7 @@ func (w *EntityWriter) TombstoneRepositoryObserved(
 			ctx,
 			queries,
 			scopes,
-			"repository.tombstoned",
+			outbox.RepositoryTombstonedKind,
 			key,
 			at,
 		); err != nil {
@@ -564,7 +571,7 @@ func (w *EntityWriter) applyRepositoryTx(
 		ctx,
 		queries,
 		scopes,
-		"repository.changed",
+		outbox.RepositoryChangedKind,
 		RepositoryEntityKey(row.InstallationID, row.GhID),
 		observedAt,
 	); err != nil {
@@ -802,7 +809,7 @@ func (w *EntityWriter) applyPullRequest(
 			),
 		)
 		if err := markAndEmit(
-			ctx, queries, scopes, "pull_request.changed", key, pull.SyncedAt,
+			ctx, queries, scopes, outbox.PullRequestChangedKind, key, pull.SyncedAt,
 		); err != nil {
 			return ApplyPullRequestResult{}, err
 		}
@@ -918,7 +925,7 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 			[]string{derivationScope(
 				repository, number, result.OldStackNumber,
 			)},
-			"pull_request.tombstoned",
+			outbox.PullRequestTombstonedKind,
 			key,
 			at,
 		); err != nil {
@@ -1076,7 +1083,7 @@ func (w *EntityWriter) applyStack(
 			}
 		}
 		if err := markAndEmit(
-			ctx, queries, []string{key}, "stack.changed", key, stack.SyncedAt,
+			ctx, queries, []string{key}, outbox.StackChangedKind, key, stack.SyncedAt,
 		); err != nil {
 			return ApplyStackResult{}, err
 		}
@@ -1196,7 +1203,7 @@ func (w *EntityWriter) TombstoneStackObserved(
 			MovedPRs: nil,
 		}
 		if err := markAndEmit(
-			ctx, queries, []string{key}, "stack.tombstoned", key, at,
+			ctx, queries, []string{key}, outbox.StackTombstonedKind, key, at,
 		); err != nil {
 			return ApplyStackResult{}, err
 		}
@@ -1319,7 +1326,7 @@ func (w *EntityWriter) ApplyChecksObserved(
 			ctx,
 			queries,
 			uniqueStrings(scopeKeys...),
-			"checks.changed",
+			outbox.ChecksChangedKind,
 			key,
 			checks.SyncedAt,
 		); err != nil {
@@ -1400,7 +1407,7 @@ func (w *EntityWriter) ApplyRepoRulesObserved(
 			ctx,
 			queries,
 			scopes,
-			"repo_rules.changed",
+			outbox.RepoRulesChangedKind,
 			key,
 			rules.SyncedAt,
 		); err != nil {
@@ -1519,19 +1526,31 @@ func (w *EntityWriter) beginEntityTx(
 	observation *Observation,
 	key string,
 ) (pgx.Tx, error) {
+	var tx pgx.Tx
+	var err error
 	if observation != nil {
 		if err := requireObservation(observation, key); err != nil {
 			return nil, err
 		}
-		return observation.begin(ctx)
+		tx, err = observation.begin(ctx)
+	} else {
+		tx, err = w.pool.Begin(ctx)
+		if err == nil {
+			err = dbgen.New(tx).AcquireEntityAdvisoryLock(ctx, key)
+			if err != nil {
+				err = fmt.Errorf("lock %s: %w", key, err)
+			}
+		}
 	}
-	tx, err := w.pool.Begin(ctx)
 	if err != nil {
+		if tx != nil {
+			_ = tx.Rollback(ctx)
+		}
 		return nil, err
 	}
-	if err := dbgen.New(tx).AcquireEntityAdvisoryLock(ctx, key); err != nil {
+	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
 		_ = tx.Rollback(ctx)
-		return nil, fmt.Errorf("lock %s: %w", key, err)
+		return nil, err
 	}
 	return tx, nil
 }
@@ -1573,7 +1592,7 @@ func markAndEmit(
 	if _, err := queries.InsertChangeEvent(
 		ctx,
 		dbgen.InsertChangeEventParams{
-			Stream:     "entities",
+			Stream:     outbox.EntitiesStream,
 			Kind:       kind,
 			EntityKey:  entityKey,
 			OccurredAt: timestamp(at),
@@ -1744,7 +1763,7 @@ func checkSemanticVersion(run CheckRunRecord) string {
 }
 
 func RepositoryEntityKey(installationID, repositoryGitHubID int64) string {
-	return fmt.Sprintf("repo:%d:%d", installationID, repositoryGitHubID)
+	return outbox.RepositoryKey(installationID, repositoryGitHubID)
 }
 
 func RepositoryDiscoveryKey(installationID int64, fullName string) string {
@@ -1756,12 +1775,7 @@ func PullRequestEntityKey(
 	repositoryGitHubID int64,
 	number int,
 ) string {
-	return fmt.Sprintf(
-		"pr:%d:%d:%d",
-		installationID,
-		repositoryGitHubID,
-		number,
-	)
+	return outbox.PullRequestKey(installationID, repositoryGitHubID, number)
 }
 
 func StackEntityKey(
@@ -1769,12 +1783,7 @@ func StackEntityKey(
 	repositoryGitHubID int64,
 	number int,
 ) string {
-	return fmt.Sprintf(
-		"stack:%d:%d:%d",
-		installationID,
-		repositoryGitHubID,
-		number,
-	)
+	return outbox.StackKey(installationID, repositoryGitHubID, number)
 }
 
 func ChecksEntityKey(
@@ -1782,23 +1791,14 @@ func ChecksEntityKey(
 	repositoryGitHubID int64,
 	sha string,
 ) string {
-	return fmt.Sprintf(
-		"checks:%d:%d:%s",
-		installationID,
-		repositoryGitHubID,
-		sha,
-	)
+	return outbox.ChecksKey(installationID, repositoryGitHubID, sha)
 }
 
 func RepoRulesEntityKey(
 	installationID int64,
 	repositoryGitHubID int64,
 ) string {
-	return fmt.Sprintf(
-		"repo_rules:%d:%d",
-		installationID,
-		repositoryGitHubID,
-	)
+	return outbox.RepoRulesKey(installationID, repositoryGitHubID)
 }
 
 func derivationScope(

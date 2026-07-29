@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/acme/frontier/internal/store"
+	"github.com/acme/frontier/internal/testdb"
 )
 
 var deriveTestID atomic.Int64
@@ -143,7 +143,7 @@ func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 	identity := PullRequestIdentity(repositoryID, 42)
 	service, err := New(Options{
 		Pool: pool,
-		Deriver: fixedDeriver{item: WorkItem{
+		Deriver: fixedDeriver{item: &WorkItem{
 			IdentityKey: identity,
 			OrgID:       1,
 			Payload:     json.RawMessage(`{"state":"ready"}`),
@@ -156,11 +156,16 @@ func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 	if _, err := service.RunOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var payload, eventPayload string
+	var owner, payload, eventPayload string
 	if err := pool.QueryRow(ctx, `
-		SELECT payload::text FROM work_items WHERE identity_key = $1
-	`, identity).Scan(&payload); err != nil {
+		SELECT scope_key, payload::text
+		FROM work_items
+		WHERE identity_key = $1
+	`, identity).Scan(&owner, &payload); err != nil {
 		t.Fatal(err)
+	}
+	if owner != scope {
+		t.Fatalf("work-item owner = %q, want %q", owner, scope)
 	}
 	if !strings.Contains(payload, `"state": "ready"`) {
 		t.Fatalf("work-item payload = %s", payload)
@@ -177,7 +182,8 @@ func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 		t.Fatal(err)
 	}
 	if strings.Contains(eventPayload, `"state"`) ||
-		!strings.Contains(eventPayload, `"version": 1`) {
+		!strings.Contains(eventPayload, `"version": 1`) ||
+		!strings.Contains(eventPayload, `"scope_key"`) {
 		t.Fatalf("C-S6 event payload is not a versioned reference: %s", eventPayload)
 	}
 	var dirty int
@@ -188,6 +194,97 @@ func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 	}
 	if dirty != 0 {
 		t.Fatalf("derived scope remains dirty")
+	}
+}
+
+func TestScopeReconciliationRemovesPriorWorkItemAndEmitsReference(
+	t *testing.T,
+) {
+	pool := deriveDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	scope, repositoryID := insertLoosePullScope(t, ctx, pool, "remove")
+	identity := PullRequestIdentity(repositoryID, 42)
+	service, err := New(Options{
+		Pool: pool,
+		Deriver: fixedDeriver{item: &WorkItem{
+			IdentityKey: identity,
+			OrgID:       1,
+			Payload:     json.RawMessage(`{"state":"ready"}`),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO derivation_dirty (scope_key, marked_at)
+		VALUES ($1, clock_timestamp())
+		ON CONFLICT (scope_key) DO UPDATE
+		SET marked_at = EXCLUDED.marked_at
+	`, scope); err != nil {
+		t.Fatal(err)
+	}
+	service.deriver = NoopDeriver{}
+	if _, err := service.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM work_items WHERE identity_key = $1
+	`, identity).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("scope reconciliation retained %d stale work items", count)
+	}
+	var payload string
+	if err := pool.QueryRow(ctx, `
+		SELECT payload::text
+		FROM change_events
+		WHERE stream = 'work_items'
+		  AND kind = 'work_item.removed'
+		  AND entity_key = $1
+		ORDER BY seq DESC
+		LIMIT 1
+	`, identity).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload, `"scope_key": "`+scope+`"`) {
+		t.Fatalf("removed event payload = %s", payload)
+	}
+}
+
+func TestDeriverRejectsIdentityNotOwnedByClaimedScope(t *testing.T) {
+	pool := deriveDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	scope, _ := insertLoosePullScope(t, ctx, pool, "identity")
+	service, err := New(Options{
+		Pool: pool,
+		Deriver: fixedDeriver{item: &WorkItem{
+			IdentityKey: "arbitrary",
+			OrgID:       1,
+			Payload:     json.RawMessage(`{"state":"bad"}`),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunOnce(ctx); err == nil ||
+		!strings.Contains(err.Error(), "not owned by scope") {
+		t.Fatalf("invalid identity error = %v", err)
+	}
+	var dirty int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM derivation_dirty WHERE scope_key = $1
+	`, scope).Scan(&dirty); err != nil {
+		t.Fatal(err)
+	}
+	if dirty != 1 {
+		t.Fatalf("invalid result cleared dirty scope: count=%d", dirty)
 	}
 }
 
@@ -205,18 +302,32 @@ type blockingDeriver struct {
 	release <-chan struct{}
 }
 
-func (d blockingDeriver) Derive(snapshot Snapshot) []WorkItem {
+func (d blockingDeriver) Derive(snapshot Snapshot) []ScopeResult {
 	d.entered <- snapshot
 	<-d.release
-	return nil
+	return NoopDeriver{}.Derive(snapshot)
 }
 
 type fixedDeriver struct {
-	item WorkItem
+	item *WorkItem
 }
 
-func (d fixedDeriver) Derive(Snapshot) []WorkItem {
-	return []WorkItem{d.item}
+func (d fixedDeriver) Derive(snapshot Snapshot) []ScopeResult {
+	results := NoopDeriver{}.Derive(snapshot)
+	if d.item == nil {
+		return results
+	}
+	for index := range results {
+		scope, err := parseScope(results[index].ScopeKey)
+		if err == nil && identityForScope(scope) == d.item.IdentityKey {
+			results[index].WorkItems = []WorkItem{*d.item}
+			return results
+		}
+	}
+	if len(results) > 0 {
+		results[0].WorkItems = []WorkItem{*d.item}
+	}
+	return results
 }
 
 func insertLoosePullScope(
@@ -292,14 +403,10 @@ func deriveDatabase(t *testing.T) *pgxpool.Pool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, url)
+	database, err := testdb.Open(ctx, url, "derive")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Migrate(ctx, pool); err != nil {
-		pool.Close()
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	t.Cleanup(database.Close)
+	return database.Pool
 }
