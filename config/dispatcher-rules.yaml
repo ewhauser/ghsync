@@ -1,5 +1,5 @@
 # ghsync dispatcher rules. Point DISPATCH_RULES_FILE at this file to make
-# Phase-0 webhook findings deployable as data (SYNC_ENGINE §2.1).
+# observed-payload findings deployable as data (SYNC_ENGINE §2.1).
 rules:
   - event: pull_request
     action: "*"
@@ -26,5 +26,5 @@ rules:
   - event: push
     action: "*"
     target: branch
-    # Pending Phase-0 validation: real push payloads have no stack object.
+    # Pending real-payload validation: push payloads have no stack object.
     stacked_target: stack

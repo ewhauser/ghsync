@@ -242,7 +242,7 @@ func (s *Service) Detect(
 	// C-O3 measures divergence of a SETTLED cache. While installation
 	// backfill is still seeding, half-populated entities legitimately
 	// differ from upstream; sampling then records noise findings that
-	// outlive the seed (observed as instant soak failures on slow CI
+	// outlive the seed (observed as instant load-verification failures on slow CI
 	// runners). Skip the pass — with a heartbeat — until backfill is done.
 	backfillDone, err := dbgen.New(s.pool).IsInstallationBackfillDone(
 		ctx,

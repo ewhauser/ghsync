@@ -42,7 +42,7 @@ publish their process-local counters and `ghsync_c_o4_role_enabled`, but do
 not repeat expensive cache/outbox aggregation on every scrape.
 
 `serve --roles=all` remains a local/CI convenience, not the production rolling
-topology. `fake-github`, `stream-tail`, and `soak` are operator/development
+topology. `fake-github` and `stream-tail` are operator/development
 utilities.
 
 ## River queues and workers

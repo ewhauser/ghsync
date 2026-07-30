@@ -16,11 +16,11 @@ import (
 	"time"
 )
 
-// ControlEmitPath is a development-only control surface used by cmd/soak to
-// ask the standalone fake to record and emit a signed delivery.
+// ControlEmitPath is a development-only control surface used by the load
+// verifier to ask the standalone fake to record and emit a signed delivery.
 const (
 	ControlEmitPath = "/_ghsync/emit"
-	// ControlTruthPath exposes current soak truth to the local oracle.
+	// ControlTruthPath exposes the fake's mutation truth to the local oracle.
 	ControlTruthPath          = "/_ghsync/truth"
 	maxRecordedAuthorizations = 1024
 )

@@ -591,8 +591,8 @@ payload (this also preserves C-I4: the fetch re-reads truth at run time).
 - **Resync test (C-S4/C-S7):** consumer paused past retention, then resumes
   → receives `RESYNC_REQUIRED`, re-snapshots, and converges with no
   duplicate application.
-- **Drift detector as test oracle (C-O3):** long-running soak against a
-  scripted fake GitHub with divergence budget = 0.
+- **Drift detector as test oracle (C-O3):** long-running load replay against
+  a scripted fake GitHub with divergence budget = 0 (see docs/TESTING.md).
 
 ## 10. Decisions & open questions
 

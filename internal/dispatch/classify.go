@@ -105,7 +105,7 @@ func DefaultClassifier() Classifier {
 	return NewClassifier(DefaultRules())
 }
 
-// LoadRulesFile makes Phase-0 webhook findings a reviewed data change rather
+// LoadRulesFile makes observed-payload findings a reviewed data change rather
 // than an event-specific code branch. YAML is a superset of the shipped JSON
 // shape, so either format is accepted.
 func LoadRulesFile(path string) ([]Rule, error) {

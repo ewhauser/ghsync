@@ -215,7 +215,7 @@ checks before submitting a pull request.
 - [`ops/DASHBOARD.md`](ops/DASHBOARD.md) — cache-trust dashboard specification
 - [`ops/alerts.yaml`](ops/alerts.yaml) — Prometheus alert rules
 - [`ops/runbooks`](ops/runbooks) — incident response procedures
-- [`ops/SOAK.md`](ops/SOAK.md) — load and convergence testing
+- [`docs/TESTING.md`](docs/TESTING.md) — conformance and load testing plan
 
 ## License
 

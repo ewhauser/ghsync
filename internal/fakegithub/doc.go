@@ -1,5 +1,5 @@
 // Package fakegithub provides a scriptable GitHub HTTP server for integration
-// tests and local soak runs.
+// tests and local load-replay runs.
 //
 // Options are applied in declaration order. Options that cannot produce a
 // meaningful server configuration panic immediately (for example, negative
