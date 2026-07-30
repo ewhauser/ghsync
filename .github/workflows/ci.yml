@@ -27,6 +27,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Disposable CI data: skip WAL durability so concurrent per-test
+      # database clones and River pipelines are not fsync-bound on the
+      # shared runner disk. synchronous_commit stays on (C-I1 verifies it);
+      # fsync/full_page_writes are server-side and reloadable.
+      - name: Relax CI Postgres durability
+        run: |
+          PGPASSWORD=ghsync psql -h localhost -U ghsync -d ghsync_test -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET fsync = off" \
+            -c "ALTER SYSTEM SET full_page_writes = off" \
+            -c "SELECT pg_reload_conf()"
       - run: go build ./...
       - run: go vet ./...
       - name: Unit and required database integration tests
@@ -115,6 +125,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Same disposable-data durability relaxation as the test job.
+      - name: Relax CI Postgres durability
+        run: |
+          PGPASSWORD=ghsync psql -h localhost -U ghsync -d ghsync_load_smoke -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET fsync = off" \
+            -c "ALTER SYSTEM SET full_page_writes = off" \
+            -c "SELECT pg_reload_conf()"
       - name: Build load-smoke binaries
         run: |
           go build -o /tmp/ghsyncd ./cmd/ghsyncd
