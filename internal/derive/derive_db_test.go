@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,6 +21,7 @@ import (
 var deriveTestID atomic.Int64
 
 func TestNoopDeriverEndToEnd(t *testing.T) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -86,6 +86,7 @@ func TestNoopDeriverEndToEnd(t *testing.T) {
 }
 
 func TestRunReconnectsAfterListenerBackendTermination(t *testing.T) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -162,6 +163,7 @@ func TestRunReconnectsAfterListenerBackendTermination(t *testing.T) {
 }
 
 func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -241,6 +243,7 @@ func TestDirtyMarkArrivingMidPassSurvives(t *testing.T) {
 }
 
 func TestFencedDirtyMarkWithConcurrentWatermarkerDoesNotStall(t *testing.T) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -447,6 +450,7 @@ func TestFencedDirtyMarkWithConcurrentWatermarkerDoesNotStall(t *testing.T) {
 func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -512,6 +516,7 @@ func TestDeriverWritesWorkItemAndReferenceEventInDirtyTransaction(
 func TestScopeReconciliationRemovesPriorWorkItemAndEmitsReference(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -571,6 +576,7 @@ func TestScopeReconciliationRemovesPriorWorkItemAndEmitsReference(
 }
 
 func TestDeriverRejectsIdentityNotOwnedByClaimedScope(t *testing.T) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -603,6 +609,7 @@ func TestDeriverRejectsIdentityNotOwnedByClaimedScope(t *testing.T) {
 }
 
 func TestScopeSnapshotContainsOnlyLiveScopeOwnedRows(t *testing.T) {
+	t.Parallel()
 	pool := deriveDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -756,6 +763,7 @@ func TestScopeSnapshotContainsOnlyLiveScopeOwnedRows(t *testing.T) {
 }
 
 func TestStableIdentityHelpers(t *testing.T) {
+	t.Parallel()
 	if got := StackIdentity(991, 12); got != "repo:991:stack:12" {
 		t.Fatalf("stack identity = %q", got)
 	}
@@ -868,18 +876,7 @@ func insertLoosePullScope(
 
 func deriveDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	database, err := testdb.Open(ctx, url, "derive")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(database.Close)
-	return database.Pool
+	return testdb.New(t).Pool
 }
 
 func waitForFenceLocks(
@@ -930,6 +927,10 @@ func fenceLockCount(
 		SELECT count(*)
 		FROM pg_locks
 		WHERE locktype = 'advisory'
+		  AND database = (
+		      SELECT oid FROM pg_database
+		      WHERE datname = current_database()
+		  )
 		  AND classid = $1
 		  AND objid = $2
 		  AND objsubid = 1

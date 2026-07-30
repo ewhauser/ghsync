@@ -6,39 +6,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
+	pool := testdb.New(t).Pool
 
 	installationID := time.Now().UnixNano()
-	t.Cleanup(func() {
-		_, _ = pool.Exec(
-			context.Background(),
-			`DELETE FROM installation_budgets WHERE installation_id = $1`,
-			installationID,
-		)
-	})
 	leases := NewPostgresLeaseStore(pool)
 	if _, _, acquired, err := leases.Acquire(
 		ctx,
@@ -120,29 +102,12 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 }
 
 func TestPostgresLeaseConcurrentStealHasExactlyOneWinner(t *testing.T) {
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
+	pool := testdb.New(t).Pool
 
 	installationID := time.Now().UnixNano()
-	t.Cleanup(func() {
-		_, _ = pool.Exec(
-			context.Background(),
-			`DELETE FROM installation_budgets WHERE installation_id = $1`,
-			installationID,
-		)
-	})
 	leases := NewPostgresLeaseStore(pool)
 	if _, _, acquired, err := leases.Acquire(
 		ctx,
@@ -244,29 +209,12 @@ func TestPostgresLeaseConcurrentStealHasExactlyOneWinner(t *testing.T) {
 }
 
 func TestPostgresLeaseOwnershipLossStopsRenewalAndAllowsFailover(t *testing.T) {
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := store.Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
+	pool := testdb.New(t).Pool
 
 	installationID := time.Now().UnixNano()
-	t.Cleanup(func() {
-		_, _ = pool.Exec(
-			context.Background(),
-			`DELETE FROM installation_budgets WHERE installation_id = $1`,
-			installationID,
-		)
-	})
 	leases := NewPostgresLeaseStore(pool)
 	ttl := 2 * time.Second
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {

@@ -1,6 +1,9 @@
 services:
   postgres:
     image: postgres:16
+    # Parallel DB tests (pgtestdb clones a database per test) open more
+    # simultaneous connections than the default limit of 100 allows.
+    command: postgres -c max_connections=300
     environment:
       POSTGRES_USER: ghsync
       POSTGRES_PASSWORD: ghsync

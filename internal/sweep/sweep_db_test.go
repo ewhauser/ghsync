@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -31,6 +30,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 const sweepTestSecret = "sweep-test-secret"
@@ -319,6 +319,7 @@ func (h *sweepHarness) start(t *testing.T) {
 func TestC_R1EndToEndBoundIncludesCadenceQueueAndFetch(
 	t *testing.T,
 ) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	h.seedCache(t, []int{4812}, false, false)
 	ctx := context.Background()
@@ -472,6 +473,7 @@ func TestC_R1EndToEndBoundIncludesCadenceQueueAndFetch(
 }
 
 func TestList304AdvancesOnlyListMembershipFreshness(t *testing.T) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	h.seedCache(t, []int{4812}, false, false)
 	ctx := context.Background()
@@ -544,6 +546,7 @@ func TestList304AdvancesOnlyListMembershipFreshness(t *testing.T) {
 }
 
 func TestPullListingOverlapPassRecoversConcurrentPageShift(t *testing.T) {
+	t.Parallel()
 	h := newSweepHarness(t, 2)
 	h.seedCache(t, nil, false, false)
 	ctx := context.Background()
@@ -612,6 +615,7 @@ func TestPullListingOverlapPassRecoversConcurrentPageShift(t *testing.T) {
 func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 	t *testing.T,
 ) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	h.seedCache(t, []int{4810, 4812}, true, true)
 	ctx := context.Background()
@@ -758,6 +762,7 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 func TestSweepCursorResumesAfterMidSweepCrashAndSignalsOverrun(
 	t *testing.T,
 ) {
+	t.Parallel()
 	h := newSweepHarness(t, 2)
 	h.seedCache(t, nil, false, false)
 	ctx := context.Background()
@@ -839,6 +844,7 @@ func TestSweepCursorResumesAfterMidSweepCrashAndSignalsOverrun(
 func TestRepositorySweepCursorsReapRenamedAndTombstonedScopes(
 	t *testing.T,
 ) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	h.seedCache(t, []int{4812}, false, false)
 	ctx := context.Background()
@@ -944,6 +950,7 @@ func TestRepositorySweepCursorsReapRenamedAndTombstonedScopes(
 func TestDisappearanceVerificationTombstonesPRStackAndRepository(
 	t *testing.T,
 ) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	h.seedCache(t, []int{4812}, true, false)
 	fixture := h.fixture
@@ -1003,6 +1010,7 @@ func TestDisappearanceVerificationTombstonesPRStackAndRepository(
 }
 
 func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	h.seedCache(t, []int{4812}, false, false)
 	ingressServer := httptest.NewServer(ingress.NewMux(
@@ -1095,6 +1103,7 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
 	t *testing.T,
 ) {
+	t.Parallel()
 	h := newSweepHarness(t, 1)
 	h.service.config.GapMaxPages = 1
 	ingressServer := httptest.NewServer(ingress.NewMux(
@@ -1161,6 +1170,7 @@ func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
 func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 	t *testing.T,
 ) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	ctx := context.Background()
 	cutoff := h.now.Add(-90 * 24 * time.Hour)
@@ -1305,6 +1315,7 @@ func TestPrunerHonorsNinetyDayBoundaryAndPreservesGUIDSkeletons(
 }
 
 func TestRequeueRefusesPayloadPrunedDeliveryWithVisibleReason(t *testing.T) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	ctx := context.Background()
 	prunedAt := h.now.Add(-time.Hour)
@@ -1349,6 +1360,7 @@ func TestRequeueRefusesPayloadPrunedDeliveryWithVisibleReason(t *testing.T) {
 }
 
 func TestPrunerCommitsBoundedBatchesUntilBacklogIsEmpty(t *testing.T) {
+	t.Parallel()
 	h := newSweepHarness(t, 100)
 	h.service.config.RetentionBatchSize = 2
 	h.seedCache(t, nil, false, false)
@@ -1677,61 +1689,11 @@ func waitFor(t *testing.T, condition func() bool) {
 
 func sweepTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	admin, err := store.Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatalf("connect admin: %v", err)
-	}
-	schema := fmt.Sprintf("ghsync_sweep_%d", time.Now().UnixNano())
-	identifier := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
-		admin.Close()
-		t.Fatalf("create test schema: %v", err)
-	}
-	config, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		admin.Close()
-		t.Fatal(err)
-	}
-	if config.ConnConfig.RuntimeParams == nil {
-		config.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	config.ConnConfig.RuntimeParams["search_path"] = schema
-	config.ConnConfig.RuntimeParams["synchronous_commit"] = "on"
-	pool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		admin.Close()
-		t.Fatal(err)
-	}
-	if err := store.Migrate(ctx, pool); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatalf("migrate: %v", err)
-	}
-	t.Cleanup(func() {
-		pool.Close()
-		dropCtx, dropCancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer dropCancel()
-		if _, err := admin.Exec(
-			dropCtx,
-			"DROP SCHEMA "+identifier+" CASCADE",
-		); err != nil {
-			t.Errorf("drop schema: %v", err)
-		}
-		admin.Close()
-	})
-	return pool
+	return testdb.New(t).Pool
 }
 
 func TestDispatcherRulesFileIsLoadable(t *testing.T) {
+	t.Parallel()
 	rules, err := dispatch.LoadRulesFile(
 		"../../config/dispatcher-rules.yaml",
 	)

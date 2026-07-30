@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -32,11 +31,13 @@ import (
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 const fetchTestSecret = "fetch-test-secret"
 
 func TestWriteRaceBothOrdersNewerWins(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -75,6 +76,7 @@ func TestWriteRaceBothOrdersNewerWins(t *testing.T) {
 }
 
 func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	writer := store.NewEntityWriter(pool)
 	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -154,6 +156,7 @@ func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
 func TestRepositoryRenameKeepsAliasesImmutableEventsAndDirtyScopes(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -277,6 +280,7 @@ func TestRepositoryRenameKeepsAliasesImmutableEventsAndDirtyScopes(
 }
 
 func TestTimestampLessChecksOnlyAppendAcceptedTransitions(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -369,6 +373,7 @@ func TestTimestampLessChecksOnlyAppendAcceptedTransitions(t *testing.T) {
 }
 
 func TestIdenticalPR200OnlyAdvancesLastCheckedAt(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -431,6 +436,7 @@ func TestIdenticalPR200OnlyAdvancesLastCheckedAt(t *testing.T) {
 }
 
 func TestPullRequestBatchIsolatesPoisonEntity(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	writer := store.NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -467,6 +473,7 @@ func TestPullRequestBatchIsolatesPoisonEntity(t *testing.T) {
 }
 
 func TestCoordinatorReturnsPerKeyWriterErrors(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake, server, handler, riverClient := newDirectHandler(
@@ -547,6 +554,7 @@ func TestCoordinatorReturnsPerKeyWriterErrors(t *testing.T) {
 }
 
 func TestCoordinatorStampsEveryGangedItemEventContext(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake, server, handler, riverClient := newDirectHandler(
@@ -631,6 +639,7 @@ func TestCoordinatorStampsEveryGangedItemEventContext(t *testing.T) {
 }
 
 func TestCoordinatorIsolatesReviewThreadTransportFailure(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	targetThread := fixture.PullRequests[1].ReviewThreads[0].ID
@@ -772,6 +781,7 @@ func TestCoordinatorIsolatesReviewThreadTransportFailure(t *testing.T) {
 }
 
 func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	_, server, handler, riverClient := newDirectHandler(
@@ -870,6 +880,7 @@ func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
 func TestBatchObservationLockBlocksConcurrentWorkerAndCommitsFollowupGeneration(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake, server, handler, riverClient := newDirectHandler(
@@ -991,6 +1002,7 @@ func TestBatchObservationLockBlocksConcurrentWorkerAndCommitsFollowupGeneration(
 }
 
 func TestPR404CreatesTombstoneAndEvent(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake, server, handler, riverClient := newDirectHandler(
@@ -1047,6 +1059,7 @@ func TestPR404CreatesTombstoneAndEvent(t *testing.T) {
 }
 
 func TestRepositoryRulesLockedCASDirtyEventAndConditionalRecheck(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake, server, handler, riverClient := newDirectHandler(
@@ -1145,6 +1158,7 @@ func TestRepositoryRulesLockedCASDirtyEventAndConditionalRecheck(t *testing.T) {
 }
 
 func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake, server, handler, riverClient := newDirectHandler(
@@ -1304,6 +1318,7 @@ func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
 }
 
 func TestChecksMidPagination404DoesNotReplaceOrTombstone(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	template := fixture.CheckRuns[0]
@@ -1413,6 +1428,7 @@ func TestChecksMidPagination404DoesNotReplaceOrTombstone(t *testing.T) {
 }
 
 func TestBackfillResumesFromDurableCursor(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake, server, handler, riverClient := newDirectHandler(
@@ -1539,6 +1555,7 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 }
 
 func TestInstallationBackfillEnumeratesAndWaitsForRepoChildren(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fake, server, handler, riverClient := newDirectHandler(
 		t,
@@ -1602,6 +1619,7 @@ func TestInstallationBackfillEnumeratesAndWaitsForRepoChildren(t *testing.T) {
 }
 
 func TestBackfillStableCreatedSnapshotSurvivesMidScanUpdate(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	var mutated atomic.Bool
 	hook := fakegithub.WithRequestHook(func(
@@ -1698,6 +1716,7 @@ func TestBackfillStableCreatedSnapshotSurvivesMidScanUpdate(t *testing.T) {
 }
 
 func TestBackfillCancelMidScanResumesFromDurablePage(t *testing.T) {
+	t.Parallel()
 	pool := fetchTestDatabase(t)
 	var pagesMu sync.Mutex
 	var pages []int
@@ -1889,6 +1908,7 @@ func TestBackfillCancelMidScanResumesFromDurablePage(t *testing.T) {
 }
 
 func TestPipelineWaitIdleIncludesKeylessBackfillJobs(t *testing.T) {
+	t.Parallel()
 	harness := newPipelineHarness(t, "acme/keyless-idle")
 	defer harness.close()
 	if _, err := StartBackfill(
@@ -1917,6 +1937,7 @@ func TestPipelineWaitIdleIncludesKeylessBackfillJobs(t *testing.T) {
 }
 
 func TestOrderIndependenceFinalCacheState(t *testing.T) {
+	t.Parallel()
 	want := expectedOrderCacheSnapshot()
 	for run := range 4 {
 		repo := "acme/order"
@@ -1996,6 +2017,7 @@ func expectedOrderCacheSnapshot() cacheSnapshot {
 }
 
 func TestStormAssertsFetchCount(t *testing.T) {
+	t.Parallel()
 	harness := newPipelineHarness(t, "acme/storm")
 	defer harness.close()
 	warm := pipelineEvent{
@@ -2512,56 +2534,5 @@ func toGHPullRequest(
 
 func fetchTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	admin, err := store.Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatalf("connect admin: %v", err)
-	}
-	schema := fmt.Sprintf("ghsync_fetch_%d", time.Now().UnixNano())
-	identifier := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
-		admin.Close()
-		t.Fatalf("create test schema: %v", err)
-	}
-	config, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		admin.Close()
-		t.Fatal(err)
-	}
-	config.ConnConfig.RuntimeParams["search_path"] = schema
-	config.ConnConfig.RuntimeParams["synchronous_commit"] = "on"
-	pool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		admin.Close()
-		t.Fatal(err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatal(err)
-	}
-	if err := store.Migrate(ctx, pool); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatalf("migrate: %v", err)
-	}
-	t.Cleanup(func() {
-		pool.Close()
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer dropCancel()
-		if _, err := admin.Exec(
-			dropCtx,
-			"DROP SCHEMA "+identifier+" CASCADE",
-		); err != nil {
-			t.Errorf("drop schema: %v", err)
-		}
-		admin.Close()
-	})
-	return pool
+	return testdb.New(t).Pool
 }

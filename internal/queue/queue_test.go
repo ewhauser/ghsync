@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -15,7 +14,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 	"github.com/ewhauser/ghsync/internal/testdb"
 )
@@ -37,21 +35,11 @@ func registerNoopWorker(workers *river.Workers) {
 }
 
 func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	pool, err := store.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	pool := testdb.New(t).Pool
 
 	client, err := NewClient(pool, WithWorkerRegistrar(registerNoopWorker))
 	if err != nil {
@@ -112,17 +100,10 @@ func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 }
 
 func TestRiverOpenTelemetryPropagatesInsertLinkToWorker(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	database, err := testdb.Open(ctx, url, "river_otel")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	database := testdb.New(t)
 
 	recorder := tracetest.NewSpanRecorder()
 	provider := sdktrace.NewTracerProvider(
@@ -249,21 +230,11 @@ completed:
 }
 
 func TestExplicitQueueSelectionDoesNotPollUnownedQueues(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	pool, err := store.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	pool := testdb.New(t).Pool
 
 	client, err := NewClient(
 		pool,
@@ -338,21 +309,11 @@ func TestExplicitQueueSelectionDoesNotPollUnownedQueues(t *testing.T) {
 }
 
 func TestDirtyGenerationReinsertsFollowUpAfterCompletion(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	pool, err := store.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	pool := testdb.New(t).Pool
 
 	key := fmt.Sprintf("branch:acme/dirty-follow-up:%d", time.Now().UnixNano())
 	pointer, err := json.Marshal([]map[string]string{{

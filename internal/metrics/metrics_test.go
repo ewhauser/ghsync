@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +31,7 @@ func (r *counterRegistrar) RegisterMetrics(meter metric.Meter) error {
 }
 
 func TestRegistryIsolatedPrometheusExposition(t *testing.T) {
+	t.Parallel()
 	registry, err := New()
 	if err != nil {
 		t.Fatal(err)
@@ -61,17 +61,10 @@ func TestRegistryIsolatedPrometheusExposition(t *testing.T) {
 }
 
 func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	database, err := testdb.Open(ctx, databaseURL, "metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	database := testdb.New(t)
 	if _, err := database.Pool.Exec(ctx, `
 		INSERT INTO installation_budgets (
 		    installation_id, class, remaining, rate_limit, reset_at
@@ -354,6 +347,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 }
 
 func TestBatchLabelUsesConfiguredDirtyCap(t *testing.T) {
+	t.Parallel()
 	options := RuntimeOptions{DeriverDirtyCap: 7}
 	for _, test := range []struct {
 		count int

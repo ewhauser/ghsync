@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -19,18 +18,11 @@ import (
 // webhook GUID dedupe works through sqlc, and the ingestion table keeps its
 // minimal primary-key plus pending-only partial-index invariant.
 func TestMigrateIdempotent(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	pool, err := Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
+	pool := testDatabasePool(t)
 	var synchronousCommit string
 	if err := pool.QueryRow(ctx, "SHOW synchronous_commit").Scan(
 		&synchronousCommit,
@@ -42,7 +34,9 @@ func TestMigrateIdempotent(t *testing.T) {
 		)
 	}
 
-	for range 2 { // twice: second run must be a no-op
+	// The test database arrives already migrated (pgtestdb template); both
+	// re-runs must be no-ops.
+	for range 2 {
 		if err := Migrate(ctx, pool); err != nil {
 			t.Fatalf("migrate: %v", err)
 		}
@@ -188,6 +182,7 @@ func TestMigrateIdempotent(t *testing.T) {
 }
 
 func TestVerifyChecksum(t *testing.T) {
+	t.Parallel()
 	checksum := []byte("expected")
 	if err := verifyChecksum("0001.sql", checksum, checksum); err != nil {
 		t.Fatalf("equal checksum rejected: %v", err)
@@ -201,20 +196,10 @@ func TestVerifyChecksum(t *testing.T) {
 }
 
 func TestInstallationBudgetSnapshotPreservesLaterBackoff(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := Connect(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
+	pool := testDatabasePool(t)
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)

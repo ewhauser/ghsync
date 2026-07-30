@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +95,7 @@ func TestIsRetryableTaxonomy(t *testing.T) {
 func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -199,6 +199,7 @@ func TestOutboxGapWatermarkDeliversDelayedSmallerSequenceInOrder(
 }
 
 func TestTailRetriesConcurrentCursorFirstTouchRace(t *testing.T) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -270,6 +271,7 @@ func TestTailRetriesConcurrentCursorFirstTouchRace(t *testing.T) {
 }
 
 func TestSnapshotCommitPriorSeqAndIdempotentClose(t *testing.T) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -373,6 +375,7 @@ func TestSnapshotCommitPriorSeqAndIdempotentClose(t *testing.T) {
 func TestRetentionCannotDeleteBetweenHorizonCheckAndPageSnapshot(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -450,6 +453,7 @@ func TestRetentionCannotDeleteBetweenHorizonCheckAndPageSnapshot(
 func TestWatermarkIgnoresUnrelatedWriterAndLongBootstrapSnapshot(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -497,6 +501,7 @@ func TestWatermarkIgnoresUnrelatedWriterAndLongBootstrapSnapshot(
 func TestTailRecoversAfterListenerDisconnectWhilePollingContinues(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -565,6 +570,7 @@ func TestTailRecoversAfterListenerDisconnectWhilePollingContinues(
 func TestTailRepeatedListenerTerminationReachesMaxBackoffAndRecovers(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -706,6 +712,7 @@ func TestTailRepeatedListenerTerminationReachesMaxBackoffAndRecovers(
 func TestTailPersistentListenerPoolExhaustionPollsThenRecovers(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool, clientPool := streamTestDatabaseWithClientPool(t, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -848,6 +855,7 @@ func TestTailPersistentListenerPoolExhaustionPollsThenRecovers(
 }
 
 func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -948,6 +956,7 @@ func TestExactlyOncePerCursorAcrossMidBatchCrashAndRestart(t *testing.T) {
 func TestBootstrapTailOverlapConvergesWithoutLostOrDoubleAppliedEffect(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1111,6 +1120,7 @@ func TestBootstrapTailOverlapConvergesWithoutLostOrDoubleAppliedEffect(
 }
 
 func TestConcurrentTailersReturnTypedCursorContention(t *testing.T) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1215,6 +1225,7 @@ func TestConcurrentTailersReturnTypedCursorContention(t *testing.T) {
 func TestRetentionResyncBootstrapConvergesWithoutDuplicateSeqApplication(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamTestDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1579,18 +1590,7 @@ func tableCount(t *testing.T, pool *pgxpool.Pool, table string) int {
 
 func streamTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	database, err := testdb.Open(ctx, url, "streamclient")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(database.Close)
-	return database.Pool
+	return testdb.New(t).Pool
 }
 
 func streamTestDatabaseWithClientPool(
@@ -1598,17 +1598,9 @@ func streamTestDatabaseWithClientPool(
 	maxConns int32,
 ) (*pgxpool.Pool, *pgxpool.Pool) {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	database, err := testdb.Open(ctx, url, "streamclientpool")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(database.Close)
+	database := testdb.New(t)
 
 	config, err := pgxpool.ParseConfig(database.URL)
 	if err != nil {

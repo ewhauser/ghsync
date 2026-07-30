@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,11 +20,13 @@ import (
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 const testWebhookSecret = "dispatch-test-secret"
 
 func TestConcurrentDispatchersLockGenerationKeysInDeterministicOrder(t *testing.T) {
+	t.Parallel()
 	pool := dispatchTestDatabase(t)
 	poolA := cloneDispatchPool(t, pool)
 	poolB := cloneDispatchPool(t, pool)
@@ -229,6 +230,7 @@ func TestConcurrentDispatchersLockGenerationKeysInDeterministicOrder(t *testing.
 }
 
 func TestFullRecordedReplayIngressToRiver(t *testing.T) {
+	t.Parallel()
 	pool := dispatchTestDatabase(t)
 	riverClient, err := queue.NewClient(pool)
 	if err != nil {
@@ -334,6 +336,7 @@ func TestFullRecordedReplayIngressToRiver(t *testing.T) {
 }
 
 func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
+	t.Parallel()
 	pool := dispatchTestDatabase(t)
 	riverClient, err := queue.NewClient(pool)
 	if err != nil {
@@ -448,6 +451,7 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 }
 
 func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		size         int
@@ -458,6 +462,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			pool := dispatchTestDatabase(t)
 			riverClient, err := queue.NewClient(pool)
 			if err != nil {
@@ -574,6 +579,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 }
 
 func TestRunningRefreshRetryableTransitionCannotCollide(t *testing.T) {
+	t.Parallel()
 	pool := dispatchTestDatabase(t)
 	riverClient, err := queue.NewClient(pool)
 	if err != nil {
@@ -667,6 +673,7 @@ func TestRunningRefreshRetryableTransitionCannotCollide(t *testing.T) {
 }
 
 func TestPoisonDeliveryParksAndUnknownEventDoesNot(t *testing.T) {
+	t.Parallel()
 	pool := dispatchTestDatabase(t)
 	riverClient, err := queue.NewClient(pool)
 	if err != nil {
@@ -900,55 +907,7 @@ func (observer *recordingDispatchObserver) DispatchUnmatchedEvent(
 
 func dispatchTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	admin, err := store.Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatalf("connect admin: %v", err)
-	}
-	schema := fmt.Sprintf("ghsync_dispatch_%d", time.Now().UnixNano())
-	identifier := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
-		admin.Close()
-		t.Fatalf("create test schema: %v", err)
-	}
-
-	config, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		admin.Close()
-		t.Fatalf("parse test database URL: %v", err)
-	}
-	config.ConnConfig.RuntimeParams["search_path"] = schema
-	pool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		admin.Close()
-		t.Fatalf("open schema pool: %v", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatalf("ping schema pool: %v", err)
-	}
-	if err := store.Migrate(ctx, pool); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatalf("migrate schema: %v", err)
-	}
-	t.Cleanup(func() {
-		pool.Close()
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer dropCancel()
-		if _, err := admin.Exec(dropCtx, "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
-			t.Errorf("drop test schema: %v", err)
-		}
-		admin.Close()
-	})
-	return pool
+	return testdb.New(t).Pool
 }
 
 func cloneDispatchPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {

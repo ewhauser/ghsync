@@ -1,108 +1,131 @@
-// Package testdb provides isolated-schema Postgres databases for integration
-// test packages that otherwise run concurrently under "go test ./...".
+// Package testdb provides fully isolated, migrated Postgres databases for
+// integration tests. Each test gets its own database cloned from a migrated
+// template (via pgtestdb), so creation is cheap and tests can run in
+// parallel.
 package testdb
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"net/url"
+	"os"
+	"runtime/debug"
 	"strings"
-	"time"
+	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib" // register the "pgx" database/sql driver for pgtestdb
+	"github.com/peterldowns/pgtestdb"
 
+	"github.com/ewhauser/ghsync/db"
 	"github.com/ewhauser/ghsync/internal/store"
 )
 
-// Database owns one migrated schema and its search-path-scoped pool.
+// Database owns one migrated per-test database and a pool connected to it.
 type Database struct {
-	Pool   *pgxpool.Pool
-	URL    string
-	admin  *pgxpool.Pool
-	schema string
+	Pool *pgxpool.Pool
+	URL  string
 }
 
-// Open creates and migrates a schema private to one test.
-func Open(
-	ctx context.Context,
-	databaseURL string,
-	prefix string,
-) (*Database, error) {
-	suffix := make([]byte, 8)
-	if _, err := rand.Read(suffix); err != nil {
-		return nil, fmt.Errorf("test schema suffix: %w", err)
+// New returns a migrated database private to the calling test, cloned from a
+// template that is migrated once per package run. Skips the test when
+// TEST_DATABASE_URL is unset. Cleanup is automatic; a failed test's database
+// is kept for inspection (pgtestdb logs its connection string).
+func New(t testing.TB) *Database {
+	t.Helper()
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
 	}
-	prefix = strings.ToLower(prefix)
-	schema := "ghsync_" + prefix + "_" + hex.EncodeToString(suffix)
-	admin, err := store.Connect(ctx, databaseURL)
+	conf, err := parseConfig(databaseURL)
 	if err != nil {
-		return nil, err
+		t.Fatal(err)
 	}
-	// Raw SQL exception: PostgreSQL cannot parameterize this computed schema
-	// identifier; pgx.Identifier sanitizes it before the test-only DDL runs.
-	if _, err := admin.Exec(
-		ctx,
-		"CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize(),
-	); err != nil {
-		admin.Close()
-		return nil, fmt.Errorf("create test schema: %w", err)
+	testConf := pgtestdb.Custom(t, conf, migrator{})
+	pool, err := store.Connect(context.Background(), testConf.URL())
+	if err != nil {
+		t.Fatalf("connect to test database: %v", err)
 	}
+	t.Cleanup(pool.Close)
+	return &Database{Pool: pool, URL: testConf.URL()}
+}
 
+func parseConfig(databaseURL string) (pgtestdb.Config, error) {
 	parsed, err := url.Parse(databaseURL)
 	if err != nil {
-		admin.Close()
-		return nil, fmt.Errorf("parse test database URL: %w", err)
+		return pgtestdb.Config{}, fmt.Errorf("parse TEST_DATABASE_URL: %w", err)
 	}
-	query := parsed.Query()
-	query.Set("search_path", schema)
-	parsed.RawQuery = query.Encode()
-	pool, err := store.Connect(ctx, parsed.String())
-	if err != nil {
-		dropSchema(ctx, admin, schema)
-		admin.Close()
-		return nil, err
+	port := parsed.Port()
+	if port == "" {
+		port = "5432"
 	}
-	if err := store.Migrate(ctx, pool); err != nil {
-		pool.Close()
-		dropSchema(ctx, admin, schema)
-		admin.Close()
-		return nil, err
-	}
-	return &Database{
-		Pool:   pool,
-		URL:    parsed.String(),
-		admin:  admin,
-		schema: schema,
+	password, _ := parsed.User.Password()
+	return pgtestdb.Config{
+		DriverName: "pgx",
+		Host:       parsed.Hostname(),
+		Port:       port,
+		User:       parsed.User.Username(),
+		Password:   password,
+		Database:   strings.TrimPrefix(parsed.Path, "/"),
+		Options:    parsed.RawQuery,
+		// Tests may hand Database.URL to helpers that own their own
+		// connections; terminate stragglers instead of failing the drop.
+		ForceTerminateConnections: true,
 	}, nil
 }
 
-// Close drops the isolated schema and all test data.
-func (d *Database) Close() {
-	if d == nil {
-		return
+// migrator adapts store.Migrate to pgtestdb's template-provisioning hook.
+type migrator struct{}
+
+// Hash fingerprints everything store.Migrate applies: the embedded SQL
+// migrations plus the River version providing River's own migrations.
+func (migrator) Hash() (string, error) {
+	digest := sha256.New()
+	entries, err := fs.ReadDir(db.Migrations, "migrations")
+	if err != nil {
+		return "", fmt.Errorf("read migrations: %w", err)
 	}
-	d.Pool.Close()
-	dropSchema(context.Background(), d.admin, d.schema)
-	d.admin.Close()
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		contents, err := fs.ReadFile(db.Migrations, "migrations/"+entry.Name())
+		if err != nil {
+			return "", err
+		}
+		_, _ = fmt.Fprintf(digest, "%s\n", entry.Name())
+		digest.Write(contents)
+	}
+	_, _ = fmt.Fprintf(digest, "river:%s\n", riverVersion())
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func dropSchema(
-	parent context.Context,
-	admin *pgxpool.Pool,
-	schema string,
-) {
-	ctx, cancel := context.WithTimeout(
-		context.WithoutCancel(parent),
-		10*time.Second,
-	)
-	defer cancel()
-	// Raw SQL exception: PostgreSQL cannot parameterize this computed schema
-	// identifier; pgx.Identifier sanitizes it before the test-only DDL runs.
-	_, _ = admin.Exec(
-		ctx,
-		"DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE",
-	)
+func (migrator) Migrate(
+	ctx context.Context,
+	_ *sql.DB,
+	conf pgtestdb.Config, //nolint:gocritic // pgtestdb.Migrator requires Config by value
+) error {
+	pool, err := store.Connect(ctx, conf.URL())
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	return store.Migrate(ctx, pool)
+}
+
+func riverVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "github.com/riverqueue/river/riverdriver/riverpgxv5" {
+			return dep.Version
+		}
+	}
+	return "unknown"
 }

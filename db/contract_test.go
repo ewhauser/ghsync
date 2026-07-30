@@ -25,10 +25,7 @@ type documentedColumn struct {
 }
 
 func TestPublicSchemaManifestMatchesMigratedDatabase(t *testing.T) {
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	rows := parseManifest(
 		t, "CONTRACT.md", "v1-schema", 5,
 	)
@@ -47,11 +44,7 @@ func TestPublicSchemaManifestMatchesMigratedDatabase(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	database, err := testdb.Open(ctx, databaseURL, "contract")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(database.Close)
+	database := testdb.New(t)
 	tableNames := make([]string, 0, len(tables))
 	for table := range tables {
 		tableNames = append(tableNames, table)
@@ -119,6 +112,7 @@ func TestPublicSchemaManifestMatchesMigratedDatabase(t *testing.T) {
 }
 
 func TestEventManifestMatchesWriterDefinitions(t *testing.T) {
+	t.Parallel()
 	rows := parseManifest(t, "CONTRACT.md", "v1-events", 5)
 	got := make([]outbox.Definition, 0, len(rows))
 	for _, row := range rows {
@@ -141,6 +135,7 @@ func TestEventManifestMatchesWriterDefinitions(t *testing.T) {
 }
 
 func TestV1EntityKeyConstructors(t *testing.T) {
+	t.Parallel()
 	tests := map[string]string{
 		"repository":      outbox.RepositoryKey(7, 11),
 		"pull request":    outbox.PullRequestKey(7, 11, 13),

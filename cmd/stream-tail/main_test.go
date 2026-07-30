@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -16,19 +15,12 @@ import (
 )
 
 func TestStreamTailSmoke(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	database, err := testdb.Open(ctx, url, "streamtail")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	database := testdb.New(t)
 	pool := database.Pool
-	url = database.URL
+	url := database.URL
 
 	suffix := time.Now().UnixNano()
 	consumer := fmt.Sprintf("m5-stream-tail-%d", suffix)
@@ -60,17 +52,10 @@ func TestStreamTailSmoke(t *testing.T) {
 }
 
 func TestStreamTailResyncSmoke(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	database, err := testdb.Open(ctx, url, "streamtailresync")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	database := testdb.New(t)
 	pool := database.Pool
 
 	suffix := time.Now().UnixNano()

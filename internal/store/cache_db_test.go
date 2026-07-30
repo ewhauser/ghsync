@@ -3,19 +3,18 @@ package store
 import (
 	"context"
 	"fmt"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 func TestWriteRaceBothOrdersNewerWinsConcurrently(t *testing.T) {
+	t.Parallel()
 	pool, newPool := storeTestDatabase(t)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 
@@ -24,6 +23,7 @@ func TestWriteRaceBothOrdersNewerWinsConcurrently(t *testing.T) {
 		{"new", "old"},
 	} {
 		t.Run(strings.Join(order, "-then-"), func(t *testing.T) {
+			t.Parallel()
 			repository := storeTestRepository(
 				fmt.Sprintf("acme/write-race-%d", index),
 				int64(2000+index),
@@ -124,6 +124,7 @@ func TestWriteRaceBothOrdersNewerWinsConcurrently(t *testing.T) {
 }
 
 func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
+	t.Parallel()
 	pool, _ := storeTestDatabase(t)
 	writer := NewEntityWriter(pool)
 	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -201,6 +202,7 @@ func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
 }
 
 func TestPullRequestResultSeparatesStackStateFromTitleChanges(t *testing.T) {
+	t.Parallel()
 	pool, _ := storeTestDatabase(t)
 	writer := NewEntityWriter(pool)
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
@@ -304,6 +306,7 @@ func TestPullRequestResultSeparatesStackStateFromTitleChanges(t *testing.T) {
 }
 
 func TestEntityKeyConstructorsMatchSQLGrammar(t *testing.T) {
+	t.Parallel()
 	pool, _ := storeTestDatabase(t)
 	writer := NewEntityWriter(pool)
 	ctx := context.Background()
@@ -550,30 +553,13 @@ func storeTestDatabase(
 	t *testing.T,
 ) (*pgxpool.Pool, func(applicationName string) *pgxpool.Pool) {
 	t.Helper()
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	admin, err := Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatalf("connect admin: %v", err)
-	}
-	schema := fmt.Sprintf("ghsync_store_%d", time.Now().UnixNano())
-	identifier := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
-		admin.Close()
-		t.Fatalf("create test schema: %v", err)
-	}
+	conf := testDatabaseConfig(t)
 	newPool := func(applicationName string) *pgxpool.Pool {
 		t.Helper()
-		config, err := pgxpool.ParseConfig(databaseURL)
+		config, err := pgxpool.ParseConfig(conf.URL())
 		if err != nil {
 			t.Fatal(err)
 		}
-		config.ConnConfig.RuntimeParams["search_path"] = schema
 		config.ConnConfig.RuntimeParams["synchronous_commit"] = "on"
 		config.ConnConfig.RuntimeParams["application_name"] = applicationName
 		pool, err := pgxpool.NewWithConfig(context.Background(), config)
@@ -587,22 +573,5 @@ func storeTestDatabase(
 		t.Cleanup(pool.Close)
 		return pool
 	}
-	pool := newPool("store-tests")
-	if err := Migrate(ctx, pool); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatalf("migrate: %v", err)
-	}
-	t.Cleanup(func() {
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer dropCancel()
-		if _, err := admin.Exec(
-			dropCtx,
-			"DROP SCHEMA "+identifier+" CASCADE",
-		); err != nil {
-			t.Errorf("drop schema: %v", err)
-		}
-		admin.Close()
-	})
-	return pool, newPool
+	return newPool("store-tests"), newPool
 }

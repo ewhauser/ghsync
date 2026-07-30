@@ -2,9 +2,7 @@ package drift
 
 import (
 	"context"
-	"fmt"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -19,8 +17,8 @@ import (
 	"github.com/ewhauser/ghsync/internal/fetch"
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/queue"
-	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
 type findingObserver struct {
@@ -216,6 +214,7 @@ func (h *driftHarness) divergePullRequest() {
 }
 
 func TestDetectSamplesWithUnrelatedBusySweepQueue(t *testing.T) {
+	t.Parallel()
 	harness := newReadyDriftHarness(t)
 	harness.divergePullRequest()
 	ctx := context.Background()
@@ -274,6 +273,7 @@ func TestDetectSamplesWithUnrelatedBusySweepQueue(t *testing.T) {
 }
 
 func TestDetectSkipsSampleWithOutstandingGeneration(t *testing.T) {
+	t.Parallel()
 	harness := newReadyDriftHarness(t)
 	harness.divergePullRequest()
 	ctx := context.Background()
@@ -341,6 +341,7 @@ func TestDetectSkipsSampleWithOutstandingGeneration(t *testing.T) {
 }
 
 func TestDetectRecordsZeroSampleHeartbeat(t *testing.T) {
+	t.Parallel()
 	pool := driftTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	server := httptest.NewServer(fakegithub.New(fixture, "drift-secret"))
@@ -409,6 +410,7 @@ func TestDetectRecordsZeroSampleHeartbeat(t *testing.T) {
 }
 
 func TestDetectSkipsWhileChildBackfillPending(t *testing.T) {
+	t.Parallel()
 	pool := driftTestDatabase(t)
 	ctx := context.Background()
 	// The installation cursor is 'done' (seeded by driftTestDatabase), but a
@@ -471,6 +473,7 @@ func TestDetectSkipsWhileChildBackfillPending(t *testing.T) {
 }
 
 func TestStackDriftIgnoresMemberUpdatedAtChurn(t *testing.T) {
+	t.Parallel()
 	pool := driftTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake := fakegithub.New(fixture, "drift-secret")
@@ -625,6 +628,7 @@ func TestStackDriftIgnoresMemberUpdatedAtChurn(t *testing.T) {
 func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := driftTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake := fakegithub.New(fixture, "drift-secret")
@@ -1069,6 +1073,7 @@ func waitForCacheProducers(t *testing.T, pool *pgxpool.Pool) {
 }
 
 func TestSemanticDiffNormalizesIDOrderedCollections(t *testing.T) {
+	t.Parallel()
 	cache := []byte(`{"runs":[{"id":10,"name":"ten"},{"id":2,"name":"two"}]}`)
 	upstream := []byte(`{"runs":[{"name":"two","id":2},{"name":"ten","id":10}]}`)
 	equal, diff, err := semanticDiff(cache, upstream)
@@ -1082,57 +1087,7 @@ func TestSemanticDiffNormalizesIDOrderedCollections(t *testing.T) {
 
 func driftTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	admin, err := store.Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatalf("connect admin: %v", err)
-	}
-	schema := fmt.Sprintf("ghsync_drift_%d", time.Now().UnixNano())
-	identifier := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
-		admin.Close()
-		t.Fatalf("create test schema: %v", err)
-	}
-	config, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		admin.Close()
-		t.Fatal(err)
-	}
-	if config.ConnConfig.RuntimeParams == nil {
-		config.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	config.ConnConfig.RuntimeParams["search_path"] = schema
-	config.ConnConfig.RuntimeParams["synchronous_commit"] = "on"
-	pool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		admin.Close()
-		t.Fatal(err)
-	}
-	if err := store.Migrate(ctx, pool); err != nil {
-		pool.Close()
-		admin.Close()
-		t.Fatalf("migrate: %v", err)
-	}
-	t.Cleanup(func() {
-		pool.Close()
-		dropCtx, dropCancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer dropCancel()
-		if _, err := admin.Exec(
-			dropCtx,
-			"DROP SCHEMA "+identifier+" CASCADE",
-		); err != nil {
-			t.Errorf("drop schema: %v", err)
-		}
-		admin.Close()
-	})
+	pool := testdb.New(t).Pool
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO installation_backfill_cursors (
 		    installation_id, phase, page, completed_at

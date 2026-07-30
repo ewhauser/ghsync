@@ -177,7 +177,10 @@ Common development commands:
 
 ```bash
 make build
-make test
+make test     # DB tests skip without TEST_DATABASE_URL
+              # DB tests run in parallel: pgtestdb clones a migrated template
+              # database per test, so the TEST_DATABASE_URL user must be able
+              # to create roles and databases (the docker/CI user is)
 make lint
 make gen
 ```

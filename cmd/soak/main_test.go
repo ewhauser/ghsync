@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +17,7 @@ import (
 )
 
 func TestProfileDuration(t *testing.T) {
+	t.Parallel()
 	if got, err := profileDuration("smoke", 0); err != nil ||
 		got != 2*time.Minute {
 		t.Fatalf("smoke duration = %s, %v", got, err)
@@ -36,6 +36,7 @@ func TestProfileDuration(t *testing.T) {
 }
 
 func TestSmokeLoadArithmeticIsExactlyTenTimesRecordedRate(t *testing.T) {
+	t.Parallel()
 	const recordedRate = 1.0
 	const multiplier = 10.0
 	got := expectedEventCount(2*time.Minute, recordedRate, multiplier)
@@ -53,6 +54,7 @@ func TestSmokeLoadArithmeticIsExactlyTenTimesRecordedRate(t *testing.T) {
 }
 
 func TestDefaultEventsCarryCompleteStackSummary(t *testing.T) {
+	t.Parallel()
 	events, err := loadEvents("")
 	if err != nil {
 		t.Fatal(err)
@@ -93,6 +95,7 @@ func TestDefaultEventsCarryCompleteStackSummary(t *testing.T) {
 }
 
 func TestMetricValueWithoutLabelsSumsZeroInitAndLabeledSeries(t *testing.T) {
+	t.Parallel()
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	families, err := parser.TextToMetricFamilies(strings.NewReader(`
 # TYPE ghsync_c_b3_starvations_total counter
@@ -120,17 +123,10 @@ ghsync_c_b3_starvations_total{class="sweep",resource="graphql"} 2
 }
 
 func TestSoakStreamConsumerAppliesExactlyOnceAcrossRestart(t *testing.T) {
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	database, err := testdb.Open(ctx, databaseURL, "soak_stream")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	database := testdb.New(t)
 
 	runID := strconv.FormatInt(time.Now().UnixNano(), 36)
 	consumer, err := newSoakStreamConsumer(ctx, database.Pool, runID)
@@ -240,6 +236,7 @@ func waitForSoakStreamConsumer(
 }
 
 func TestValidateConfigRequiresPositiveInstallation(t *testing.T) {
+	t.Parallel()
 	cfg := config{
 		engineURL:      "http://engine",
 		fakeGitHubURL:  "http://fake",
@@ -260,6 +257,7 @@ func TestValidateConfigRequiresPositiveInstallation(t *testing.T) {
 }
 
 func TestHistogramQuantileUsesConstraintBuckets(t *testing.T) {
+	t.Parallel()
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	families, err := parser.TextToMetricFamilies(strings.NewReader(`
 # TYPE ghsync_c_q2_event_to_cache_latency_seconds histogram
@@ -289,6 +287,7 @@ ghsync_c_q2_event_to_cache_latency_seconds_count 100
 }
 
 func TestHistogramDeltasExcludePreexistingSamples(t *testing.T) {
+	t.Parallel()
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	priorFamilies, err := parser.TextToMetricFamilies(strings.NewReader(`
 # TYPE ghsync_c_q2_event_to_cache_latency_seconds histogram

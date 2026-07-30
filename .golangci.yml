@@ -62,14 +62,6 @@ linters:
     paths:
       - ^internal/store/dbgen/
     rules:
-      # These integration tests share one live Postgres and shared tables.
-      # Running them in parallel can make otherwise isolated assertions flaky.
-      - path: _db_test\.go$
-        linters:
-          - paralleltest
-      - path: ^(cmd/(soak|stream-tail)/main_test\.go|db/contract_test\.go|internal/(budget/lease|metrics/metrics|queue/queue|store/migrate)_test\.go)$
-        linters:
-          - paralleltest
       # These suites exercise deliberate scheduling, concurrency ceilings, and
       # embedded HTTP servers; process-level parallelism would add timing noise.
       - path: ^internal/(budget/lease_runtime|fakegithub/fakegithub|gh/conformance)_test\.go$

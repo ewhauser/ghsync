@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +23,7 @@ import (
 )
 
 func TestWatermarkProgressIdleAndUnderLoad(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -86,6 +86,7 @@ func TestWatermarkProgressIdleAndUnderLoad(t *testing.T) {
 }
 
 func TestWatermarkerStandbyFailsOverWithinLeaseTTL(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -142,6 +143,7 @@ func TestWatermarkerStandbyFailsOverWithinLeaseTTL(t *testing.T) {
 func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -269,6 +271,7 @@ func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 }
 
 func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -327,6 +330,7 @@ func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
 func TestWatermarkerBoundsFenceWaitRetriesAndAdvancesAfterWriterTermination(
 	t *testing.T,
 ) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -423,6 +427,7 @@ func TestWatermarkerBoundsFenceWaitRetriesAndAdvancesAfterWriterTermination(
 }
 
 func TestWatermarkNoopSkipsPublicationAndThrottlesHeartbeat(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -526,6 +531,7 @@ func TestWatermarkNoopSkipsPublicationAndThrottlesHeartbeat(t *testing.T) {
 }
 
 func TestChangeEventInsertRequiresWriterFence(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -552,6 +558,7 @@ func TestChangeEventInsertRequiresWriterFence(t *testing.T) {
 }
 
 func TestStorePoolBoundsIdleInTransactionSessions(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -572,6 +579,7 @@ func TestStorePoolBoundsIdleInTransactionSessions(t *testing.T) {
 func TestWatermarkerFencesRealEntityWriterAndDeriverTransactions(
 	t *testing.T,
 ) {
+	t.Parallel()
 	for _, origin := range []string{
 		outbox.EntityWriterOrigin,
 		outbox.DeriverOrigin,
@@ -582,6 +590,7 @@ func TestWatermarkerFencesRealEntityWriterAndDeriverTransactions(
 				name = origin + "/commit"
 			}
 			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 				testRealWriterFence(t, origin, commit)
 			})
 		}
@@ -589,6 +598,7 @@ func TestWatermarkerFencesRealEntityWriterAndDeriverTransactions(
 }
 
 func TestEntityWriterUsesPostgresValidationAndCommitClock(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -828,6 +838,7 @@ func (d fenceDeriver) Derive(
 }
 
 func TestRetentionNeverPrunesAboveSafeWatermark(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -894,6 +905,7 @@ func TestRetentionNeverPrunesAboveSafeWatermark(t *testing.T) {
 }
 
 func TestRetentionSevenDayFloor(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	if _, err := NewRetention(pool, RetentionOptions{
 		Age:       minimumRetentionAge - time.Second,
@@ -912,6 +924,7 @@ func TestRetentionSevenDayFloor(t *testing.T) {
 }
 
 func TestStatementLevelWakeTriggersEmitOneConstantNotification(t *testing.T) {
+	t.Parallel()
 	pool := streamDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1039,6 +1052,10 @@ func waitForExclusiveFenceHolder(
 			SELECT pid
 			FROM pg_locks
 			WHERE locktype = 'advisory'
+			  AND database = (
+			      SELECT oid FROM pg_database
+			      WHERE datname = current_database()
+			  )
 			  AND classid = $1
 			  AND objid = $2
 			  AND objsubid = 1
@@ -1084,6 +1101,10 @@ func waitForFenceLocks(
 			SELECT count(*)
 			FROM pg_locks
 			WHERE locktype = 'advisory'
+			  AND database = (
+			      SELECT oid FROM pg_database
+			      WHERE datname = current_database()
+			  )
 			  AND classid = $1
 			  AND objid = $2
 			  AND objsubid = 1
@@ -1211,16 +1232,5 @@ func (r *watermarkProgressRecorder) WatermarkStep(
 
 func streamDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	database, err := testdb.Open(ctx, url, "stream")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(database.Close)
-	return database.Pool
+	return testdb.New(t).Pool
 }
