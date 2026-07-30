@@ -96,23 +96,23 @@ func TestCrawlerResumesAfterRateLimit(t *testing.T) {
 	if _, err := os.Stat(output + ".cursor.json"); !os.IsNotExist(err) {
 		t.Fatalf("completed cursor still exists: %v", err)
 	}
-	if fixture.operationCount("FrontierRecordingPulls") != 2 {
+	if fixture.operationCount("GhsyncRecordingPulls") != 2 {
 		t.Fatalf(
 			"pull discovery calls = %d, want two pages",
-			fixture.operationCount("FrontierRecordingPulls"),
+			fixture.operationCount("GhsyncRecordingPulls"),
 		)
 	}
-	if fixture.requestCount("FrontierRecordingPull", "", 7) != 1 ||
+	if fixture.requestCount("GhsyncRecordingPull", "", 7) != 1 ||
 		fixture.requestCount(
-			"FrontierRecordingPull",
+			"GhsyncRecordingPull",
 			"timeline-7-1",
 			7,
 		) != 1 {
 		t.Fatalf(
 			"completed timeline pages were refetched: first=%d second=%d",
-			fixture.requestCount("FrontierRecordingPull", "", 7),
+			fixture.requestCount("GhsyncRecordingPull", "", 7),
 			fixture.requestCount(
-				"FrontierRecordingPull",
+				"GhsyncRecordingPull",
 				"timeline-7-1",
 				7,
 			),
@@ -148,15 +148,15 @@ func TestCrawlerResumesAfterCancellationWithoutRefetch(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if fixture.requestCount("FrontierRecordingPulls", "", 0) != 1 ||
+	if fixture.requestCount("GhsyncRecordingPulls", "", 0) != 1 ||
 		fixture.requestCount(
-			"FrontierRecordingPulls",
+			"GhsyncRecordingPulls",
 			"pulls-1",
 			0,
 		) != 1 ||
-		fixture.requestCount("FrontierRecordingPull", "", 7) != 1 ||
+		fixture.requestCount("GhsyncRecordingPull", "", 7) != 1 ||
 		fixture.requestCount(
-			"FrontierRecordingPull",
+			"GhsyncRecordingPull",
 			"timeline-7-1",
 			7,
 		) != 1 {
@@ -299,17 +299,17 @@ func TestCrawlerPaginatesAndRecordsTrackTwoTimeline(t *testing.T) {
 		after     string
 		number    int
 	}{
-		{"FrontierRecordingPulls", "", 0},
-		{"FrontierRecordingPulls", "pulls-1", 0},
-		{"FrontierRecordingPull", "", 7},
-		{"FrontierRecordingPull", "timeline-7-1", 7},
-		{"FrontierRecordingThreads", "", 7},
-		{"FrontierRecordingThreads", "threads-1", 7},
-		{"FrontierRecordingCommitChecks", "suites-1", 0},
-		{"FrontierRecordingCheckRuns", "runs-1", 0},
-		{"FrontierRecordingThreadComments", "comments-1", 0},
-		{"FrontierRecordingDefaultHistory", "", 0},
-		{"FrontierRecordingDefaultHistory", "history-1", 0},
+		{"GhsyncRecordingPulls", "", 0},
+		{"GhsyncRecordingPulls", "pulls-1", 0},
+		{"GhsyncRecordingPull", "", 7},
+		{"GhsyncRecordingPull", "timeline-7-1", 7},
+		{"GhsyncRecordingThreads", "", 7},
+		{"GhsyncRecordingThreads", "threads-1", 7},
+		{"GhsyncRecordingCommitChecks", "suites-1", 0},
+		{"GhsyncRecordingCheckRuns", "runs-1", 0},
+		{"GhsyncRecordingThreadComments", "comments-1", 0},
+		{"GhsyncRecordingDefaultHistory", "", 0},
+		{"GhsyncRecordingDefaultHistory", "history-1", 0},
 	} {
 		if count := fixture.requestCount(
 			request.operation,
@@ -397,7 +397,7 @@ func TestCrawlerRejectsInvalidCursorPhase(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "invalid phase") {
 		t.Fatalf("invalid cursor error = %v", err)
 	}
-	if fixture.operationCount("FrontierRecordingPulls") != 0 {
+	if fixture.operationCount("GhsyncRecordingPulls") != 0 {
 		t.Fatal("invalid cursor reached GraphQL")
 	}
 }
@@ -510,9 +510,9 @@ func (f *graphQLFixture) ServeHTTP(
 	f.mu.Lock()
 	f.counts[operation]++
 	f.counts[key]++
-	fail := operation == "FrontierRecordingCheckRuns" &&
+	fail := operation == "GhsyncRecordingCheckRuns" &&
 		f.failFirstNested && !f.interrupted
-	cancel := operation == "FrontierRecordingCheckRuns" &&
+	cancel := operation == "GhsyncRecordingCheckRuns" &&
 		f.cancelNested != nil && !f.interrupted
 	if fail || cancel {
 		f.interrupted = true
@@ -586,7 +586,7 @@ func (f *graphQLFixture) response(
 	after := fixtureStringVariable(variables, "after")
 	number := fixtureIntVariable(variables, "number")
 	switch operation {
-	case "FrontierRecordingPulls":
+	case "GhsyncRecordingPulls":
 		nodes := []any{map[string]any{"number": 7}}
 		page := map[string]any{
 			"hasNextPage": true, "endCursor": "pulls-1",
@@ -616,13 +616,13 @@ func (f *graphQLFixture) response(
 				"nodes":      nodes,
 			},
 		}
-	case "FrontierRecordingPull":
+	case "GhsyncRecordingPull":
 		return map[string]any{
 			"repository": map[string]any{
 				"pullRequest": fixturePullRequest(number, after),
 			},
 		}
-	case "FrontierRecordingThreads":
+	case "GhsyncRecordingThreads":
 		nodes := []any{}
 		page := map[string]any{
 			"hasNextPage": false, "endCursor": nil,
@@ -645,13 +645,13 @@ func (f *graphQLFixture) response(
 				},
 			},
 		}
-	case "FrontierRecordingCommitChecks":
+	case "GhsyncRecordingCommitChecks":
 		return fixtureCommitChecksResponse()
-	case "FrontierRecordingCheckRuns":
+	case "GhsyncRecordingCheckRuns":
 		return fixtureCheckRunsResponse()
-	case "FrontierRecordingThreadComments":
+	case "GhsyncRecordingThreadComments":
 		return fixtureThreadCommentsResponse()
-	case "FrontierRecordingDefaultHistory":
+	case "GhsyncRecordingDefaultHistory":
 		commits := []any{
 			fixtureCommit(
 				"dddddddddddddddddddddddddddddddddddddddd",
@@ -694,13 +694,13 @@ func (f *graphQLFixture) response(
 
 func fixtureOperation(query string) string {
 	for _, operation := range []string{
-		"FrontierRecordingPulls",
-		"FrontierRecordingPull",
-		"FrontierRecordingThreads",
-		"FrontierRecordingDefaultHistory",
-		"FrontierRecordingCommitChecks",
-		"FrontierRecordingCheckRuns",
-		"FrontierRecordingThreadComments",
+		"GhsyncRecordingPulls",
+		"GhsyncRecordingPull",
+		"GhsyncRecordingThreads",
+		"GhsyncRecordingDefaultHistory",
+		"GhsyncRecordingCommitChecks",
+		"GhsyncRecordingCheckRuns",
+		"GhsyncRecordingThreadComments",
 	} {
 		if strings.Contains(query, "query "+operation+"(") {
 			return operation

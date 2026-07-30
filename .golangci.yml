@@ -62,6 +62,13 @@ linters:
     paths:
       - ^internal/store/dbgen/
     rules:
+      # The recording/replay pipeline deliberately passes detached immutable
+      # snapshots by value. Suppress only gocritic's copy-cost suggestions in
+      # these files; other gocritic diagnostics remain enabled.
+      - path: ^(cmd/(ghrecord/crawler|loadgen/(assertions|main|main_test|replay))|internal/(conformance/schema_test|fakegithub/(payloads|truth)|fetch/projection_conformance_test|replay/(compiler|recording|recording_test|stacks)))\.go$
+        text: "^(hugeParam|rangeValCopy):"
+        linters:
+          - gocritic
       # These suites exercise deliberate scheduling, concurrency ceilings, and
       # embedded HTTP servers; process-level parallelism would add timing noise.
       - path: ^internal/(budget/lease_runtime|fakegithub/fakegithub|gh/conformance)_test\.go$

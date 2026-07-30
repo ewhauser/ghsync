@@ -1,4 +1,3 @@
-//nolint:gocritic // Conformance cases intentionally keep decoded webhook snapshots by value.
 package fetch
 
 import (
@@ -700,7 +699,7 @@ func timestampsEqual(
 	return actual.Valid && actual.Time.Equal(*expected)
 }
 
-func assertJSONEqual(t *testing.T, actual []byte, expected []byte) {
+func assertJSONEqual(t *testing.T, actual, expected []byte) {
 	t.Helper()
 	var actualValue, expectedValue any
 	if err := json.Unmarshal(actual, &actualValue); err != nil {

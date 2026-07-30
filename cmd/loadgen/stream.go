@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,9 +17,7 @@ import (
 type loadStreamConsumer struct {
 	pool        *pgxpool.Pool
 	consumer    string
-	appliedMu   sync.Mutex
-	applied     map[int64]struct{}
-	appliedRows int64
+	tableSQL    string
 	initialSeq  int64
 	restartSeq  int64
 	restartRows int64
@@ -46,10 +43,22 @@ func newLoadStreamConsumer(
 	if _, err := strconv.ParseInt(runID, 36, 64); err != nil {
 		return nil, fmt.Errorf("load stream run ID is invalid: %w", err)
 	}
+	table := "ghsync_loadgen_applied_" + runID
+	tableSQL := pgx.Identifier{table}.Sanitize()
+	// Raw SQL exception: this run-scoped scratch-table identifier is dynamic,
+	// sanitized, and cannot be parameterized by PostgreSQL or modeled by sqlc.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE `+tableSQL+` (
+		    seq BIGINT PRIMARY KEY,
+		    applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+		)
+	`); err != nil {
+		return nil, fmt.Errorf("create load stream applied set: %w", err)
+	}
 	consumer := &loadStreamConsumer{
 		pool:     pool,
 		consumer: "ghsync-loadgen-" + runID,
-		applied:  make(map[int64]struct{}),
+		tableSQL: tableSQL,
 	}
 	client, err := streamclient.New(pool, streamclient.Config{
 		BatchSize:    256,
@@ -93,20 +102,23 @@ func (c *loadStreamConsumer) start(ctx context.Context) error {
 			c.consumer,
 			loadStream,
 			func(
-				_ context.Context,
-				_ pgx.Tx,
+				ctx context.Context,
+				tx pgx.Tx,
 				event streamclient.Event,
 			) error {
-				c.appliedMu.Lock()
-				defer c.appliedMu.Unlock()
-				c.appliedRows++
-				if _, exists := c.applied[event.Seq]; exists {
+				// Raw SQL exception: this INSERT targets the dynamic,
+				// sanitized run-scoped scratch table created above.
+				if _, err := tx.Exec(
+					ctx,
+					"INSERT INTO "+c.tableSQL+" (seq) VALUES ($1)",
+					event.Seq,
+				); err != nil {
 					return fmt.Errorf(
-						"apply stream seq %d exactly once: duplicate",
+						"apply stream seq %d exactly once: %w",
 						event.Seq,
+						err,
 					)
 				}
-				c.applied[event.Seq] = struct{}{}
 				return nil
 			},
 		)
@@ -271,13 +283,32 @@ func (c *loadStreamConsumer) assertFinal(
 }
 
 func (c *loadStreamConsumer) counts(ctx context.Context) (streamCounts, error) {
-	state, err := dbgen.New(c.pool).GetLoadgenStreamState(
-		ctx,
-		dbgen.GetLoadgenStreamStateParams{
-			StreamName:   loadStream,
-			ConsumerName: c.consumer,
-			InitialSeq:   c.initialSeq,
-		},
+	var result streamCounts
+	// Raw SQL exception: the aggregate reads the dynamic, sanitized run-scoped
+	// scratch table; PostgreSQL cannot parameterize that table identifier.
+	err := c.pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM `+c.tableSQL+`),
+		    (SELECT count(DISTINCT seq) FROM `+c.tableSQL+`),
+		    count(events.seq),
+		    COALESCE(cursor.seq, $2),
+		    COALESCE(max(events.seq), $2)
+		FROM stream_watermark AS watermark
+		LEFT JOIN change_events AS events
+		  ON events.stream = $1
+		 AND events.seq > $2
+		 AND events.seq <= watermark.safe_seq
+		LEFT JOIN consumer_cursors AS cursor
+		  ON cursor.consumer = $3
+		 AND cursor.stream = $1
+		WHERE watermark.singleton
+		GROUP BY cursor.seq
+	`, loadStream, c.initialSeq, c.consumer).Scan(
+		&result.total,
+		&result.distinct,
+		&result.expected,
+		&result.cursor,
+		&result.maxSeq,
 	)
 	if err != nil {
 		return streamCounts{}, fmt.Errorf(
@@ -285,17 +316,7 @@ func (c *loadStreamConsumer) counts(ctx context.Context) (streamCounts, error) {
 			err,
 		)
 	}
-	c.appliedMu.Lock()
-	total := c.appliedRows
-	distinct := int64(len(c.applied))
-	c.appliedMu.Unlock()
-	return streamCounts{
-		total:    total,
-		distinct: distinct,
-		expected: state.Expected,
-		cursor:   state.CurrentSeq,
-		maxSeq:   state.MaxSeq,
-	}, nil
+	return result, nil
 }
 
 func (c *loadStreamConsumer) cleanup(parent context.Context) {
@@ -308,6 +329,11 @@ func (c *loadStreamConsumer) cleanup(parent context.Context) {
 	)
 	defer cancel()
 	_ = c.stop(ctx)
+	if c.tableSQL != "" {
+		// Raw SQL exception: this DROP targets the dynamic, sanitized
+		// run-scoped scratch-table identifier.
+		_, _ = c.pool.Exec(ctx, "DROP TABLE IF EXISTS "+c.tableSQL)
+	}
 	if c.consumer != "" {
 		_ = dbgen.New(c.pool).DeleteLoadgenConsumerCursor(
 			ctx,

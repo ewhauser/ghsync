@@ -1,4 +1,3 @@
-//nolint:gocritic // Test fixtures favor explicit immutable value snapshots.
 package main
 
 import (
@@ -327,7 +326,7 @@ func TestChaosKnobsPassStrictEndToEndAssertions(t *testing.T) {
 	t.Setenv("HTTP_ADDR", engineAddress)
 	t.Setenv(
 		"DISPATCH_RULES_FILE",
-		filepath.Join(repositoryRoot, "config/dispatcher-rules.yaml"),
+		filepath.Join(repositoryRoot, "config", "dispatcher-rules.yaml"),
 	)
 	for key, value := range map[string]string{
 		"DISPATCH_DEBOUNCE":              "50ms",

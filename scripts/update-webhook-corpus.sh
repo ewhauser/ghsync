@@ -29,7 +29,7 @@ if ! grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' "$version_file"; then
 	exit 1
 fi
 
-temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/frontier-webhooks.XXXXXX")
+temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/ghsync-webhooks.XXXXXX")
 trap 'rm -rf "$temporary_root"' EXIT HUP INT TERM
 
 archive="$temporary_root/webhooks.tar.gz"

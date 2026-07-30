@@ -1,4 +1,3 @@
-//nolint:gocritic // Schema fixtures intentionally remain immutable values within each test case.
 package conformance_test
 
 import (
@@ -351,7 +350,7 @@ func eventPayloadActions(t *testing.T, event string) []string {
 	return actions
 }
 
-func fakeSchemaFixture(event string, action string) fakegithub.Fixture {
+func fakeSchemaFixture(event, action string) fakegithub.Fixture {
 	fixture := fakegithub.DefaultFixture()
 	created := fixture.CheckRuns[0]
 	created.ID = 99003

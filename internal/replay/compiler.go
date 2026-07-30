@@ -1,4 +1,3 @@
-//nolint:gocritic // Replay compiler values are immutable snapshots; copies isolate transformations.
 package replay
 
 import (
@@ -18,7 +17,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/gh"
 )
 
-const DefaultWebhookSecret = "frontier-replay-secret"
+const DefaultWebhookSecret = "ghsync-replay-secret"
 
 type CompileOptions struct {
 	Speed         float64
@@ -275,7 +274,7 @@ func positiveStride(maximum int64) (int64, error) {
 	return maximum + 1, nil
 }
 
-func replayNamespace(lap uint64, copies int, copyIndex int) (uint64, error) {
+func replayNamespace(lap uint64, copies, copyIndex int) (uint64, error) {
 	if lap > math.MaxUint64/uint64(copies) {
 		return 0, fmt.Errorf("replay namespace overflows")
 	}
@@ -342,8 +341,8 @@ func (p *Program) renumberEvent(
 	offsetNumber := int(offsetNumber64)
 	originalRepository := p.recording.Header.Repository
 	if result.Repository != nil {
-		copy := repository
-		result.Repository = &copy
+		repositorySnapshot := repository
+		result.Repository = &repositorySnapshot
 	}
 	if result.PullRequest != nil {
 		if err := renumberPullRequest(
@@ -839,9 +838,9 @@ func overlayReviewThread(payload map[string]any, thread ReviewThread) {
 	}
 	comments := make([]any, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		copy := cloneMap(templateComments[0].(map[string]any))
-		overlayCommentObject(copy, comment)
-		comments = append(comments, copy)
+		commentWire := cloneMap(templateComments[0].(map[string]any))
+		overlayCommentObject(commentWire, comment)
+		comments = append(comments, commentWire)
 	}
 	wire["comments"] = comments
 }
@@ -911,9 +910,9 @@ func overlayPush(
 		return
 	}
 	actor := map[string]any{
-		"name":     "Frontier replay",
+		"name":     "ghsync replay",
 		"email":    nil,
-		"username": "frontier-replay",
+		"username": "ghsync-replay",
 	}
 	commit := map[string]any{
 		"id":        push.After,
@@ -1014,14 +1013,14 @@ func checkedOffset(stride int64, namespace uint64) (int64, error) {
 	return stride * int64(namespace), nil
 }
 
-func addID(value int64, offset int64) (int64, error) {
+func addID(value, offset int64) (int64, error) {
 	if value < 0 || offset > math.MaxInt64-value {
 		return 0, fmt.Errorf("entity ID overflows")
 	}
 	return value + offset, nil
 }
 
-func addNumber(value int, offset int) (int, error) {
+func addNumber(value, offset int) (int, error) {
 	if value < 0 || offset > math.MaxInt-value {
 		return 0, fmt.Errorf("entity number overflows")
 	}
@@ -1111,9 +1110,9 @@ func renumberFullName(value string, namespace uint64) string {
 func normalizeEventForReplay(event Event) Event {
 	if event.CheckSuite != nil &&
 		strings.EqualFold(event.CheckSuite.Conclusion, "skipped") {
-		copy := *event.CheckSuite
-		copy.Conclusion = "neutral"
-		event.CheckSuite = &copy
+		checkSuite := *event.CheckSuite
+		checkSuite.Conclusion = "neutral"
+		event.CheckSuite = &checkSuite
 	}
 	return event
 }

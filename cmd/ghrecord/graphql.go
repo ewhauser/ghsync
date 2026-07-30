@@ -92,7 +92,7 @@ func (c *graphQLClient) call(
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("Authorization", "Bearer "+c.token)
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("User-Agent", "frontier-ghrecord/1")
+	request.Header.Set("User-Agent", "ghsync-ghrecord/1")
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("call GitHub GraphQL: %w", err)
@@ -211,7 +211,7 @@ func parseRateReset(header http.Header, now time.Time) time.Time {
 	return time.Time{}
 }
 
-const listPullRequestsQuery = `query FrontierRecordingPulls(
+const listPullRequestsQuery = `query GhsyncRecordingPulls(
   $owner: String!,
   $name: String!,
   $query: String!,
@@ -234,7 +234,7 @@ const listPullRequestsQuery = `query FrontierRecordingPulls(
   rateLimit { cost remaining resetAt }
 }`
 
-const pullRequestTimelineQuery = `query FrontierRecordingPull(
+const pullRequestTimelineQuery = `query GhsyncRecordingPull(
   $owner: String!,
   $name: String!,
   $number: Int!,
@@ -366,7 +366,7 @@ const pullRequestTimelineQuery = `query FrontierRecordingPull(
   rateLimit { cost remaining resetAt }
 }`
 
-const pullRequestThreadsQuery = `query FrontierRecordingThreads(
+const pullRequestThreadsQuery = `query GhsyncRecordingThreads(
   $owner: String!,
   $name: String!,
   $number: Int!,
@@ -403,7 +403,7 @@ const pullRequestThreadsQuery = `query FrontierRecordingThreads(
   rateLimit { cost remaining resetAt }
 }`
 
-const reviewThreadCommentsQuery = `query FrontierRecordingThreadComments(
+const reviewThreadCommentsQuery = `query GhsyncRecordingThreadComments(
   $id: ID!,
   $after: String
 ) {
@@ -428,7 +428,7 @@ const reviewThreadCommentsQuery = `query FrontierRecordingThreadComments(
   rateLimit { cost remaining resetAt }
 }`
 
-const defaultBranchHistoryQuery = `query FrontierRecordingDefaultHistory(
+const defaultBranchHistoryQuery = `query GhsyncRecordingDefaultHistory(
   $owner: String!,
   $name: String!,
   $since: GitTimestamp!,
@@ -485,7 +485,7 @@ const defaultBranchHistoryQuery = `query FrontierRecordingDefaultHistory(
   rateLimit { cost remaining resetAt }
 }`
 
-const commitCheckSuitesQuery = `query FrontierRecordingCommitChecks(
+const commitCheckSuitesQuery = `query GhsyncRecordingCommitChecks(
   $owner: String!,
   $name: String!,
   $oid: GitObjectID!,
@@ -525,7 +525,7 @@ const commitCheckSuitesQuery = `query FrontierRecordingCommitChecks(
   rateLimit { cost remaining resetAt }
 }`
 
-const checkSuiteRunsQuery = `query FrontierRecordingCheckRuns(
+const checkSuiteRunsQuery = `query GhsyncRecordingCheckRuns(
   $id: ID!,
   $after: String
 ) {

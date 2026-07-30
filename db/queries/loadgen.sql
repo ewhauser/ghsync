@@ -52,44 +52,6 @@ SELECT delivery_guid, received_at, status
 FROM webhook_deliveries
 WHERE delivery_guid = ANY(sqlc.arg(delivery_guids)::text[]);
 
--- name: GetLoadgenStreamState :one
-WITH params AS (
-    SELECT
-        sqlc.arg(stream_name)::text AS stream_name,
-        sqlc.arg(consumer_name)::text AS consumer_name,
-        sqlc.arg(initial_seq)::bigint AS initial_seq
-)
-SELECT
-    (
-        SELECT count(*)
-        FROM change_events AS event
-        JOIN stream_watermark AS watermark ON watermark.singleton
-        WHERE event.stream = params.stream_name
-          AND event.seq > params.initial_seq
-          AND event.seq <= watermark.safe_seq
-    ) AS expected,
-    COALESCE(
-        (
-            SELECT consumer_cursor.seq
-            FROM consumer_cursors AS consumer_cursor
-            WHERE consumer_cursor.consumer = params.consumer_name
-              AND consumer_cursor.stream = params.stream_name
-        ),
-        params.initial_seq
-    ) AS current_seq,
-    COALESCE(
-        (
-            SELECT max(event.seq)
-            FROM change_events AS event
-            JOIN stream_watermark AS watermark ON watermark.singleton
-            WHERE event.stream = params.stream_name
-              AND event.seq > params.initial_seq
-              AND event.seq <= watermark.safe_seq
-        ),
-        params.initial_seq
-    ) AS max_seq
-FROM params;
-
 -- name: DeleteLoadgenConsumerCursor :exec
 DELETE FROM consumer_cursors
 WHERE consumer = sqlc.arg(consumer)

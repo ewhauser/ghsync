@@ -314,7 +314,7 @@ before allocating its first sequence, it calls the shared internal helper that
 takes:
 
 ```sql
-SELECT pg_advisory_xact_lock_shared(5076242250190120306);
+SELECT pg_advisory_xact_lock_shared(113698311597667);
 ```
 
 The value is the ASCII bytes for `ghsync` interpreted as a signed `BIGINT`;

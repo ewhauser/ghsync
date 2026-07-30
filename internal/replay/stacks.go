@@ -1,4 +1,3 @@
-//nolint:gocritic // Stack derivation intentionally transforms immutable pull-request snapshots by value.
 package replay
 
 import (
@@ -126,8 +125,8 @@ func chooseStackParent(
 			(candidate.State == "open" && fallback.State != "open") ||
 			(candidate.State == fallback.State &&
 				candidate.UpdatedAt.After(fallback.UpdatedAt)) {
-			copy := candidate
-			fallback = &copy
+			fallbackCandidate := candidate
+			fallback = &fallbackCandidate
 		}
 	}
 	if fallback == nil {
@@ -241,7 +240,7 @@ func orderStackComponent(
 	return ordered
 }
 
-func branchKey(repository string, ref string) string {
+func branchKey(repository, ref string) string {
 	return repository + "\x00" + ref
 }
 

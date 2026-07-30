@@ -1,4 +1,3 @@
-//nolint:gocritic // Recording values are immutable snapshots; copies isolate validation and compilation.
 package replay
 
 import (

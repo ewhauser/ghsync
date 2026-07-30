@@ -16,7 +16,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
-const conformanceWebhookSecret = "frontier-conformance-secret"
+const conformanceWebhookSecret = "ghsync-conformance-secret"
 
 func TestIngressCorpus(t *testing.T) {
 	t.Parallel()

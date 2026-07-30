@@ -1,7 +1,5 @@
 // loadgen replays recorded repository truth through standalone fake GitHub
 // and exits successfully only after every end-to-end load assertion holds.
-//
-//nolint:gocritic // Load verification intentionally passes immutable configuration and truth snapshots by value.
 package main
 
 import (

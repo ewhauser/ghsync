@@ -1,4 +1,3 @@
-//nolint:gocritic // Truth mutations use detached value snapshots to prevent fixture aliasing.
 package fakegithub
 
 import (

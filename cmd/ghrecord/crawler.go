@@ -1,4 +1,3 @@
-//nolint:gocritic // Recording snapshots are immutable values; copying them isolates resumable crawl state.
 package main
 
 import (
@@ -446,24 +445,21 @@ func crawlPullDetails(
 		}
 		for index := range cursor.CurrentPull.Timeline {
 			node := &cursor.CurrentPull.Timeline[index]
-			switch node.Typename {
-			case "PullRequestCommit":
-				if node.Commit == nil {
-					continue
-				}
-				if err := completeCommitChecks(
-					ctx,
-					config,
-					node.Commit,
-					checkpoint,
-				); err != nil {
-					return fmt.Errorf(
-						"pull request %d commit %s: %w",
-						cursor.CurrentPull.Number,
-						node.Commit.OID,
-						err,
-					)
-				}
+			if node.Typename != "PullRequestCommit" || node.Commit == nil {
+				continue
+			}
+			if err := completeCommitChecks(
+				ctx,
+				config,
+				node.Commit,
+				checkpoint,
+			); err != nil {
+				return fmt.Errorf(
+					"pull request %d commit %s: %w",
+					cursor.CurrentPull.Number,
+					node.Commit.OID,
+					err,
+				)
 			}
 		}
 		for index := range cursor.CurrentPull.Threads {
@@ -1690,6 +1686,6 @@ func truncateText(value string) string {
 }
 
 func timePointer(value time.Time) *time.Time {
-	copy := value.UTC()
-	return &copy
+	result := value.UTC()
+	return &result
 }

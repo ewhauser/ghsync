@@ -2,7 +2,7 @@
 --
 -- The writer fence (ghsync_require_change_event_writer_fence) DB-enforces
 -- C-S: change_events inserts must hold the shared advisory fence lock
--- (classid=1181904750, objid=1953064306, objsubid=1). The notify functions
+-- (classid=26472, objid=1937337955, objsubid=1). The notify functions
 -- publish statement-level wakes for the change stream and deriver.
 
 -- ------------------------------------------------------------------
@@ -43,8 +43,8 @@ BEGIN
         FROM pg_locks
         WHERE locktype = 'advisory'
           AND pid = pg_backend_pid()
-          AND classid = 1181904750
-          AND objid = 1953064306
+          AND classid = 26472
+          AND objid = 1937337955
           AND objsubid = 1
           AND mode = 'ShareLock'
           AND granted

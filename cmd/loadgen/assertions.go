@@ -1,4 +1,3 @@
-//nolint:gocritic // Load verification intentionally passes immutable configuration and truth snapshots by value.
 package main
 
 import (
@@ -1432,7 +1431,7 @@ func labelsOf(item *dto.Metric) map[string]string {
 	return labels
 }
 
-func labelsMatch(got map[string]string, want map[string]string) bool {
+func labelsMatch(got, want map[string]string) bool {
 	for key, value := range want {
 		if got[key] != value {
 			return false

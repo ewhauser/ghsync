@@ -1,4 +1,3 @@
-//nolint:gocritic // Load verification intentionally passes immutable configuration and truth snapshots by value.
 package main
 
 import (

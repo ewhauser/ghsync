@@ -111,64 +111,6 @@ func (q *Queries) GetLoadgenCacheSeedState(ctx context.Context, installationID i
 	return i, err
 }
 
-const getLoadgenStreamState = `-- name: GetLoadgenStreamState :one
-WITH params AS (
-    SELECT
-        $1::text AS stream_name,
-        $2::text AS consumer_name,
-        $3::bigint AS initial_seq
-)
-SELECT
-    (
-        SELECT count(*)
-        FROM change_events AS event
-        JOIN stream_watermark AS watermark ON watermark.singleton
-        WHERE event.stream = params.stream_name
-          AND event.seq > params.initial_seq
-          AND event.seq <= watermark.safe_seq
-    ) AS expected,
-    COALESCE(
-        (
-            SELECT consumer_cursor.seq
-            FROM consumer_cursors AS consumer_cursor
-            WHERE consumer_cursor.consumer = params.consumer_name
-              AND consumer_cursor.stream = params.stream_name
-        ),
-        params.initial_seq
-    ) AS current_seq,
-    COALESCE(
-        (
-            SELECT max(event.seq)
-            FROM change_events AS event
-            JOIN stream_watermark AS watermark ON watermark.singleton
-            WHERE event.stream = params.stream_name
-              AND event.seq > params.initial_seq
-              AND event.seq <= watermark.safe_seq
-        ),
-        params.initial_seq
-    ) AS max_seq
-FROM params
-`
-
-type GetLoadgenStreamStateParams struct {
-	StreamName   string
-	ConsumerName string
-	InitialSeq   int64
-}
-
-type GetLoadgenStreamStateRow struct {
-	Expected   int64
-	CurrentSeq int64
-	MaxSeq     int64
-}
-
-func (q *Queries) GetLoadgenStreamState(ctx context.Context, arg GetLoadgenStreamStateParams) (GetLoadgenStreamStateRow, error) {
-	row := q.db.QueryRow(ctx, getLoadgenStreamState, arg.StreamName, arg.ConsumerName, arg.InitialSeq)
-	var i GetLoadgenStreamStateRow
-	err := row.Scan(&i.Expected, &i.CurrentSeq, &i.MaxSeq)
-	return i, err
-}
-
 const listLoadgenCachedCheckRuns = `-- name: ListLoadgenCachedCheckRuns :many
 SELECT
     run.gh_id,

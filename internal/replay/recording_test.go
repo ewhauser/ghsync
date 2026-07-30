@@ -1,4 +1,3 @@
-//nolint:gocritic // Test fixtures favor explicit immutable value snapshots.
 package replay_test
 
 import (
@@ -759,7 +758,7 @@ func TestDeriveStacksIgnoresForkDefaultBranchHeads(t *testing.T) {
 	}
 	pulls[0].Head.Repository = repository.FullName()
 	pulls[0].Base.Repository = repository.FullName()
-	pulls[1].Head.Repository = "contributor/frontier"
+	pulls[1].Head.Repository = "contributor/ghsync"
 	pulls[1].Base.Repository = repository.FullName()
 	if stacks := replay.DeriveStacks(repository, pulls); len(stacks) != 0 {
 		t.Fatalf("fork default-branch head created stacks: %+v", stacks)
@@ -1059,14 +1058,14 @@ func testRecording() replay.Recording {
 
 func testRepository() replay.Repository {
 	return replay.Repository{
-		ID: 1001, NodeID: "R_node_1001", Owner: "acme", Name: "frontier",
+		ID: 1001, NodeID: "R_node_1001", Owner: "acme", Name: "ghsync",
 		DefaultBranch:    "main",
 		DefaultBranchSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		UpdatedAt:        time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC),
 	}
 }
 
-func testPull(number int, head string, base string) replay.PullRequest {
+func testPull(number int, head, base string) replay.PullRequest {
 	return replay.PullRequest{
 		ID: int64(number), NodeID: "PR", Number: number,
 		Title: "Pull", State: "open", AuthorLogin: "octocat",
