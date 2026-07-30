@@ -147,6 +147,47 @@ func TestReplayPlanRejectsVacuousOracleAndNoOpChaos(t *testing.T) {
 	}
 }
 
+func TestOracleRecordSortingUsesCanonicalKeys(t *testing.T) {
+	t.Parallel()
+	assertSameOrder := func(name string, left, right any) {
+		t.Helper()
+		if !reflect.DeepEqual(left, right) {
+			t.Fatalf("%s canonical order differs\nleft=%+v\nright=%+v", name, left, right)
+		}
+	}
+
+	leftPulls := []oraclePull{{Number: 2}, {Number: 1}}
+	rightPulls := []oraclePull{{Number: 1}, {Number: 2}}
+	sortOraclePulls(leftPulls)
+	sortOraclePulls(rightPulls)
+	assertSameOrder("pull requests", leftPulls, rightPulls)
+
+	leftStacks := []oracleStack{{Number: 2}, {Number: 1}}
+	rightStacks := []oracleStack{{Number: 1}, {Number: 2}}
+	sortOracleStacks(leftStacks)
+	sortOracleStacks(rightStacks)
+	assertSameOrder("stacks", leftStacks, rightStacks)
+
+	leftChecks := []oracleCheck{{ID: 2}, {ID: 1}}
+	rightChecks := []oracleCheck{{ID: 1}, {ID: 2}}
+	sortOracleChecks(leftChecks)
+	sortOracleChecks(rightChecks)
+	assertSameOrder("check runs", leftChecks, rightChecks)
+
+	const (
+		hyphenatedID = "PRRT_kwDOIANE6c6SwE-z"
+		letterID     = "PRRT_kwDOIANE6c6SwEWD"
+	)
+	leftThreads := []oracleThread{{ID: letterID}, {ID: hyphenatedID}}
+	rightThreads := []oracleThread{{ID: hyphenatedID}, {ID: letterID}}
+	sortOracleThreads(leftThreads)
+	sortOracleThreads(rightThreads)
+	assertSameOrder("review threads", leftThreads, rightThreads)
+	if leftThreads[0].ID != hyphenatedID {
+		t.Fatalf("review-thread byte order = %q first, want %q", leftThreads[0].ID, hyphenatedID)
+	}
+}
+
 func TestExecuteReplayAppliesTruthAndDuplicatesDelivery(t *testing.T) {
 	t.Parallel()
 	var received atomic.Int64

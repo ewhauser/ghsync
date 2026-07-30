@@ -966,6 +966,8 @@ func assertFixtureConverged(
 	if err != nil {
 		return err
 	}
+	sortOraclePulls(expectedPulls)
+	sortOraclePulls(cachedPulls)
 	if !reflect.DeepEqual(expectedPulls, cachedPulls) {
 		return fmt.Errorf(
 			"pull-request cache mismatch\ntruth=%+v\ncache=%+v",
@@ -1004,6 +1006,8 @@ func assertFixtureConverged(
 	if err != nil {
 		return err
 	}
+	sortOracleStacks(expectedStacks)
+	sortOracleStacks(cachedStacks)
 	if !reflect.DeepEqual(expectedStacks, cachedStacks) {
 		return fmt.Errorf(
 			"stack cache mismatch\ntruth=%+v\ncache=%+v",
@@ -1033,6 +1037,8 @@ func assertFixtureConverged(
 	if err != nil {
 		return err
 	}
+	sortOracleChecks(expectedChecks)
+	sortOracleChecks(cachedChecks)
 	if !reflect.DeepEqual(expectedChecks, cachedChecks) {
 		return fmt.Errorf(
 			"check-run cache mismatch\ntruth=%+v\ncache=%+v",
@@ -1076,6 +1082,8 @@ func assertFixtureConverged(
 	if err != nil {
 		return err
 	}
+	sortOracleThreads(expectedThreads)
+	sortOracleThreads(cachedThreads)
 	if !reflect.DeepEqual(expectedThreads, cachedThreads) {
 		return fmt.Errorf(
 			"review-thread cache mismatch\ntruth=%+v\ncache=%+v",
@@ -1084,6 +1092,30 @@ func assertFixtureConverged(
 		)
 	}
 	return nil
+}
+
+func sortOraclePulls(pulls []oraclePull) {
+	sort.Slice(pulls, func(i, j int) bool {
+		return pulls[i].Number < pulls[j].Number
+	})
+}
+
+func sortOracleStacks(stacks []oracleStack) {
+	sort.Slice(stacks, func(i, j int) bool {
+		return stacks[i].Number < stacks[j].Number
+	})
+}
+
+func sortOracleChecks(checks []oracleCheck) {
+	sort.Slice(checks, func(i, j int) bool {
+		return checks[i].ID < checks[j].ID
+	})
+}
+
+func sortOracleThreads(threads []oracleThread) {
+	sort.Slice(threads, func(i, j int) bool {
+		return threads[i].ID < threads[j].ID
+	})
 }
 
 func readCachedPulls(
