@@ -24,6 +24,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/conformance"
 	"github.com/ewhauser/ghsync/internal/fakegithub"
 	"github.com/ewhauser/ghsync/internal/gh"
 )
@@ -64,7 +65,7 @@ func TestCorpusSchemasCompileOffline(t *testing.T) {
 func TestFakeGitHubWebhookPayloadsValidateAgainstSchemas(t *testing.T) {
 	target, emitted := newWebhookCapture()
 	defer target.Close()
-	compiler := newCorpusSchemaCompiler(t)
+	validator := conformance.NewWebhookSchemaValidator()
 
 	for _, event := range corpusEvents {
 		actions := eventPayloadActions(t, event)
@@ -99,7 +100,7 @@ func TestFakeGitHubWebhookPayloadsValidateAgainstSchemas(t *testing.T) {
 				}
 				validateEmittedWebhook(
 					t,
-					compiler,
+					validator,
 					received,
 					event,
 				)
@@ -146,7 +147,7 @@ func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
 		}
 		validateEmittedWebhook(
 			t,
-			newCorpusSchemaCompiler(t),
+			conformance.NewWebhookSchemaValidator(),
 			receiveWebhook(t, emitted),
 			"push",
 		)
@@ -199,7 +200,7 @@ func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
 		}
 		validateEmittedWebhook(
 			t,
-			newCorpusSchemaCompiler(t),
+			conformance.NewWebhookSchemaValidator(),
 			receiveWebhook(t, emitted),
 			"pull_request",
 		)
@@ -267,7 +268,7 @@ func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
 		}
 		validateEmittedWebhook(
 			t,
-			newCorpusSchemaCompiler(t),
+			conformance.NewWebhookSchemaValidator(),
 			received,
 			"push",
 		)
@@ -437,7 +438,7 @@ func waitForRecordedRedelivery(
 
 func validateEmittedWebhook(
 	t *testing.T,
-	compiler *jsonschema.Compiler,
+	validator *conformance.WebhookSchemaValidator,
 	received emittedWebhook,
 	event string,
 ) {
@@ -464,12 +465,9 @@ func validateEmittedWebhook(
 	if !json.Valid(received.body) {
 		t.Fatalf("emitted body is invalid JSON: %q", received.body)
 	}
-	schemaPath := payloadSchemaPath(t, event, received.body)
-	schema, err := compiler.Compile(schemaPath)
-	if err != nil {
-		t.Fatalf("compile matching schema offline: %v", err)
+	if err := validator.Validate(event, received.body); err != nil {
+		t.Fatal(err)
 	}
-	validateJSON(t, schema, received.body)
 }
 
 func assertFakePayloadMatchesFixture(
