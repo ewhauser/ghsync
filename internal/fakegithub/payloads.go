@@ -1,3 +1,4 @@
+//nolint:gocritic // Payload generation uses detached fixture snapshots by value.
 package fakegithub
 
 import (

@@ -35,7 +35,11 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	s.mu.Lock()
-	fx := cloneFixture(&s.fixture)
+	fixtures := make([]Fixture, 0, len(s.additionalFixtures)+1)
+	fixtures = append(fixtures, cloneFixture(&s.fixture))
+	for _, fixture := range s.additionalFixtures {
+		fixtures = append(fixtures, cloneFixture(fixture))
+	}
 	s.mu.Unlock()
 	var ids []string
 	if raw := request.Variables["ids"]; len(raw) > 0 {
@@ -46,10 +50,16 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		nodes := make([]any, 0, len(ids))
 		for _, id := range ids {
 			var node any
-			for index := range fx.PullRequests {
-				pull := &fx.PullRequests[index]
-				if pull.NodeID == id {
-					node = graphQLPullRequest(&fx.Repository, pull)
+			for fixtureIndex := range fixtures {
+				fx := &fixtures[fixtureIndex]
+				for pullIndex := range fx.PullRequests {
+					pull := &fx.PullRequests[pullIndex]
+					if pull.NodeID == id {
+						node = graphQLPullRequest(&fx.Repository, pull)
+						break
+					}
+				}
+				if node != nil {
 					break
 				}
 			}
@@ -61,15 +71,21 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		"GhsyncPullRequestReviewThreadsPage",
 	):
 		id, after := graphQLCursorVariables(request.Variables)
-		for index := range fx.PullRequests {
-			pull := &fx.PullRequests[index]
-			if pull.NodeID == id {
-				data["node"] = map[string]any{
-					"reviewThreads": graphQLReviewThreads(
-						pull.ReviewThreads,
-						after,
-					),
+		for fixtureIndex := range fixtures {
+			fx := &fixtures[fixtureIndex]
+			for pullIndex := range fx.PullRequests {
+				pull := &fx.PullRequests[pullIndex]
+				if pull.NodeID == id {
+					data["node"] = map[string]any{
+						"reviewThreads": graphQLReviewThreads(
+							pull.ReviewThreads,
+							after,
+						),
+					}
+					break
 				}
+			}
+			if data["node"] != nil {
 				break
 			}
 		}
@@ -78,19 +94,28 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		"GhsyncReviewThreadCommentsPage",
 	):
 		id, after := graphQLCursorVariables(request.Variables)
-		for index := range fx.PullRequests {
-			pull := &fx.PullRequests[index]
-			for threadIndex := range pull.ReviewThreads {
-				thread := &pull.ReviewThreads[threadIndex]
-				if thread.ID == id {
-					data["node"] = map[string]any{
-						"comments": graphQLReviewComments(
-							thread.Comments,
-							after,
-						),
+		for fixtureIndex := range fixtures {
+			fx := &fixtures[fixtureIndex]
+			for pullIndex := range fx.PullRequests {
+				pull := &fx.PullRequests[pullIndex]
+				for threadIndex := range pull.ReviewThreads {
+					thread := &pull.ReviewThreads[threadIndex]
+					if thread.ID == id {
+						data["node"] = map[string]any{
+							"comments": graphQLReviewComments(
+								thread.Comments,
+								after,
+							),
+						}
+						break
 					}
+				}
+				if data["node"] != nil {
 					break
 				}
+			}
+			if data["node"] != nil {
+				break
 			}
 		}
 	}

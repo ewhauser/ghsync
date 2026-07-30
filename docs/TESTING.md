@@ -113,9 +113,9 @@ event shapes, and `--loop` renumbers per lap for unbounded duration.
 ### T2.3 `cmd/loadgen` — the strict verifier (replaces `cmd/soak`)
 
 Drives the fake's control surface with compiled steps. The fake applies each
-truth mutation to its fixture itself — generalizing today's title-only
-`applySoakMutation`/`SoakTruth` into full fixture mutations (rename the
-`Soak*` identifiers to `Truth*` when this lands).
+truth mutation to its fixture itself through `TruthMutation`, and exposes the
+full final state through `TruthSnapshot`; these replace the former title-only
+control model.
 
 Keeps every strict assertion the soak had, and widens the final oracle:
 
@@ -139,12 +139,69 @@ engine SIGKILL/restart mid-run (resume must not break any assertion).
 - CI job `load-smoke` (successor to the deleted `soak-smoke`): committed
   small recording, high `--speed`, full assertions, ~2–3 minute budget,
   fresh Postgres, `--roles=all`, backfill-gated start.
-- Release load run: large recording (e.g., 30 days of a high-traffic repo,
-  ideally one with real stacked PRs), multi-hour wall time via `--speed`,
-  chaos knobs on, `--copies` sized to hold ≥10x the recorded rate. Evidence
-  to attach: loadgen success line, final `/metrics` exposition, delivery
-  status and heartbeat queries, alert-rule evaluation over the window —
-  same spirit as the old soak sign-off list.
+
+Release load run (30-day recording with real stacks; ten copies supplies
+at least 10x width, while `--speed=12` compresses the month to about 60
+hours):
+
+```sh
+set -euo pipefail
+mkdir -p evidence
+export RECORDING=/secure/ghsync-recordings/release-30d.ndjson
+export DATABASE_URL='postgres://ghsync:ghsync@127.0.0.1:54329/ghsync_release_load?sslmode=disable'
+export GITHUB_BASE_URL=http://127.0.0.1:19797 GITHUB_TOKEN=fake-installation-release-load-token
+export GITHUB_WEBHOOK_SECRET=release-load-secret GITHUB_INSTALLATION_ID=1 GITHUB_ORG_ID=1
+export HTTP_ADDR=127.0.0.1:18080 GAP_HEAL_PERIOD=30s DRIFT_PERIOD=2m
+export BUDGET_LEASE_TTL=10s BUDGET_LEASE_RENEW_INTERVAL=3s
+base_deliveries=$(
+  tail -n +2 "$RECORDING" |
+    jq -s '[.[] | select(
+      .kind != "repository" and .kind != "commit" and .kind != "stack"
+    )] | length'
+)
+expected_deliveries=$((base_deliveries * 10))
+go build -o /tmp/ghsyncd ./cmd/ghsyncd
+go build -o /tmp/fake-github ./cmd/fake-github
+go build -o /tmp/ghsync-loadgen ./cmd/loadgen
+/tmp/ghsyncd migrate
+/tmp/fake-github -addr=127.0.0.1:19797 -recording="$RECORDING" -copies=10 \
+  -webhook-secret="$GITHUB_WEBHOOK_SECRET" -app-token="$GITHUB_TOKEN" \
+  >evidence/fake-github.log 2>&1 &
+/tmp/ghsyncd serve --roles=all >evidence/bootstrap.log 2>&1 & bootstrap=$!
+/tmp/ghsyncd backfill; kill "$bootstrap"; wait "$bootstrap" || true
+(while :; do
+  curl -fsS http://127.0.0.1:18080/metrics >evidence/metrics.tmp &&
+    mv evidence/metrics.tmp evidence/metrics.prom
+  sleep 5
+done) & metrics_sampler=$!
+set +e
+/tmp/ghsync-loadgen --database-url="$DATABASE_URL" --installation-id=1 \
+  --engine-url=http://127.0.0.1:18080 --fake-github-url=http://127.0.0.1:19797 \
+  --recording="$RECORDING" --speed=12 --copies=10 \
+  --expected-deliveries="$expected_deliveries" --target-rate=50 \
+  --traffic-timeout=64h --drain-timeout=15m --duplicate-every=100 \
+  --reorder-window=8 --drop-every=250 --fake-500-burst=8 \
+  --fake-429-burst=3 --fake-429-retry-after=2s --restart-after=45m \
+  --engine-cmd='/tmp/ghsyncd serve --roles=all' 2>&1 | tee evidence/loadgen.txt
+loadgen_status=${PIPESTATUS[0]}
+set -e
+kill "$metrics_sampler"; wait "$metrics_sampler" || true
+if [ "$loadgen_status" -ne 0 ]; then
+  tail -200 evidence/bootstrap.log evidence/fake-github.log
+  exit "$loadgen_status"
+fi
+psql "$DATABASE_URL" -X -c "select status,count(*) from webhook_deliveries group by 1" \
+  -c "select component,operation,last_success_at,last_sample_at from operation_heartbeats order by 1,2" \
+  >evidence/database.txt
+promtool check rules ops/alerts.yaml >evidence/alerts.txt
+```
+
+Attach `evidence/loadgen.txt`, the final successful `metrics.prom`, delivery
+and heartbeat query output, engine/fake logs, and alert-rule validation.
+When an engine is supervised externally instead, the operator must SIGKILL
+the process during traffic, restart it with the identical environment, and
+retain equivalent before/after logs; the automated strict restart assertion
+is only enabled by `--engine-cmd` plus `--restart-after`.
 
 ### T2.5 (optional, later) arrival shaping
 

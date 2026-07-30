@@ -28,6 +28,8 @@ const (
 	defaultBudgetRESTLimit         = int64(15000)
 	defaultBudgetGraphQLLimit      = int64(5000)
 	defaultBudgetSecondaryFallback = 60 * time.Second
+	defaultBudgetLeaseTTL          = 30 * time.Second
+	defaultBudgetLeaseRenew        = 10 * time.Second
 
 	defaultSweepOpenStackStaleness = 5 * time.Minute
 	defaultSweepOpenPRStaleness    = 10 * time.Minute
@@ -120,6 +122,10 @@ type Config struct {
 	// BudgetSecondaryFallback is used when a secondary-limit response supplies
 	// no valid Retry-After value.
 	BudgetSecondaryFallback time.Duration
+	// BudgetLeaseTTL bounds failover after an ungraceful singleton exit.
+	BudgetLeaseTTL time.Duration
+	// BudgetLeaseRenewInterval controls budget lease renewal cadence.
+	BudgetLeaseRenewInterval time.Duration
 
 	// M4 C-R1 bounds and periodic schedules are runtime configuration rather
 	// than constants in the sweeper.
@@ -198,6 +204,8 @@ func FromEnv() (Config, error) {
 		BudgetRESTLimit:            defaultBudgetRESTLimit,
 		BudgetGraphQLLimit:         defaultBudgetGraphQLLimit,
 		BudgetSecondaryFallback:    defaultBudgetSecondaryFallback,
+		BudgetLeaseTTL:             defaultBudgetLeaseTTL,
+		BudgetLeaseRenewInterval:   defaultBudgetLeaseRenew,
 		SweepOpenStackMaxStaleness: defaultSweepOpenStackStaleness,
 		SweepOpenPRMaxStaleness:    defaultSweepOpenPRStaleness,
 		SweepRepoRulesMaxStaleness: defaultSweepRepoRulesStaleness,
@@ -302,6 +310,8 @@ func FromEnv() (Config, error) {
 		{"RETENTION_PERIOD", &cfg.RetentionPeriod},
 		{"FETCH_BATCH_WINDOW", &cfg.FetchBatchWindow},
 		{"BUDGET_SECONDARY_FALLBACK", &cfg.BudgetSecondaryFallback},
+		{"BUDGET_LEASE_TTL", &cfg.BudgetLeaseTTL},
+		{"BUDGET_LEASE_RENEW_INTERVAL", &cfg.BudgetLeaseRenewInterval},
 		{"STREAM_WATERMARK_REFRESH", &cfg.WatermarkRefresh},
 		{"STREAM_WATERMARK_LEASE_TTL", &cfg.WatermarkLeaseTTL},
 		{"STREAM_WATERMARK_FENCE_LOCK_TIMEOUT", &cfg.WatermarkFenceTimeout},
@@ -407,6 +417,11 @@ func FromEnv() (Config, error) {
 	if cfg.BudgetEventFloor >= cfg.BudgetSweepFloor {
 		return Config{}, fmt.Errorf(
 			"BUDGET_EVENT_FLOOR must be less than BUDGET_SWEEP_FLOOR",
+		)
+	}
+	if cfg.BudgetLeaseRenewInterval >= cfg.BudgetLeaseTTL {
+		return Config{}, fmt.Errorf(
+			"BUDGET_LEASE_RENEW_INTERVAL must be less than BUDGET_LEASE_TTL",
 		)
 	}
 	if cfg.BackfillPageSize > 100 {

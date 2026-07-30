@@ -145,6 +145,7 @@ func TestHandlerAcknowledgesDuplicateGUID(t *testing.T) {
 }
 
 func TestHandlerAcceptsFormDeliveryAndPreservesWireBody(t *testing.T) {
+	t.Parallel()
 	store := &recordingInserter{rows: 1}
 	handler := NewHandler(store, "secret", 1024, time.Second)
 	formBody := []byte(url.Values{
@@ -178,6 +179,7 @@ func TestHandlerAcceptsFormDeliveryAndPreservesWireBody(t *testing.T) {
 func TestHandlerRejectsMalformedOrUnsupportedPayloadWithoutStoring(
 	t *testing.T,
 ) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		body        []byte
@@ -212,6 +214,7 @@ func TestHandlerRejectsMalformedOrUnsupportedPayloadWithoutStoring(
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			store := &recordingInserter{rows: 1}
 			handler := NewHandler(store, "secret", 1024, time.Second)
 			request := signedRequest(

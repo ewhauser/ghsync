@@ -58,7 +58,7 @@ func PayloadExamples(event string) ([]PayloadExample, error) {
 
 // ExamplePayload returns a fresh copy of the canonical octokit payload example
 // for an event and action. Push has no action and uses the empty string.
-func ExamplePayload(event string, action string) (map[string]any, error) {
+func ExamplePayload(event, action string) (map[string]any, error) {
 	examples, err := PayloadExamples(event)
 	if err != nil {
 		return nil, err

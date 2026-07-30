@@ -47,6 +47,7 @@ jobs:
             exit 1
           fi
           go test -race \
+            ./cmd/loadgen/... \
             ./internal/budget/... \
             ./internal/gh/... \
             ./internal/fakegithub/... \
@@ -77,3 +78,138 @@ jobs:
         if: steps.cache-custom-gcl.outputs.cache-hit == 'true'
         run: chmod +x custom-gcl && touch custom-gcl
       - run: make lint
+
+  load-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ghsync
+          POSTGRES_PASSWORD: ghsync
+          POSTGRES_DB: ghsync_load_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ghsync"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build load-smoke binaries
+        run: |
+          go build -o /tmp/ghsyncd ./cmd/ghsyncd
+          go build -o /tmp/fake-github ./cmd/fake-github
+          go build -o /tmp/ghsync-loadgen ./cmd/loadgen
+      - name: Replay committed recording with strict assertions
+        shell: bash
+        env:
+          DATABASE_URL: postgres://ghsync:ghsync@127.0.0.1:5432/ghsync_load_smoke?sslmode=disable&pool_max_conns=20
+          GITHUB_WEBHOOK_SECRET: smoke-secret
+          GITHUB_BASE_URL: http://127.0.0.1:19797
+          GITHUB_TOKEN: fake-installation-smoke-token
+          GITHUB_INSTALLATION_ID: "1"
+          GITHUB_ORG_ID: "1"
+          HTTP_ADDR: 127.0.0.1:18080
+          DISPATCH_DEBOUNCE: 100ms
+          DISPATCH_POLL_INTERVAL: 25ms
+          FETCH_BATCH_WINDOW: 2ms
+          GAP_HEAL_PERIOD: 2s
+          DRIFT_PERIOD: 5s
+          SWEEP_OPEN_STACK_MAX_STALENESS: 30s
+          SWEEP_OPEN_PR_MAX_STALENESS: 30s
+          STREAM_WATERMARK_REFRESH: 50ms
+          DERIVER_POLL_INTERVAL: 50ms
+        run: |
+          set -euo pipefail
+          recording=internal/replay/testdata/workerd-week.ndjson
+          expected_recording_events=1764
+          expected_non_delivery_events=$((1 + 24 + 1)) # repository + commits + stack
+          expected_deliveries=$((expected_recording_events - expected_non_delivery_events))
+          actual_recording_events=$(($(wc -l < "$recording") - 1))
+          actual_deliveries=$(
+            tail -n +2 "$recording" |
+              jq -s '[.[] | select(
+                .kind != "repository" and
+                .kind != "commit" and
+                .kind != "stack"
+              )] | length'
+          )
+          if [ "$actual_recording_events" -ne "$expected_recording_events" ] ||
+             [ "$actual_deliveries" -ne "$expected_deliveries" ]; then
+            echo "recording arithmetic changed: events=$actual_recording_events/$expected_recording_events deliveries=$actual_deliveries/$expected_deliveries"
+            exit 1
+          fi
+          echo "load-smoke expects $expected_deliveries = $expected_recording_events - $expected_non_delivery_events deliveries"
+          /tmp/ghsyncd migrate
+          /tmp/fake-github \
+            -addr=127.0.0.1:19797 \
+            -webhook-secret="$GITHUB_WEBHOOK_SECRET" \
+            -app-token="$GITHUB_TOKEN" \
+            -recording="$recording" \
+            > /tmp/fake-github.log 2>&1 &
+          fake_pid=$!
+          /tmp/ghsyncd serve --roles=all \
+            > /tmp/ghsyncd.log 2>&1 &
+          sync_pid=$!
+          cleanup() {
+            kill "$sync_pid" "$fake_pid" 2>/dev/null || true
+            wait "$sync_pid" "$fake_pid" 2>/dev/null || true
+          }
+          on_exit() {
+            status=$?
+            set +e
+            if [ "$status" -ne 0 ]; then
+              echo "load-smoke failed; ghsyncd log follows"
+              tail -200 /tmp/ghsyncd.log
+              echo "fake-github log follows"
+              tail -200 /tmp/fake-github.log
+              if [ -f /tmp/ghsync-loadgen.log ]; then
+                echo "loadgen log follows"
+                tail -200 /tmp/ghsync-loadgen.log
+              fi
+            fi
+            cleanup
+            exit "$status"
+          }
+          trap on_exit EXIT
+          for url in \
+            http://127.0.0.1:19797/healthz \
+            http://127.0.0.1:18080/healthz; do
+            healthy=false
+            for attempt in $(seq 1 30); do
+              if curl -fsS "$url" >/dev/null; then
+                healthy=true
+                break
+              fi
+              sleep 1
+            done
+            if [ "$healthy" != true ]; then
+              echo "service did not become healthy: $url"
+              exit 1
+            fi
+          done
+          /tmp/ghsyncd backfill
+          set +e
+          /tmp/ghsync-loadgen \
+            --database-url="$DATABASE_URL" \
+            --installation-id="$GITHUB_INSTALLATION_ID" \
+            --engine-url=http://127.0.0.1:18080 \
+            --fake-github-url=http://127.0.0.1:19797 \
+            --recording="$recording" \
+            --expected-deliveries="$expected_deliveries" \
+            --speed=10000 \
+            --target-rate=20 \
+            --traffic-timeout=2m \
+            --drain-timeout=90s \
+            2>&1 | tee /tmp/ghsync-loadgen.log
+          loadgen_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$loadgen_status" -ne 0 ]; then
+            exit "$loadgen_status"
+          fi

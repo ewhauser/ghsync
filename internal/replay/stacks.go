@@ -1,3 +1,4 @@
+//nolint:gocritic // Stack derivation intentionally transforms immutable pull-request snapshots by value.
 package replay
 
 import (
@@ -85,12 +86,20 @@ func DeriveStacks(repository Repository, pulls []PullRequest) []Stack {
 			component,
 			parentByChild,
 		)
+		if len(ordered) == 0 {
+			continue
+		}
 		bottom := byNumber[ordered[0]]
+		states := make([]PullRequest, 0, len(ordered))
+		for _, member := range ordered {
+			states = append(states, byNumber[member])
+		}
 		stacks = append(stacks, Stack{
-			ID:           stackID(repository.FullName(), ordered),
-			Number:       ordered[0],
-			Base:         bottom.Base,
-			PullRequests: ordered,
+			ID:                stackID(repository.FullName(), ordered),
+			Number:            ordered[0],
+			Base:              bottom.Base,
+			PullRequests:      ordered,
+			PullRequestStates: states,
 		})
 	}
 	sort.Slice(stacks, func(i, j int) bool {
@@ -145,7 +154,7 @@ func SynthesizeStackBases(
 			realMembers[number] = true
 		}
 	}
-	var eligible []int
+	eligible := make([]int, 0, len(result))
 	for index := range result {
 		if !realMembers[result[index].Number] &&
 			result[index].Head.Ref != repository.DefaultBranch {
@@ -209,7 +218,7 @@ func orderStackComponent(
 	for parent := range children {
 		sort.Ints(children[parent])
 	}
-	var ordered []int
+	ordered := make([]int, 0, len(component))
 	seen := make(map[int]bool, len(component))
 	var visit func(int)
 	visit = func(number int) {

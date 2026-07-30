@@ -134,7 +134,7 @@ func runContext(
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(
+	if _, err := fmt.Fprintf(
 		stdout,
 		"recorded %d events from %s/%s (%s to %s)\n",
 		result.Events,
@@ -142,7 +142,9 @@ func runContext(
 		name,
 		since.Format(time.RFC3339),
 		until.Format(time.RFC3339),
-	)
+	); err != nil {
+		return fmt.Errorf("write recording summary: %w", err)
+	}
 	return nil
 }
 
@@ -157,7 +159,7 @@ func parseRepository(value string) (string, string, error) {
 	return owner, name, nil
 }
 
-func samePath(left string, right string) (bool, error) {
+func samePath(left, right string) (bool, error) {
 	leftAbsolute, err := filepath.Abs(left)
 	if err != nil {
 		return false, fmt.Errorf("resolve --out path: %w", err)

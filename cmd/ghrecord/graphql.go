@@ -72,13 +72,13 @@ func (c *graphQLClient) call(
 	query string,
 	variables map[string]any,
 	target any,
-) (graphQLRateLimit, error) {
+) error {
 	body, err := json.Marshal(map[string]any{
 		"query":     query,
 		"variables": variables,
 	})
 	if err != nil {
-		return graphQLRateLimit{}, fmt.Errorf("marshal GraphQL request: %w", err)
+		return fmt.Errorf("marshal GraphQL request: %w", err)
 	}
 	request, err := http.NewRequestWithContext(
 		ctx,
@@ -87,7 +87,7 @@ func (c *graphQLClient) call(
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return graphQLRateLimit{}, fmt.Errorf("create GraphQL request: %w", err)
+		return fmt.Errorf("create GraphQL request: %w", err)
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("Authorization", "Bearer "+c.token)
@@ -95,27 +95,29 @@ func (c *graphQLClient) call(
 	request.Header.Set("User-Agent", "frontier-ghrecord/1")
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return graphQLRateLimit{}, fmt.Errorf("call GitHub GraphQL: %w", err)
+		return fmt.Errorf("call GitHub GraphQL: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		message, readErr := io.ReadAll(
 			io.LimitReader(response.Body, 64<<10),
 		)
 		if readErr != nil {
-			return graphQLRateLimit{}, fmt.Errorf(
+			return fmt.Errorf(
 				"read GraphQL HTTP %d response: %w",
 				response.StatusCode,
 				readErr,
 			)
 		}
 		if isRateLimitedResponse(response, message) {
-			return graphQLRateLimit{}, &rateLimitError{
+			return &rateLimitError{
 				ResetAt: parseRateReset(response.Header, time.Now()),
 				Message: strings.TrimSpace(string(message)),
 			}
 		}
-		return graphQLRateLimit{}, fmt.Errorf(
+		return fmt.Errorf(
 			"GitHub GraphQL returned HTTP %d: %s",
 			response.StatusCode,
 			strings.TrimSpace(string(message)),
@@ -124,10 +126,10 @@ func (c *graphQLClient) call(
 	limited := io.LimitReader(response.Body, maxGraphQLResponseBytes+1)
 	responseBody, err := io.ReadAll(limited)
 	if err != nil {
-		return graphQLRateLimit{}, fmt.Errorf("read GraphQL response: %w", err)
+		return fmt.Errorf("read GraphQL response: %w", err)
 	}
 	if len(responseBody) > maxGraphQLResponseBytes {
-		return graphQLRateLimit{}, fmt.Errorf(
+		return fmt.Errorf(
 			"GraphQL response exceeds %d bytes",
 			maxGraphQLResponseBytes,
 		)
@@ -137,14 +139,14 @@ func (c *graphQLClient) call(
 		Errors []graphQLError  `json:"errors"`
 	}
 	if err := json.Unmarshal(responseBody, &envelope); err != nil {
-		return graphQLRateLimit{}, fmt.Errorf("decode GraphQL response: %w", err)
+		return fmt.Errorf("decode GraphQL response: %w", err)
 	}
 	var rateContainer struct {
 		RateLimit graphQLRateLimit `json:"rateLimit"`
 	}
 	if len(envelope.Data) > 0 {
 		if err := json.Unmarshal(envelope.Data, &rateContainer); err != nil {
-			return graphQLRateLimit{}, fmt.Errorf(
+			return fmt.Errorf(
 				"decode GraphQL rate limit: %w",
 				err,
 			)
@@ -154,25 +156,25 @@ func (c *graphQLClient) call(
 		first := envelope.Errors[0]
 		if strings.Contains(strings.ToUpper(first.Type), "RATE_LIMIT") ||
 			strings.Contains(strings.ToLower(first.Message), "rate limit") {
-			return rateContainer.RateLimit, &rateLimitError{
+			return &rateLimitError{
 				ResetAt: rateContainer.RateLimit.ResetAt,
 				Message: first.Message,
 			}
 		}
-		return rateContainer.RateLimit, fmt.Errorf(
+		return fmt.Errorf(
 			"GitHub GraphQL: %s",
 			first.Message,
 		)
 	}
 	if target != nil && len(envelope.Data) > 0 {
 		if err := json.Unmarshal(envelope.Data, target); err != nil {
-			return rateContainer.RateLimit, fmt.Errorf(
+			return fmt.Errorf(
 				"decode GraphQL data: %w",
 				err,
 			)
 		}
 	}
-	return rateContainer.RateLimit, nil
+	return nil
 }
 
 func isRateLimitedResponse(response *http.Response, body []byte) bool {

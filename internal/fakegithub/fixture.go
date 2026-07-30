@@ -31,6 +31,7 @@ func cloneFixture(source *Fixture) Fixture {
 	for index := range source.PullRequests {
 		pull := &source.PullRequests[index]
 		clone.PullRequests[index] = *pull
+		clone.PullRequests[index].MergedAt = cloneTime(pull.MergedAt)
 		if pull.Stack != nil {
 			stack := *pull.Stack
 			clone.PullRequests[index].Stack = &stack

@@ -41,9 +41,10 @@ type corpusPayload struct {
 	Body     []byte
 }
 
-var releaseTagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+var releaseTagPattern = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
 
 func TestCorpusLayout(t *testing.T) {
+	t.Parallel()
 	version, err := os.ReadFile(filepath.Join("corpus", "VERSION"))
 	if err != nil {
 		t.Fatalf("read corpus version: %v", err)
@@ -98,6 +99,7 @@ func TestCorpusLayout(t *testing.T) {
 
 	for _, event := range corpusEvents {
 		t.Run(event, func(t *testing.T) {
+			t.Parallel()
 			files, err := os.ReadDir(filepath.Join("corpus", event))
 			if err != nil {
 				t.Fatalf("read event corpus: %v", err)

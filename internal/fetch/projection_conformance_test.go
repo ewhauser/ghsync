@@ -1,3 +1,4 @@
+//nolint:gocritic // Conformance cases intentionally keep decoded webhook snapshots by value.
 package fetch
 
 import (
@@ -44,7 +45,7 @@ func TestPullRequestCorpusProjection(t *testing.T) {
 	}
 
 	var sawLongString, sawNull bool
-	for index, example := range examples {
+	for index, example := range examples { //nolint:paralleltest // cases update shared corpus-coverage sentinels
 		t.Run(example.Filename, func(t *testing.T) {
 			repo := fmt.Sprintf("acme/projection-pull-%02d", index)
 			fixture := projectionFixture(index, repo)
@@ -159,7 +160,7 @@ func TestCheckRunCorpusProjection(t *testing.T) {
 	}
 
 	var sawLongString, sawNull bool
-	for index, example := range examples {
+	for index, example := range examples { //nolint:paralleltest // cases update shared corpus-coverage sentinels
 		t.Run(example.Filename, func(t *testing.T) {
 			repo := fmt.Sprintf("acme/projection-check-%02d", index)
 			fixture := projectionFixture(100+index, repo)
@@ -279,7 +280,7 @@ func TestCheckSuiteCorpusProjection(t *testing.T) {
 	}
 
 	var sawNull bool
-	for index, example := range examples {
+	for index, example := range examples { //nolint:paralleltest // cases update shared corpus-coverage sentinels
 		t.Run(example.Filename, func(t *testing.T) {
 			repo := fmt.Sprintf("acme/projection-suite-%02d", index)
 			fixture := projectionFixture(200+index, repo)

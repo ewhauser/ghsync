@@ -52,6 +52,10 @@ func (s *Server) validateAppAuthorization(
 ) bool {
 	const bearer = "Bearer "
 	rawAuthorization := r.Header.Get("Authorization")
+	if s.appBearerToken != "" &&
+		rawAuthorization == bearer+s.appBearerToken {
+		return true
+	}
 	if !strings.HasPrefix(rawAuthorization, bearer) ||
 		s.appPublicKey == nil || s.appID <= 0 {
 		http.Error(w, "valid App JWT required", http.StatusUnauthorized)
@@ -170,8 +174,10 @@ func (s *Server) redeliverAppHookDelivery(
 			break
 		}
 	}
-	if original != nil {
+	_, alreadyInFlight := s.redeliveryInFlight[id]
+	if original != nil && !alreadyInFlight {
 		s.redeliveries = append(s.redeliveries, id)
+		s.redeliveryInFlight[id] = struct{}{}
 	}
 	s.mu.Unlock()
 	if original == nil {
@@ -182,7 +188,15 @@ func (s *Server) redeliverAppHookDelivery(
 	// Use a background context because the request context is canceled as
 	// soon as this 202 response completes.
 	w.WriteHeader(http.StatusAccepted)
+	if alreadyInFlight {
+		return
+	}
 	go func(delivery storedHookDelivery) { //nolint:contextcheck // redelivery must outlive the accepted control request
+		defer func() {
+			s.mu.Lock()
+			delete(s.redeliveryInFlight, delivery.ID)
+			s.mu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		statusCode, _ := s.sendWebhook(
@@ -288,13 +302,26 @@ func (s *Server) DropWebhook(
 	event string,
 	payload any,
 ) (string, error) {
+	return s.DropWebhookWithGUID(targetURL, event, "", payload)
+}
+
+// DropWebhookWithGUID records a GitHub-side delivery with an explicit GUID
+// without sending it to ingress. The gap-healing sweep can later request it.
+func (s *Server) DropWebhookWithGUID(
+	targetURL string,
+	event string,
+	guid string,
+	payload any,
+) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal payload: %w", err)
 	}
-	guid, err := newDeliveryGUID()
-	if err != nil {
-		return "", fmt.Errorf("generate delivery GUID: %w", err)
+	if guid == "" {
+		guid, err = newDeliveryGUID()
+		if err != nil {
+			return "", fmt.Errorf("generate delivery GUID: %w", err)
+		}
 	}
 	s.recordHookDelivery(targetURL, event, guid, body, false, 0)
 	return guid, nil
@@ -350,7 +377,13 @@ func (s *Server) recordHookDelivery(
 	}
 	var action string
 	var envelope struct {
-		Action string `json:"action"`
+		Action     string `json:"action"`
+		Repository struct {
+			ID int64 `json:"id"`
+		} `json:"repository"`
+		Installation struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
 	}
 	if json.Unmarshal(body, &envelope) == nil {
 		action = envelope.Action
@@ -361,15 +394,16 @@ func (s *Server) recordHookDelivery(
 	s.nextDeliveryID++
 	s.deliveries = append(s.deliveries, storedHookDelivery{
 		HookDelivery: HookDelivery{
-			ID:           id,
-			GUID:         guid,
-			DeliveredAt:  s.now().UTC(),
-			Redelivery:   redelivery,
-			Status:       status,
-			StatusCode:   statusCode,
-			Event:        event,
-			Action:       action,
-			RepositoryID: s.fixture.Repository.ID,
+			ID:             id,
+			GUID:           guid,
+			DeliveredAt:    s.now().UTC(),
+			Redelivery:     redelivery,
+			Status:         status,
+			StatusCode:     statusCode,
+			Event:          event,
+			Action:         action,
+			InstallationID: envelope.Installation.ID,
+			RepositoryID:   envelope.Repository.ID,
 		},
 		targetURL: targetURL,
 		body:      append([]byte(nil), body...),

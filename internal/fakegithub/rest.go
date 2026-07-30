@@ -9,9 +9,15 @@ import (
 
 func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, bool) {
 	s.mu.Lock()
-	fx := cloneFixture(&s.fixture)
+	fixture := s.fixtureByKeyLocked(
+		r.PathValue("owner") + "/" + r.PathValue("repo"),
+	)
+	var fx Fixture
+	if fixture != nil {
+		fx = cloneFixture(fixture)
+	}
 	s.mu.Unlock()
-	if r.PathValue("owner") != fx.Owner || r.PathValue("repo") != fx.Repo {
+	if fixture == nil {
 		http.NotFound(w, r)
 		return Fixture{}, false
 	}
@@ -31,12 +37,28 @@ func (s *Server) listInstallationRepositories(
 	r *http.Request,
 ) {
 	s.mu.Lock()
-	fx := cloneFixture(&s.fixture)
-	repositories := fx.Repositories
-	if repositories == nil {
-		repositories = []Repository{fx.Repository}
+	fixtures := make([]Fixture, 0, len(s.additionalFixtures)+1)
+	fixtures = append(fixtures, cloneFixture(&s.fixture))
+	for _, fixture := range s.additionalFixtures {
+		fixtures = append(fixtures, cloneFixture(fixture))
 	}
 	s.mu.Unlock()
+	byID := make(map[int64]Repository)
+	for fixtureIndex := range fixtures {
+		fixture := &fixtures[fixtureIndex]
+		repositories := fixture.Repositories
+		if repositories == nil {
+			repositories = []Repository{fixture.Repository}
+		}
+		for repositoryIndex := range repositories {
+			repository := &repositories[repositoryIndex]
+			byID[repository.ID] = *repository
+		}
+	}
+	repositories := make([]Repository, 0, len(byID))
+	for repositoryID := range byID {
+		repositories = append(repositories, byID[repositoryID])
+	}
 	sort.SliceStable(repositories, func(i, j int) bool {
 		return repositories[i].ID < repositories[j].ID
 	})

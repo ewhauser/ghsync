@@ -5,6 +5,9 @@ through 2026-07-28T00:00:00Z (the inclusive date window July 21–27), with
 20% deterministic stack synthesis using seed 1. It was generated from the
 repository root with:
 
+The artifact uses recording schema v2. Stack events contain an ordered full
+pull-request snapshot for every member so fixture truth is self-contained.
+
 ```sh
 ghrecord_token="$(gh auth token)"
 go run ./cmd/ghrecord \

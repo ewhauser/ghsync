@@ -1,3 +1,4 @@
+//nolint:gocritic // Recording snapshots are immutable values; copying them isolates resumable crawl state.
 package main
 
 import (
@@ -233,10 +234,7 @@ func crawl(ctx context.Context, config crawlConfig) (crawlResult, error) {
 			return crawlResult{}, err
 		}
 	}
-	recording, err := buildRecording(cursor)
-	if err != nil {
-		return crawlResult{}, err
-	}
+	recording := buildRecording(cursor)
 	if err := writeRecordingFile(config.OutputPath, recording); err != nil {
 		return crawlResult{}, err
 	}
@@ -342,7 +340,7 @@ func crawlPullNumbers(
 			config.Since.Format("2006-01-02"),
 			config.Until.Add(-time.Nanosecond).Format("2006-01-02"),
 		)
-		_, err := config.Client.call(
+		err := config.Client.call(
 			ctx,
 			listPullRequestsQuery,
 			map[string]any{
@@ -520,7 +518,7 @@ func fetchPullThreadsPage(
 			} `json:"pullRequest"`
 		} `json:"repository"`
 	}
-	_, err := config.Client.call(
+	err := config.Client.call(
 		ctx,
 		pullRequestThreadsQuery,
 		map[string]any{
@@ -570,7 +568,7 @@ func fetchPullTimelinePage(
 			} `json:"pullRequest"`
 		} `json:"repository"`
 	}
-	_, err := config.Client.call(
+	err := config.Client.call(
 		ctx,
 		pullRequestTimelineQuery,
 		map[string]any{
@@ -628,7 +626,7 @@ func completeThreadComments(
 				Comments commentPage `json:"comments"`
 			} `json:"node"`
 		}
-		_, err := config.Client.call(
+		err := config.Client.call(
 			ctx,
 			reviewThreadCommentsQuery,
 			map[string]any{"id": threadID, "after": after},
@@ -712,7 +710,7 @@ func completeCommitChecks(
 				} `json:"object"`
 			} `json:"repository"`
 		}
-		_, err := config.Client.call(
+		err := config.Client.call(
 			ctx,
 			commitCheckSuitesQuery,
 			map[string]any{
@@ -773,7 +771,7 @@ func completeCheckRuns(
 				CheckRuns checkRunPage `json:"checkRuns"`
 			} `json:"node"`
 		}
-		_, err := config.Client.call(
+		err := config.Client.call(
 			ctx,
 			checkSuiteRunsQuery,
 			map[string]any{"id": suite.ID, "after": after},
@@ -843,7 +841,7 @@ func crawlDefaultHistory(
 				} `json:"defaultBranchRef"`
 			} `json:"repository"`
 		}
-		_, err := config.Client.call(
+		err := config.Client.call(
 			ctx,
 			defaultBranchHistoryQuery,
 			map[string]any{
@@ -931,17 +929,19 @@ func writeAtomic(path string, body []byte, mode os.FileMode) error {
 		return fmt.Errorf("create crawl cursor temporary file: %w", err)
 	}
 	tempPath := temp.Name()
-	defer os.Remove(tempPath)
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
 	if err := temp.Chmod(mode); err != nil {
-		temp.Close()
+		_ = temp.Close()
 		return fmt.Errorf("set crawl cursor permissions: %w", err)
 	}
 	if _, err := temp.Write(body); err != nil {
-		temp.Close()
+		_ = temp.Close()
 		return fmt.Errorf("write crawl cursor: %w", err)
 	}
 	if err := temp.Sync(); err != nil {
-		temp.Close()
+		_ = temp.Close()
 		return fmt.Errorf("sync crawl cursor: %w", err)
 	}
 	if err := temp.Close(); err != nil {
@@ -953,7 +953,7 @@ func writeAtomic(path string, body []byte, mode os.FileMode) error {
 	return nil
 }
 
-func buildRecording(cursor crawlCursor) (replay.Recording, error) {
+func buildRecording(cursor crawlCursor) replay.Recording {
 	var events []replay.TimedEvent
 	add := func(at time.Time, key string, event replay.Event) {
 		if at.Before(cursor.Since) || !at.Before(cursor.Until) {
@@ -1024,7 +1024,7 @@ func buildRecording(cursor crawlCursor) (replay.Recording, error) {
 			Seed:             cursor.Seed,
 		},
 		Events: normalized,
-	}, nil
+	}
 }
 
 func appendPullEvents(

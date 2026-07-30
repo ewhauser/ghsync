@@ -46,7 +46,7 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	body, err := json.Marshal(map[string]any{
 		"target_url": target.URL,
 		"event":      "pull_request",
-		"guid":       "soak-guid",
+		"guid":       "control-guid",
 		"payload":    payload,
 	})
 	if err != nil {
@@ -73,7 +73,7 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	}
 	select {
 	case request := <-received:
-		if request.Header.Get("X-GitHub-Delivery") != "soak-guid" ||
+		if request.Header.Get("X-GitHub-Delivery") != "control-guid" ||
 			request.Header.Get("X-GitHub-Event") != "pull_request" ||
 			request.Header.Get("X-Hub-Signature-256") == "" {
 			t.Fatalf("emitted headers = %#v", request.Header)
@@ -82,18 +82,20 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 		t.Fatal("control emit did not deliver webhook")
 	}
 	if deliveries := fakeServer.Deliveries(); len(deliveries) != 1 ||
-		deliveries[0].GUID != "soak-guid" {
+		deliveries[0].GUID != "control-guid" {
 		t.Fatalf("recorded deliveries = %#v", deliveries)
 	}
 }
 
-func TestControlTruthReportsLatestMutatedPullState(t *testing.T) {
+func TestControlTruthReportsFullMutatedPullState(t *testing.T) {
 	fake := New(DefaultFixture(), "secret")
-	payload := json.RawMessage(`{
-		"number": 4812,
-		"soak_revision": 77
-	}`)
-	fake.applySoakMutation("pull_request", payload)
+	fixture := DefaultFixture()
+	pull := fixture.PullRequests[1]
+	pull.Title = "Replay revision 77"
+	pull.UpdatedAt = pull.UpdatedAt.Add(time.Minute)
+	if err := fake.applyTruthMutation(truthPullMutation(fixture, pull)); err != nil {
+		t.Fatal(err)
+	}
 	response := serve(
 		fake,
 		http.MethodGet,
@@ -101,15 +103,492 @@ func TestControlTruthReportsLatestMutatedPullState(t *testing.T) {
 		nil,
 	)
 	defer func() { _ = response.Body.Close() }()
-	var truth SoakTruth
+	var truth TruthSnapshot
 	if err := json.NewDecoder(response.Body).Decode(&truth); err != nil {
 		t.Fatal(err)
 	}
-	if truth.Repository != "acme/monolith" ||
-		len(truth.PullRequests) != 1 ||
-		truth.PullRequests[0].Number != 4812 ||
-		truth.PullRequests[0].Title != "Soak revision 77 for PR 4812" {
+	if len(truth.Repositories) != 1 ||
+		truth.Repositories[0].Repository.FullName != "acme/monolith" ||
+		len(truth.Repositories[0].PullRequests) != 5 ||
+		truth.Repositories[0].PullRequests[1].Number != 4812 ||
+		truth.Repositories[0].PullRequests[1].Title != "Replay revision 77" {
 		t.Fatalf("truth = %+v", truth)
+	}
+}
+
+func TestTruthMutationsCoverStacksChecksAndReviewThreads(t *testing.T) {
+	now := time.Date(2026, 7, 30, 18, 0, 0, 0, time.UTC)
+	repository := TruthRepository{
+		ID:               7001,
+		NodeID:           "R_truth",
+		Owner:            "acme",
+		Name:             "truth",
+		DefaultBranch:    "main",
+		DefaultBranchSHA: "base",
+		UpdatedAt:        now,
+	}
+	fake := New(
+		EmptyFixture(truthRepository(repository)),
+		"secret",
+	)
+	mergedAt := now.Add(4 * time.Minute)
+	pullStates := []TruthPullRequest{
+		{
+			ID:          8001,
+			NodeID:      "PR_truth_1",
+			Number:      1,
+			Title:       "bottom",
+			State:       "open",
+			AuthorLogin: "author",
+			Head:        TruthBranch{Ref: "bottom", SHA: "head-1"},
+			Base:        TruthBranch{Ref: "main", SHA: "base"},
+			CreatedAt:   now,
+			UpdatedAt:   now.Add(time.Minute),
+		},
+		{
+			ID:          8002,
+			NodeID:      "PR_truth_2",
+			Number:      2,
+			Title:       "top",
+			State:       "closed",
+			Merged:      true,
+			AuthorLogin: "author",
+			Head:        TruthBranch{Ref: "top", SHA: "head-2"},
+			Base:        TruthBranch{Ref: "bottom", SHA: "head-1"},
+			CreatedAt:   now,
+			UpdatedAt:   mergedAt,
+			MergedAt:    &mergedAt,
+		},
+	}
+	for index := range pullStates {
+		mutation := TruthMutation{
+			Kind:        "pull_request",
+			Repository:  repository,
+			PullRequest: &pullStates[index],
+		}
+		if err := fake.applyTruthMutation(mutation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line := 23
+	pull := pullStates[0]
+	pull.UpdatedAt = now.Add(5 * time.Minute)
+	pullStates[0] = pull
+	if err := fake.applyTruthMutation(TruthMutation{
+		Kind:        "review_thread",
+		Repository:  repository,
+		PullRequest: &pull,
+		ReviewThread: &TruthReviewThread{
+			ID:         "T_truth",
+			IsResolved: true,
+			Path:       "truth.go",
+			Line:       &line,
+			Comments: []TruthReviewComment{{
+				ID:          9001,
+				NodeID:      "C_truth",
+				Body:        "resolved",
+				Path:        "truth.go",
+				Line:        &line,
+				AuthorLogin: "reviewer",
+				CreatedAt:   now,
+				UpdatedAt:   now.Add(5 * time.Minute),
+			}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.applyTruthMutation(TruthMutation{
+		Kind:       "check_run",
+		Repository: repository,
+		CheckRun: &TruthCheckRun{
+			ID:          10001,
+			NodeID:      "CR_truth",
+			HeadSHA:     "head-1",
+			Name:        "unit",
+			Status:      "completed",
+			Conclusion:  "success",
+			DetailsURL:  "https://example.test/check",
+			AppSlug:     "actions",
+			StartedAt:   &now,
+			CompletedAt: &mergedAt,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.applyTruthMutation(TruthMutation{
+		Kind:       "stack",
+		Repository: repository,
+		Stack: &TruthStack{
+			ID:                11001,
+			Number:            7,
+			Base:              TruthBranch{Ref: "main", SHA: "base"},
+			PullRequests:      []int{1, 2},
+			PullRequestStates: pullStates,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pullStates[1].Title = "top after stack"
+	pullStates[1].UpdatedAt = now.Add(6 * time.Minute)
+	if err := fake.applyTruthMutation(TruthMutation{
+		Kind:        "pull_request",
+		Repository:  repository,
+		PullRequest: &pullStates[1],
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := snapshotFixture(fake.fixture)
+	if len(snapshot.PullRequests) != 2 ||
+		len(snapshot.Stacks) != 1 ||
+		len(snapshot.CheckRuns) != 1 ||
+		len(snapshot.ReviewThreads) != 1 {
+		t.Fatalf("full truth snapshot = %+v", snapshot)
+	}
+	if snapshot.Stacks[0].PullRequests[1].MergedAt == nil ||
+		!snapshot.Stacks[0].PullRequests[1].MergedAt.Equal(mergedAt) {
+		t.Fatalf(
+			"stack did not retain merged timestamp: %+v",
+			snapshot.Stacks[0],
+		)
+	}
+	if !snapshot.Stacks[0].UpdatedAt.Equal(pullStates[1].UpdatedAt) ||
+		!snapshot.Stacks[0].PullRequests[1].UpdatedAt.Equal(
+			pullStates[1].UpdatedAt,
+		) {
+		t.Fatalf(
+			"post-stack pull mutation did not refresh stack truth: %+v",
+			snapshot.Stacks[0],
+		)
+	}
+	if snapshot.PullRequests[0].Stack == nil ||
+		snapshot.PullRequests[0].Stack.Position != 1 ||
+		snapshot.ReviewThreads[0].Comments[0].ID != "C_truth" {
+		t.Fatalf("mutated fixture details = %+v", snapshot)
+	}
+}
+
+func TestTruthMutationKindsMatchReplayCompilerAndRejectUnknowns(t *testing.T) {
+	now := time.Date(2026, 7, 30, 20, 0, 0, 0, time.UTC)
+	repository := TruthRepository{
+		ID:               12001,
+		NodeID:           "R_kinds",
+		Owner:            "acme",
+		Name:             "kinds",
+		DefaultBranch:    "main",
+		DefaultBranchSHA: "initial",
+		UpdatedAt:        now,
+	}
+	pull := func(id int64, number int, head string) TruthPullRequest {
+		return TruthPullRequest{
+			ID:          id,
+			NodeID:      fmt.Sprintf("PR_kinds_%d", number),
+			Number:      number,
+			Title:       fmt.Sprintf("pull %d", number),
+			State:       "open",
+			AuthorLogin: "author",
+			Head:        TruthBranch{Ref: head, SHA: head + "-sha"},
+			Base:        TruthBranch{Ref: "main", SHA: "initial"},
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+	}
+	first := pull(13001, 1, "first")
+	second := pull(13002, 2, "second")
+	fixture := EmptyFixture(truthRepository(repository))
+	fixture.PullRequests = []PullRequest{
+		truthPullRequest(&first),
+		truthPullRequest(&second),
+	}
+	fake := New(fixture, "secret")
+	line := 9
+	started := now.Add(time.Second)
+	completed := now.Add(2 * time.Second)
+	thread := TruthReviewThread{
+		ID:   "T_kinds",
+		Path: "kinds.go",
+		Line: &line,
+		Comments: []TruthReviewComment{{
+			ID:          14001,
+			NodeID:      "C_kinds",
+			Body:        "before edit",
+			Path:        "kinds.go",
+			Line:        &line,
+			AuthorLogin: "reviewer",
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}},
+	}
+	mutations := []TruthMutation{
+		{Kind: "repository", Repository: repository},
+		{
+			Kind:       "commit",
+			Repository: repository,
+			Commit: &TruthCommit{
+				SHA:           "commit-head",
+				Ref:           "refs/heads/main",
+				CommittedAt:   now,
+				DefaultBranch: true,
+			},
+		},
+		{
+			Kind:       "push",
+			Repository: repository,
+			Push: &TruthPush{
+				Ref:           "refs/heads/main",
+				Before:        "commit-head",
+				After:         "push-head",
+				DefaultBranch: true,
+				PushedAt:      now.Add(time.Second),
+			},
+		},
+		{Kind: "pull_request", Repository: repository, PullRequest: &first},
+		{
+			Kind:        "pull_request_review",
+			Repository:  repository,
+			PullRequest: &first,
+			Review: &TruthReview{
+				ID:          15001,
+				NodeID:      "REV_kinds",
+				State:       "approved",
+				AuthorLogin: "reviewer",
+				SubmittedAt: now,
+			},
+		},
+		{
+			Kind:         "review_thread",
+			Repository:   repository,
+			PullRequest:  &first,
+			ReviewThread: &thread,
+		},
+		{
+			Kind:        "review_comment",
+			Repository:  repository,
+			PullRequest: &first,
+			ReviewComment: &TruthReviewComment{
+				ID:          14001,
+				NodeID:      "C_kinds",
+				Body:        "after edit",
+				Path:        "kinds.go",
+				Line:        &line,
+				AuthorLogin: "reviewer",
+				CreatedAt:   now,
+				UpdatedAt:   now.Add(time.Minute),
+			},
+		},
+		{
+			Kind:       "check_suite",
+			Repository: repository,
+			CheckSuite: &TruthCheckSuite{
+				ID:        16001,
+				NodeID:    "CS_kinds",
+				HeadSHA:   first.Head.SHA,
+				Status:    "queued",
+				CreatedAt: now,
+				UpdatedAt: now,
+			},
+		},
+		{
+			Kind:       "check_run",
+			Repository: repository,
+			CheckRun: &TruthCheckRun{
+				ID:          17001,
+				NodeID:      "CR_kinds",
+				HeadSHA:     first.Head.SHA,
+				Name:        "unit",
+				Status:      "completed",
+				Conclusion:  "success",
+				DetailsURL:  "https://example.test/check",
+				StartedAt:   &started,
+				CompletedAt: &completed,
+			},
+		},
+		{
+			Kind:       "stack",
+			Repository: repository,
+			Stack: &TruthStack{
+				ID:                18001,
+				Number:            3,
+				Base:              TruthBranch{Ref: "main", SHA: "push-head"},
+				PullRequests:      []int{1, 2},
+				PullRequestStates: []TruthPullRequest{first, second},
+			},
+		},
+	}
+	for _, mutation := range mutations {
+		if err := fake.applyTruthMutation(mutation); err != nil {
+			t.Fatalf("apply %s mutation: %v", mutation.Kind, err)
+		}
+	}
+	snapshot := snapshotFixture(fake.fixture)
+	if snapshot.Repository.DefaultBranchSHA != "push-head" {
+		t.Fatalf(
+			"later mutations reset mutable repository truth to %q",
+			snapshot.Repository.DefaultBranchSHA,
+		)
+	}
+	if len(fake.fixture.Repositories) != 1 ||
+		fake.fixture.Repositories[0].DefaultBranchSHA != "push-head" ||
+		!fake.fixture.Repositories[0].PushedAt.Equal(now.Add(time.Second)) {
+		t.Fatal("repository-list truth diverged from repository endpoint truth")
+	}
+	if got := snapshot.ReviewThreads[0].Comments[0].Body; got != "after edit" {
+		t.Fatalf("review-comment mutation body = %q", got)
+	}
+	before := cloneFixture(&fake.fixture)
+	if err := fake.applyTruthMutation(TruthMutation{
+		Kind:       "future_compiler_kind",
+		Repository: repository,
+	}); err == nil {
+		t.Fatal("unknown compiler mutation kind was silently accepted")
+	}
+	if !reflect.DeepEqual(before, fake.fixture) {
+		t.Fatal("rejected mutation partially changed fixture truth")
+	}
+	additionalBefore := len(fake.additionalFixtures)
+	unknownRepository := repository
+	unknownRepository.ID++
+	unknownRepository.Name = "unknown"
+	if err := fake.applyTruthMutation(TruthMutation{
+		Kind:       "stack",
+		Repository: unknownRepository,
+		Stack: &TruthStack{
+			ID:           19001,
+			Number:       4,
+			PullRequests: []int{999},
+		},
+	}); err == nil {
+		t.Fatal("invalid new-repository stack mutation was accepted")
+	}
+	if len(fake.additionalFixtures) != additionalBefore {
+		t.Fatal("rejected mutation created a partial repository fixture")
+	}
+}
+
+func TestControlEmitValidatesDeliveriesBeforeCommittingTruth(t *testing.T) {
+	fixture := DefaultFixture()
+	fake := New(fixture, "secret")
+	pull := fixture.PullRequests[0]
+	pull.Title = "must not commit"
+	requestBody, err := json.Marshal(map[string]any{
+		"target_url": "http://127.0.0.1:1/webhook",
+		"mutation":   truthPullMutation(fixture, pull),
+		"deliveries": []map[string]any{{
+			"event":   "",
+			"payload": json.RawMessage(`{"invalid":true}`),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serve(
+		fake,
+		http.MethodPost,
+		"http://fake.test"+ControlEmitPath,
+		bytes.NewReader(requestBody),
+	)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("control status = %d, want 400", response.StatusCode)
+	}
+	if fake.fixture.PullRequests[0].Title == "must not commit" {
+		t.Fatal("invalid control delivery partially committed truth")
+	}
+}
+
+func truthPullRequest(pull *TruthPullRequest) PullRequest {
+	return PullRequest{
+		ID:             pull.ID,
+		NodeID:         pull.NodeID,
+		Number:         pull.Number,
+		Title:          pull.Title,
+		State:          pull.State,
+		Draft:          pull.Draft,
+		AuthorLogin:    pull.AuthorLogin,
+		ReviewDecision: pull.ReviewDecision,
+		MergeableState: pull.MergeableState,
+		Head: PullRequestBranch{
+			Ref: pull.Head.Ref,
+			SHA: pull.Head.SHA,
+		},
+		Base: PullRequestBranch{
+			Ref: pull.Base.Ref,
+			SHA: pull.Base.SHA,
+		},
+		CreatedAt: pull.CreatedAt,
+		UpdatedAt: pull.UpdatedAt,
+		MergedAt:  cloneTime(pull.MergedAt),
+	}
+}
+
+func TestControlFaultBurstApplies500And429(t *testing.T) {
+	fake := New(DefaultFixture(), "secret")
+	body := bytes.NewReader([]byte(
+		`{"internal_errors":1,"rate_limits":1,"retry_after":1000000000}`,
+	))
+	response := serve(
+		fake,
+		http.MethodPost,
+		"http://fake.test"+ControlFaultPath,
+		body,
+	)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("control fault status = %d", response.StatusCode)
+	}
+	first := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/stacks",
+		nil,
+	)
+	_ = first.Body.Close()
+	second := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/stacks",
+		nil,
+	)
+	_ = second.Body.Close()
+	third := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/stacks",
+		nil,
+	)
+	_ = third.Body.Close()
+	if first.StatusCode != http.StatusInternalServerError ||
+		second.StatusCode != http.StatusTooManyRequests ||
+		second.Header.Get("Retry-After") != "1" ||
+		third.StatusCode != http.StatusOK {
+		t.Fatalf(
+			"fault statuses = %d/%d/%d Retry-After=%q",
+			first.StatusCode,
+			second.StatusCode,
+			third.StatusCode,
+			second.Header.Get("Retry-After"),
+		)
+	}
+	truth := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test"+ControlTruthPath,
+		nil,
+	)
+	defer func() {
+		_ = truth.Body.Close()
+	}()
+	var snapshot TruthSnapshot
+	if err := json.NewDecoder(truth.Body).Decode(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Faults != (TruthFaultSnapshot{
+		Configured500: 1,
+		Configured429: 1,
+		Applied500:    1,
+		Applied429:    1,
+	}) {
+		t.Fatalf("fault snapshot = %+v", snapshot.Faults)
 	}
 }
 
@@ -388,10 +867,11 @@ func TestPullListHonorsSortDirectionAndPagination(t *testing.T) {
 	}
 }
 
-func TestConcurrentListPullsAndSoakMutationUseIsolatedFixtureData(
+func TestConcurrentListPullsAndTruthMutationUseIsolatedFixtureData(
 	t *testing.T,
 ) {
-	fake := New(DefaultFixture(), "secret")
+	fixture := DefaultFixture()
+	fake := New(fixture, "secret")
 	start := make(chan struct{})
 	errs := make(chan error, 9)
 	var workers sync.WaitGroup
@@ -426,13 +906,17 @@ func TestConcurrentListPullsAndSoakMutationUseIsolatedFixtureData(
 	workers.Go(func() {
 		<-start
 		for revision := range 2_000 {
-			fake.applySoakMutation(
-				"pull_request",
-				json.RawMessage(fmt.Sprintf(
-					`{"number":4812,"soak_revision":%d}`,
-					revision,
-				)),
+			pull := fixture.PullRequests[1]
+			pull.Title = fmt.Sprintf("Replay revision %d", revision)
+			pull.UpdatedAt = pull.UpdatedAt.Add(
+				time.Duration(revision) * time.Nanosecond,
 			)
+			if err := fake.applyTruthMutation(
+				truthPullMutation(fixture, pull),
+			); err != nil {
+				errs <- err
+				return
+			}
 		}
 	})
 	close(start)
@@ -440,6 +924,46 @@ func TestConcurrentListPullsAndSoakMutationUseIsolatedFixtureData(
 	close(errs)
 	for err := range errs {
 		t.Fatal(err)
+	}
+}
+
+//nolint:gocritic // Concurrent mutation tests intentionally copy detached fixture snapshots.
+func truthPullMutation(
+	fixture Fixture,
+	pull PullRequest,
+) TruthMutation {
+	return TruthMutation{
+		Kind: "pull_request",
+		Repository: TruthRepository{
+			ID:               fixture.Repository.ID,
+			NodeID:           fixture.Repository.NodeID,
+			Owner:            fixture.Repository.Owner,
+			Name:             fixture.Repository.Name,
+			DefaultBranch:    fixture.Repository.DefaultBranch,
+			DefaultBranchSHA: fixture.Repository.DefaultBranchSHA,
+			UpdatedAt:        fixture.Repository.UpdatedAt,
+		},
+		PullRequest: &TruthPullRequest{
+			ID:             pull.ID,
+			NodeID:         pull.NodeID,
+			Number:         pull.Number,
+			Title:          pull.Title,
+			State:          pull.State,
+			Draft:          pull.Draft,
+			AuthorLogin:    pull.AuthorLogin,
+			ReviewDecision: pull.ReviewDecision,
+			MergeableState: pull.MergeableState,
+			Head: TruthBranch{
+				Ref: pull.Head.Ref,
+				SHA: pull.Head.SHA,
+			},
+			Base: TruthBranch{
+				Ref: pull.Base.Ref,
+				SHA: pull.Base.SHA,
+			},
+			CreatedAt: pull.CreatedAt,
+			UpdatedAt: pull.UpdatedAt,
+		},
 	}
 }
 
@@ -877,6 +1401,28 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 			received.Load(),
 			fake.RedeliveryRequests(),
 			fake.Deliveries(),
+		)
+	}
+	duplicate := serveAuthorized(
+		fake,
+		http.MethodPost,
+		fmt.Sprintf(
+			"http://fake.test/app/hook/deliveries/%d/attempts",
+			deliveries[0].ID,
+		),
+		nil,
+		"Bearer "+appJWT,
+	)
+	_ = duplicate.Body.Close()
+	if duplicate.StatusCode != http.StatusAccepted ||
+		received.Load() != 1 ||
+		len(fake.RedeliveryRequests()) != 1 {
+		t.Fatalf(
+			"duplicate in-flight redelivery spawned work: "+
+				"status=%d received=%d requests=%v",
+			duplicate.StatusCode,
+			received.Load(),
+			fake.RedeliveryRequests(),
 		)
 	}
 	close(release)

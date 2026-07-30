@@ -21,7 +21,9 @@ import (
 const (
 	ControlEmitPath = "/_ghsync/emit"
 	// ControlTruthPath exposes the fake's mutation truth to the local oracle.
-	ControlTruthPath          = "/_ghsync/truth"
+	ControlTruthPath = "/_ghsync/truth"
+	// ControlFaultPath configures flag-gated API failures for load tests.
+	ControlFaultPath          = "/_ghsync/faults"
 	maxRecordedAuthorizations = 1024
 )
 
@@ -61,6 +63,7 @@ type PullRequest struct {
 	Base           PullRequestBranch `json:"base"`
 	UpdatedAt      time.Time         `json:"updated_at"`
 	CreatedAt      time.Time         `json:"-"`
+	MergedAt       *time.Time        `json:"-"`
 	Stack          *StackRef         `json:"stack"`
 	ReviewThreads  []ReviewThread    `json:"-"`
 }
@@ -116,20 +119,20 @@ func (r Repository) MarshalJSON() ([]byte, error) { //nolint:gocritic // value r
 
 // ReviewThread is fixture truth for one GraphQL review thread.
 type ReviewThread struct {
-	ID         string
-	IsResolved bool
-	IsOutdated bool
-	Path       string
-	Line       *int
-	Comments   []ReviewComment
+	ID         string          `json:"id"`
+	IsResolved bool            `json:"is_resolved"`
+	IsOutdated bool            `json:"is_outdated"`
+	Path       string          `json:"path"`
+	Line       *int            `json:"line,omitempty"`
+	Comments   []ReviewComment `json:"comments"`
 }
 
 // ReviewComment is fixture truth for one review comment.
 type ReviewComment struct {
-	ID          string
-	Body        string
-	UpdatedAt   time.Time
-	AuthorLogin string
+	ID          string    `json:"id"`
+	Body        string    `json:"body"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	AuthorLogin string    `json:"author_login"`
 }
 
 // CheckRun is fixture truth for one check run.
@@ -224,6 +227,29 @@ func WithFixture(fixture Fixture) Option { //nolint:gocritic // option takes an 
 	}
 }
 
+// WithAdditionalFixtures adds independently addressable repositories to the
+// installation. It is used to seed --copies replay namespaces before backfill.
+func WithAdditionalFixtures(fixtures ...Fixture) Option {
+	return func(s *Server) {
+		for index := range fixtures {
+			fixture := &fixtures[index]
+			clone := cloneFixture(fixture)
+			s.additionalFixtures[clone.Owner+"/"+clone.Repo] = &clone
+		}
+	}
+}
+
+// WithAppBearerToken allows the standalone development fake to accept the
+// static token ghsyncd uses for App deliveries-API gap healing.
+func WithAppBearerToken(token string) Option {
+	if strings.TrimSpace(token) == "" {
+		panic("App bearer token is required")
+	}
+	return func(s *Server) {
+		s.appBearerToken = token
+	}
+}
+
 // WithRequestHook mutates fixture truth at a deterministic request boundary.
 // Tests use it to expose mutable-pagination races without timing sleeps.
 func WithRequestHook(
@@ -309,36 +335,45 @@ func WithNow(now func() time.Time) Option {
 // Server implements http.Handler for the API surface and can emit webhooks.
 // All mutable state is guarded so tests can mutate the fixture mid-scenario.
 type Server struct {
-	mu             sync.Mutex
-	fixture        Fixture
-	webhookSecret  []byte
-	restBudget     rateState
-	graphQLBudget  rateState
-	restSteps      []RateLimitStep
-	graphQLSteps   []RateLimitStep
-	restStep       int
-	graphQLStep    int
-	responseDelay  time.Duration
-	active         int
-	maxActive      int
-	tokenMaxActive int
-	tokenTTL       time.Duration
-	tokenRequests  int
-	authorizations []string
-	appID          int64
-	appPublicKey   *rsa.PublicKey
-	now            func() time.Time
-	mux            *http.ServeMux
-	client         *http.Client
-	requestCounts  map[string]int
-	notModified    map[string]int
-	notFound       map[string]int
-	notFoundAt     map[string]map[int]struct{}
-	requestHook    func(string, string, int, *Fixture)
-	deliveries     []storedHookDelivery
-	nextDeliveryID int64
-	redeliveries   []int64
-	soakTruth      map[int]string
+	mu                 sync.Mutex
+	fixture            Fixture
+	webhookSecret      []byte
+	restBudget         rateState
+	graphQLBudget      rateState
+	restSteps          []RateLimitStep
+	graphQLSteps       []RateLimitStep
+	restStep           int
+	graphQLStep        int
+	responseDelay      time.Duration
+	active             int
+	maxActive          int
+	tokenMaxActive     int
+	tokenTTL           time.Duration
+	tokenRequests      int
+	authorizations     []string
+	appID              int64
+	appPublicKey       *rsa.PublicKey
+	now                func() time.Time
+	mux                *http.ServeMux
+	client             *http.Client
+	requestCounts      map[string]int
+	notModified        map[string]int
+	notFound           map[string]int
+	notFoundAt         map[string]map[int]struct{}
+	requestHook        func(string, string, int, *Fixture)
+	deliveries         []storedHookDelivery
+	nextDeliveryID     int64
+	redeliveries       []int64
+	redeliveryInFlight map[int64]struct{}
+	additionalFixtures map[string]*Fixture
+	truthKeys          map[string]struct{}
+	appBearerToken     string
+	faults             []int
+	faultRetryAfter    time.Duration
+	configured500      int
+	configured429      int
+	applied500         int
+	applied429         int
 }
 
 // New constructs a scriptable fake GitHub server.
@@ -359,15 +394,17 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server { //n
 			resetAt:   resetAt,
 			resource:  "graphql",
 		},
-		tokenTTL:       time.Hour,
-		now:            time.Now,
-		client:         &http.Client{Timeout: 10 * time.Second},
-		requestCounts:  make(map[string]int),
-		notModified:    make(map[string]int),
-		notFound:       make(map[string]int),
-		notFoundAt:     make(map[string]map[int]struct{}),
-		nextDeliveryID: 1,
-		soakTruth:      make(map[int]string),
+		tokenTTL:           time.Hour,
+		now:                time.Now,
+		client:             &http.Client{Timeout: 10 * time.Second},
+		requestCounts:      make(map[string]int),
+		notModified:        make(map[string]int),
+		notFound:           make(map[string]int),
+		notFoundAt:         make(map[string]map[int]struct{}),
+		nextDeliveryID:     1,
+		redeliveryInFlight: make(map[int64]struct{}),
+		additionalFixtures: make(map[string]*Fixture),
+		truthKeys:          make(map[string]struct{}),
 	}
 	for _, option := range options {
 		option(s)
@@ -376,6 +413,7 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server { //n
 	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("POST "+ControlEmitPath, s.controlEmit)
 	mux.HandleFunc("GET "+ControlTruthPath, s.controlTruth)
+	mux.HandleFunc("POST "+ControlFaultPath, s.controlFaults)
 	mux.HandleFunc("GET /repos/{owner}/{repo}", s.getRepository)
 	mux.HandleFunc("GET /installation/repositories", s.listInstallationRepositories)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets", s.listRepositoryRules)
@@ -457,6 +495,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordAuthorization(r.Header.Get("Authorization"))
+	if status, retryAfter, ok := s.takeFault(); ok {
+		s.writeFault(w, r, resource, status, retryAfter)
+		return
+	}
 	rate := s.nextRate(resource, 1)
 	setRateHeaders(w.Header(), rate.snapshot)
 	if rate.scripted {
@@ -525,12 +567,73 @@ func (s *Server) recordAuthorization(authorization string) {
 	s.authorizations[len(s.authorizations)-1] = authorization
 }
 
+func (s *Server) takeFault() (int, time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.faults) == 0 {
+		return 0, 0, false
+	}
+	status := s.faults[0]
+	s.faults = s.faults[1:]
+	if status == http.StatusTooManyRequests {
+		s.applied429++
+	} else {
+		s.applied500++
+	}
+	return status, s.faultRetryAfter, true
+}
+
+func (s *Server) writeFault(
+	w http.ResponseWriter,
+	_ *http.Request,
+	resource string,
+	status int,
+	retryAfter time.Duration,
+) {
+	snapshot := s.snapshot(resource)
+	setRateHeaders(w.Header(), snapshot)
+	if status == http.StatusTooManyRequests {
+		if retryAfter > 0 {
+			w.Header().Set(
+				"Retry-After",
+				strconv.FormatInt(
+					int64((retryAfter+time.Second-1)/time.Second),
+					10,
+				),
+			)
+		}
+		writeSecondaryRateLimitExceeded(
+			w,
+			status,
+			resource,
+			snapshot,
+			1,
+		)
+		return
+	}
+	writeJSONStatus(w, status, map[string]any{
+		"message": "scripted fake GitHub internal error",
+	})
+}
+
 type controlEmitRequest struct {
-	TargetURL string          `json:"target_url"`
-	Event     string          `json:"event"`
-	GUID      string          `json:"guid,omitempty"`
-	Mutate    bool            `json:"mutate,omitempty"`
-	Payload   json.RawMessage `json:"payload"`
+	TargetURL             string            `json:"target_url"`
+	Event                 string            `json:"event"`
+	GUID                  string            `json:"guid,omitempty"`
+	Mutate                bool              `json:"mutate,omitempty"`
+	Payload               json.RawMessage   `json:"payload"`
+	Mutation              *TruthMutation    `json:"mutation,omitempty"`
+	Deliveries            []ControlDelivery `json:"deliveries,omitempty"`
+	AllowDeliveryFailures bool              `json:"allow_delivery_failures,omitempty"`
+}
+
+// ControlDelivery is one signed delivery emitted (or GitHub-side dropped)
+// after a truth mutation has been applied.
+type ControlDelivery struct {
+	Event   string          `json:"event"`
+	GUID    string          `json:"guid,omitempty"`
+	Payload json.RawMessage `json:"payload"`
+	Drop    bool            `json:"drop,omitempty"`
 }
 
 func (s *Server) controlEmit(w http.ResponseWriter, r *http.Request) {
@@ -542,103 +645,157 @@ func (s *Server) controlEmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "decode emit request", http.StatusBadRequest)
 		return
 	}
-	target, err := url.Parse(request.TargetURL)
-	if err != nil || target.Scheme != "http" || !loopbackHost(target.Hostname()) {
+	deliveries := request.Deliveries
+	if request.Event != "" || len(request.Payload) > 0 {
+		deliveries = append(deliveries, ControlDelivery{
+			Event: request.Event, GUID: request.GUID, Payload: request.Payload,
+		})
+	}
+	if request.Mutation == nil && len(deliveries) == 0 {
+		http.Error(w, "mutation or deliveries are required", http.StatusBadRequest)
+		return
+	}
+	if len(deliveries) > 0 {
+		target, err := url.Parse(request.TargetURL)
+		if err != nil || target.Scheme != "http" ||
+			!loopbackHost(target.Hostname()) {
+			http.Error(
+				w,
+				"target_url must be an http loopback address",
+				http.StatusBadRequest,
+			)
+			return
+		}
+	}
+	if request.Mutate {
 		http.Error(
 			w,
-			"target_url must be an http loopback address",
+			"legacy mutate is unsupported; send a full mutation",
 			http.StatusBadRequest,
 		)
 		return
 	}
-	if request.Event == "" || len(request.Payload) == 0 {
-		http.Error(w, "event and payload are required", http.StatusBadRequest)
-		return
+	for _, delivery := range deliveries {
+		if delivery.Event == "" || len(delivery.Payload) == 0 {
+			http.Error(
+				w,
+				"delivery event and payload are required",
+				http.StatusBadRequest,
+			)
+			return
+		}
 	}
-	if request.Mutate {
-		s.applySoakMutation(request.Event, request.Payload)
+	if request.Mutation != nil {
+		if err := s.applyTruthMutation(*request.Mutation); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
-	guid, err := s.EmitWebhookWithGUID(
-		r.Context(),
-		request.TargetURL,
-		request.Event,
-		request.GUID,
-		request.Payload,
-	)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+	guids := make([]string, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		var (
+			guid string
+			err  error
+		)
+		if delivery.Drop {
+			guid, err = s.DropWebhookWithGUID(
+				request.TargetURL,
+				delivery.Event,
+				delivery.GUID,
+				delivery.Payload,
+			)
+		} else {
+			guid, err = s.EmitWebhookWithGUID(
+				r.Context(),
+				request.TargetURL,
+				delivery.Event,
+				delivery.GUID,
+				delivery.Payload,
+			)
+		}
+		if err != nil {
+			if request.AllowDeliveryFailures {
+				guids = append(guids, guid)
+				continue
+			}
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		guids = append(guids, guid)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"guid": guid})
-}
-
-// SoakTruthPullRequest is the oracle's current pull-request state.
-type SoakTruthPullRequest struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-}
-
-// SoakTruth is the fake's current mutation sequence and pull state.
-type SoakTruth struct {
-	Repository   string                 `json:"repository"`
-	PullRequests []SoakTruthPullRequest `json:"pull_requests"`
+	_ = json.NewEncoder(w).Encode(map[string]any{"guids": guids})
 }
 
 func (s *Server) controlTruth(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
-	truth := SoakTruth{
-		Repository:   s.fixture.Owner + "/" + s.fixture.Repo,
-		PullRequests: make([]SoakTruthPullRequest, 0, len(s.soakTruth)),
+	truth := TruthSnapshot{
+		Repositories: make([]TruthFixtureSnapshot, 0, len(s.truthKeys)),
+		Faults: TruthFaultSnapshot{
+			Configured500: s.configured500,
+			Configured429: s.configured429,
+			Applied500:    s.applied500,
+			Applied429:    s.applied429,
+		},
 	}
-	for number, title := range s.soakTruth {
-		truth.PullRequests = append(
-			truth.PullRequests,
-			SoakTruthPullRequest{Number: number, Title: title},
-		)
+	for key := range s.truthKeys {
+		fixture := s.fixtureByKeyLocked(key)
+		if fixture != nil {
+			truth.Repositories = append(
+				truth.Repositories,
+				snapshotFixture(cloneFixture(fixture)),
+			)
+		}
 	}
 	s.mu.Unlock()
-	sort.Slice(truth.PullRequests, func(i, j int) bool {
-		return truth.PullRequests[i].Number < truth.PullRequests[j].Number
+	sort.Slice(truth.Repositories, func(i, j int) bool {
+		return truth.Repositories[i].Repository.FullName <
+			truth.Repositories[j].Repository.FullName
 	})
 	writeJSON(w, truth)
 }
 
-func (s *Server) applySoakMutation(event string, payload json.RawMessage) {
-	if event != "pull_request" {
+func (s *Server) fixtureByKeyLocked(key string) *Fixture {
+	if key == s.fixture.Owner+"/"+s.fixture.Repo {
+		return &s.fixture
+	}
+	return s.additionalFixtures[key]
+}
+
+type controlFaultRequest struct {
+	InternalErrors int           `json:"internal_errors"`
+	RateLimits     int           `json:"rate_limits"`
+	RetryAfter     time.Duration `json:"retry_after"`
+}
+
+func (s *Server) controlFaults(w http.ResponseWriter, r *http.Request) {
+	var request controlFaultRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		http.Error(w, "decode fault request", http.StatusBadRequest)
 		return
 	}
-	var envelope struct {
-		Number       int   `json:"number"`
-		SoakRevision int64 `json:"soak_revision"`
-	}
-	if json.Unmarshal(payload, &envelope) != nil || envelope.Number <= 0 {
+	if request.InternalErrors < 0 || request.RateLimits < 0 ||
+		request.RetryAfter < 0 {
+		http.Error(w, "fault counts and retry_after cannot be negative", http.StatusBadRequest)
 		return
+	}
+	if request.RetryAfter == 0 && request.RateLimits > 0 {
+		request.RetryAfter = time.Second
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for index := range s.fixture.PullRequests {
-		pull := &s.fixture.PullRequests[index]
-		if pull.Number != envelope.Number {
-			continue
-		}
-		pull.Title = fmt.Sprintf(
-			"Soak revision %d for PR %d",
-			envelope.SoakRevision,
-			envelope.Number,
-		)
-		s.soakTruth[pull.Number] = pull.Title
-		pull.UpdatedAt = s.now().UTC()
-		for stackIndex := range s.fixture.Stacks {
-			for prIndex := range s.fixture.Stacks[stackIndex].PullRequests {
-				stackPull := &s.fixture.Stacks[stackIndex].PullRequests[prIndex]
-				if stackPull.Number == envelope.Number {
-					stackPull.UpdatedAt = pull.UpdatedAt
-				}
-			}
-		}
-		return
+	s.configured500 += request.InternalErrors
+	s.configured429 += request.RateLimits
+	for range request.InternalErrors {
+		s.faults = append(s.faults, http.StatusInternalServerError)
 	}
+	for range request.RateLimits {
+		s.faults = append(s.faults, http.StatusTooManyRequests)
+	}
+	s.faultRetryAfter = request.RetryAfter
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func loopbackHost(host string) bool {

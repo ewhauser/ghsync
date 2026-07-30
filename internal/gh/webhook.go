@@ -28,7 +28,7 @@ func DecodeWebhookPayload(contentType string, body []byte) ([]byte, error) {
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"%w: %q: %v",
+			"%w: %q: %w",
 			ErrUnsupportedWebhookContentType,
 			contentType,
 			err,

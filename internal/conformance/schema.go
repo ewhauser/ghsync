@@ -125,7 +125,9 @@ func (embeddedSchemaLoader) Load(rawURL string) (any, error) {
 		}
 		return nil, err
 	}
-	defer document.Close()
+	defer func() {
+		_ = document.Close()
+	}()
 	decoded, err := jsonschema.UnmarshalJSON(document)
 	if err != nil {
 		return nil, fmt.Errorf(

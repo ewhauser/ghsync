@@ -565,6 +565,8 @@ func serve(args []string) error {
 			budget.LeaseOptions{
 				InstallationID: cfg.GitHubInstallationID,
 				Owner:          owner,
+				TTL:            cfg.BudgetLeaseTTL,
+				RenewInterval:  cfg.BudgetLeaseRenewInterval,
 			},
 		)
 		if err != nil {

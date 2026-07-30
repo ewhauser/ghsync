@@ -1,3 +1,4 @@
+//nolint:gocritic // Replay compiler values are immutable snapshots; copies isolate transformations.
 package replay
 
 import (
@@ -345,33 +346,16 @@ func (p *Program) renumberEvent(
 		result.Repository = &copy
 	}
 	if result.PullRequest != nil {
-		result.PullRequest.ID, err = addID(result.PullRequest.ID, offsetID)
-		if err != nil {
-			return Event{}, err
-		}
-		result.PullRequest.Number, err = addNumber(
-			result.PullRequest.Number,
+		if err := renumberPullRequest(
+			result.PullRequest,
+			offsetID,
 			offsetNumber,
-		)
-		if err != nil {
+			namespace,
+			originalRepository,
+			repository,
+		); err != nil {
 			return Event{}, err
 		}
-		result.PullRequest.NodeID = renumberNodeID(
-			result.PullRequest.NodeID,
-			namespace,
-		)
-		result.PullRequest.Head = renumberBranch(
-			result.PullRequest.Head,
-			namespace,
-			originalRepository,
-			repository,
-		)
-		result.PullRequest.Base = renumberBranch(
-			result.PullRequest.Base,
-			namespace,
-			originalRepository,
-			repository,
-		)
 	}
 	if result.PreviousBase != nil {
 		branch := renumberBranch(
@@ -484,8 +468,53 @@ func (p *Program) renumberEvent(
 				return Event{}, err
 			}
 		}
+		for index := range result.Stack.PullRequestStates {
+			if err := renumberPullRequest(
+				&result.Stack.PullRequestStates[index],
+				offsetID,
+				offsetNumber,
+				namespace,
+				originalRepository,
+				repository,
+			); err != nil {
+				return Event{}, err
+			}
+		}
 	}
 	return result, nil
+}
+
+func renumberPullRequest(
+	pull *PullRequest,
+	offsetID int64,
+	offsetNumber int,
+	namespace uint64,
+	originalRepository Repository,
+	repository Repository,
+) error {
+	var err error
+	pull.ID, err = addID(pull.ID, offsetID)
+	if err != nil {
+		return err
+	}
+	pull.Number, err = addNumber(pull.Number, offsetNumber)
+	if err != nil {
+		return err
+	}
+	pull.NodeID = renumberNodeID(pull.NodeID, namespace)
+	pull.Head = renumberBranch(
+		pull.Head,
+		namespace,
+		originalRepository,
+		repository,
+	)
+	pull.Base = renumberBranch(
+		pull.Base,
+		namespace,
+		originalRepository,
+		repository,
+	)
+	return nil
 }
 
 func compileDeliveries(
@@ -958,7 +987,7 @@ func deliveryGUID(
 	copyIndex int,
 	deliveryIndex int,
 ) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf(
+	sum := sha256.Sum256(fmt.Appendf(nil,
 		"%s:%d:%d:%d:%d:%d",
 		repository,
 		sourceSeq,
@@ -966,7 +995,7 @@ func deliveryGUID(
 		lap,
 		copyIndex,
 		deliveryIndex,
-	)))
+	))
 	hexValue := hex.EncodeToString(sum[:16])
 	return fmt.Sprintf(
 		"%s-%s-%s-%s-%s",
@@ -1042,11 +1071,11 @@ func renumberBranchRef(ref string, namespace uint64) string {
 
 func renumberRef(ref string, namespace uint64) string {
 	const heads = "refs/heads/"
-	if strings.HasPrefix(ref, heads) {
+	if after, ok := strings.CutPrefix(ref, heads); ok {
 		return heads + fmt.Sprintf(
 			"replay/%d/%s",
 			namespace,
-			strings.TrimPrefix(ref, heads),
+			after,
 		)
 	}
 	return fmt.Sprintf("refs/replay/%d/%s", namespace, strings.TrimPrefix(ref, "refs/"))
@@ -1056,7 +1085,7 @@ func renumberSHA(value string, namespace uint64) string {
 	if value == "" || isZeroSHA(value) {
 		return value
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", namespace, value)))
+	sum := sha256.Sum256(fmt.Appendf(nil, "%d:%s", namespace, value))
 	return hex.EncodeToString(sum[:20])
 }
 
@@ -1125,6 +1154,9 @@ func eventMaximumID(event Event) int64 {
 	}
 	if event.Stack != nil {
 		maximum = max(maximum, event.Stack.ID)
+		for _, pull := range event.Stack.PullRequestStates {
+			maximum = max(maximum, pull.ID)
+		}
 	}
 	return maximum
 }
@@ -1138,6 +1170,9 @@ func eventMaximumNumber(event Event) int {
 		maximum = max(maximum, event.Stack.Number)
 		for _, number := range event.Stack.PullRequests {
 			maximum = max(maximum, number)
+		}
+		for _, pull := range event.Stack.PullRequestStates {
+			maximum = max(maximum, pull.Number)
 		}
 	}
 	return maximum

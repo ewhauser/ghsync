@@ -236,6 +236,8 @@ func environmentDefaults() map[string]any {
 		"BUDGET_REST_LIMIT":                   defaultBudgetRESTLimit,
 		"BUDGET_GRAPHQL_LIMIT":                defaultBudgetGraphQLLimit,
 		"BUDGET_SECONDARY_FALLBACK":           defaultBudgetSecondaryFallback,
+		"BUDGET_LEASE_TTL":                    defaultBudgetLeaseTTL,
+		"BUDGET_LEASE_RENEW_INTERVAL":         defaultBudgetLeaseRenew,
 		"SWEEP_OPEN_STACK_MAX_STALENESS":      defaultSweepOpenStackStaleness,
 		"SWEEP_OPEN_PR_MAX_STALENESS":         defaultSweepOpenPRStaleness,
 		"SWEEP_REPO_RULES_MAX_STALENESS":      defaultSweepRepoRulesStaleness,

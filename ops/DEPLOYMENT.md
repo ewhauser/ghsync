@@ -29,13 +29,15 @@ jobs, sweep cursors, and drift cursors preserve work while the role is down.
 Set the platform strategy for this group to `Recreate`/`maxSurge: 0`;
 `maxUnavailable: 1`.
 
-The budget lease has a fixed 30-second TTL and renews every 10 seconds. A
+The budget lease defaults to a 30-second TTL and renews every 10 seconds. A
 graceful shutdown drains admitted requests, saves the last budget snapshot, and
 releases the lease, so the replacement can normally start immediately. If a
 process or host disappears, the last confirmed TTL is the safety bound: wait
 for the lease to expire rather than bypassing it. The 10-second renew cadence
 leaves two renewal opportunities inside each TTL and makes a rolling restart a
-bounded stop/start operation, not a replica-first overlap.
+bounded stop/start operation, not a replica-first overlap. Load verification may
+use a shorter TTL to exercise failover without weakening its latency oracle, but
+the renewal interval must remain shorter than the TTL.
 
 The `metrics` role is the sole database aggregate collector. Other roles still
 publish their process-local counters and `ghsync_c_o4_role_enabled`, but do
@@ -94,6 +96,8 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 | `BUDGET_REST_LIMIT` | `15000` | Initial REST denominator until GitHub headers are observed. |
 | `BUDGET_GRAPHQL_LIMIT` | `5000` | Initial GraphQL denominator until GitHub rate data is observed. |
 | `BUDGET_SECONDARY_FALLBACK` | `60s` | Backoff for a secondary limit with no valid `Retry-After`. |
+| `BUDGET_LEASE_TTL` | `30s` | Budget singleton lease TTL and ungraceful failover bound. |
+| `BUDGET_LEASE_RENEW_INTERVAL` | `10s` | Budget lease renewal cadence; must be shorter than the TTL. |
 | `SWEEP_OPEN_STACK_MAX_STALENESS` | `5m` | C-R1 stack bound. |
 | `SWEEP_OPEN_PR_MAX_STALENESS` | `10m` | C-R1 PR bound. |
 | `SWEEP_REPO_RULES_MAX_STALENESS` | `1h` | C-R1 rules bound. |

@@ -1,3 +1,4 @@
+//nolint:gocritic // Recording values are immutable snapshots; copies isolate validation and compilation.
 package replay
 
 import (
@@ -6,11 +7,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sort"
 	"time"
 )
 
-const RecordingVersion = 1
+const RecordingVersion = 2
 
 type Header struct {
 	Type             string     `json:"type"`
@@ -141,11 +143,12 @@ type Push struct {
 }
 
 type Stack struct {
-	ID           int64  `json:"id"`
-	Number       int    `json:"number"`
-	Base         Branch `json:"base"`
-	PullRequests []int  `json:"pull_requests"`
-	Synthetic    bool   `json:"synthetic,omitempty"`
+	ID                int64         `json:"id"`
+	Number            int           `json:"number"`
+	Base              Branch        `json:"base"`
+	PullRequests      []int         `json:"pull_requests"`
+	PullRequestStates []PullRequest `json:"pull_request_states"`
+	Synthetic         bool          `json:"synthetic,omitempty"`
 }
 
 type Event struct {
@@ -431,6 +434,39 @@ func validateEvent(event Event) error {
 			len(event.Stack.PullRequests) < 2 {
 			return fmt.Errorf("stack identity or members are incomplete")
 		}
+		if len(event.Stack.PullRequestStates) !=
+			len(event.Stack.PullRequests) {
+			return fmt.Errorf(
+				"stack has %d members but %d member states",
+				len(event.Stack.PullRequests),
+				len(event.Stack.PullRequestStates),
+			)
+		}
+		seen := make(map[int]struct{}, len(event.Stack.PullRequests))
+		for index, pull := range event.Stack.PullRequestStates {
+			if err := validatePullRequest(&pull); err != nil {
+				return fmt.Errorf(
+					"stack member %d: %w",
+					index,
+					err,
+				)
+			}
+			if pull.Number != event.Stack.PullRequests[index] {
+				return fmt.Errorf(
+					"stack member %d number %d does not match member list %d",
+					index,
+					pull.Number,
+					event.Stack.PullRequests[index],
+				)
+			}
+			if _, duplicate := seen[pull.Number]; duplicate {
+				return fmt.Errorf(
+					"stack repeats pull request %d",
+					pull.Number,
+				)
+			}
+			seen[pull.Number] = struct{}{}
+		}
 	default:
 		return fmt.Errorf("unknown kind %q", event.Kind)
 	}
@@ -457,12 +493,7 @@ func validateReviewComment(comment *ReviewComment) error {
 }
 
 func oneOf(value string, allowed ...string) bool {
-	for _, candidate := range allowed {
-		if value == candidate {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allowed, value)
 }
 
 func validateHeader(header Header) error {

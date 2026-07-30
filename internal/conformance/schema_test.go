@@ -1,3 +1,4 @@
+//nolint:gocritic // Schema fixtures intentionally remain immutable values within each test case.
 package conformance_test
 
 import (
@@ -40,9 +41,10 @@ type emittedWebhook struct {
 }
 
 func TestCorpusSchemasCompileOffline(t *testing.T) {
+	t.Parallel()
 	compiler := newCorpusSchemaCompiler(t)
 	schemaFamilies := append([]string{"common"}, corpusEvents...)
-	for _, event := range schemaFamilies {
+	for _, event := range schemaFamilies { //nolint:paralleltest // cases share one offline schema compiler
 		schemas, err := filepath.Glob(
 			filepath.Join("corpus", event, "*.schema.json"),
 		)
@@ -63,11 +65,12 @@ func TestCorpusSchemasCompileOffline(t *testing.T) {
 }
 
 func TestFakeGitHubWebhookPayloadsValidateAgainstSchemas(t *testing.T) {
+	t.Parallel()
 	target, emitted := newWebhookCapture()
 	defer target.Close()
 	validator := conformance.NewWebhookSchemaValidator()
 
-	for _, event := range corpusEvents {
+	for _, event := range corpusEvents { //nolint:paralleltest // cases share one ordered webhook capture channel
 		actions := eventPayloadActions(t, event)
 		for _, action := range actions {
 			name := event + "/" + action
@@ -116,7 +119,9 @@ func TestFakeGitHubWebhookPayloadsValidateAgainstSchemas(t *testing.T) {
 }
 
 func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
+	t.Parallel()
 	t.Run("explicit GUID", func(t *testing.T) {
+		t.Parallel()
 		fake := fakegithub.New(
 			fakegithub.DefaultFixture(),
 			fakeSchemaWebhookSecret,
@@ -154,6 +159,7 @@ func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
 	})
 
 	t.Run("control endpoint", func(t *testing.T) {
+		t.Parallel()
 		fake := fakegithub.New(
 			fakegithub.DefaultFixture(),
 			fakeSchemaWebhookSecret,
@@ -189,7 +195,9 @@ func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer response.Body.Close()
+		defer func() {
+			_ = response.Body.Close()
+		}()
 		if response.StatusCode != http.StatusOK {
 			message, _ := io.ReadAll(response.Body)
 			t.Fatalf(
@@ -207,6 +215,7 @@ func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
 	})
 
 	t.Run("dropped delivery redelivery", func(t *testing.T) {
+		t.Parallel()
 		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 		if err != nil {
 			t.Fatal(err)
@@ -662,52 +671,12 @@ func (loader corpusSchemaLoader) Load(rawURL string) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open schema %s: %w", relative, err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	document, err := jsonschema.UnmarshalJSON(file)
 	if err != nil {
 		return nil, fmt.Errorf("decode schema %s: %w", relative, err)
 	}
 	return document, nil
-}
-
-func payloadSchemaPath(t *testing.T, event string, body []byte) string {
-	t.Helper()
-	schemaName := "event"
-	if event != "push" {
-		var envelope struct {
-			Action string `json:"action"`
-		}
-		if err := json.Unmarshal(body, &envelope); err != nil {
-			t.Fatalf("decode %s action: %v", event, err)
-		}
-		if envelope.Action == "" {
-			t.Fatalf("%s payload has no action", event)
-		}
-		schemaName = envelope.Action
-	}
-	schemaPath := filepath.Join(
-		"corpus",
-		event,
-		schemaName+".schema.json",
-	)
-	if _, err := os.Stat(schemaPath); err != nil {
-		t.Fatalf(
-			"no schema for %s action %q: %v",
-			event,
-			schemaName,
-			err,
-		)
-	}
-	return schemaPath
-}
-
-func validateJSON(t *testing.T, schema *jsonschema.Schema, body []byte) {
-	t.Helper()
-	value, err := jsonschema.UnmarshalJSON(bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("decode payload for validation: %v", err)
-	}
-	if err := schema.Validate(value); err != nil {
-		t.Fatalf("validate payload: %v", err)
-	}
 }

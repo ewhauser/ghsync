@@ -1,8 +1,10 @@
+//nolint:gocritic // Test fixtures favor explicit immutable value snapshots.
 package replay_test
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"reflect"
@@ -16,6 +18,7 @@ import (
 )
 
 func TestRecordingRoundTripIsByteIdentical(t *testing.T) {
+	t.Parallel()
 	recording := testRecording()
 	var first bytes.Buffer
 	if err := replay.Write(&first, recording); err != nil {
@@ -35,6 +38,7 @@ func TestRecordingRoundTripIsByteIdentical(t *testing.T) {
 }
 
 func TestNormalizeEventsUsesInstantsAcrossTimeZones(t *testing.T) {
+	t.Parallel()
 	mountain := time.FixedZone("MDT", -6*60*60)
 	start := time.Date(2026, 7, 1, 6, 0, 0, 0, mountain)
 	repository := testRepository()
@@ -65,6 +69,7 @@ func TestNormalizeEventsUsesInstantsAcrossTimeZones(t *testing.T) {
 }
 
 func TestNormalizeEventsUsesCausalTieOrdering(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 	pull := testPull(1, "feature", "main")
 	comment := replay.ReviewComment{
@@ -126,6 +131,7 @@ func TestNormalizeEventsUsesCausalTieOrdering(t *testing.T) {
 }
 
 func TestWriteRejectsUnorderedRecording(t *testing.T) {
+	t.Parallel()
 	recording := testRecording()
 	recording.Events[2].AtMS = recording.Events[1].AtMS - 1
 	var output bytes.Buffer
@@ -136,6 +142,7 @@ func TestWriteRejectsUnorderedRecording(t *testing.T) {
 }
 
 func TestCompilerDeterminismAndSchemaValidity(t *testing.T) {
+	t.Parallel()
 	recording := testRecording()
 	options := replay.CompileOptions{
 		Speed:         8,
@@ -347,6 +354,7 @@ func jsonBool(t *testing.T, parent map[string]any, key string) bool {
 }
 
 func TestSpeedCompressionPreservesSourceOrdering(t *testing.T) {
+	t.Parallel()
 	recording := testRecording()
 	for index := range recording.Events {
 		recording.Events[index].AtMS = int64(index)
@@ -385,6 +393,7 @@ func TestSpeedCompressionPreservesSourceOrdering(t *testing.T) {
 }
 
 func TestCompilerPreservesGitHubInt64IDs(t *testing.T) {
+	t.Parallel()
 	const largeID = int64(9_007_199_254_740_993)
 	recording := testRecording()
 	for index := range recording.Events {
@@ -426,6 +435,7 @@ func TestCompilerPreservesGitHubInt64IDs(t *testing.T) {
 }
 
 func TestCompilerNormalizesCheckSuiteTruthAndDeliveryTogether(t *testing.T) {
+	t.Parallel()
 	recording := testRecording()
 	for index := range recording.Events {
 		suite := recording.Events[index].CheckSuite
@@ -468,6 +478,7 @@ func TestCompilerNormalizesCheckSuiteTruthAndDeliveryTogether(t *testing.T) {
 }
 
 func TestCopiesUseDisjointEntitySpaces(t *testing.T) {
+	t.Parallel()
 	steps, err := replay.FirstLap(testRecording(), replay.CompileOptions{
 		Copies: 3,
 	})
@@ -522,7 +533,7 @@ func TestCopiesUseDisjointEntitySpaces(t *testing.T) {
 	if len(spaces) != 3 {
 		t.Fatalf("entity spaces = %d, want 3", len(spaces))
 	}
-	for left := 0; left < 3; left++ {
+	for left := range 3 {
 		for right := left + 1; right < 3; right++ {
 			assertDisjoint(t, "IDs", spaces[left].ids, spaces[right].ids)
 			assertDisjoint(
@@ -640,6 +651,7 @@ func assertDisjoint[K comparable](
 }
 
 func TestLoopRenumbersEveryLap(t *testing.T) {
+	t.Parallel()
 	program, err := replay.Compile(testRecording(), replay.CompileOptions{
 		Copies: 2,
 		Loop:   true,
@@ -655,6 +667,9 @@ func TestLoopRenumbersEveryLap(t *testing.T) {
 	second, err := program.NextLap()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatal("compiled replay lap is empty")
 	}
 	firstIDs := mutationPullIDs(first)
 	secondIDs := mutationPullIDs(second)
@@ -695,6 +710,7 @@ func TestLoopRenumbersEveryLap(t *testing.T) {
 }
 
 func TestDeriveStacksFromBaseRefChains(t *testing.T) {
+	t.Parallel()
 	repository := testRepository()
 	pulls := []replay.PullRequest{
 		testPull(11, "one", "main"),
@@ -712,12 +728,30 @@ func TestDeriveStacksFromBaseRefChains(t *testing.T) {
 			stacks[0].PullRequests,
 		)
 	}
+	if len(stacks[0].PullRequestStates) != 3 {
+		t.Fatalf(
+			"stack member states = %+v, want all three full pulls",
+			stacks[0].PullRequestStates,
+		)
+	}
+	for index, number := range stacks[0].PullRequests {
+		if stacks[0].PullRequestStates[index] != pulls[index] ||
+			stacks[0].PullRequestStates[index].Number != number {
+			t.Fatalf(
+				"stack member state %d = %+v, want %+v",
+				index,
+				stacks[0].PullRequestStates[index],
+				pulls[index],
+			)
+		}
+	}
 	if stacks[0].Base.Ref != "main" {
 		t.Fatalf("stack base = %+v, want main", stacks[0].Base)
 	}
 }
 
 func TestDeriveStacksIgnoresForkDefaultBranchHeads(t *testing.T) {
+	t.Parallel()
 	repository := testRepository()
 	pulls := []replay.PullRequest{
 		testPull(11, "feature", "main"),
@@ -733,6 +767,7 @@ func TestDeriveStacksIgnoresForkDefaultBranchHeads(t *testing.T) {
 }
 
 func TestDeriveStacksDisambiguatesReusedHeadBranchesBySHA(t *testing.T) {
+	t.Parallel()
 	repository := testRepository()
 	old := testPull(10, "feature", "main")
 	old.State = "closed"
@@ -755,6 +790,7 @@ func TestDeriveStacksDisambiguatesReusedHeadBranchesBySHA(t *testing.T) {
 }
 
 func TestStackSynthesisIsSeededAndDeterministic(t *testing.T) {
+	t.Parallel()
 	repository := testRepository()
 	pulls := []replay.PullRequest{
 		testPull(1, "one", "main"),
@@ -784,6 +820,7 @@ func TestStackSynthesisIsSeededAndDeterministic(t *testing.T) {
 }
 
 func TestStackSynthesisUsesEntireEvenTarget(t *testing.T) {
+	t.Parallel()
 	repository := testRepository()
 	pulls := []replay.PullRequest{
 		testPull(1, "one", "main"),
@@ -865,6 +902,16 @@ func collectEntitySpace(steps []replay.Step) entitySpace {
 		if step.Mutation.Push != nil {
 			space.addSHA(step.Mutation.Push.Before)
 			space.addSHA(step.Mutation.Push.After)
+		}
+		if step.Mutation.Stack != nil {
+			space.addID(step.Mutation.Stack.ID)
+			space.numbers[step.Mutation.Stack.Number] = true
+			for _, number := range step.Mutation.Stack.PullRequests {
+				space.numbers[number] = true
+			}
+			for _, pull := range step.Mutation.Stack.PullRequestStates {
+				space.addPull(pull)
+			}
 		}
 	}
 	return space
@@ -986,13 +1033,17 @@ func testRecording() replay.Recording {
 		Seq: 13, AtMS: 11000, Kind: "pull_request", Action: "closed",
 		PullRequest: &closed,
 	})
-	stack := replay.DeriveStacks(
+	stacks := replay.DeriveStacks(
 		repository,
 		[]replay.PullRequest{
 			testPull(10, "parent", "main"),
 			testPull(11, "feature", "parent"),
 		},
-	)[0]
+	)
+	if len(stacks) == 0 {
+		panic("test recording produced no derived stack")
+	}
+	stack := stacks[0]
 	events = append(events, replay.Event{
 		Seq: 14, AtMS: 12000, Kind: "stack", Stack: &stack,
 	})
@@ -1033,6 +1084,7 @@ func testPull(number int, head string, base string) replay.PullRequest {
 }
 
 func TestProgramStopsWithoutLoop(t *testing.T) {
+	t.Parallel()
 	program, err := replay.Compile(testRecording(), replay.CompileOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -1040,15 +1092,19 @@ func TestProgramStopsWithoutLoop(t *testing.T) {
 	if _, err := program.NextLap(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := program.NextLap(); err != io.EOF {
+	if _, err := program.NextLap(); !errors.Is(err, io.EOF) {
 		t.Fatalf("second lap error = %v, want EOF", err)
 	}
 }
 
 func TestStepJSONContainsLogicalMutationNotBarePayload(t *testing.T) {
+	t.Parallel()
 	steps, err := replay.FirstLap(testRecording(), replay.CompileOptions{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(steps) < 2 {
+		t.Fatalf("compiled steps = %d, want at least 2", len(steps))
 	}
 	body, err := json.Marshal(steps[1])
 	if err != nil {
@@ -1062,6 +1118,7 @@ func TestStepJSONContainsLogicalMutationNotBarePayload(t *testing.T) {
 }
 
 func TestCommittedRecordingCompilesToSchemaValidDeliveries(t *testing.T) {
+	t.Parallel()
 	entries, err := os.ReadDir("testdata")
 	if err != nil {
 		t.Fatal(err)
@@ -1105,7 +1162,9 @@ func TestCommittedRecordingCompilesToSchemaValidDeliveries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	recording, err := replay.Read(file)
 	if err != nil {
 		t.Fatal(err)
@@ -1131,11 +1190,23 @@ func TestCommittedRecordingCompilesToSchemaValidDeliveries(t *testing.T) {
 		)
 	}
 	var hasCommit bool
+	var stackHasCompleteTruth bool
 	for _, event := range recording.Events {
 		hasCommit = hasCommit || event.Kind == "commit"
+		if event.Kind == "stack" &&
+			len(event.Stack.PullRequestStates) ==
+				len(event.Stack.PullRequests) {
+			for _, pull := range event.Stack.PullRequestStates {
+				stackHasCompleteTruth = stackHasCompleteTruth ||
+					pull.Number == 6823
+			}
+		}
 	}
 	if !hasCommit {
 		t.Fatal("committed recording has no explicit commit events")
+	}
+	if !stackHasCompleteTruth {
+		t.Fatal("committed stack lacks full fixture truth for member 6823")
 	}
 	options := replay.CompileOptions{
 		Speed: 1000,

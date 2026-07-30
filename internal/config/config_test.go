@@ -126,7 +126,9 @@ func TestFromEnvBudgetDefaultsAndOverrides(t *testing.T) {
 		cfg.BudgetMaxConcurrent != defaultBudgetMaxConcurrent ||
 		cfg.BudgetRESTLimit != defaultBudgetRESTLimit ||
 		cfg.BudgetGraphQLLimit != defaultBudgetGraphQLLimit ||
-		cfg.BudgetSecondaryFallback != defaultBudgetSecondaryFallback {
+		cfg.BudgetSecondaryFallback != defaultBudgetSecondaryFallback ||
+		cfg.BudgetLeaseTTL != defaultBudgetLeaseTTL ||
+		cfg.BudgetLeaseRenewInterval != defaultBudgetLeaseRenew {
 		t.Fatalf("unexpected budget defaults: %+v", cfg)
 	}
 
@@ -136,6 +138,8 @@ func TestFromEnvBudgetDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("BUDGET_REST_LIMIT", "12000")
 	t.Setenv("BUDGET_GRAPHQL_LIMIT", "4000")
 	t.Setenv("BUDGET_SECONDARY_FALLBACK", "90s")
+	t.Setenv("BUDGET_LEASE_TTL", "12s")
+	t.Setenv("BUDGET_LEASE_RENEW_INTERVAL", "3s")
 	cfg, err = FromEnv()
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +149,9 @@ func TestFromEnvBudgetDefaultsAndOverrides(t *testing.T) {
 		cfg.BudgetMaxConcurrent != 12 ||
 		cfg.BudgetRESTLimit != 12000 ||
 		cfg.BudgetGraphQLLimit != 4000 ||
-		cfg.BudgetSecondaryFallback != 90*time.Second {
+		cfg.BudgetSecondaryFallback != 90*time.Second ||
+		cfg.BudgetLeaseTTL != 12*time.Second ||
+		cfg.BudgetLeaseRenewInterval != 3*time.Second {
 		t.Fatalf("unexpected budget overrides: %+v", cfg)
 	}
 }
@@ -163,6 +169,8 @@ func TestFromEnvRejectsInvalidBudgetValues(t *testing.T) {
 		{key: "BUDGET_REST_LIMIT", value: "-1"},
 		{key: "BUDGET_GRAPHQL_LIMIT", value: "many"},
 		{key: "BUDGET_SECONDARY_FALLBACK", value: "0s"},
+		{key: "BUDGET_LEASE_TTL", value: "0s"},
+		{key: "BUDGET_LEASE_RENEW_INTERVAL", value: "0s"},
 	} {
 		t.Run(test.key+"="+test.value, func(t *testing.T) {
 			clearConfigEnv(t)
@@ -171,6 +179,15 @@ func TestFromEnvRejectsInvalidBudgetValues(t *testing.T) {
 				t.Fatalf("%s=%q accepted", test.key, test.value)
 			}
 		})
+	}
+}
+
+func TestFromEnvRequiresBudgetRenewalShorterThanTTL(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("BUDGET_LEASE_TTL", "6s")
+	t.Setenv("BUDGET_LEASE_RENEW_INTERVAL", "6s")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("budget renew interval equal to TTL accepted")
 	}
 }
 
@@ -403,6 +420,8 @@ func clearConfigEnv(t *testing.T) {
 		"BUDGET_REST_LIMIT",
 		"BUDGET_GRAPHQL_LIMIT",
 		"BUDGET_SECONDARY_FALLBACK",
+		"BUDGET_LEASE_TTL",
+		"BUDGET_LEASE_RENEW_INTERVAL",
 		"SWEEP_OPEN_STACK_MAX_STALENESS",
 		"SWEEP_OPEN_PR_MAX_STALENESS",
 		"SWEEP_REPO_RULES_MAX_STALENESS",

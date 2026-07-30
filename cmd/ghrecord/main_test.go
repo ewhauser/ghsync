@@ -21,6 +21,7 @@ import (
 )
 
 func TestCrawlerRecordingIsDeterministic(t *testing.T) {
+	t.Parallel()
 	fixture := newGraphQLFixture(false)
 	server := httptest.NewServer(fixture)
 	defer server.Close()
@@ -63,6 +64,7 @@ func TestCrawlerRecordingIsDeterministic(t *testing.T) {
 }
 
 func TestCrawlerResumesAfterRateLimit(t *testing.T) {
+	t.Parallel()
 	fixture := newGraphQLFixture(true)
 	server := httptest.NewServer(fixture)
 	defer server.Close()
@@ -119,6 +121,7 @@ func TestCrawlerResumesAfterRateLimit(t *testing.T) {
 }
 
 func TestCrawlerResumesAfterCancellationWithoutRefetch(t *testing.T) {
+	t.Parallel()
 	fixture := newGraphQLFixture(false)
 	ctx, cancel := context.WithCancel(t.Context())
 	fixture.cancelNested = cancel
@@ -163,13 +166,16 @@ func TestCrawlerResumesAfterCancellationWithoutRefetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recordingFile.Close()
+	defer func() {
+		_ = recordingFile.Close()
+	}()
 	if _, err := replay.Read(recordingFile); err != nil {
 		t.Fatalf("resumed recording is corrupt: %v", err)
 	}
 }
 
 func TestCrawlerPaginatesAndRecordsTrackTwoTimeline(t *testing.T) {
+	t.Parallel()
 	fixture := newGraphQLFixture(false)
 	server := httptest.NewServer(fixture)
 	defer server.Close()
@@ -187,7 +193,9 @@ func TestCrawlerPaginatesAndRecordsTrackTwoTimeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	recording, err := replay.Read(file)
 	if err != nil {
 		t.Fatal(err)
@@ -320,6 +328,7 @@ func TestCrawlerPaginatesAndRecordsTrackTwoTimeline(t *testing.T) {
 }
 
 func TestParseBoundaryTreatsDateUntilAsInclusiveDay(t *testing.T) {
+	t.Parallel()
 	since, err := parseBoundary("2026-07-01", false)
 	if err != nil {
 		t.Fatal(err)
@@ -334,6 +343,7 @@ func TestParseBoundaryTreatsDateUntilAsInclusiveDay(t *testing.T) {
 }
 
 func TestRunRejectsOutputCursorCollisionAndNonFiniteSynthesis(t *testing.T) {
+	t.Parallel()
 	output := filepath.Join(t.TempDir(), "recording.ndjson")
 	for _, args := range [][]string{
 		append(testArguments(output), "--cursor="+output),
@@ -353,6 +363,7 @@ func TestRunRejectsOutputCursorCollisionAndNonFiniteSynthesis(t *testing.T) {
 }
 
 func TestCrawlerRejectsInvalidCursorPhase(t *testing.T) {
+	t.Parallel()
 	directory := t.TempDir()
 	output := filepath.Join(directory, "recording.ndjson")
 	cursorPath := output + ".cursor.json"
@@ -392,6 +403,7 @@ func TestCrawlerRejectsInvalidCursorPhase(t *testing.T) {
 }
 
 func TestGraphQLForbiddenIsNotMisclassifiedAsRateLimit(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(
 		func(writer http.ResponseWriter, _ *http.Request) {
 			http.Error(
@@ -406,7 +418,7 @@ func TestGraphQLForbiddenIsNotMisclassifiedAsRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.call(
+	err = client.call(
 		t.Context(),
 		"query Test { viewer { login } }",
 		nil,
@@ -419,6 +431,7 @@ func TestGraphQLForbiddenIsNotMisclassifiedAsRateLimit(t *testing.T) {
 }
 
 func TestGraphQLRateLimitUsesRetryAfter(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(
 		func(writer http.ResponseWriter, _ *http.Request) {
 			writer.Header().Set("Retry-After", "60")
@@ -431,7 +444,7 @@ func TestGraphQLRateLimitUsesRetryAfter(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := time.Now().UTC().Add(59 * time.Second)
-	_, err = client.call(
+	err = client.call(
 		t.Context(),
 		"query Test { viewer { login } }",
 		nil,
@@ -544,7 +557,7 @@ func (f *graphQLFixture) requestCount(
 	return f.counts[fixtureRequestKey(operation, after, number)]
 }
 
-func fixtureRequestKey(operation string, after string, number int) string {
+func fixtureRequestKey(operation, after string, number int) string {
 	return fmt.Sprintf("%s\x00%s\x00%d", operation, after, number)
 }
 

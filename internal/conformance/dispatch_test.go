@@ -35,6 +35,7 @@ type dispatchGoldenOutcome struct {
 }
 
 func TestDispatchCorpus(t *testing.T) {
+	t.Parallel()
 	defaultRules := dispatch.DefaultRules()
 	configuredRules, err := dispatch.LoadRulesFile(
 		"../../config/dispatcher-rules.yaml",
@@ -194,7 +195,7 @@ func classifyWithoutPanic(
 	return classifier.ClassifyContent(event, contentType, body)
 }
 
-func matchesRule(rules []dispatch.Rule, event string, action string) bool {
+func matchesRule(rules []dispatch.Rule, event, action string) bool {
 	for _, rule := range rules {
 		if rule.Event == event &&
 			(rule.Action == dispatch.ActionAny || rule.Action == action) {

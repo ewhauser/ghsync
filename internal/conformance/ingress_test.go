@@ -29,7 +29,7 @@ func TestIngressCorpus(t *testing.T) {
 		5*time.Second,
 	))
 
-	for _, payload := range loadCorpusPayloads(t) {
+	for _, payload := range loadCorpusPayloads(t) { //nolint:paralleltest // cases share one schema-isolated ingress database
 		t.Run(payload.Filename, func(t *testing.T) {
 			guid := corpusGUID(payload.Filename)
 			response := serveWebhook(
@@ -225,7 +225,8 @@ func serveWebhook(
 	contentType string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
-	request := httptest.NewRequest(
+	request := httptest.NewRequestWithContext(
+		t.Context(),
 		http.MethodPost,
 		ingress.WebhookPath,
 		bytes.NewReader(body),
