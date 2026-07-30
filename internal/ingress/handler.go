@@ -114,6 +114,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing GitHub delivery headers", http.StatusBadRequest)
 		return
 	}
+	if _, err := gh.DecodeWebhookPayload(
+		r.Header.Get("Content-Type"),
+		body,
+	); err != nil {
+		if errors.Is(err, gh.ErrUnsupportedWebhookContentType) {
+			http.Error(
+				w,
+				"unsupported webhook content type",
+				http.StatusUnsupportedMediaType,
+			)
+			return
+		}
+		http.Error(w, "invalid webhook payload", http.StatusBadRequest)
+		return
+	}
 	headers, err := json.Marshal(requestEnvelope{
 		Headers:          r.Header.Clone(),
 		Host:             r.Host,

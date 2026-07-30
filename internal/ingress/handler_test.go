@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestHandlerVerifiesThenStoresRawDelivery(t *testing.T) {
 	t.Parallel()
 	store := &recordingInserter{rows: 1}
 	handler := NewHandler(store, "secret", 1024, time.Second)
-	body := []byte(`not-json-at-ingress`)
+	body := []byte(`{"raw":"preserved"}`)
 	request := signedRequest(t, body, "secret", "guid-1", "pull_request")
 	request.Header.Set("X-Extra-Test-Header", "preserved")
 	response := httptest.NewRecorder()
@@ -140,6 +141,103 @@ func TestHandlerAcknowledgesDuplicateGUID(t *testing.T) {
 
 	if response.Code != http.StatusOK || store.calls != 1 {
 		t.Fatalf("status=%d insert calls=%d", response.Code, store.calls)
+	}
+}
+
+func TestHandlerAcceptsFormDeliveryAndPreservesWireBody(t *testing.T) {
+	store := &recordingInserter{rows: 1}
+	handler := NewHandler(store, "secret", 1024, time.Second)
+	formBody := []byte(url.Values{
+		"payload": {`{"action":"opened"}`},
+	}.Encode())
+	request := signedRequest(
+		t,
+		formBody,
+		"secret",
+		"form-guid",
+		"pull_request",
+	)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+
+	NewMux(handler).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if store.calls != 1 || !bytes.Equal(store.params.RawBody, formBody) {
+		t.Fatalf(
+			"insert calls = %d, raw body = %q, want exact form body %q",
+			store.calls,
+			store.params.RawBody,
+			formBody,
+		)
+	}
+}
+
+func TestHandlerRejectsMalformedOrUnsupportedPayloadWithoutStoring(
+	t *testing.T,
+) {
+	tests := []struct {
+		name        string
+		body        []byte
+		contentType string
+		wantStatus  int
+	}{
+		{
+			name:        "truncated JSON",
+			body:        []byte(`{"action":"opened"`),
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "non-object JSON",
+			body:        []byte(`[]`),
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "missing form payload",
+			body:        []byte(`other=value`),
+			contentType: "application/x-www-form-urlencoded",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "unsupported content type",
+			body:        []byte(`{"action":"opened"}`),
+			contentType: "text/plain",
+			wantStatus:  http.StatusUnsupportedMediaType,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &recordingInserter{rows: 1}
+			handler := NewHandler(store, "secret", 1024, time.Second)
+			request := signedRequest(
+				t,
+				test.body,
+				"secret",
+				"rejected-guid",
+				"pull_request",
+			)
+			request.Header.Set("Content-Type", test.contentType)
+			response := httptest.NewRecorder()
+
+			NewMux(handler).ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d; body = %q",
+					response.Code,
+					test.wantStatus,
+					response.Body.String(),
+				)
+			}
+			if store.calls != 0 {
+				t.Fatalf("rejected delivery was stored %d times", store.calls)
+			}
+		})
 	}
 }
 
@@ -253,6 +351,7 @@ func signedRequest(
 ) *http.Request {
 	t.Helper()
 	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, WebhookPath, bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Hub-Signature-256", gh.SignBody([]byte(secret), body))
 	if guid != "" {
 		request.Header.Set("X-GitHub-Delivery", guid)

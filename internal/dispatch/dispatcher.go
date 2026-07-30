@@ -254,9 +254,10 @@ func (d *Dispatcher) DispatchBatch(
 	unmatchedEvents := make([]string, 0)
 	for index := range deliveries {
 		delivery := &deliveries[index]
-		result, classifyErr := d.config.Classifier.classify(
+		result, classifyErr := d.config.Classifier.classifyStored(
 			delivery.Event,
 			delivery.RawBody,
+			delivery.Headers,
 		)
 		if classifyErr != nil {
 			status := "pending"

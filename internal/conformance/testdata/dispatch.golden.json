@@ -1,0 +1,1650 @@
+{
+  "check_run/completed.1.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_run/completed.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_run/completed.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_run/created.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_run/created.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_run/requested_action.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:electron/electron:5bd5f196a46b8222fb7484f05faba41a73cf34bd",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:electron/electron:5bd5f196a46b8222fb7484f05faba41a73cf34bd",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_run/rerequested.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:github/hello-world:d6fde92930d4715a2b49857d24b940956b26d2d3",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:github/hello-world:d6fde92930d4715a2b49857d24b940956b26d2d3",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_run/rerequested.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:github/hello-world:d6fde92930d4715a2b49857d24b940956b26d2d3",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:github/hello-world:d6fde92930d4715a2b49857d24b940956b26d2d3",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/completed.1.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/completed.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/completed.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/requested.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/requested.payload.with-email-with-special-characters.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/requested.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/rerequested.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "check_suite/rerequested.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_checks",
+          "key": "checks:Codertocat/Hello-World:ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/assigned.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/assigned.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/closed.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/closed.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/converted_to_draft.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/converted_to_draft.with-installation.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/converted_to_draft.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/labeled.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/labeled.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/locked.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/locked.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/opened.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/opened.with-null-body.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/opened.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/ready_for_review.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/ready_for_review.with-installation.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/ready_for_review.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/reopened.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/reopened.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/review_request_removed.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/review_requested.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/synchronize.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/unassigned.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/unassigned.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/unlabeled.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/unlabeled.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/unlocked.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request/unlocked.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        },
+        {
+          "kind": "resolve_stack_membership",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review/dismissed.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review/submitted.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review/submitted.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review_comment/created.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review_comment/created.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review_comment/deleted.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review_comment/edited.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review_thread/resolved.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "pull_request_review_thread/unresolved.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:2",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "push/1.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "push/payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "push/with-installation.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "push/with-new-branch.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_branch",
+          "key": "branch:Codertocat/Hello-World:master",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_branch",
+          "key": "branch:Codertocat/Hello-World:master",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "push/with-no-username-committer.payload.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_branch",
+          "key": "branch:Codertocat/Hello-World:master",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_branch",
+          "key": "branch:Codertocat/Hello-World:master",
+          "priority": "event"
+        }
+      ]
+    }
+  },
+  "push/with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  }
+}

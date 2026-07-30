@@ -98,8 +98,8 @@ Consequences baked into the design:
 - **C-I1 — Durable before acknowledged.** A webhook delivery is written to
   `webhook_deliveries` (raw body + headers) and committed before the handler
   returns 200. Processing is asynchronous. The HTTP handler does nothing else:
-  verify, insert, ack. Target ack p99 < 250ms; GitHub times out at 10s and a
-  timed-out delivery is a dropped delivery.
+  verify, validate the delivery envelope, insert, ack. Target ack p99 < 250ms;
+  GitHub times out at 10s and a timed-out delivery is a dropped delivery.
 - **C-I2 — Verified or rejected.** HMAC (`X-Hub-Signature-256`) verified with
   constant-time compare before the body is parsed. Unverifiable deliveries are
   rejected 401 and never enqueued.

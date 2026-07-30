@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 
+	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"gopkg.in/yaml.v3"
 )
@@ -289,6 +291,26 @@ func (c Classifier) Classify(event string, body []byte) ([]Intent, error) {
 }
 
 func (c Classifier) classify(event string, body []byte) (classification, error) {
+	return c.classifyContent(event, gh.WebhookJSONContentType, body)
+}
+
+// ClassifyContent classifies a webhook body in either GitHub-supported wire
+// format. It is primarily exposed for conformance tests; the dispatcher reads
+// the content type captured by ingress before calling the same path.
+func (c Classifier) ClassifyContent(
+	event string,
+	contentType string,
+	body []byte,
+) ([]Intent, error) {
+	result, err := c.classifyContent(event, contentType, body)
+	return result.intents, err
+}
+
+func (c Classifier) classifyContent(
+	event string,
+	contentType string,
+	body []byte,
+) (classification, error) {
 	eventRules := make([]Rule, 0, 1)
 	for _, rule := range c.rules {
 		if rule.Event == event {
@@ -299,6 +321,10 @@ func (c Classifier) classify(event string, body []byte) (classification, error) 
 		return classification{}, nil
 	}
 
+	body, err := gh.DecodeWebhookPayload(contentType, body)
+	if err != nil {
+		return classification{}, fmt.Errorf("decode %s payload: %w", event, err)
+	}
 	var payload payloadEnvelope
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return classification{}, fmt.Errorf("decode %s payload: %w", event, err)
@@ -344,6 +370,37 @@ func (c Classifier) classify(event string, body []byte) (classification, error) 
 	}
 	result.stackHint = completeStackSummaryHint(&payload, intents)
 	return result, nil
+}
+
+func (c Classifier) classifyStored(
+	event string,
+	body []byte,
+	storedHeaders []byte,
+) (classification, error) {
+	contentType, err := storedWebhookContentType(storedHeaders)
+	if err != nil {
+		return classification{}, err
+	}
+	return c.classifyContent(event, contentType, body)
+}
+
+func storedWebhookContentType(storedHeaders []byte) (string, error) {
+	if len(bytes.TrimSpace(storedHeaders)) == 0 {
+		return gh.WebhookJSONContentType, nil
+	}
+	var envelope struct {
+		Headers http.Header `json:"headers"`
+	}
+	if err := json.Unmarshal(storedHeaders, &envelope); err != nil {
+		return "", fmt.Errorf("decode stored webhook headers: %w", err)
+	}
+	contentType := envelope.Headers.Get("Content-Type")
+	if contentType == "" {
+		// Older fixtures and restored deliveries may predate the request
+		// envelope. Their raw bodies have always been JSON.
+		return gh.WebhookJSONContentType, nil
+	}
+	return contentType, nil
 }
 
 func intentKey(

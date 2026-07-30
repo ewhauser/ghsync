@@ -1,11 +1,15 @@
 package dispatch
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/queue"
 )
 
@@ -314,6 +318,55 @@ func TestCompleteStackSummaryHintRequiresAuthoritativeResolver(t *testing.T) {
 			"stack hint without authoritative PR resolver = %+v",
 			result.stackHint,
 		)
+	}
+}
+
+func TestClassifierUsesStoredFormContentType(t *testing.T) {
+	t.Parallel()
+	jsonBody := []byte(`{
+		"ref":"refs/heads/main",
+		"repository":{"full_name":"acme/monolith"}
+	}`)
+	formBody := []byte(url.Values{
+		"payload": {string(jsonBody)},
+	}.Encode())
+	headers, err := json.Marshal(struct {
+		Headers http.Header `json:"headers"`
+	}{
+		Headers: http.Header{
+			"Content-Type": {gh.WebhookFormContentType},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := DefaultClassifier().classifyStored(
+		"push",
+		formBody,
+		headers,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Intent{{
+		Kind: queue.KindRefreshBranch, Key: "branch:acme/monolith:main",
+		Priority: PriorityEvent,
+	}}
+	if !reflect.DeepEqual(got.intents, want) {
+		t.Fatalf("intents = %#v, want %#v", got.intents, want)
+	}
+}
+
+func TestClassifierRejectsMalformedStoredHeaders(t *testing.T) {
+	t.Parallel()
+	_, err := DefaultClassifier().classifyStored(
+		"push",
+		[]byte(`{}`),
+		[]byte(`not-json`),
+	)
+	if err == nil {
+		t.Fatal("malformed stored headers were accepted")
 	}
 }
 
