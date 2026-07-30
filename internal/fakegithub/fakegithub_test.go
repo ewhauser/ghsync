@@ -36,16 +36,22 @@ func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	fakeServer := New(DefaultFixture(), "secret")
 	fake := httptest.NewServer(fakeServer)
 	defer fake.Close()
-	body := fmt.Appendf(nil, `{
-		"target_url": %q,
-		"event": "pull_request",
-		"guid": "soak-guid",
-		"payload": {
-			"action": "synchronize",
-			"number": 4812,
-			"repository": {"full_name": "acme/monolith"}
-		}
-	}`, target.URL)
+	payload, err := fakeServer.PullRequestWebhookPayload(
+		"synchronize",
+		4812,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"target_url": target.URL,
+		"event":      "pull_request",
+		"guid":       "soak-guid",
+		"payload":    payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	request, err := http.NewRequestWithContext(
 		t.Context(),
 		http.MethodPost,
@@ -651,7 +657,10 @@ func TestEmitWebhookSignsAndDelivers(t *testing.T) {
 		return emptyResponse(http.StatusAccepted), nil
 	})}
 
-	payload := map[string]any{"action": "stacked", "number": 4815}
+	payload, err := fake.PullRequestWebhookPayload("synchronize", 4815)
+	if err != nil {
+		t.Fatal(err)
+	}
 	guid, err := fake.EmitWebhook(
 		context.Background(),
 		"http://webhook.test",
@@ -689,13 +698,17 @@ func TestEmitWebhookWithGUIDOverride(t *testing.T) {
 	})}
 
 	const guid = "intentional-redelivery-guid"
+	payload, err := fake.PullRequestWebhookPayload("synchronize", 4812)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for range 2 {
 		returned, err := fake.EmitWebhookWithGUID(
 			context.Background(),
 			"http://webhook.test",
 			"pull_request",
 			guid,
-			map[string]any{"action": "synchronize"},
+			payload,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -714,11 +727,19 @@ func TestEmitWebhookFailsOnNon2xx(t *testing.T) {
 	fake.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return emptyResponse(http.StatusServiceUnavailable), nil
 	})}
+	payload, err := fake.PushWebhookPayload(
+		"refs/heads/main",
+		"aaaa000",
+		"bbbb000",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fake.EmitWebhook(
 		context.Background(),
 		"http://webhook.test",
 		"push",
-		map[string]any{},
+		payload,
 	); err == nil {
 		t.Fatal("expected error on 503 target")
 	}
@@ -749,14 +770,19 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 		WithAppAuthentication(99, &key.PublicKey),
 		WithNow(func() time.Time { return now }),
 	)
-	for index := range 3 {
+	pushPayload, err := fake.PushWebhookPayload(
+		"refs/heads/main",
+		"aaaa000",
+		"bbbb000",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
 		if _, err := fake.DropWebhook(
 			target.URL,
 			"push",
-			map[string]any{
-				"action": "test",
-				"index":  index,
-			},
+			pushPayload,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -803,7 +829,7 @@ func TestAppHookDeliveriesPaginateAndRedeliver(t *testing.T) {
 	if _, err := fake.DropWebhook(
 		target.URL,
 		"push",
-		map[string]any{"action": "concurrent"},
+		pushPayload,
 	); err != nil {
 		t.Fatal(err)
 	}

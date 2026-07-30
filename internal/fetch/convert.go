@@ -1,6 +1,8 @@
 package fetch
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -216,6 +218,35 @@ func stackRecordFromREST(
 		SyncedAt:        syncedAt,
 		Source:          source,
 	}
+}
+
+func checkRecordFromREST(run *gh.CheckRun) (store.CheckRunRecord, error) {
+	if !json.Valid(run.Raw) {
+		return store.CheckRunRecord{}, fmt.Errorf(
+			"check run %d has no valid raw observation",
+			run.ID,
+		)
+	}
+	observed := append(json.RawMessage(nil), run.Raw...)
+	var semanticTime *time.Time
+	if run.CompletedAt != nil {
+		semanticTime = run.CompletedAt
+	} else if run.StartedAt != nil {
+		semanticTime = run.StartedAt
+	}
+	return store.CheckRunRecord{
+		GitHubID:        run.ID,
+		NodeID:          run.NodeID,
+		Name:            run.Name,
+		Status:          run.Status,
+		Conclusion:      run.Conclusion,
+		DetailsURL:      run.DetailsURL,
+		AppSlug:         run.AppSlug,
+		StartedAt:       run.StartedAt,
+		CompletedAt:     run.CompletedAt,
+		GitHubUpdatedAt: semanticTime,
+		Observed:        observed,
+	}, nil
 }
 
 func pullRecordsFromList(

@@ -42,6 +42,7 @@ source_root="$temporary_root/webhooks-${release_tag#v}"
 staged_corpus="$temporary_root/corpus"
 mkdir -p "$staged_corpus"
 cp "$source_root/LICENSE" "$staged_corpus/LICENSE"
+cp -R "$source_root/payload-schemas/api.github.com/common" "$staged_corpus/common"
 
 for event in $events; do
 	destination="$staged_corpus/$event"

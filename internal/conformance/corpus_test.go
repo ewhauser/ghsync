@@ -33,6 +33,8 @@ var corpusFileCounts = map[string]struct {
 	"push":                        {payloads: 6, schemas: 1},
 }
 
+const commonSchemaCount = 67
+
 type corpusPayload struct {
 	Event    string
 	Filename string
@@ -66,6 +68,7 @@ func TestCorpusLayout(t *testing.T) {
 	wantEntries := map[string]bool{
 		"LICENSE": true,
 		"VERSION": true,
+		"common":  true,
 	}
 	for _, event := range corpusEvents {
 		wantEntries[event] = true
@@ -78,6 +81,19 @@ func TestCorpusLayout(t *testing.T) {
 	}
 	if len(wantEntries) != 0 {
 		t.Fatalf("missing corpus entries: %v", wantEntries)
+	}
+	commonSchemas, err := filepath.Glob(
+		filepath.Join("corpus", "common", "*.schema.json"),
+	)
+	if err != nil {
+		t.Fatalf("list common schemas: %v", err)
+	}
+	if len(commonSchemas) != commonSchemaCount {
+		t.Fatalf(
+			"common schema files = %d, want %d",
+			len(commonSchemas),
+			commonSchemaCount,
+		)
 	}
 
 	for _, event := range corpusEvents {

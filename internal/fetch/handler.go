@@ -4,7 +4,6 @@ package fetch
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -607,29 +606,11 @@ func (h *Handler) RefreshChecks(
 	records := make([]store.CheckRunRecord, 0, len(all))
 	for index := range all {
 		run := &all[index]
-		observed, err := json.Marshal(run)
+		record, err := checkRecordFromREST(run)
 		if err != nil {
-			return fmt.Errorf("encode check observation: %w", err)
+			return err
 		}
-		var semanticTime *time.Time
-		if run.CompletedAt != nil {
-			semanticTime = run.CompletedAt
-		} else if run.StartedAt != nil {
-			semanticTime = run.StartedAt
-		}
-		records = append(records, store.CheckRunRecord{
-			GitHubID:        run.ID,
-			NodeID:          run.NodeID,
-			Name:            run.Name,
-			Status:          run.Status,
-			Conclusion:      run.Conclusion,
-			DetailsURL:      run.DetailsURL,
-			AppSlug:         run.AppSlug,
-			StartedAt:       run.StartedAt,
-			CompletedAt:     run.CompletedAt,
-			GitHubUpdatedAt: semanticTime,
-			Observed:        observed,
-		})
+		records = append(records, record)
 	}
 	_, err = h.writer.ApplyChecksObserved(
 		ctx,

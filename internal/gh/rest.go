@@ -135,16 +135,17 @@ func (r *Repository) UnmarshalJSON(data []byte) error {
 
 // CheckRun is the cache-relevant check-run shape.
 type CheckRun struct {
-	ID          int64      `json:"id"`
-	NodeID      string     `json:"node_id"`
-	HeadSHA     string     `json:"head_sha"`
-	Name        string     `json:"name"`
-	Status      string     `json:"status"`
-	Conclusion  string     `json:"conclusion"`
-	DetailsURL  string     `json:"details_url"`
-	AppSlug     string     `json:"-"`
-	StartedAt   *time.Time `json:"started_at"`
-	CompletedAt *time.Time `json:"completed_at"`
+	ID          int64           `json:"id"`
+	NodeID      string          `json:"node_id"`
+	HeadSHA     string          `json:"head_sha"`
+	Name        string          `json:"name"`
+	Status      string          `json:"status"`
+	Conclusion  string          `json:"conclusion"`
+	DetailsURL  string          `json:"details_url"`
+	AppSlug     string          `json:"-"`
+	StartedAt   *time.Time      `json:"started_at"`
+	CompletedAt *time.Time      `json:"completed_at"`
+	Raw         json.RawMessage `json:"-"`
 }
 
 // UnmarshalJSON flattens GitHub's nested App slug.
@@ -178,6 +179,7 @@ func (c *CheckRun) UnmarshalJSON(data []byte) error {
 		AppSlug:     wire.App.Slug,
 		StartedAt:   wire.StartedAt,
 		CompletedAt: wire.CompletedAt,
+		Raw:         append(json.RawMessage(nil), data...),
 	}
 	return nil
 }
