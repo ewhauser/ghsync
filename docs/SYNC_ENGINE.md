@@ -1,7 +1,8 @@
 # ghsync Sync Engine — Go + Postgres Design
 
 Draft v0.2. Decisions locked in this revision: **single org** (single-tenant
-deployment; one installation), **GHEC only** (no GHES support), **90-day
+deployment; one installation), **github.com only** (public GitHub by
+default; GHEC works identically — no GHES support), **90-day
 retention** for raw webhook payloads and check history, **River**
 (`riverqueue/river`) as the job queue, and **sqlc + pgx** as the data layer.
 
@@ -531,8 +532,10 @@ type Deriver interface { // pure (C-D1)
 
 ## 7. Budget math (sanity check against C-B)
 
-Assume GHEC (15,000 REST/hr + 5,000 GraphQL points/hr per installation), one
-org, 60 engineers, ~40 active PRs, peak ~300 PR-affecting events/hr.
+Assume public GitHub's App-installation baseline (5,000 REST/hr + 5,000
+GraphQL points/hr; GHEC reports 15,000 REST/hr, which the budgeter adopts
+from rate headers), one org, 60 engineers, ~40 active PRs, peak ~300
+PR-affecting events/hr.
 
 - Event path: 300 events/hr → coalescing (C-Q1) → ~120 fetch batches/hr ×
   (1 GraphQL batch + ~1 REST call) ≈ **~150 REST/hr + ~600 GraphQL points/hr**.
@@ -603,8 +606,10 @@ payload (this also preserves C-I4: the fetch re-reads truth at run time).
    machinery is built now.
 2. **Retention: 90 days** for `webhook_deliveries` payloads and
    `check_history`, pruned by a River periodic job (schema note in §5).
-3. **No GHES.** Budgeter assumes GHEC limits (15k REST/hr, 5k GraphQL
-   points/hr per installation); no per-host budget abstraction.
+3. **No GHES.** github.com only (public GitHub or GHEC). The budgeter
+   starts from public GitHub's baseline (5k REST/hr, 5k GraphQL points/hr
+   per installation) and adopts the actual limits from observed rate
+   headers; no per-host budget abstraction.
 4. **River** for queuing; **sqlc + pgx** for the data layer (§8).
 
 **Open:**

@@ -20,8 +20,10 @@ import (
 )
 
 const (
-	defaultConcurrency       = 40
-	defaultRESTLimit         = int64(15000)
+	defaultConcurrency = 40
+	// Public-GitHub App installation baseline; higher GHEC limits are
+	// adopted from observed rate headers.
+	defaultRESTLimit         = int64(5000)
 	defaultGraphQLLimit      = int64(5000)
 	defaultRESTEstimate      = 1
 	defaultGraphQLEstimate   = 100

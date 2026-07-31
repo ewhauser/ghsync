@@ -30,8 +30,11 @@ The core design rule is simple:
 ## Scope
 
 `ghsync` is currently designed for one GitHub App installation and one
-organization on GitHub Enterprise Cloud. PostgreSQL is its only stateful
-dependency.
+organization on github.com — public GitHub by default, and GitHub
+Enterprise Cloud works identically (same API endpoints; its higher rate
+limits are picked up automatically from response headers). GitHub
+Enterprise Server (self-hosted, custom API hosts) is not supported.
+PostgreSQL is ghsync's only stateful dependency.
 
 The version 1 delivery interface is PostgreSQL. `ghsync` does not currently
 ship a user interface, gRPC API, or SSE API. Its stacked pull request support

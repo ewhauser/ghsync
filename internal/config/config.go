@@ -22,10 +22,12 @@ const (
 	defaultFetchBatchWindow = 5 * time.Millisecond
 	defaultBackfillPageSize = 100
 
-	defaultBudgetSweepFloor        = 0.20
-	defaultBudgetEventFloor        = 0.10
-	defaultBudgetMaxConcurrent     = 40
-	defaultBudgetRESTLimit         = int64(15000)
+	defaultBudgetSweepFloor    = 0.20
+	defaultBudgetEventFloor    = 0.10
+	defaultBudgetMaxConcurrent = 40
+	// Public-GitHub App installation baseline; GHEC installations report
+	// 15,000 in rate headers, which the budgeter adopts on first response.
+	defaultBudgetRESTLimit         = int64(5000)
 	defaultBudgetGraphQLLimit      = int64(5000)
 	defaultBudgetSecondaryFallback = 60 * time.Second
 	defaultBudgetLeaseTTL          = 30 * time.Second
