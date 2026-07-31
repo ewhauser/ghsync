@@ -2,10 +2,17 @@ GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT_BASE := CGO_ENABLED=0 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 CUSTOM_GCL := $(CURDIR)/custom-gcl
 
-.PHONY: build test lint custom-gcl gen migrate dev clean
+GORELEASER_VERSION ?= v2.12.5
+GORELEASER := go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
+
+.PHONY: build test lint custom-gcl gen migrate dev clean release-snapshot
 
 build:
 	go build ./...
+
+# Build release archives locally into dist/ without tagging or publishing.
+release-snapshot:
+	$(GORELEASER) release --snapshot --clean
 
 test:
 	go test ./...

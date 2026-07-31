@@ -82,7 +82,11 @@ PostgreSQL volume, run `make clean`.
 
 ## Running with GitHub
 
-Build the daemon:
+Prebuilt static binaries for `ghsyncd` and `stream-tail` (linux and darwin,
+amd64 and arm64) are published on
+[GitHub Releases](https://github.com/ewhauser/ghsync/releases) with a
+checksums file; releases are cut by pushing a `v*` tag. To build from source
+instead:
 
 ```bash
 go build -o ./bin/ghsyncd ./cmd/ghsyncd

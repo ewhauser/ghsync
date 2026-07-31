@@ -1,0 +1,60 @@
+version: 2
+project_name: ghsync
+
+builds:
+  - id: ghsyncd
+    main: ./cmd/ghsyncd
+    binary: ghsyncd
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: stream-tail
+    main: ./cmd/stream-tail
+    binary: stream-tail
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  use: github-native
+
+release:
+  footer: |
+    Binaries are static (CGO disabled) for linux and darwin on amd64 and
+    arm64. Verify downloads against `checksums.txt`. Run migrations with
+    `ghsyncd migrate` before starting the new version; see
+    `ops/DEPLOYMENT.md` for the rolling-deployment topology.
