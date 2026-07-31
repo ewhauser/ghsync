@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,16 @@ type graphQLRateLimit struct {
 	Cost      int       `json:"cost"`
 	Remaining int       `json:"remaining"`
 	ResetAt   time.Time `json:"resetAt"`
+}
+
+// resourceLimitError reports GitHub's per-query node budget being exceeded;
+// callAdaptive retries the same cursor with a smaller page size.
+type resourceLimitError struct {
+	Message string
+}
+
+func (e *resourceLimitError) Error() string {
+	return fmt.Sprintf("GitHub GraphQL resource limit: %s", e.Message)
 }
 
 type rateLimitError struct {
@@ -65,6 +76,40 @@ func newGraphQLClient(
 		token:      token,
 		httpClient: httpClient,
 	}, nil
+}
+
+const (
+	defaultCrawlPageSize = 50
+	minimumCrawlPageSize = 5
+)
+
+// callAdaptive runs a paged query whose outer connection takes a $pageSize
+// variable, halving the page size (down to a floor) whenever GitHub reports
+// its per-query resource budget exceeded. The page cursor in variables is
+// unchanged across retries, so no page is skipped or repeated.
+func (c *graphQLClient) callAdaptive(
+	ctx context.Context,
+	query string,
+	variables map[string]any,
+	target any,
+) error {
+	pageSize := defaultCrawlPageSize
+	for {
+		variables["pageSize"] = pageSize
+		err := c.call(ctx, query, variables, target)
+		var limitError *resourceLimitError
+		if !errors.As(err, &limitError) {
+			return err
+		}
+		if pageSize <= minimumCrawlPageSize {
+			return fmt.Errorf(
+				"GraphQL resource limit persists at page size %d: %s",
+				pageSize,
+				limitError.Message,
+			)
+		}
+		pageSize = max(pageSize/2, minimumCrawlPageSize)
+	}
 }
 
 func (c *graphQLClient) call(
@@ -161,6 +206,13 @@ func (c *graphQLClient) call(
 				Message: first.Message,
 			}
 		}
+		if strings.Contains(strings.ToUpper(first.Type), "RESOURCE_LIMIT") ||
+			strings.Contains(
+				strings.ToLower(first.Message),
+				"resource limits",
+			) {
+			return &resourceLimitError{Message: first.Message}
+		}
 		return fmt.Errorf(
 			"GitHub GraphQL: %s",
 			first.Message,
@@ -238,6 +290,7 @@ const pullRequestTimelineQuery = `query GhsyncRecordingPull(
   $owner: String!,
   $name: String!,
   $number: Int!,
+  $pageSize: Int!,
   $after: String
 ) {
   repository(owner: $owner, name: $name) {
@@ -262,7 +315,7 @@ const pullRequestTimelineQuery = `query GhsyncRecordingPull(
       baseRefOid
       baseRepository { nameWithOwner }
       author { login }
-      timelineItems(first: 50, after: $after) {
+      timelineItems(first: $pageSize, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
           __typename
@@ -433,6 +486,7 @@ const defaultBranchHistoryQuery = `query GhsyncRecordingDefaultHistory(
   $name: String!,
   $since: GitTimestamp!,
   $until: GitTimestamp!,
+  $pageSize: Int!,
   $after: String
 ) {
   repository(owner: $owner, name: $name) {
@@ -441,7 +495,7 @@ const defaultBranchHistoryQuery = `query GhsyncRecordingDefaultHistory(
       target {
         ... on Commit {
           history(
-            first: 50,
+            first: $pageSize,
             after: $after,
             since: $since,
             until: $until

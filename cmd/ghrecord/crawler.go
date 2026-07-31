@@ -564,7 +564,7 @@ func fetchPullTimelinePage(
 			} `json:"pullRequest"`
 		} `json:"repository"`
 	}
-	err := config.Client.call(
+	err := config.Client.callAdaptive(
 		ctx,
 		pullRequestTimelineQuery,
 		map[string]any{
@@ -837,7 +837,7 @@ func crawlDefaultHistory(
 				} `json:"defaultBranchRef"`
 			} `json:"repository"`
 		}
-		err := config.Client.call(
+		err := config.Client.callAdaptive(
 			ctx,
 			defaultBranchHistoryQuery,
 			map[string]any{
