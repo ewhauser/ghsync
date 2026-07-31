@@ -151,6 +151,12 @@ type DriftEntity struct {
 	LastCheckedAt  pgtype.Timestamptz
 }
 
+type DriftEntityKey struct {
+	InstallationID int64
+	EntityKind     string
+	SourceID       int64
+}
+
 type DriftFinding struct {
 	ID                int64
 	InstallationID    int64

@@ -17,6 +17,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/budget"
 	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
@@ -426,4 +427,115 @@ func metricLabelsMatch(item *dto.Metric, want map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// CollectDeliveryMetrics feeds the C-I5 parked gauges and the C-Q2 oldest
+// unprocessed delivery age. It was rewritten from one FILTERed pass over
+// webhook_deliveries into per-status aggregates that ride
+// webhook_deliveries_unfinished_received_idx; this pins the values that
+// rewrite must keep producing, including LEAST()'s NULL handling when only
+// one of pending/processing is present.
+func TestCollectDeliveryMetricsPerStatusAggregates(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testdb.New(t).Pool
+	queries := dbgen.New(pool)
+
+	row, err := queries.CollectDeliveryMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.OldestUnprocessed != 0 || row.Parked != 0 || row.OldestParked != 0 {
+		t.Fatalf("empty delivery table metrics = %+v, want zeroes", row)
+	}
+
+	// 'processed' is the terminal status and must contribute to nothing.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO webhook_deliveries (
+		    delivery_guid, event, headers, received_at, status, next_attempt_at
+		) VALUES (
+		    'done-1', 'pull_request', '{}'::jsonb,
+		    clock_timestamp() - interval '9 hours', 'processed',
+		    clock_timestamp()
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	row, err = queries.CollectDeliveryMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.OldestUnprocessed != 0 || row.Parked != 0 || row.OldestParked != 0 {
+		t.Fatalf("processed-only metrics = %+v, want zeroes", row)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO webhook_deliveries (
+		    delivery_guid, event, headers, received_at, status, next_attempt_at
+		) VALUES
+		    ('pending-1', 'pull_request', '{}'::jsonb,
+		     clock_timestamp() - interval '600 seconds', 'pending',
+		     clock_timestamp()),
+		    ('processing-1', 'pull_request', '{}'::jsonb,
+		     clock_timestamp() - interval '900 seconds', 'processing',
+		     clock_timestamp()),
+		    ('parked-1', 'pull_request', '{}'::jsonb,
+		     clock_timestamp() - interval '1200 seconds', 'parked',
+		     clock_timestamp()),
+		    ('parked-2', 'pull_request', '{}'::jsonb,
+		     clock_timestamp() - interval '300 seconds', 'parked',
+		     clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+	row, err = queries.CollectDeliveryMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The unprocessed age spans pending AND processing, and parked never
+	// leaks into it even though parked is older.
+	assertDeliveryAge(t, "oldest_unprocessed", row.OldestUnprocessed, 900)
+	if row.Parked != 2 {
+		t.Fatalf("parked = %d, want 2", row.Parked)
+	}
+	assertDeliveryAge(t, "oldest_parked", row.OldestParked, 1200)
+
+	// With processing gone, LEAST() must fall through to the pending side
+	// rather than collapsing to NULL and then to the COALESCE zero.
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM webhook_deliveries WHERE delivery_guid = 'processing-1'`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	row, err = queries.CollectDeliveryMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDeliveryAge(t, "oldest_unprocessed", row.OldestUnprocessed, 600)
+
+	// With neither present the gauge reports zero, not a negative clock age.
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM webhook_deliveries WHERE delivery_guid = 'pending-1'`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	row, err = queries.CollectDeliveryMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.OldestUnprocessed != 0 {
+		t.Fatalf("oldest_unprocessed = %v, want 0", row.OldestUnprocessed)
+	}
+	if row.Parked != 2 {
+		t.Fatalf("parked = %d, want 2", row.Parked)
+	}
+}
+
+func assertDeliveryAge(t *testing.T, name string, got, want float64) {
+	t.Helper()
+	// Row ages are seeded off clock_timestamp() and read back moments later.
+	if got < want || got > want+60 {
+		t.Fatalf("%s = %v seconds, want ~%v", name, got, want)
+	}
 }

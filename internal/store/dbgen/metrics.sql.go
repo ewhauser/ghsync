@@ -203,15 +203,28 @@ func (q *Queries) CollectConsumerStreamMetrics(ctx context.Context) ([]CollectCo
 
 const collectDeliveryMetrics = `-- name: CollectDeliveryMetrics :one
 SELECT
-    COALESCE(EXTRACT(EPOCH FROM (
-        clock_timestamp() - min(received_at)
-            FILTER (WHERE status IN ('pending', 'processing'))
-    )), 0)::double precision AS oldest_unprocessed,
-    count(*) FILTER (WHERE status = 'parked') AS parked,
-    COALESCE(EXTRACT(EPOCH FROM (
-        clock_timestamp() - min(received_at)
-            FILTER (WHERE status = 'parked')
-    )), 0)::double precision AS oldest_parked,
+    COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - LEAST(
+        (
+            SELECT min(received_at)
+            FROM webhook_deliveries
+            WHERE status = 'pending'
+        ),
+        (
+            SELECT min(received_at)
+            FROM webhook_deliveries
+            WHERE status = 'processing'
+        )
+    ))), 0)::double precision AS oldest_unprocessed,
+    (
+        SELECT count(*)
+        FROM webhook_deliveries
+        WHERE status = 'parked'
+    )::bigint AS parked,
+    COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - (
+        SELECT min(received_at)
+        FROM webhook_deliveries
+        WHERE status = 'parked'
+    ))), 0)::double precision AS oldest_parked,
     (
         SELECT count(*)
         FROM refresh_intent_generations
@@ -225,7 +238,6 @@ SELECT
         WHERE completed_generation < generation
           AND event_received_at IS NOT NULL
     ) AS oldest_generation
-FROM webhook_deliveries
 `
 
 type CollectDeliveryMetricsRow struct {
@@ -236,6 +248,14 @@ type CollectDeliveryMetricsRow struct {
 	OldestGeneration       float64
 }
 
+// Every aggregate here is per-status so that it rides
+// webhook_deliveries_unfinished_received_idx (status, received_at) WHERE
+// status IN ('pending','processing','parked'). Aggregate FILTER clauses
+// block both the min/max index optimisation and the partial index's
+// predicate proof, so the older single-pass form seq-scanned the whole
+// delivery table on every metrics scrape. LEAST() ignores NULLs, so
+// LEAST(min pending, min processing) is exactly the old
+// min(received_at) FILTER (WHERE status IN ('pending','processing')).
 func (q *Queries) CollectDeliveryMetrics(ctx context.Context) (CollectDeliveryMetricsRow, error) {
 	row := q.db.QueryRow(ctx, collectDeliveryMetrics)
 	var i CollectDeliveryMetricsRow

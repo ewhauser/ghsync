@@ -130,6 +130,27 @@ func TestMigrateIdempotent(t *testing.T) {
 		)
 	}
 
+	// The C-O3 drift sampler resolves its keyset and rebuilds check snapshots
+	// through this partial index; without it both halves fall back to a full
+	// check_runs scan per sample.
+	var checkGroupIndex string
+	err = pool.QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND tablename = 'check_runs'
+		  AND indexname = 'check_runs_live_group_idx'
+	`).Scan(&checkGroupIndex)
+	if err != nil ||
+		!strings.Contains(checkGroupIndex, "(repo_id, head_sha, gh_id)") ||
+		!strings.Contains(checkGroupIndex, "WHERE (tombstoned_at IS NULL)") {
+		t.Fatalf(
+			"live check-group index = %q (err=%v)",
+			checkGroupIndex,
+			err,
+		)
+	}
+
 	var riverTables int
 	err = pool.QueryRow(ctx,
 		`SELECT count(*)

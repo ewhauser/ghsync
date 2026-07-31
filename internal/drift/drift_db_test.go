@@ -3,6 +3,7 @@ package drift
 import (
 	"context"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1082,6 +1083,315 @@ func TestSemanticDiffNormalizesIDOrderedCollections(t *testing.T) {
 	}
 	if !equal || string(diff) != "{}" {
 		t.Fatalf("normalization-stable compare equal=%v diff=%s", equal, diff)
+	}
+}
+
+// The sampler resolves its keyset against drift_entity_keys and then reads
+// the snapshots back out of drift_entities by source_id. That is only
+// equivalent to ordering drift_entities directly while the two views project
+// the same (installation_id, entity_kind, source_id) triples, so pin both the
+// projection invariant and the window the sampler returns. The check group
+// gets extra live runs plus a tombstoned one first: 'checks' is the only kind
+// whose source_id is a group representative rather than a row id.
+func TestDriftSampleKeysetMatchesDriftEntities(t *testing.T) {
+	t.Parallel()
+	pool := driftTestDatabase(t)
+	ctx := context.Background()
+	seedCheckRunGroup(t, pool)
+
+	var mismatches int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM (
+		    (SELECT installation_id, entity_kind, source_id FROM drift_entities
+		     EXCEPT ALL
+		     SELECT installation_id, entity_kind, source_id
+		     FROM drift_entity_keys)
+		    UNION ALL
+		    (SELECT installation_id, entity_kind, source_id
+		     FROM drift_entity_keys
+		     EXCEPT ALL
+		     SELECT installation_id, entity_kind, source_id FROM drift_entities)
+		) AS diff
+	`).Scan(&mismatches); err != nil {
+		t.Fatal(err)
+	}
+	if mismatches != 0 {
+		t.Fatalf(
+			"drift_entity_keys diverges from drift_entities in %d rows",
+			mismatches,
+		)
+	}
+
+	queries := dbgen.New(pool)
+	for _, kind := range driftEntityKinds {
+		cursors, err := driftSourceIDs(ctx, pool, kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Guard against a vacuous pass: every kind must hold more rows than
+		// one sample window, so the LIMIT and the keyset both bite.
+		if len(cursors) < 3 {
+			t.Fatalf("%s has %d cached rows, want at least 3", kind, len(cursors))
+		}
+		// Sample from before every row, from the first row, and from past
+		// the end so both halves of the rotation are covered.
+		probes := []int64{0}
+		probes = append(probes, cursors...)
+		for _, cursor := range probes {
+			const sampleSize = 2
+			want, err := driftEntityWindow(
+				ctx, pool, kind, "source_id > $2", cursor, sampleSize,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := queries.SampleCachedEntitiesAfter(
+				ctx,
+				dbgen.SampleCachedEntitiesAfterParams{
+					InstallationID: 1,
+					EntityKind:     kind,
+					AfterSourceID:  cursor,
+					SampleSize:     sampleSize,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertSampleMatches(t, kind, "after", cursor, want, got)
+
+			want, err = driftEntityWindow(
+				ctx, pool, kind, "source_id <= $2", cursor, sampleSize,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapped, err := queries.SampleCachedEntitiesThrough(
+				ctx,
+				dbgen.SampleCachedEntitiesThroughParams{
+					InstallationID:  1,
+					EntityKind:      kind,
+					ThroughSourceID: cursor,
+					SampleSize:      sampleSize,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			through := make([]dbgen.SampleCachedEntitiesAfterRow, 0, len(wrapped))
+			for _, row := range wrapped {
+				through = append(through, dbgen.SampleCachedEntitiesAfterRow(row))
+			}
+			assertSampleMatches(t, kind, "through", cursor, want, through)
+		}
+	}
+}
+
+// seedCheckRunGroup gives acme/monolith a check group with three live runs and
+// one tombstoned run, so the 'checks' representative is the smallest LIVE
+// gh_id and its snapshot must carry exactly the live runs in gh_id order.
+func seedCheckRunGroup(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO repos (
+		    id, installation_id, org_id, gh_id, node_id, owner, name,
+		    full_name, default_branch, archived, synced_at, sync_source,
+		    last_checked_at
+		) VALUES
+		    (9001, 1, 1, 9001, 'R_keyset', 'acme', 'monolith',
+		     'acme/monolith', 'main', false, clock_timestamp(), 'backfill',
+		     clock_timestamp()),
+		    (9002, 1, 1, 9002, 'R_two', 'acme', 'tools', 'acme/tools',
+		     'main', false, clock_timestamp(), 'backfill',
+		     clock_timestamp()),
+		    (9003, 1, 1, 9003, 'R_three', 'acme', 'docs', 'acme/docs',
+		     'main', false, clock_timestamp(), 'backfill',
+		     clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO check_runs (
+		    gh_id, repo_id, node_id, name, status, head_sha, synced_at,
+		    sync_source, last_checked_at, tombstoned_at
+		) VALUES
+		    (5003, 9001, 'CR_c', 'lint', 'completed', 'deadbeef',
+		     clock_timestamp(), 'backfill', clock_timestamp(), NULL),
+		    (5001, 9001, 'CR_a', 'build', 'completed', 'deadbeef',
+		     clock_timestamp(), 'backfill', clock_timestamp(), NULL),
+		    (5002, 9001, 'CR_b', 'test', 'completed', 'deadbeef',
+		     clock_timestamp(), 'backfill', clock_timestamp(), NULL),
+		    (5000, 9001, 'CR_dead', 'old', 'completed', 'deadbeef',
+		     clock_timestamp(), 'backfill', clock_timestamp(),
+		     clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+	// A second check group, plus pull requests, stacks and review threads, so
+	// every kind has more rows than one sample window holds and ordering is
+	// observable.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO check_runs (
+		    gh_id, repo_id, node_id, name, status, head_sha, synced_at,
+		    sync_source, last_checked_at
+		) VALUES
+		    (4002, 9001, 'CR_e', 'build', 'completed', 'cafebabe',
+		     clock_timestamp(), 'backfill', clock_timestamp()),
+		    (4001, 9001, 'CR_d', 'test', 'completed', 'cafebabe',
+		     clock_timestamp(), 'backfill', clock_timestamp()),
+		    (3001, 9002, 'CR_f', 'build', 'completed', 'feedface',
+		     clock_timestamp(), 'backfill', clock_timestamp());
+
+		INSERT INTO pull_requests (
+		    id, repo_id, gh_id, node_id, number, title, state, draft,
+		    author_login, head_ref, head_sha, base_ref, base_sha, synced_at,
+		    sync_source, last_checked_at
+		) VALUES
+		    (7001, 9001, 7001, 'PR_a', 11, 'first', 'open', false, 'ada',
+		     'f1', 'aaa', 'main', 'bbb', clock_timestamp(), 'backfill',
+		     clock_timestamp()),
+		    (7002, 9001, 7002, 'PR_b', 12, 'second', 'open', false, 'ada',
+		     'f2', 'ccc', 'main', 'bbb', clock_timestamp(), 'backfill',
+		     clock_timestamp()),
+		    (7003, 9001, 7003, 'PR_c', 13, 'third', 'closed', false, 'ada',
+		     'f3', 'ddd', 'main', 'bbb', clock_timestamp(), 'backfill',
+		     clock_timestamp());
+
+		INSERT INTO stacks (
+		    id, repo_id, gh_id, node_id, number, base_ref, base_sha, open,
+		    entries, synced_at, sync_source, last_checked_at
+		) VALUES
+		    (8001, 9001, 8001, 'ST_a', 21, 'main', 'bbb', true,
+		     '[]'::jsonb, clock_timestamp(), 'backfill', clock_timestamp()),
+		    (8002, 9001, 8002, 'ST_b', 22, 'main', 'bbb', false,
+		     '[]'::jsonb, clock_timestamp(), 'backfill', clock_timestamp()),
+		    (8003, 9001, 8003, 'ST_c', 23, 'main', 'bbb', true,
+		     '[]'::jsonb, clock_timestamp(), 'backfill', clock_timestamp());
+
+		INSERT INTO review_threads (
+		    id, repo_id, pr_number, is_resolved, is_outdated, path, line,
+		    comments, synced_at, sync_source, last_checked_at
+		) VALUES
+		    ('RT_a', 9001, 11, false, false, 'a.go', 3, '[]'::jsonb,
+		     clock_timestamp(), 'backfill', clock_timestamp()),
+		    ('RT_b', 9001, 12, true, false, 'b.go', 9, '[]'::jsonb,
+		     clock_timestamp(), 'backfill', clock_timestamp());
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	var sourceID int64
+	var snapshot []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT source_id, cache_snapshot
+		FROM drift_entities
+		WHERE installation_id = 1
+		  AND entity_kind = 'checks'
+		  AND entity_key = 'checks:acme/monolith:deadbeef'
+	`).Scan(&sourceID, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if sourceID != 5001 {
+		t.Fatalf("checks source_id = %d, want the smallest live gh_id 5001", sourceID)
+	}
+	if got := string(snapshot); !strings.Contains(got, `"id": 5001`) ||
+		!strings.Contains(got, `"id": 5002`) ||
+		!strings.Contains(got, `"id": 5003`) ||
+		strings.Contains(got, `"id": 5000`) {
+		t.Fatalf("checks snapshot = %s, want the three live runs only", got)
+	}
+}
+
+func driftSourceIDs(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	kind string,
+) ([]int64, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT source_id
+		FROM drift_entities
+		WHERE installation_id = 1 AND entity_kind = $1
+		ORDER BY source_id
+	`, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// driftEntityWindow is the pre-optimisation sampler: order drift_entities
+// directly and LIMIT it.
+func driftEntityWindow(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	kind string,
+	bound string,
+	cursor int64,
+	sampleSize int32,
+) ([]dbgen.SampleCachedEntitiesAfterRow, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
+		       last_checked_at
+		FROM drift_entities
+		WHERE installation_id = 1
+		  AND entity_kind = $1
+		  AND `+bound+`
+		ORDER BY source_id
+		LIMIT $3
+	`, kind, cursor, sampleSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	window := make([]dbgen.SampleCachedEntitiesAfterRow, 0, sampleSize)
+	for rows.Next() {
+		var row dbgen.SampleCachedEntitiesAfterRow
+		if err := rows.Scan(
+			&row.EntityKind,
+			&row.SourceID,
+			&row.EntityKey,
+			&row.LockKey,
+			&row.CacheSnapshot,
+			&row.LastCheckedAt,
+		); err != nil {
+			return nil, err
+		}
+		window = append(window, row)
+	}
+	return window, rows.Err()
+}
+
+func assertSampleMatches(
+	t *testing.T,
+	kind string,
+	half string,
+	cursor int64,
+	want []dbgen.SampleCachedEntitiesAfterRow,
+	got []dbgen.SampleCachedEntitiesAfterRow,
+) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf(
+			"%s %s sample after %d returned %d rows, want %d",
+			kind, half, cursor, len(got), len(want),
+		)
+	}
+	for index := range want {
+		if !reflect.DeepEqual(got[index], want[index]) {
+			t.Fatalf(
+				"%s %s sample after %d row %d = %+v, want %+v",
+				kind, half, cursor, index, got[index], want[index],
+			)
+		}
 	}
 }
 

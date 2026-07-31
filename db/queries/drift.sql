@@ -35,25 +35,51 @@ SET source_id = EXCLUDED.source_id,
 -- name: SampleCachedEntitiesAfter :many
 -- Q11: the forward half of the rotating sample is a plain indexed source_id
 -- range. Detect issues a second bounded range only when this reaches the end.
-SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
-       last_checked_at
-FROM drift_entities
-WHERE installation_id = sqlc.arg(installation_id)
-  AND entity_kind = sqlc.arg(entity_kind)
-  AND source_id > sqlc.arg(after_source_id)
-ORDER BY source_id
-LIMIT sqlc.arg(sample_size);
+--
+-- The keyset is resolved against drift_entity_keys, which projects the same
+-- (installation_id, entity_kind, source_id) triples as drift_entities with no
+-- snapshot payload. Ordering drift_entities directly forced PostgreSQL to
+-- plan every UNION ALL arm for full retrieval -- an ORDER BY at this level
+-- stops the LIMIT's tuple fraction from reaching the arms -- so the 'checks'
+-- arm built a jsonb snapshot for every cached check group on every sample.
+-- The ARRAY() sub-select becomes an InitPlan, whose Param IS pushed into the
+-- arms as an indexable source_id qual, so only the sampled rows are built.
+-- source_id is unique per (installation_id, entity_kind), so the rows and
+-- their order are identical to the single-statement form.
+SELECT entity.entity_kind, entity.source_id, entity.entity_key,
+       entity.lock_key, entity.cache_snapshot, entity.last_checked_at
+FROM drift_entities AS entity
+WHERE entity.installation_id = sqlc.arg(installation_id)
+  AND entity.entity_kind = sqlc.arg(entity_kind)
+  AND entity.source_id = ANY (ARRAY(
+      SELECT sampled.source_id
+      FROM drift_entity_keys AS sampled
+      WHERE sampled.installation_id = sqlc.arg(installation_id)
+        AND sampled.entity_kind = sqlc.arg(entity_kind)
+        AND sampled.source_id > sqlc.arg(after_source_id)
+      ORDER BY sampled.source_id
+      LIMIT sqlc.arg(sample_size)
+  ))
+ORDER BY entity.source_id;
 
 -- name: SampleCachedEntitiesThrough :many
 -- The wrap half cannot overlap the forward half and retains source_id order.
-SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
-       last_checked_at
-FROM drift_entities
-WHERE installation_id = sqlc.arg(installation_id)
-  AND entity_kind = sqlc.arg(entity_kind)
-  AND source_id <= sqlc.arg(through_source_id)
-ORDER BY source_id
-LIMIT sqlc.arg(sample_size);
+-- Same two-phase keyset shape as SampleCachedEntitiesAfter.
+SELECT entity.entity_kind, entity.source_id, entity.entity_key,
+       entity.lock_key, entity.cache_snapshot, entity.last_checked_at
+FROM drift_entities AS entity
+WHERE entity.installation_id = sqlc.arg(installation_id)
+  AND entity.entity_kind = sqlc.arg(entity_kind)
+  AND entity.source_id = ANY (ARRAY(
+      SELECT sampled.source_id
+      FROM drift_entity_keys AS sampled
+      WHERE sampled.installation_id = sqlc.arg(installation_id)
+        AND sampled.entity_kind = sqlc.arg(entity_kind)
+        AND sampled.source_id <= sqlc.arg(through_source_id)
+      ORDER BY sampled.source_id
+      LIMIT sqlc.arg(sample_size)
+  ))
+ORDER BY entity.source_id;
 
 -- name: GetCachedEntitySnapshot :one
 SELECT entity_kind, source_id, entity_key, lock_key, cache_snapshot,
