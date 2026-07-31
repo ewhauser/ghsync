@@ -286,7 +286,11 @@ func TestPostgresLeaseOwnershipLossStopsRenewalAndAllowsFailover(t *testing.T) {
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, ErrLeaseHeld) {
+		// A store call that exceeds the 100ms StoreTimeout on a cold
+		// per-test pool is retryable, same as a still-held lease; the
+		// loop's TTL deadline is the assertion.
+		if !errors.Is(err, ErrLeaseHeld) &&
+			!errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("replacement acquire = %v", err)
 		}
 		time.Sleep(25 * time.Millisecond)
