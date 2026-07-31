@@ -151,11 +151,18 @@ func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
 	t.Parallel()
 	var active atomic.Int64
 	var maxActive atomic.Int64
-	started := make(chan struct{}, 2)
-	release := make(chan struct{})
+	started := make(chan struct{}, 3)
+	handlerExited := make(chan struct{}, 3)
+	release := make(chan struct{}, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		current := active.Add(1)
-		defer active.Add(-1)
+		decremented := false
+		defer func() {
+			if !decremented {
+				active.Add(-1)
+			}
+			handlerExited <- struct{}{}
+		}()
 		for {
 			observed := maxActive.Load()
 			if current <= observed || maxActive.CompareAndSwap(observed, current) {
@@ -172,6 +179,11 @@ func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
 		w.(http.Flusher).Flush()
 		select {
 		case <-release:
+			// Decrement before the final write: the write produces the
+			// client-side EOF that frees the gate slot, so the next
+			// handler must never observe this one as still active.
+			active.Add(-1)
+			decremented = true
 			_, _ = io.WriteString(w, "done")
 		case <-r.Context().Done():
 		}
@@ -210,16 +222,41 @@ func TestConcurrencySlotHeldUntilNetworkBodyEOFOrClose(t *testing.T) {
 		t.Fatalf("in-flight while body blocked = %d, want 1", got)
 	}
 
+	// EOF path: complete the first request cleanly. The handler decrements
+	// its active count before the final write, so the EOF that frees the
+	// slot cannot race the concurrency measurement.
+	release <- struct{}{}
+	if _, err := io.ReadAll(first.HTTP.Body); err != nil {
+		t.Fatal(err)
+	}
 	if err := first.HTTP.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
+	<-handlerExited
 	<-started
 	second := <-secondResult
 	if err := <-secondErr; err != nil {
 		t.Fatal(err)
 	}
-	close(release)
-	if _, err := io.ReadAll(second.HTTP.Body); err != nil {
+
+	// Close path: releasing the slot by closing an undrained body must also
+	// admit the next request. Wait for the canceled handler to fully exit
+	// before issuing it so server-side teardown of the dead request cannot
+	// overlap the measurement.
+	if err := second.HTTP.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-handlerExited
+	third, err := do()
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	release <- struct{}{}
+	if _, err := io.ReadAll(third.HTTP.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := third.HTTP.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if got := maxActive.Load(); got != 1 {
