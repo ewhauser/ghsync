@@ -10,6 +10,8 @@ mirror resilient to duplicate, delayed, missing, and out-of-order deliveries.
 Consumers can read the mirror directly from PostgreSQL and follow a durable,
 transactionally consistent change stream.
 
+![ghsync architecture: GitHub events flow through ingest, coalescing, authoritative refresh, and publishing into PostgreSQL-backed downstream projections](docs/images/ghsync-architecture.png)
+
 ## Features
 
 - HMAC-verified webhook ingestion with durable-before-acknowledge storage
