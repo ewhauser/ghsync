@@ -255,6 +255,7 @@ checks before submitting a pull request.
 
 ## License
 
-This repository does not currently include an open-source license. Until one
-is added, copyright law reserves reuse and redistribution rights to the
-copyright holder.
+MIT — see [`LICENSE`](LICENSE). The vendored webhook payload corpus under
+`internal/conformance/corpus/` comes from
+[octokit/webhooks](https://github.com/octokit/webhooks) and retains its own
+MIT license and copyright notice alongside the vendored files.
