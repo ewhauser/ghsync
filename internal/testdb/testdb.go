@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,6 +25,13 @@ import (
 	"github.com/ewhauser/ghsync/db"
 	"github.com/ewhauser/ghsync/internal/store"
 )
+
+// A River client holds one connection for LISTEN/NOTIFY and concurrently
+// needs connections for its queue producers, leader election, job completion,
+// maintenance, workers, and the test itself. pgxpool's CPU-derived default is
+// only four connections on GitHub-hosted runners, which is insufficient for a
+// full test client. Match the pool size used by the CI load-smoke engine.
+const defaultTestPoolMaxConns int32 = 20
 
 // Database owns one migrated per-test database and a pool connected to it.
 type Database struct {
@@ -41,24 +49,60 @@ func New(t testing.TB) *Database {
 	if databaseURL == "" {
 		t.Skip("TEST_DATABASE_URL not set")
 	}
-	conf, err := parseConfig(databaseURL)
+	conf, poolMaxConns, err := parseConfig(databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testConf := pgtestdb.Custom(t, conf, migrator{})
-	pool, err := store.Connect(context.Background(), testConf.URL())
+	poolURL, err := withPoolMaxConns(testConf.URL(), poolMaxConns)
+	if err != nil {
+		t.Fatalf("size test database pool: %v", err)
+	}
+	pool, err := store.Connect(context.Background(), poolURL)
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}
 	t.Cleanup(pool.Close)
-	return &Database{Pool: pool, URL: testConf.URL()}
+	return &Database{Pool: pool, URL: poolURL}
 }
 
-func parseConfig(databaseURL string) (pgtestdb.Config, error) {
+func withPoolMaxConns(databaseURL string, maxConns int32) (string, error) {
 	parsed, err := url.Parse(databaseURL)
 	if err != nil {
-		return pgtestdb.Config{}, fmt.Errorf("parse TEST_DATABASE_URL: %w", err)
+		return "", err
 	}
+	query := parsed.Query()
+	query.Set("pool_max_conns", strconv.FormatInt(int64(maxConns), 10))
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func parseConfig(databaseURL string) (pgtestdb.Config, int32, error) {
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		return pgtestdb.Config{}, 0, fmt.Errorf(
+			"parse TEST_DATABASE_URL: %w",
+			err,
+		)
+	}
+	query := parsed.Query()
+	poolMaxConns := defaultTestPoolMaxConns
+	if value := query.Get("pool_max_conns"); value != "" {
+		parsedMaxConns, err := strconv.ParseInt(value, 10, 32)
+		if err != nil || parsedMaxConns < 1 {
+			return pgtestdb.Config{}, 0, fmt.Errorf(
+				"parse TEST_DATABASE_URL pool_max_conns %q: require a positive integer",
+				value,
+			)
+		}
+		poolMaxConns = int32(parsedMaxConns)
+	}
+	// pool_max_conns is a pgxpool client option, not a PostgreSQL runtime
+	// parameter. pgtestdb opens plain pgx connections while creating and
+	// cloning databases, so keep it out of pgtestdb's admin URL and restore it
+	// only on the per-test runtime URL returned from New.
+	query.Del("pool_max_conns")
+	parsed.RawQuery = query.Encode()
 	port := parsed.Port()
 	if port == "" {
 		port = "5432"
@@ -75,7 +119,7 @@ func parseConfig(databaseURL string) (pgtestdb.Config, error) {
 		// Tests may hand Database.URL to helpers that own their own
 		// connections; terminate stragglers instead of failing the drop.
 		ForceTerminateConnections: true,
-	}, nil
+	}, poolMaxConns, nil
 }
 
 // migrator adapts store.Migrate to pgtestdb's template-provisioning hook.
