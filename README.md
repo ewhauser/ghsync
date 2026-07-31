@@ -171,6 +171,37 @@ updates and cursor advancement in the transaction supplied to the event
 handler. See [`db/CONTRACT.md`](db/CONTRACT.md) for database grants, the
 versioned public schema, and the full consumer protocol.
 
+## Performance
+
+Load testing replays real recorded GitHub history — pull requests, reviews,
+review threads, pushes, and CI check runs crawled from
+[cloudflare/workerd](https://github.com/cloudflare/workerd) — through a
+fixture GitHub server at compressed time, then verifies exact convergence
+between upstream truth and the mirror (see [`docs/TESTING.md`](docs/TESTING.md)).
+Numbers below are from a laptop-class machine with a local PostgreSQL 16.
+
+- **Sustained replay:** a 30-day recording fanned out across ten repository
+  namespaces at roughly 20 webhook deliveries/second (about 170x that
+  repository's real-time event rate) processed ~140,000 deliveries with
+  zero parked deliveries, zero queue starvation, and zero open drift
+  findings.
+- **Write path is flat:** webhook ingest held a 0.11 ms mean insert across
+  133,000+ calls, and cache/check-history writes stayed under 0.5 ms — no
+  measurable degradation as tables grew to hundreds of megabytes.
+- **Aggregates are sublinear:** the two queries that scale with table size
+  by nature — the metrics-scrape delivery aggregate and the drift-detector
+  entity sampler — run on index-only plans (0.5 ms and 9 ms respectively at
+  ~140k-delivery scale, down from 15 ms and 137 ms before optimization).
+- **End-to-end latency:** event-to-cache p95/p99 stayed at 10s/10s under
+  clean load and 15s/30s with chaos injection (dropped, duplicated, and
+  reordered deliveries; HTTP 429/500 bursts; a mid-run engine `SIGKILL`) —
+  within the 20s/60s C-Q2 bounds, with every dropped delivery healed by the
+  reconciliation sweep.
+
+Every push re-verifies a compressed replay in CI with the full assertion
+set, including field-by-field convergence of pull requests, stacks, check
+runs, and review threads.
+
 ## Development
 
 Common development commands:
