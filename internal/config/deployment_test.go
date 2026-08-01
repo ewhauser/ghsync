@@ -214,6 +214,7 @@ func deploymentEnvironmentVariables(
 func environmentDefaults() map[string]any {
 	return map[string]any{
 		"DATABASE_URL":                        defaultNone,
+		"DATABASE_AUTH":                       string(defaultDatabaseAuth),
 		"HTTP_ADDR":                           defaultHTTPAddr,
 		"GITHUB_APP_ID":                       int64(0),
 		"GITHUB_INSTALLATION_ID":              int64(0),

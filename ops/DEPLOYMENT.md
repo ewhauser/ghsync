@@ -73,7 +73,8 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 
 | Variable | Default | Required / meaning |
 |---|---:|---|
-| `DATABASE_URL` | none | Required; the one stateful Postgres dependency. |
+| `DATABASE_URL` | none | Required; the one stateful Postgres dependency. In `rds-iam` mode, include one host and port, user, database, TLS, `search_path`, and other runtime parameters but configure no password source. |
+| `DATABASE_AUTH` | `password` | Database authentication mode: `password` or `rds-iam`. IAM mode resolves the region and credentials through the default AWS SDK chain and generates a token for each new physical connection. |
 | `HTTP_ADDR` | `:8080` | Health, metrics, and optional ingress address. |
 | `GITHUB_APP_ID` | `0` | Production fetch credential. |
 | `GITHUB_INSTALLATION_ID` | `0` | Required and positive for **every** serve process. |
@@ -219,6 +220,19 @@ signals, River retries jobs, and reconciliation cursors resume. It is not
 zero-downtime fetching and is never documented as such.
 
 ## Postgres tuning and capacity
+
+For Amazon RDS IAM database authentication, set `DATABASE_AUTH=rds-iam`, keep
+all password sources unset (including `DATABASE_URL`, `PGPASSWORD`, and
+password files), and configure the AWS SDK's region and credential sources
+(for example `AWS_REGION` plus an instance, task, or pod role). A missing
+region or unavailable startup credentials fails before the first database
+connection. Keep TLS verification settings such as `sslmode=verify-full` and
+all PostgreSQL runtime parameters in `DATABASE_URL`; ghsync changes only the
+per-connection password. IAM mode supports one database endpoint because RDS
+tokens are endpoint-specific. It applies to all ghsyncd database commands and
+to `stream-tail`; loadgen accepts the equivalent `--database-auth=rds-iam`
+setting for its assertion connection. `pkg/streamclient` accepts a pool and
+does not create connections.
 
 Wave A bounds the watermarker writer-fence wait with
 `STREAM_WATERMARK_FENCE_LOCK_TIMEOUT` (default `1s`). A fence timeout is a

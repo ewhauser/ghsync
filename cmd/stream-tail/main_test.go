@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ewhauser/ghsync/internal/config"
 	"github.com/ewhauser/ghsync/internal/outbox"
 	streammaint "github.com/ewhauser/ghsync/internal/stream"
 	"github.com/ewhauser/ghsync/internal/testdb"
@@ -36,6 +37,7 @@ func TestStreamTailSmoke(t *testing.T) {
 				"--poll-interval=10ms",
 			},
 			url,
+			config.DatabaseAuthPassword,
 		)
 	}()
 	waitCommandCursor(t, pool, consumer, streamName, -1)
@@ -88,6 +90,7 @@ func TestStreamTailResyncSmoke(t *testing.T) {
 				"--poll-interval=10ms",
 			},
 			database.URL,
+			config.DatabaseAuthPassword,
 		)
 	}()
 	waitCommandResync(t, pool, consumer, streamName, oldSeq, 1)

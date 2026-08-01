@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/ewhauser/ghsync/internal/config"
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/pkg/streamclient"
 )
@@ -32,13 +33,18 @@ func run(args []string) error {
 		syscall.SIGTERM,
 	)
 	defer stop()
-	return runContext(ctx, args, os.Getenv("DATABASE_URL"))
+	databaseAuth, err := config.ParseDatabaseAuth(os.Getenv("DATABASE_AUTH"))
+	if err != nil {
+		return err
+	}
+	return runContext(ctx, args, os.Getenv("DATABASE_URL"), databaseAuth)
 }
 
 func runContext(
 	ctx context.Context,
 	args []string,
 	databaseURL string,
+	databaseAuth config.DatabaseAuth,
 ) error {
 	fs := flag.NewFlagSet("stream-tail", flag.ContinueOnError)
 	consumer := fs.String(
@@ -68,7 +74,11 @@ func runContext(
 		return fmt.Errorf("DATABASE_URL is required")
 	}
 
-	pool, err := store.Connect(ctx, databaseURL)
+	var connectOptions []store.ConnectOption
+	if databaseAuth == config.DatabaseAuthRDSIAM {
+		connectOptions = append(connectOptions, store.WithRDSIAMAuthentication())
+	}
+	pool, err := store.Connect(ctx, databaseURL, connectOptions...)
 	if err != nil {
 		return err
 	}

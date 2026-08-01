@@ -19,8 +19,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	dto "github.com/prometheus/client_model/go"
 
+	runtimeconfig "github.com/ewhauser/ghsync/internal/config"
 	"github.com/ewhauser/ghsync/internal/ingress"
 	"github.com/ewhauser/ghsync/internal/replay"
+	"github.com/ewhauser/ghsync/internal/store"
 )
 
 const (
@@ -36,6 +38,7 @@ type config struct {
 	engineURL      string
 	fakeGitHubURL  string
 	databaseURL    string
+	databaseAuth   runtimeconfig.DatabaseAuth
 	installationID int64
 	recordingPath  string
 	speed          float64
@@ -129,6 +132,11 @@ func runMain(args []string) error {
 		os.Getenv("DATABASE_URL"),
 		"Postgres URL used for strict assertions",
 	)
+	databaseAuth := fs.String(
+		"database-auth",
+		os.Getenv("DATABASE_AUTH"),
+		"database authentication mode: password or rds-iam",
+	)
 	installationID := fs.Int64(
 		"installation-id",
 		0,
@@ -218,6 +226,10 @@ func runMain(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("loadgen does not accept positional arguments")
 	}
+	parsedDatabaseAuth, err := runtimeconfig.ParseDatabaseAuth(*databaseAuth)
+	if err != nil {
+		return err
+	}
 	if *installationID == 0 {
 		raw := strings.TrimSpace(os.Getenv("GITHUB_INSTALLATION_ID"))
 		if raw != "" {
@@ -232,6 +244,7 @@ func runMain(args []string) error {
 		engineURL:      strings.TrimRight(*engineURL, "/"),
 		fakeGitHubURL:  strings.TrimRight(*fakeGitHubURL, "/"),
 		databaseURL:    strings.TrimSpace(*databaseURL),
+		databaseAuth:   parsedDatabaseAuth,
 		installationID: *installationID,
 		recordingPath:  *recordingPath,
 		speed:          *speed,
@@ -287,6 +300,9 @@ func runMain(args []string) error {
 }
 
 func validateConfig(cfg config) error {
+	if _, err := runtimeconfig.ParseDatabaseAuth(string(cfg.databaseAuth)); err != nil {
+		return err
+	}
 	if cfg.engineURL == "" || cfg.fakeGitHubURL == "" ||
 		cfg.databaseURL == "" || cfg.recordingPath == "" {
 		return fmt.Errorf(
@@ -372,14 +388,15 @@ func run(ctx context.Context, cfg config) (runResult, error) {
 	); err != nil {
 		return runResult{}, fmt.Errorf("fake GitHub health: %w", err)
 	}
-	pool, err := pgxpool.New(ctx, cfg.databaseURL)
+	var connectOptions []store.ConnectOption
+	if cfg.databaseAuth == runtimeconfig.DatabaseAuthRDSIAM {
+		connectOptions = append(connectOptions, store.WithRDSIAMAuthentication())
+	}
+	pool, err := store.Connect(ctx, cfg.databaseURL, connectOptions...)
 	if err != nil {
 		return runResult{}, fmt.Errorf("connect assertion database: %w", err)
 	}
 	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return runResult{}, fmt.Errorf("ping assertion database: %w", err)
-	}
 	if err := waitForCacheSeed(ctx, cfg, pool); err != nil {
 		return runResult{}, err
 	}

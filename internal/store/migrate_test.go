@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
@@ -213,6 +217,164 @@ func TestVerifyChecksum(t *testing.T) {
 	}
 	if err := verifyChecksum("0001.sql", nil, checksum); err == nil {
 		t.Fatal("missing checksum accepted")
+	}
+}
+
+func TestMigrationLockSerializesPoolsAndReleasesOnEveryExit(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conf := testDatabaseConfig(t)
+	firstPool, err := Connect(ctx, conf.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(firstPool.Close)
+	secondPool, err := Connect(ctx, conf.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(secondPool.Close)
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- withMigrationLock(ctx, firstPool, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- withMigrationLock(ctx, secondPool, func() error {
+			close(secondEntered)
+			return nil
+		})
+	}()
+	serialized := true
+	select {
+	case <-secondEntered:
+		serialized = false
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first migration lock: %v", err)
+	}
+	if !serialized {
+		<-secondDone
+		t.Fatal("second migration pool entered while the first held the session lock")
+	}
+	select {
+	case <-secondEntered:
+	case <-ctx.Done():
+		t.Fatalf("second migration pool did not acquire released lock: %v", ctx.Err())
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second migration lock: %v", err)
+	}
+
+	sentinel := errors.New("migration callback failed")
+	if err := withMigrationLock(ctx, firstPool, func() error {
+		return sentinel
+	}); !errors.Is(err, sentinel) {
+		t.Fatalf("migration callback error = %v, want sentinel", err)
+	}
+	assertMigrationLockAvailable(t, ctx, secondPool)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = withMigrationLock(ctx, firstPool, func() error {
+			panic("migration callback panicked")
+		})
+	}()
+	if recovered != "migration callback panicked" {
+		t.Fatalf("migration panic = %v", recovered)
+	}
+	assertMigrationLockAvailable(t, ctx, secondPool)
+}
+
+func TestMigrationLockWaitFailureClosesHijackedConnection(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conf := testDatabaseConfig(t)
+	firstPool, err := Connect(ctx, conf.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(firstPool.Close)
+	lockConn, err := acquireMigrationLock(ctx, firstPool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Close(context.WithoutCancel(ctx)) //nolint:errcheck // test cleanup releases the session lock
+
+	applicationName := fmt.Sprintf("migration-lock-timeout-%d", time.Now().UnixNano())
+	parsed, err := url.Parse(conf.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("application_name", applicationName)
+	query.Set("pool_max_conns", "1")
+	parsed.RawQuery = query.Encode()
+	waitingPool, err := Connect(ctx, parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(waitingPool.Close)
+
+	waitCtx, stopWaiting := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer stopWaiting()
+	if leakedConn, err := acquireMigrationLock(waitCtx, waitingPool); err == nil {
+		_ = leakedConn.Close(context.WithoutCancel(ctx))
+		t.Fatal("contended migration lock ignored its context deadline")
+	}
+
+	var remaining int
+	if err := firstPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND application_name = $1
+	`, applicationName).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf(
+			"failed migration lock leaked %d hijacked database connections",
+			remaining,
+		)
+	}
+}
+
+func assertMigrationLockAvailable(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+) {
+	t.Helper()
+	var acquired bool
+	if err := pool.QueryRow(ctx,
+		`SELECT pg_try_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`).
+		Scan(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("migration session lock remained held after callback exit")
+	}
+	if _, err := pool.Exec(ctx,
+		`SELECT pg_advisory_unlock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
+		t.Fatal(err)
 	}
 }
 
