@@ -85,8 +85,10 @@ PostgreSQL volume, run `make clean`.
 Prebuilt static binaries for `ghsyncd` and `stream-tail` (linux and darwin,
 amd64 and arm64) are published on
 [GitHub Releases](https://github.com/ewhauser/ghsync/releases) with a
-checksums file; releases are cut by pushing a `v*` tag. To build from source
-instead:
+checksums file and GitHub artifact attestations. Verify a downloaded archive
+with `gh attestation verify <archive> --repo ewhauser/ghsync`, then verify its
+checksum against `checksums.txt`. Releases are cut by pushing a `v*` tag. To
+build from source instead:
 
 ```bash
 go build -o ./bin/ghsyncd ./cmd/ghsyncd
