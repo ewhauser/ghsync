@@ -4,28 +4,50 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   goreleaser:
+    name: release
     runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      attestations: write # Publish provenance for the release archives.
+      contents: write # Create the GitHub release and upload its assets.
+      id-token: write # Mint the short-lived OIDC identity for attestation signing.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+          persist-credentials: false
+      - name: Require the release commit to be on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          cache: false
       # Tag pushes do not trigger the main ci workflow, so gate the release
       # on the checks that need no database service. DB-gated tests skip
       # without TEST_DATABASE_URL by design.
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
-      - uses: goreleaser/goreleaser-action@v6
+      - name: Build and publish release
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          version: v2.12.5
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest release archives
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: dist/checksums.txt
