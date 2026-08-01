@@ -115,13 +115,24 @@ The principal runtime settings are:
 
 | Variable | Purpose |
 | --- | --- |
-| `DATABASE_URL` | PostgreSQL connection string |
+| `DATABASE_URL` | PostgreSQL connection string; omit all password credentials in `rds-iam` mode |
+| `DATABASE_AUTH` | Database authentication mode: `password` (default) or `rds-iam` |
 | `GITHUB_APP_ID` | GitHub App ID |
 | `GITHUB_INSTALLATION_ID` | App installation to mirror |
 | `GITHUB_ORG_ID` | Stable GitHub organization ID stored in mirror rows |
 | `GITHUB_PRIVATE_KEY_PATH` | Absolute path to the App's PEM private key |
 | `GITHUB_WEBHOOK_SECRET` | Secret used to verify webhook signatures |
 | `HTTP_ADDR` | Health, metrics, and webhook listen address; defaults to `:8080` |
+
+With `DATABASE_AUTH=rds-iam`, ghsyncd resolves the AWS region (for example,
+from `AWS_REGION` or the selected AWS profile) and credentials through the
+default AWS SDK chain at startup. A missing region, unavailable credentials,
+or password supplied by `DATABASE_URL`, `PGPASSWORD`, or a password file is a
+startup error. A fresh token is generated for every new physical connection;
+TLS, `search_path`, and other PostgreSQL parameters remain in `DATABASE_URL`.
+The same mode is supported by `stream-tail` and by loadgen's assertion
+connection (`--database-auth` overrides `DATABASE_AUTH`). `pkg/streamclient`
+accepts a caller-owned pool and does not dial PostgreSQL itself.
 
 Apply migrations before starting a new version:
 

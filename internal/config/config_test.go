@@ -1,9 +1,107 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestFromEnvDatabaseAuthentication(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DatabaseAuth != DatabaseAuthPassword {
+		t.Fatalf("database auth = %q, want %q", cfg.DatabaseAuth, DatabaseAuthPassword)
+	}
+
+	t.Setenv("DATABASE_AUTH", string(DatabaseAuthRDSIAM))
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DatabaseAuth != DatabaseAuthRDSIAM {
+		t.Fatalf("database auth = %q, want %q", cfg.DatabaseAuth, DatabaseAuthRDSIAM)
+	}
+
+	t.Setenv("DATABASE_AUTH", "token")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("unsupported DATABASE_AUTH accepted")
+	}
+}
+
+func TestParseDatabaseAuth(t *testing.T) {
+	t.Parallel()
+	for value, want := range map[string]DatabaseAuth{
+		"":         DatabaseAuthPassword,
+		"password": DatabaseAuthPassword,
+		"rds-iam":  DatabaseAuthRDSIAM,
+	} {
+		got, err := ParseDatabaseAuth(value)
+		if err != nil {
+			t.Fatalf("ParseDatabaseAuth(%q): %v", value, err)
+		}
+		if got != want {
+			t.Fatalf("ParseDatabaseAuth(%q) = %q, want %q", value, got, want)
+		}
+	}
+	if _, err := ParseDatabaseAuth("token"); err == nil {
+		t.Fatal("unsupported database authentication mode accepted")
+	}
+}
+
+func TestRequireDatabaseRDSIAMRejectsPassword(t *testing.T) {
+	t.Parallel()
+
+	passwordURL := Config{
+		DatabaseURL:  "postgres://app:secret@db.example.com:5432/ghsync",
+		DatabaseAuth: DatabaseAuthRDSIAM,
+	}
+	err := passwordURL.RequireDatabase()
+	if err == nil || !strings.Contains(err.Error(), "password credentials must not be configured") {
+		t.Fatalf("password-bearing RDS IAM URL error = %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("validation error disclosed DATABASE_URL password: %v", err)
+	}
+	queryPasswordURL := passwordURL
+	queryPasswordURL.DatabaseURL = "postgres://app@db.example.com:5432/ghsync?password=secret"
+	if err := queryPasswordURL.RequireDatabase(); err == nil {
+		t.Fatal("RDS IAM URL with a password query parameter accepted")
+	}
+	keywordPassword := passwordURL
+	keywordPassword.DatabaseURL = "host=db.example.com user=app dbname=ghsync password=secret"
+	if err := keywordPassword.RequireDatabase(); err == nil {
+		t.Fatal("RDS IAM keyword connection string with a password accepted")
+	} else if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("keyword validation error disclosed password: %v", err)
+	}
+	malformed := passwordURL
+	malformed.DatabaseURL = "postgres://app:secret%@db.example.com/ghsync"
+	if err := malformed.RequireDatabase(); err == nil {
+		t.Fatal("malformed RDS IAM URL accepted")
+	} else if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("parse error disclosed malformed DATABASE_URL password: %v", err)
+	}
+
+	passwordlessURL := Config{
+		DatabaseURL: "postgres://app@db.example.com:5432/ghsync" +
+			"?sslmode=verify-full&search_path=mirror",
+		DatabaseAuth: DatabaseAuthRDSIAM,
+	}
+	if err := passwordlessURL.RequireDatabase(); err != nil {
+		t.Fatalf("passwordless RDS IAM URL rejected: %v", err)
+	}
+
+	passwordMode := Config{
+		DatabaseURL:  passwordURL.DatabaseURL,
+		DatabaseAuth: DatabaseAuthPassword,
+	}
+	if err := passwordMode.RequireDatabase(); err != nil {
+		t.Fatalf("password mode rejected existing DATABASE_URL: %v", err)
+	}
+}
 
 func TestFromEnvDispatchDefaultsAndOverrides(t *testing.T) {
 	clearConfigEnv(t)
@@ -398,6 +496,7 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"DATABASE_URL",
+		"DATABASE_AUTH",
 		"HTTP_ADDR",
 		"GITHUB_APP_ID",
 		"GITHUB_INSTALLATION_ID",

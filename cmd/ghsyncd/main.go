@@ -65,6 +65,16 @@ const (
 	roleMetrics            = "metrics"
 )
 
+func databaseConnectOptions(
+	cfg *config.Config,
+	options ...store.ConnectOption,
+) []store.ConnectOption {
+	if cfg.DatabaseAuth == config.DatabaseAuthRDSIAM {
+		options = append(options, store.WithRDSIAMAuthentication())
+	}
+	return options
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "ghsyncd:", err)
@@ -143,7 +153,10 @@ func backfill(args []string) error {
 	pool, err := store.Connect(
 		ctx,
 		cfg.DatabaseURL,
-		store.WithTracerProvider(tracing.Provider()),
+		databaseConnectOptions(
+			&cfg,
+			store.WithTracerProvider(tracing.Provider()),
+		)...,
 	)
 	if err != nil {
 		return err
@@ -271,7 +284,10 @@ func requeue(args []string) error {
 	pool, err := store.Connect(
 		ctx,
 		cfg.DatabaseURL,
-		store.WithTracerProvider(tracing.Provider()),
+		databaseConnectOptions(
+			&cfg,
+			store.WithTracerProvider(tracing.Provider()),
+		)...,
 	)
 	if err != nil {
 		return err
@@ -323,7 +339,10 @@ func migrate() error {
 	pool, err := store.Connect(
 		ctx,
 		cfg.DatabaseURL,
-		store.WithTracerProvider(tracing.Provider()),
+		databaseConnectOptions(
+			&cfg,
+			store.WithTracerProvider(tracing.Provider()),
+		)...,
 	)
 	if err != nil {
 		return err
@@ -406,7 +425,10 @@ func serve(args []string) error {
 	pool, err := store.Connect(
 		signalCtx,
 		cfg.DatabaseURL,
-		store.WithTracerProvider(tracing.Provider()),
+		databaseConnectOptions(
+			&cfg,
+			store.WithTracerProvider(tracing.Provider()),
+		)...,
 	)
 	if err != nil {
 		return err

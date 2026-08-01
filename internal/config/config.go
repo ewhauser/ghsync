@@ -7,10 +7,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/ewhauser/ghsync/internal/dispatch"
 )
 
 const (
+	defaultDatabaseAuth        = DatabaseAuthPassword
 	defaultHTTPAddr            = ":8080"
 	defaultGitHubBaseURL       = "https://api.github.com"
 	defaultWebhookMaxBodyBytes = int64(2 << 20)
@@ -61,10 +64,24 @@ const (
 	defaultDeriverDirtyCap       = 500
 )
 
+// DatabaseAuth selects how new Postgres connections authenticate.
+type DatabaseAuth string
+
+const (
+	// DatabaseAuthPassword uses the password and existing behavior from
+	// DATABASE_URL.
+	DatabaseAuthPassword DatabaseAuth = "password"
+	// DatabaseAuthRDSIAM generates a fresh AWS RDS IAM token per connection.
+	DatabaseAuthRDSIAM DatabaseAuth = "rds-iam"
+)
+
 // Config is ghsyncd's validated environment-derived runtime surface.
 type Config struct {
 	// DatabaseURL is the Postgres connection string (DATABASE_URL).
 	DatabaseURL string
+	// DatabaseAuth selects password or AWS RDS IAM authentication
+	// (DATABASE_AUTH).
+	DatabaseAuth DatabaseAuth
 	// HTTPAddr is the listen address for the ingress/health server (HTTP_ADDR).
 	HTTPAddr string
 	// GitHubAppID identifies the GitHub App installation (GITHUB_APP_ID).
@@ -187,6 +204,7 @@ type Config struct {
 func FromEnv() (Config, error) {
 	cfg := Config{
 		DatabaseURL:                os.Getenv("DATABASE_URL"),
+		DatabaseAuth:               DatabaseAuth(envOr("DATABASE_AUTH", string(defaultDatabaseAuth))),
 		HTTPAddr:                   envOr("HTTP_ADDR", defaultHTTPAddr),
 		GitHubPrivateKeyPath:       os.Getenv("GITHUB_PRIVATE_KEY_PATH"),
 		GitHubWebhookSecret:        os.Getenv("GITHUB_WEBHOOK_SECRET"),
@@ -435,7 +453,35 @@ func FromEnv() (Config, error) {
 			"SWEEP_PAGE_SIZE, GAP_PAGE_SIZE, and DRIFT_PAGE_SIZE must not exceed 100",
 		)
 	}
+	databaseAuth, err := ParseDatabaseAuth(string(cfg.DatabaseAuth))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DatabaseAuth = databaseAuth
 	return cfg, nil
+}
+
+// ParseDatabaseAuth validates a DATABASE_AUTH value for commands that do not
+// otherwise load ghsyncd's full runtime configuration.
+func ParseDatabaseAuth(value string) (DatabaseAuth, error) {
+	if value == "" {
+		return defaultDatabaseAuth, nil
+	}
+	auth := DatabaseAuth(value)
+	switch auth {
+	case DatabaseAuthPassword, DatabaseAuthRDSIAM:
+		return auth, nil
+	default:
+		return "", databaseAuthError()
+	}
+}
+
+func databaseAuthError() error {
+	return fmt.Errorf(
+		"DATABASE_AUTH must be %q or %q",
+		DatabaseAuthPassword,
+		DatabaseAuthRDSIAM,
+	)
 }
 
 // RequireDatabase returns an error when the configuration lacks a database
@@ -443,6 +489,20 @@ func FromEnv() (Config, error) {
 func (c Config) RequireDatabase() error { //nolint:gocritic // value receiver supports validating temporary configurations
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
+	}
+	if c.DatabaseAuth == DatabaseAuthRDSIAM {
+		parsed, err := pgxpool.ParseConfig(c.DatabaseURL)
+		if err != nil {
+			return fmt.Errorf(
+				"parse DATABASE_URL for RDS IAM database authentication: invalid PostgreSQL connection string",
+			)
+		}
+		if parsed.ConnConfig.Password != "" {
+			return fmt.Errorf(
+				"database password credentials must not be configured when DATABASE_AUTH=%s",
+				DatabaseAuthRDSIAM,
+			)
+		}
 	}
 	return nil
 }

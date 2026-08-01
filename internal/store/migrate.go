@@ -20,22 +20,28 @@ import (
 // lexical order, tracked in schema_migrations. Each of our migrations runs in
 // its own transaction and is applied at most once.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	return withMigrationLock(ctx, pool, func() error {
+		return migrateLocked(ctx, pool)
+	})
+}
+
+func withMigrationLock(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	migrate func() error,
+) error {
 	// Serialize the whole migration pipeline across processes. The integration
 	// tests exercise Migrate from separate packages against the same database,
 	// and production replicas may also start together.
-	lockConn, err := pgx.ConnectConfig(ctx, pool.Config().ConnConfig.Copy())
+	lockConn, err := acquireMigrationLock(ctx, pool)
 	if err != nil {
-		return fmt.Errorf("migration lock connection: %w", err)
+		return err
 	}
 	defer lockConn.Close(context.WithoutCancel(ctx)) //nolint:errcheck // close releases the session lock
-	// Raw SQL exception: the migration runner must bootstrap its advisory lock
-	// and schema_migrations ledger, then apply DDL before generated queries can
-	// safely assume that the application schema exists.
-	if _, err := lockConn.Exec(ctx,
-		`SELECT pg_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
-	}
+	return migrate()
+}
 
+func migrateLocked(ctx context.Context, pool *pgxpool.Pool) error {
 	migrator, err := rivermigrate.New(riverpgxv5.New(pool), nil)
 	if err != nil {
 		return fmt.Errorf("river migrator: %w", err)
@@ -77,6 +83,28 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("enforce schema_migrations checksum: %w", err)
 	}
 	return nil
+}
+
+func acquireMigrationLock(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+) (*pgx.Conn, error) {
+	acquired, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("migration lock connection: %w", err)
+	}
+	// Hijack removes this physical connection from the pool so its
+	// session-scoped advisory lock remains held until Close below.
+	lockConn := acquired.Hijack()
+	// Raw SQL exception: the migration runner must bootstrap its advisory lock
+	// and schema_migrations ledger, then apply DDL before generated queries can
+	// safely assume that the application schema exists.
+	if _, err := lockConn.Exec(ctx,
+		`SELECT pg_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
+		_ = lockConn.Close(context.WithoutCancel(ctx))
+		return nil, fmt.Errorf("acquire migration lock: %w", err)
+	}
+	return lockConn, nil
 }
 
 func migrationNames() ([]string, error) {
