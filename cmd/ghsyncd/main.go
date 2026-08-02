@@ -734,12 +734,8 @@ func serve(args []string) error {
 				),
 				queue.WithRefreshObserver(runtimeMetrics),
 			)
-		} else {
-			clientOptions = append(
-				clientOptions,
-				queue.WithoutRefreshWorkers(),
-			)
 		}
+		clientOptions = append(clientOptions, refreshWorkerOptions(roles)...)
 		if worksJobs {
 			// River elects one cluster leader. Every leader-eligible client
 			// therefore receives the same schedule table, independent of the
@@ -952,6 +948,20 @@ func validateRoles(roles string) error {
 
 type riverRolePlan struct {
 	queues []string
+}
+
+// refreshWorkerOptions decides refresh-worker registration for the enabled
+// roles. Fetch installs the real handler-backed workers elsewhere. Dispatch
+// keeps River's default (handler-less, never-started) registrations because
+// it produces refresh jobs and River validates insert args against the
+// client's Workers bundle — opting out crashed dispatch-only processes on
+// their first classified refresh (issue #7). Every other fetchless role is
+// worker-only for its own queues and opts out.
+func refreshWorkerOptions(roles map[string]bool) []queue.ClientOption {
+	if roles[roleFetch] || roles[roleDispatch] {
+		return nil
+	}
+	return []queue.ClientOption{queue.WithoutRefreshWorkers()}
 }
 
 func riverPlanForRoles(roles map[string]bool) riverRolePlan {

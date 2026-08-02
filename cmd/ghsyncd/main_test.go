@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,9 +12,15 @@ import (
 	"time"
 
 	"github.com/ewhauser/ghsync/internal/config"
+	"github.com/ewhauser/ghsync/internal/dispatch"
 	"github.com/ewhauser/ghsync/internal/ingress"
 	ghsyncmetrics "github.com/ewhauser/ghsync/internal/metrics"
 	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
+	"github.com/ewhauser/ghsync/internal/testdb"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
 )
 
 func TestServiceMuxKeepsWebhookRoleSeparated(t *testing.T) {
@@ -261,5 +268,138 @@ func TestParseRequeueOptions(t *testing.T) {
 		if _, err := parseRequeueOptions(args); err == nil {
 			t.Fatalf("%v accepted", args)
 		}
+	}
+}
+
+// seedPushDelivery stores one webhook delivery that DefaultClassifier maps
+// to a refresh_branch intent.
+func seedPushDelivery(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	guid string,
+) {
+	t.Helper()
+	payload := []byte(`{
+		"ref": "refs/heads/main",
+		"repository": {"full_name": "acme/monolith"}
+	}`)
+	headers := []byte(`{
+		"x-github-delivery": "` + guid + `",
+		"x-github-event": "push"
+	}`)
+	if _, err := dbgen.New(pool).InsertWebhookDelivery(
+		context.Background(),
+		dbgen.InsertWebhookDeliveryParams{
+			DeliveryGuid: guid,
+			Event:        "push",
+			RawBody:      payload,
+			Headers:      headers,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func issue7Dispatcher(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	riverClient *river.Client[pgx.Tx],
+) *dispatch.Dispatcher {
+	t.Helper()
+	dispatcher, err := dispatch.New(pool, riverClient, dispatch.Config{
+		BatchSize:    10,
+		MaxAttempts:  3,
+		Debounce:     time.Millisecond,
+		PollInterval: time.Millisecond,
+		// Stay ahead of the row's DB-clock received_at so the debounce
+		// window has always elapsed.
+		Now:        func() time.Time { return time.Now().Add(time.Minute) },
+		Classifier: dispatch.DefaultClassifier(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dispatcher
+}
+
+// Regression test for issue #7: a dispatch-only process is a producer of
+// refresh jobs, so its never-started River client must still register the
+// refresh job kinds for insert validation.
+func TestDispatchOnlyClientInsertsClassifiedRefreshJobs(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	dispatchRoles := map[string]bool{roleDispatch: true}
+
+	clientOptions := append(
+		[]queue.ClientOption{
+			queue.WithQueues(riverPlanForRoles(dispatchRoles).queues...),
+		},
+		refreshWorkerOptions(dispatchRoles)...,
+	)
+	riverClient, err := queue.NewClient(database.Pool, clientOptions...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seedPushDelivery(t, database.Pool, "issue-7-dispatch-only")
+	count, err := issue7Dispatcher(t, database.Pool, riverClient).
+		DispatchBatch(context.Background())
+	if err != nil {
+		t.Fatalf("dispatch-only refresh insert: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("claimed %d deliveries, want 1", count)
+	}
+
+	// The client was never started: the inserted job must exist and remain
+	// unworked (available or debounce-scheduled), proving dispatch produced
+	// it without running refresh workers locally.
+	var pending int
+	if err := database.Pool.QueryRow(
+		context.Background(),
+		`SELECT count(*) FROM river_job
+		 WHERE kind = 'refresh_branch'
+		   AND state IN ('available', 'scheduled')`,
+	).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 {
+		t.Fatalf("unworked refresh_branch jobs = %d, want 1", pending)
+	}
+}
+
+// Pins the mechanism issue #7 exposed: a client that opts out of refresh
+// registrations (correct for worker-only roles such as the pruner) cannot
+// insert refresh jobs, which is exactly why dispatch must not opt out.
+func TestWithoutRefreshWorkersRejectsRefreshInserts(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	prunerRoles := map[string]bool{rolePruner: true}
+
+	workerOnlyOptions := refreshWorkerOptions(prunerRoles)
+	if len(workerOnlyOptions) == 0 {
+		t.Fatal("fetchless worker-only roles must opt out of refresh registrations")
+	}
+	riverClient, err := queue.NewClient(
+		database.Pool,
+		append(
+			[]queue.ClientOption{
+				queue.WithQueues(riverPlanForRoles(prunerRoles).queues...),
+			},
+			workerOnlyOptions...,
+		)...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seedPushDelivery(t, database.Pool, "issue-7-worker-only")
+	_, err = issue7Dispatcher(t, database.Pool, riverClient).
+		DispatchBatch(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf(
+			"worker-only refresh insert error = %v, want unregistered-kind rejection",
+			err,
+		)
 	}
 }
