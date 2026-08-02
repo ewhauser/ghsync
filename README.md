@@ -37,9 +37,9 @@ Enterprise Server (self-hosted, custom API hosts) is not supported.
 PostgreSQL is ghsync's only stateful dependency.
 
 The version 1 delivery interface is PostgreSQL. `ghsync` does not currently
-ship a user interface, gRPC API, or SSE API. Its stacked pull request support
-also depends on GitHub stack surfaces that may not be available to every
-installation.
+ship a production user interface, gRPC API, or SSE service. Its stacked pull
+request support also depends on GitHub stack surfaces that may not be
+available to every installation.
 
 See [`docs/SYNC_ENGINE.md`](docs/SYNC_ENGINE.md) for the architecture and
 invariants, and [`db/CONTRACT.md`](db/CONTRACT.md) for the public database and
@@ -192,6 +192,15 @@ Run exactly one tailer for each `(consumer, stream)` pair. Apply projection
 updates and cursor advancement in the transaction supplied to the event
 handler. See [`db/CONTRACT.md`](db/CONTRACT.md) for database grants, the
 versioned public schema, and the full consumer protocol.
+
+[`cmd/example-api`](cmd/example-api) is a reference example of serving REST
+and SSE directly from the mirror without copying mirror data into another
+store. It demonstrates the consumer pattern, not a production service.
+Start it with `DATABASE_URL=... go run ./cmd/example-api`; the URL should use
+the consumer role described in [`db/CONTRACT.md`](db/CONTRACT.md).
+`go run ./cmd/example-api --help` documents RDS IAM authentication and the
+`API_ADDR` and `API_CONSUMER_NAME` settings, plus bounded ring, subscriber
+queue, and database-replay limits.
 
 ## Performance
 
