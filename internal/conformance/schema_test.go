@@ -63,6 +63,54 @@ func TestCorpusSchemasCompileOffline(t *testing.T) {
 	}
 }
 
+func TestWebhookValidatorChecksPrivateStackPreview(t *testing.T) {
+	t.Parallel()
+	fixture := fakegithub.DefaultFixture()
+	fixture.PullRequests[1].Stack.Base.SHA = ""
+	fake := fakegithub.New(fixture, fakeSchemaWebhookSecret)
+	payload, err := fake.PullRequestWebhookPayload("synchronize", 4812)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := conformance.NewWebhookSchemaValidator()
+	validate := func() error {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return validator.Validate("pull_request", body)
+	}
+	if err := validate(); err != nil {
+		t.Fatalf("valid null-SHA stack preview rejected: %v", err)
+	}
+	pull := payload["pull_request"].(map[string]any)
+	stack := pull["stack"].(map[string]any)
+	base := stack["base"].(map[string]any)
+	base["sha"] = ""
+	if err := validate(); err == nil ||
+		!strings.Contains(err.Error(), "stack.base.sha") {
+		t.Fatalf("invalid empty stack SHA error = %v", err)
+	}
+	base["sha"] = nil
+	delete(base, "sha")
+	if err := validate(); err == nil ||
+		!strings.Contains(err.Error(), "stack.base.sha is required") {
+		t.Fatalf("missing stack SHA error = %v", err)
+	}
+	base["sha"] = nil
+	stack["unexpected"] = true
+	if err := validate(); err == nil ||
+		!strings.Contains(err.Error(), "stack.unexpected is not supported") {
+		t.Fatalf("unexpected stack field error = %v", err)
+	}
+	delete(stack, "unexpected")
+	delete(payload, "repository")
+	if err := validate(); err == nil ||
+		strings.Contains(err.Error(), "stack preview") {
+		t.Fatalf("public payload violation was masked by stack carve-out: %v", err)
+	}
+}
+
 func TestFakeGitHubWebhookPayloadsValidateAgainstSchemas(t *testing.T) {
 	t.Parallel()
 	target, emitted := newWebhookCapture()

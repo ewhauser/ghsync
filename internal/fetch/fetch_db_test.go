@@ -2134,6 +2134,220 @@ func TestReviewRequestSetDoesNotOscillateBetweenGraphQLAndREST(t *testing.T) {
 	}
 }
 
+func TestResolveStackMembershipCompletesWithNullHistoricalBaseSHA(
+	t *testing.T,
+) {
+	t.Parallel()
+	const repo = "acme/historical-stack"
+	harness := newPipelineHarness(t, repo)
+	defer harness.close()
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	historical := &fixture.PullRequests[0]
+	if historical.Stack == nil {
+		t.Fatal("historical fixture PR has no stack summary")
+	}
+	historical.Stack.Base.Ref = "deleted/historical-base"
+	historical.Stack.Base.SHA = ""
+	fixture.Stacks[0].Base.Ref = "deleted/historical-base"
+	fixture.Stacks[0].Base.SHA = ""
+	if !fixture.Stacks[0].Open {
+		t.Fatal("regression fixture must exercise an open stack")
+	}
+	harness.fake.SetFixture(fixture)
+
+	payload, err := harness.fake.PullRequestWebhookPayload(
+		"closed",
+		historical.Number,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wirePull, ok := payload["pull_request"].(map[string]any)
+	if !ok {
+		t.Fatalf("webhook pull_request = %#v", payload["pull_request"])
+	}
+	wireStack, ok := wirePull["stack"].(map[string]any)
+	if !ok {
+		t.Fatalf("webhook stack = %#v", wirePull["stack"])
+	}
+	wireBase, ok := wireStack["base"].(map[string]any)
+	if !ok || wireBase["ref"] != "deleted/historical-base" ||
+		wireBase["sha"] != nil {
+		t.Fatalf("webhook historical stack base = %#v", wireStack["base"])
+	}
+
+	harness.emit("historical-null-stack-base", pipelineEvent{
+		event:   "pull_request",
+		payload: payload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+
+	ctx := t.Context()
+	var stackNumber, stackPosition int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT stack_number, stack_position
+		FROM pull_requests
+		JOIN repos ON repos.id = pull_requests.repo_id
+		WHERE repos.full_name = $1
+		  AND pull_requests.number = $2
+	`, repo, historical.Number).Scan(&stackNumber, &stackPosition); err != nil {
+		t.Fatal(err)
+	}
+	if stackNumber != historical.Stack.Number ||
+		stackPosition != historical.Stack.Position {
+		t.Fatalf(
+			"persisted membership = stack %d position %d, want %d/%d",
+			stackNumber,
+			stackPosition,
+			historical.Stack.Number,
+			historical.Stack.Position,
+		)
+	}
+	var cachedStackBaseSHA string
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT stacks.base_sha
+		FROM stacks
+		JOIN repos ON repos.id = stacks.repo_id
+		WHERE repos.full_name = $1
+		  AND stacks.number = $2
+	`, repo, historical.Stack.Number).Scan(&cachedStackBaseSHA); err != nil {
+		t.Fatal(err)
+	}
+	if cachedStackBaseSHA != "" {
+		t.Fatalf("cached historical stack base SHA = %q, want unknown", cachedStackBaseSHA)
+	}
+
+	var jobs, completed, maxAttempts int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE state = 'completed'),
+		       COALESCE(max(attempt), 0)
+		FROM river_job
+		WHERE kind = 'resolve_stack_membership'
+		  AND args->>'key' = $1
+	`, fmt.Sprintf("pr:%s:%d", repo, historical.Number)).Scan(
+		&jobs,
+		&completed,
+		&maxAttempts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if jobs == 0 || completed != jobs || maxAttempts != 1 {
+		t.Fatalf(
+			"resolve_stack_membership jobs/completed/max-attempt = %d/%d/%d",
+			jobs,
+			completed,
+			maxAttempts,
+		)
+	}
+	var stackJobs, completedStackJobs, maxStackAttempts int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE state = 'completed'),
+		       COALESCE(max(attempt), 0)
+		FROM river_job
+		WHERE kind = 'refresh_stack'
+		  AND args->>'key' = $1
+	`, fmt.Sprintf("stack:%s:%d", repo, historical.Stack.Number)).Scan(
+		&stackJobs,
+		&completedStackJobs,
+		&maxStackAttempts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if stackJobs < 1 || stackJobs > 3 || completedStackJobs != stackJobs ||
+		maxStackAttempts != 1 {
+		t.Fatalf(
+			"open unknown-SHA stack refreshes/completed/max-attempt = %d/%d/%d, want 1..3/all/1",
+			stackJobs,
+			completedStackJobs,
+			maxStackAttempts,
+		)
+	}
+	if got := harness.fake.RequestCount(
+		http.MethodGet,
+		fmt.Sprintf("/repos/%s/pulls/%d", repo, historical.Number),
+	); got < 1 {
+		t.Fatalf("historical PR fetches = %d, want at least one", got)
+	}
+}
+
+func TestRefreshPRWorkerPersistsNullGraphQLBaseRefOID(t *testing.T) {
+	t.Parallel()
+	const repo = "acme/graphql-null-base"
+	harness := newPipelineHarness(t, repo)
+	defer harness.close()
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	pull := &fixture.PullRequests[1]
+	harness.fake.SetFixture(fixture)
+
+	payload, err := harness.fake.PullRequestWebhookPayload(
+		"synchronize",
+		pull.Number,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.emit("graphql-null-base-seed", pipelineEvent{
+		event:   "pull_request",
+		payload: payload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+
+	pull.Base.SHA = ""
+	pull.UpdatedAt = pull.UpdatedAt.Add(time.Minute)
+	harness.fake.SetFixture(fixture)
+	graphQLBefore := harness.fake.RequestCount(http.MethodPost, "/graphql")
+	key := fmt.Sprintf("pr:%s:%d", repo, pull.Number)
+	if _, err := harness.river.Insert(
+		t.Context(),
+		queue.NewRefreshPRArgs(key),
+		queue.NewRefreshInsertOptsForQueue(queue.QueueEvent, time.Time{}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	harness.waitIdle()
+
+	if got := harness.fake.RequestCount(http.MethodPost, "/graphql") -
+		graphQLBefore; got != 1 {
+		t.Fatalf("GraphQL null-base refresh calls = %d, want 1", got)
+	}
+	var cachedBaseSHA string
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT pull_requests.base_sha
+		FROM pull_requests
+		JOIN repos ON repos.id = pull_requests.repo_id
+		WHERE repos.full_name = $1
+		  AND pull_requests.number = $2
+	`, repo, pull.Number).Scan(&cachedBaseSHA); err != nil {
+		t.Fatal(err)
+	}
+	if cachedBaseSHA != "" {
+		t.Fatalf("GraphQL null baseRefOid cached as %q, want unknown", cachedBaseSHA)
+	}
+	var jobs, completed, maxAttempts int
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT count(*),
+		       count(*) FILTER (WHERE state = 'completed'),
+		       COALESCE(max(attempt), 0)
+		FROM river_job
+		WHERE kind = 'refresh_pr'
+		  AND args->>'key' = $1
+	`, key).Scan(&jobs, &completed, &maxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 || completed != 1 || maxAttempts != 1 {
+		t.Fatalf(
+			"GraphQL refresh_pr jobs/completed/max-attempt = %d/%d/%d, want 1/1/1",
+			jobs,
+			completed,
+			maxAttempts,
+		)
+	}
+}
+
 func TestOrderIndependenceFinalCacheState(t *testing.T) {
 	t.Parallel()
 	want := expectedOrderCacheSnapshot()

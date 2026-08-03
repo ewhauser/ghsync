@@ -422,6 +422,11 @@ func pullStackSummaryMatches(
 	prNumber int,
 	summary *StackSummaryRecord,
 ) (bool, error) {
+	// An unknown SHA cannot prove that the summary and cached stack describe
+	// the same base commit. Fail open so the authoritative stack fetch runs.
+	if summary.BaseSHA == "" {
+		return false, nil
+	}
 	stack, err := queries.GetStackByIdentity(
 		ctx,
 		dbgen.GetStackByIdentityParams{
@@ -439,6 +444,7 @@ func pullStackSummaryMatches(
 		!stack.GhID.Valid ||
 		stack.GhID.Int64 != summary.GitHubID ||
 		stack.BaseRef != summary.BaseRef ||
+		stack.BaseSha == "" ||
 		stack.BaseSha != summary.BaseSHA {
 		return false, nil
 	}

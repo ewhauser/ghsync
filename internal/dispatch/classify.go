@@ -502,6 +502,8 @@ func completeStackSummaryHint(
 		stack.Position <= 0 ||
 		stack.Position > stack.Size ||
 		stack.Base.Ref == "" ||
+		// An unknown SHA is valid payload truth, but it is not a complete
+		// suppression hint. Leaving stackHint nil preserves the eager fetch.
 		stack.Base.SHA == "" {
 		return nil
 	}

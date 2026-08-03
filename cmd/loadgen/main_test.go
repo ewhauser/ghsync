@@ -1140,7 +1140,7 @@ func TestFullFixtureOracleComparesEveryCacheFamily(t *testing.T) {
 		)
 		VALUES (
 		    $1, 8001, 'PR_oracle', 42, 'Oracle PR', 'open', false,
-		    'author', 'feature', 'head', 'main', 'base',
+		    'author', 'feature', 'head', 'main', '',
 		    'APPROVED', 'MERGEABLE', 9, 1, $2, $2, $2, 'webhook'
 		)
 	`, repoID, now); err != nil {
@@ -1153,7 +1153,7 @@ func TestFullFixtureOracleComparesEveryCacheFamily(t *testing.T) {
 		    sync_source
 		)
 		VALUES (
-		    $1, 9001, 'S_oracle', 9, 'main', 'base', true,
+		    $1, 9001, 'S_oracle', 9, 'main', '', true,
 		    $2, $3, 'head', $3, $3, 'webhook'
 		)
 	`, repoID, encodedEntries, now); err != nil {
@@ -1200,21 +1200,21 @@ func TestFullFixtureOracleComparesEveryCacheFamily(t *testing.T) {
 			ReviewDecision: "APPROVED",
 			MergeableState: "MERGEABLE",
 			Head:           fakegithub.PullRequestBranch{Ref: "feature", SHA: "head"},
-			Base:           fakegithub.PullRequestBranch{Ref: "main", SHA: "base"},
+			Base:           fakegithub.Base{Ref: "main", SHA: ""},
 			UpdatedAt:      now,
 			Stack: &fakegithub.StackRef{
 				ID:       9001,
 				Number:   stackNumber,
 				Size:     1,
 				Position: stackPosition,
-				Base:     fakegithub.Base{Ref: "main", SHA: "base"},
+				Base:     fakegithub.Base{Ref: "main", SHA: ""},
 			},
 		}},
 		Stacks: []fakegithub.Stack{{
 			ID:        9001,
 			NodeID:    "S_oracle",
 			Number:    9,
-			Base:      fakegithub.Base{Ref: "main", SHA: "base"},
+			Base:      fakegithub.Base{Ref: "main", SHA: ""},
 			Open:      true,
 			UpdatedAt: now,
 			PullRequests: []fakegithub.StackPullRequest{{

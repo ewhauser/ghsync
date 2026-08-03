@@ -173,7 +173,7 @@ type TruthPullRequestSnapshot struct {
 	ReviewDecision string            `json:"review_decision"`
 	MergeableState string            `json:"mergeable_state"`
 	Head           PullRequestBranch `json:"head"`
-	Base           PullRequestBranch `json:"base"`
+	Base           Base              `json:"base"`
 	UpdatedAt      time.Time         `json:"updated_at"`
 	Stack          *StackRef         `json:"stack"`
 	ReviewRequests []ReviewRequest   `json:"review_requests"`
@@ -445,7 +445,7 @@ func applyTruthPullRequest(fixture *Fixture, mutation TruthPullRequest) {
 			Ref: mutation.Head.Ref,
 			SHA: mutation.Head.SHA,
 		},
-		Base: PullRequestBranch{
+		Base: Base{
 			Ref: mutation.Base.Ref,
 			SHA: mutation.Base.SHA,
 		},

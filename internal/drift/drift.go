@@ -852,6 +852,9 @@ func (s *Service) fullFetch(
 			stackNumber = pull.Stack.Number
 			stackPosition = pull.Stack.Position
 		}
+		// JSON null decodes through go-github as "", the public cache
+		// contract's sentinel for an upstream-unknown base SHA.
+		baseSHA := pull.GetBase().GetSHA()
 		return encodeSnapshot(map[string]any{
 			"id":              pull.GetID(),
 			"node_id":         pull.GetNodeID(),
@@ -863,7 +866,7 @@ func (s *Service) fullFetch(
 			"head_ref":        pull.GetHead().GetRef(),
 			"head_sha":        pull.GetHead().GetSHA(),
 			"base_ref":        pull.GetBase().GetRef(),
-			"base_sha":        pull.GetBase().GetSHA(),
+			"base_sha":        baseSHA,
 			"review_decision": pull.ReviewDecision,
 			"mergeable_state": pull.GetMergeableState(),
 			"stack_number":    stackNumber,
@@ -916,12 +919,15 @@ func (s *Service) fullFetch(
 			}
 			entries = append(entries, entry)
 		}
+		// StackBase.SHA likewise decodes JSON null as the contract's
+		// empty-string unknown sentinel, matching drift_entities.
+		baseSHA := stack.Base.SHA
 		return encodeSnapshot(map[string]any{
 			"id":       stack.ID,
 			"node_id":  stack.NodeID,
 			"number":   stack.Number,
 			"base_ref": stack.Base.Ref,
-			"base_sha": stack.Base.SHA,
+			"base_sha": baseSHA,
 			"open":     stack.Open,
 			"entries":  entries,
 		}), spec, nil

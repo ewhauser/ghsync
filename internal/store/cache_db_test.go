@@ -15,6 +15,248 @@ import (
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
+func TestUnknownStackBaseSHAFailsOpenWithoutPoisoningPullWrite(t *testing.T) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/unknown-stack-base", 9050, now)
+	stackNumber := 142
+	stackPosition := 1
+	if _, err := writer.ApplyStack(ctx, StackRecord{
+		Repository: repository,
+		GitHubID:   7000,
+		NodeID:     "stack-node-142",
+		Number:     stackNumber,
+		BaseRef:    "deleted/historical-base",
+		BaseSHA:    "",
+		Open:       true,
+		Entries: []StackEntry{{
+			Number:    42,
+			State:     "open",
+			UpdatedAt: now,
+			HeadRef:   "feature",
+			HeadSHA:   "head-one",
+		}},
+		GitHubUpdatedAt: now,
+		SyncedAt:        now,
+		Source:          SyncSourceWebhook,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pull := storeTestPull(&repository, now, "head-one")
+	pull.StackNumber = &stackNumber
+	pull.StackPosition = &stackPosition
+	pull.StackSummary = &StackSummaryRecord{
+		GitHubID: 7000,
+		Number:   stackNumber,
+		Size:     1,
+		Position: stackPosition,
+		BaseRef:  "deleted/historical-base",
+		BaseSHA:  "",
+	}
+	pull.MembershipKnown = true
+	if _, err := writer.ApplyPullRequest(ctx, pull); err != nil {
+		t.Fatalf("apply PR with unknown stack base SHA: %v", err)
+	}
+
+	// A repeated unknown SHA cannot prove the tuple matches. Even a title-only
+	// PR update must therefore retain the stack-refresh follow-up signal.
+	updated := pull
+	updated.Title = "title-only change with unknown stack base"
+	updated.GitHubUpdatedAt = now.Add(time.Minute)
+	updated.SyncedAt = now.Add(time.Minute)
+	result, err := writer.ApplyPullRequest(ctx, updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DomainChanged || !result.StackStateChanged {
+		t.Fatalf("unknown-SHA PR result = %+v", result)
+	}
+	row, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: repository.FullName,
+			PrNumber:     42,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.StackNumber.Valid || row.StackNumber.Int32 != int32(stackNumber) ||
+		!row.StackPosition.Valid || row.StackPosition.Int32 != int32(stackPosition) {
+		t.Fatalf("persisted PR membership = %+v", row)
+	}
+}
+
+func TestStackUnknownBaseSHAObeysWriteIfNewerOrderingBothDirections(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 2, 13, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/unknown-stack-order", 9060, now)
+	known := StackRecord{
+		Repository:      repository,
+		GitHubID:        7100,
+		NodeID:          "stack-node-order",
+		Number:          143,
+		BaseRef:         "historical-base",
+		BaseSHA:         "known-before-deletion",
+		Open:            false,
+		GitHubUpdatedAt: now,
+		SyncedAt:        now,
+		Source:          SyncSourceWebhook,
+	}
+	if _, err := writer.ApplyStack(ctx, known); err != nil {
+		t.Fatal(err)
+	}
+	unknown := known
+	unknown.BaseSHA = ""
+	unknown.GitHubUpdatedAt = now.Add(time.Minute)
+	unknown.SyncedAt = now.Add(time.Minute)
+	result, err := writer.ApplyStack(ctx, unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Applied {
+		t.Fatalf("newer unknown-SHA result = %+v", result)
+	}
+
+	staleKnown := known
+	staleKnown.SyncedAt = now.Add(2 * time.Minute)
+	result, err = writer.ApplyStack(ctx, staleKnown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied {
+		t.Fatalf("older known SHA overwrote newer unknown truth: %+v", result)
+	}
+	row, err := dbgen.New(pool).GetStackByKey(
+		ctx,
+		dbgen.GetStackByKeyParams{
+			RepoFullName: repository.FullName,
+			StackNumber:  143,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.BaseRef != "historical-base" || row.BaseSha != "" ||
+		!row.GhUpdatedAt.Valid ||
+		!row.GhUpdatedAt.Time.Equal(unknown.GitHubUpdatedAt) {
+		t.Fatalf("monotonic unknown-SHA stack row = %+v", row)
+	}
+
+	resolved := unknown
+	resolved.BaseSHA = "known-after-recreation"
+	resolved.GitHubUpdatedAt = now.Add(3 * time.Minute)
+	resolved.SyncedAt = now.Add(3 * time.Minute)
+	result, err = writer.ApplyStack(ctx, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Applied {
+		t.Fatalf("newer resolved-SHA result = %+v", result)
+	}
+	row, err = dbgen.New(pool).GetStackByKey(
+		ctx,
+		dbgen.GetStackByKeyParams{
+			RepoFullName: repository.FullName,
+			StackNumber:  143,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.BaseSha != resolved.BaseSHA || !row.GhUpdatedAt.Valid ||
+		!row.GhUpdatedAt.Time.Equal(resolved.GitHubUpdatedAt) {
+		t.Fatalf("newer resolved SHA did not replace unknown truth: %+v", row)
+	}
+}
+
+func TestPullRequestUnknownBaseSHAObeysWriteIfNewerOrderingBothDirections(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 2, 14, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/unknown-pr-order", 9070, now)
+	known := storeTestPull(&repository, now, "head")
+	known.BaseRef = "historical-base"
+	known.BaseSHA = "known-before-deletion"
+	if _, err := writer.ApplyPullRequest(ctx, known); err != nil {
+		t.Fatal(err)
+	}
+
+	unknown := known
+	unknown.BaseSHA = ""
+	unknown.GitHubUpdatedAt = now.Add(time.Minute)
+	unknown.SyncedAt = now.Add(time.Minute)
+	result, err := writer.ApplyPullRequest(ctx, unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DomainChanged {
+		t.Fatalf("newer unknown PR SHA result = %+v", result)
+	}
+
+	staleKnown := known
+	staleKnown.SyncedAt = now.Add(2 * time.Minute)
+	result, err = writer.ApplyPullRequest(ctx, staleKnown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DomainChanged {
+		t.Fatalf("older known PR SHA overwrote newer unknown truth: %+v", result)
+	}
+	row, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: repository.FullName,
+			PrNumber:     int32(known.Number),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.BaseSha != "" || !row.GhUpdatedAt.Valid ||
+		!row.GhUpdatedAt.Time.Equal(unknown.GitHubUpdatedAt) {
+		t.Fatalf("monotonic unknown-SHA PR row = %+v", row)
+	}
+
+	resolved := unknown
+	resolved.BaseSHA = "known-after-recreation"
+	resolved.GitHubUpdatedAt = now.Add(3 * time.Minute)
+	resolved.SyncedAt = now.Add(3 * time.Minute)
+	result, err = writer.ApplyPullRequest(ctx, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DomainChanged {
+		t.Fatalf("newer resolved PR SHA result = %+v", result)
+	}
+	row, err = dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: repository.FullName,
+			PrNumber:     int32(known.Number),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.BaseSha != resolved.BaseSHA || !row.GhUpdatedAt.Valid ||
+		!row.GhUpdatedAt.Time.Equal(resolved.GitHubUpdatedAt) {
+		t.Fatalf("newer resolved PR SHA did not replace unknown truth: %+v", row)
+	}
+}
+
 func TestPullRequestReviewRequestsReplaceAgeMonotonicityAndAtomicEvent(
 	t *testing.T,
 ) {

@@ -199,6 +199,51 @@ func TestCompilerDeterminismAndSchemaValidity(t *testing.T) {
 	}
 }
 
+func TestCompilerPreservesUnknownStackBaseSHAAcrossRenumbering(t *testing.T) {
+	t.Parallel()
+	recording := testRecording()
+	var stackSeq int64
+	for index := range recording.Events {
+		event := &recording.Events[index]
+		if event.Stack == nil {
+			continue
+		}
+		stackSeq = event.Seq
+		event.Stack.Base.SHA = ""
+		if len(event.Stack.PullRequestStates) == 0 {
+			t.Fatal("test stack has no full member snapshots")
+		}
+		event.Stack.PullRequestStates[0].Base.SHA = ""
+		break
+	}
+	if stackSeq == 0 {
+		t.Fatal("test recording has no stack mutation")
+	}
+	steps, err := replay.FirstLap(recording, replay.CompileOptions{
+		Copies:        2,
+		WebhookSecret: []byte("unknown-stack-base"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, step := range steps {
+		if step.SourceSeq != stackSeq {
+			continue
+		}
+		seen++
+		if step.Mutation.Stack == nil ||
+			step.Mutation.Stack.Base.SHA != "" ||
+			len(step.Mutation.Stack.PullRequestStates) == 0 ||
+			step.Mutation.Stack.PullRequestStates[0].Base.SHA != "" {
+			t.Fatalf("renumbered unknown stack base = %+v", step.Mutation.Stack)
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("renumbered stack copies = %d, want 2", seen)
+	}
+}
+
 func assertDeliveryMatchesMutation(
 	t *testing.T,
 	step replay.Step,
@@ -783,6 +828,30 @@ func TestDeriveStacksDisambiguatesReusedHeadBranchesBySHA(t *testing.T) {
 		!reflect.DeepEqual(stacks[0].PullRequests, []int{11, 12}) {
 		t.Fatalf(
 			"stack from reused branch = %+v, want [11 12]",
+			stacks,
+		)
+	}
+}
+
+func TestDeriveStacksUnknownBaseSHAFallsBackWithoutEmptySHAIdentity(
+	t *testing.T,
+) {
+	t.Parallel()
+	repository := testRepository()
+	old := testPull(10, "feature", "main")
+	old.State = "closed"
+	old.UpdatedAt = old.UpdatedAt.Add(time.Hour)
+	current := testPull(11, "feature", "main")
+	child := testPull(12, "child", "feature")
+	child.Base.SHA = ""
+	stacks := replay.DeriveStacks(
+		repository,
+		[]replay.PullRequest{old, child, current},
+	)
+	if len(stacks) != 1 ||
+		!reflect.DeepEqual(stacks[0].PullRequests, []int{11, 12}) {
+		t.Fatalf(
+			"unknown-SHA reused branch stack = %+v, want open fallback [11 12]",
 			stacks,
 		)
 	}

@@ -36,16 +36,35 @@ type StackRef struct {
 	Base     Base  `json:"base"`
 }
 
-// Base identifies a stack's base ref and commit.
+// Base identifies a pull request or stack base ref and commit.
 type Base struct {
 	Ref string `json:"ref"`
 	SHA string `json:"sha"`
+}
+
+// MarshalJSON emits GitHub's wire representation for an unresolved commit:
+// the ref remains present while sha is null.
+func (b Base) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Ref string `json:"ref"`
+		SHA any    `json:"sha"`
+	}{
+		Ref: b.Ref,
+		SHA: nullableSHA(b.SHA),
+	})
 }
 
 // PullRequestBranch identifies one pull request branch.
 type PullRequestBranch struct {
 	Ref string `json:"ref"`
 	SHA string `json:"sha"`
+}
+
+func nullableSHA(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 // PullRequest is fixture truth for REST and GraphQL pull responses.
@@ -60,7 +79,7 @@ type PullRequest struct {
 	ReviewDecision string            `json:"review_decision"`
 	MergeableState string            `json:"mergeable_state"`
 	Head           PullRequestBranch `json:"head"`
-	Base           PullRequestBranch `json:"base"`
+	Base           Base              `json:"base"`
 	UpdatedAt      time.Time         `json:"updated_at"`
 	CreatedAt      time.Time         `json:"-"`
 	MergedAt       *time.Time        `json:"-"`

@@ -403,9 +403,26 @@ func overlayPullRequestPayload(
 		return err
 	}
 	base["ref"] = pull.Base.Ref
+	// The vendored public webhook schema requires this ordinary PR field to
+	// remain a string. The private stack extension below is the field GitHub
+	// reports as JSON null when its base commit cannot be resolved.
 	base["sha"] = pull.Base.SHA
 	if baseRepository, ok := base["repo"].(map[string]any); ok {
 		overlayRepositoryPayload(baseRepository, repository)
+	}
+	if pull.Stack == nil {
+		payload["stack"] = nil
+	} else {
+		payload["stack"] = map[string]any{
+			"id":       pull.Stack.ID,
+			"number":   pull.Stack.Number,
+			"size":     pull.Stack.Size,
+			"position": pull.Stack.Position,
+			"base": map[string]any{
+				"ref": pull.Stack.Base.Ref,
+				"sha": nullableSHA(pull.Stack.Base.SHA),
+			},
+		}
 	}
 	return nil
 }

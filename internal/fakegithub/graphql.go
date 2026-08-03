@@ -164,7 +164,7 @@ func graphQLPullRequest(
 		"headRefName":    pull.Head.Ref,
 		"headRefOid":     pull.Head.SHA,
 		"baseRefName":    pull.Base.Ref,
-		"baseRefOid":     pull.Base.SHA,
+		"baseRefOid":     nullableSHA(pull.Base.SHA),
 		"author":         map[string]any{"login": pull.AuthorLogin},
 		"repository": map[string]any{
 			"id":            repository.NodeID,
