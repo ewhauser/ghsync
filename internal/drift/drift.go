@@ -868,6 +868,7 @@ func (s *Service) fullFetch(
 			"mergeable_state": pull.GetMergeableState(),
 			"stack_number":    stackNumber,
 			"stack_position":  stackPosition,
+			"review_requests": semanticReviewRequests(pull),
 		}), spec, nil
 	case "stack":
 		repo, number, err := numberedKey(key, "stack:")
@@ -1132,6 +1133,47 @@ func semanticReviewThreads(node *gh.PullRequestNode) []map[string]any {
 	return result
 }
 
+func semanticReviewRequests(pull *gh.PullRequest) []map[string]any {
+	requests := make(
+		[]map[string]any,
+		0,
+		len(pull.GetRequestedReviewers())+len(pull.GetRequestedTeams()),
+	)
+	for _, reviewer := range pull.GetRequestedReviewers() {
+		if !gh.IsSupportedReviewRequestUser(reviewer) {
+			continue
+		}
+		requests = append(requests, map[string]any{
+			"kind":     "user",
+			"id":       reviewer.GetID(),
+			"node_id":  reviewer.GetNodeID(),
+			"login":    reviewer.GetLogin(),
+			"head_sha": pull.GetHead().GetSHA(),
+		})
+	}
+	for _, team := range pull.GetRequestedTeams() {
+		if !gh.IsSupportedReviewRequestTeam(team) {
+			continue
+		}
+		requests = append(requests, map[string]any{
+			"kind":     "team",
+			"id":       team.GetID(),
+			"node_id":  team.GetNodeID(),
+			"login":    team.GetSlug(),
+			"head_sha": pull.GetHead().GetSHA(),
+		})
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		leftKind := requests[i]["kind"].(string)
+		rightKind := requests[j]["kind"].(string)
+		if leftKind != rightKind {
+			return leftKind < rightKind
+		}
+		return requests[i]["id"].(int64) < requests[j]["id"].(int64)
+	})
+	return requests
+}
+
 func semanticDiff(cache, upstream []byte) (bool, []byte, error) {
 	var cachedValue, upstreamValue any
 	if err := json.Unmarshal(cache, &cachedValue); err != nil {
@@ -1179,9 +1221,19 @@ func normalizeSemantic(value any) any {
 		}
 		if allHaveID {
 			sort.SliceStable(normalized, func(i, j int) bool {
-				left := fmt.Sprint(normalized[i].(map[string]any)["id"])
-				right := fmt.Sprint(normalized[j].(map[string]any)["id"])
-				return left < right
+				left := normalized[i].(map[string]any)
+				right := normalized[j].(map[string]any)
+				leftKind, _ := left["kind"].(string)
+				rightKind, _ := right["kind"].(string)
+				if leftKind != rightKind {
+					return leftKind < rightKind
+				}
+				leftNumber, leftNumeric := left["id"].(float64)
+				rightNumber, rightNumeric := right["id"].(float64)
+				if leftNumeric && rightNumeric {
+					return leftNumber < rightNumber
+				}
+				return fmt.Sprint(left["id"]) < fmt.Sprint(right["id"])
 			})
 		}
 		return normalized

@@ -663,6 +663,8 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 	}
 	fixture := h.fixture
 	fixture.PullRequests[1].ReviewThreads[0].IsResolved = true
+	fixture.PullRequests[1].ReviewRequests =
+		fixture.PullRequests[1].ReviewRequests[1:]
 	h.fake.SetFixture(fixture)
 	h.start(t)
 	for _, kind := range []string{
@@ -756,6 +758,25 @@ func TestSweepOnlyRefreshesStaleEntitiesWithinConfiguredBounds(
 	}
 	if !resolved {
 		t.Fatal("periodic GraphQL PR reconciliation missed review-thread state")
+	}
+	var requestKind, requestLogin string
+	var requestCount int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT count(*), min(reviewer_kind), min(reviewer_login)
+		FROM pull_request_review_requests
+		WHERE pr_number = 4812
+		  AND tombstoned_at IS NULL
+	`).Scan(&requestCount, &requestKind, &requestLogin); err != nil {
+		t.Fatal(err)
+	}
+	if requestCount != 1 || requestKind != "team" ||
+		requestLogin != "search-platform" {
+		t.Fatalf(
+			"periodic review-request reconciliation = %d %s/%s",
+			requestCount,
+			requestKind,
+			requestLogin,
+		)
 	}
 }
 

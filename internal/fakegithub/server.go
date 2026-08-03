@@ -66,6 +66,7 @@ type PullRequest struct {
 	MergedAt       *time.Time        `json:"-"`
 	Stack          *StackRef         `json:"stack"`
 	ReviewThreads  []ReviewThread    `json:"-"`
+	ReviewRequests []ReviewRequest   `json:"-"`
 }
 
 // Stack is fixture truth for the gh-stack preview API.
@@ -133,6 +134,17 @@ type ReviewComment struct {
 	Body        string    `json:"body"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	AuthorLogin string    `json:"author_login"`
+}
+
+// ReviewRequest is fixture truth for one RequestedReviewer union member.
+// Login carries a user login for kind=user and a team slug for kind=team.
+// The bot, mannequin, and nil kinds exist to exercise the documented v1
+// exclusion policy; they are not projected as user or team requests.
+type ReviewRequest struct {
+	Kind   string `json:"kind"`
+	ID     int64  `json:"id"`
+	NodeID string `json:"node_id"`
+	Login  string `json:"login"`
 }
 
 // CheckRun is fixture truth for one check run.

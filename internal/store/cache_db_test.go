@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -10,8 +11,329 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
+
+func TestPullRequestReviewRequestsReplaceAgeMonotonicityAndAtomicEvent(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := context.Background()
+	updatedAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	authoritativeRequestedAt := updatedAt.Add(-time.Hour)
+	repository := storeTestRepository(
+		"acme/review-requests",
+		9100,
+		updatedAt,
+	)
+	pull := storeTestPull(&repository, updatedAt, "review-head")
+	pull.ReviewRequestsKnown = true
+	pull.ReviewRequests = []ReviewRequestRecord{
+		{
+			Kind: ReviewRequestUser, GitHubID: 5001,
+			NodeID: "user-node-5001", Login: "alice",
+			RequestedAt: &authoritativeRequestedAt,
+		},
+		{
+			Kind: ReviewRequestTeam, GitHubID: 6001,
+			NodeID: "team-node-6001", Login: "platform",
+		},
+	}
+	initial, err := writer.ApplyPullRequest(ctx, pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initial.ReviewRequestsChanged || !initial.Applied {
+		t.Fatalf("initial review-request result = %+v", initial)
+	}
+	entityKey := PullRequestEntityKey(1, repository.GitHubID, 42)
+	if events := pullRequestChangedEventCount(t, pool, entityKey); events != 1 {
+		t.Fatalf("initial pull-request events = %d, want 1", events)
+	}
+	initialRows := liveReviewRequestRows(t, pool, repository.GitHubID)
+	if len(initialRows) != 2 || initialRows[0].Kind != "team" ||
+		initialRows[1].Kind != "user" || initialRows[0].RequestedAt != nil ||
+		initialRows[1].RequestedAt == nil ||
+		!initialRows[1].RequestedAt.Equal(authoritativeRequestedAt) {
+		t.Fatalf("initial review requests = %+v", initialRows)
+	}
+	teamFirstSeen := initialRows[0].FirstSeenAt
+	userFirstSeen := initialRows[1].FirstSeenAt
+
+	identical := pull
+	identical.ReviewRequests = append(
+		[]ReviewRequestRecord(nil),
+		pull.ReviewRequests...,
+	)
+	identical.ReviewRequests[0].RequestedAt = nil
+	identical.SyncedAt = pull.SyncedAt.Add(time.Minute)
+	eventsBeforeIdentical := pullRequestChangedEventCount(t, pool, entityKey)
+	identicalResult, err := writer.ApplyPullRequest(ctx, identical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identicalResult.Applied || identicalResult.ReviewRequestsChanged {
+		t.Fatalf("identical review-request result = %+v", identicalResult)
+	}
+	if events := pullRequestChangedEventCount(t, pool, entityKey); events !=
+		eventsBeforeIdentical {
+		t.Fatalf(
+			"identical refresh event storm: events=%d, want %d",
+			events,
+			eventsBeforeIdentical,
+		)
+	}
+	identicalRows := liveReviewRequestRows(t, pool, repository.GitHubID)
+	if len(identicalRows) != 2 {
+		t.Fatalf("identical refresh rows = %+v, want two", identicalRows)
+	}
+	if !identicalRows[0].FirstSeenAt.Equal(teamFirstSeen) ||
+		!identicalRows[1].FirstSeenAt.Equal(userFirstSeen) ||
+		identicalRows[1].RequestedAt == nil {
+		t.Fatalf("identical refresh reset first_seen_at: %+v", identicalRows)
+	}
+	if !identicalRows[1].RequestedAt.Equal(authoritativeRequestedAt) {
+		t.Fatalf("identical refresh reset requested_at: %+v", identicalRows)
+	}
+
+	removed := pull
+	removed.ReviewRequests = pull.ReviewRequests[1:]
+	eventsBeforeRemoval := pullRequestChangedEventCount(t, pool, entityKey)
+	removedResult, err := writer.ApplyPullRequest(ctx, removed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removedResult.DomainChanged || !removedResult.ReviewRequestsChanged ||
+		!removedResult.Applied {
+		t.Fatalf("pure removal result = %+v", removedResult)
+	}
+	removedRows := liveReviewRequestRows(t, pool, repository.GitHubID)
+	if len(removedRows) != 1 || removedRows[0].Kind != "team" {
+		t.Fatalf("live requests after removal = %+v", removedRows)
+	}
+	if events := pullRequestChangedEventCount(t, pool, entityKey); events !=
+		eventsBeforeRemoval+1 {
+		t.Fatalf("pure removal events = %d, want %d", events, eventsBeforeRemoval+1)
+	}
+	var removedTombstoned bool
+	if err := pool.QueryRow(ctx, `
+		SELECT request.tombstoned_at IS NOT NULL
+		FROM pull_request_review_requests AS request
+		JOIN repos ON repos.id = request.repo_id
+		WHERE repos.gh_id = $1
+		  AND request.pr_number = 42
+		  AND request.reviewer_kind = 'user'
+		  AND request.reviewer_gh_id = 5001
+	`, repository.GitHubID).Scan(&removedTombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if !removedTombstoned {
+		t.Fatal("removed user request was deleted or left live instead of tombstoned")
+	}
+
+	rerequested := pull
+	rerequested.ReviewRequests = append(
+		[]ReviewRequestRecord(nil),
+		pull.ReviewRequests...,
+	)
+	rerequested.ReviewRequests[0].RequestedAt = nil
+	eventsBeforeRerequest := pullRequestChangedEventCount(t, pool, entityKey)
+	rerequestedResult, err := writer.ApplyPullRequest(ctx, rerequested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rerequestedResult.ReviewRequestsChanged {
+		t.Fatalf("re-request result = %+v", rerequestedResult)
+	}
+	rerequestedRows := liveReviewRequestRows(t, pool, repository.GitHubID)
+	if len(rerequestedRows) != 2 ||
+		!rerequestedRows[0].FirstSeenAt.Equal(teamFirstSeen) ||
+		!rerequestedRows[1].FirstSeenAt.After(userFirstSeen) ||
+		rerequestedRows[1].RequestedAt != nil {
+		t.Fatalf("re-request first_seen_at rows = %+v", rerequestedRows)
+	}
+	if events := pullRequestChangedEventCount(t, pool, entityKey); events !=
+		eventsBeforeRerequest+1 {
+		t.Fatalf(
+			"re-request events = %d, want %d",
+			events,
+			eventsBeforeRerequest+1,
+		)
+	}
+
+	newer := rerequested
+	newer.GitHubUpdatedAt = updatedAt.Add(time.Minute)
+	if _, err := writer.ApplyPullRequest(ctx, newer); err != nil {
+		t.Fatal(err)
+	}
+	olderEmpty := rerequested
+	olderEmpty.ReviewRequests = nil
+	olderResult, err := writer.ApplyPullRequest(ctx, olderEmpty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if olderResult.Applied || olderResult.ReviewRequestsChanged {
+		t.Fatalf("older review-request observation applied = %+v", olderResult)
+	}
+	if rows := liveReviewRequestRows(t, pool, repository.GitHubID); len(rows) != 2 {
+		t.Fatalf("older observation changed live requests = %+v", rows)
+	}
+
+	eventsBefore := pullRequestChangedEventCount(t, pool, entityKey)
+	failing := newer
+	failing.ReviewRequests = newer.ReviewRequests[1:]
+	failingCtx := outbox.WithSequenceAllocationHook(
+		ctx,
+		func(origin string, _ int64) error {
+			if origin != outbox.EntityWriterOrigin {
+				t.Fatalf("sequence origin = %q", origin)
+			}
+			return errors.New("stop after request-set event allocation")
+		},
+	)
+	if _, err := writer.ApplyPullRequest(failingCtx, failing); err == nil {
+		t.Fatal("atomic request-set write unexpectedly committed")
+	}
+	if rows := liveReviewRequestRows(t, pool, repository.GitHubID); len(rows) != 2 {
+		t.Fatalf("failed event transaction changed requests = %+v", rows)
+	}
+	if events := pullRequestChangedEventCount(t, pool, entityKey); events != eventsBefore {
+		t.Fatalf("failed event transaction count = %d, want %d", events, eventsBefore)
+	}
+}
+
+func TestDelayedOlderReviewRequestFetchCannotClobberNewerSet(t *testing.T) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := context.Background()
+	oldVersion := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	repository := storeTestRepository(
+		"acme/delayed-review-requests",
+		9200,
+		oldVersion,
+	)
+	older := storeTestPull(&repository, oldVersion, "old-head")
+	older.ReviewRequestsKnown = true
+	newer := storeTestPull(
+		&repository,
+		oldVersion.Add(time.Minute),
+		"new-head",
+	)
+	newer.ReviewRequestsKnown = true
+	newer.ReviewRequests = []ReviewRequestRecord{{
+		Kind: ReviewRequestTeam, GitHubID: 6001,
+		NodeID: "team-node-6001", Login: "platform",
+	}}
+
+	type applyOutcome struct {
+		result ApplyPullRequestResult
+		err    error
+	}
+	olderFetchStarted := make(chan struct{})
+	releaseOlderResponse := make(chan struct{})
+	olderDone := make(chan applyOutcome, 1)
+	go func() {
+		close(olderFetchStarted)
+		<-releaseOlderResponse
+		result, err := writer.ApplyPullRequest(ctx, older)
+		olderDone <- applyOutcome{result: result, err: err}
+	}()
+	<-olderFetchStarted
+	newerResult, err := writer.ApplyPullRequest(ctx, newer)
+	if err != nil {
+		close(releaseOlderResponse)
+		<-olderDone
+		t.Fatal(err)
+	}
+	if !newerResult.ReviewRequestsChanged {
+		close(releaseOlderResponse)
+		<-olderDone
+		t.Fatalf("newer request set result = %+v", newerResult)
+	}
+	close(releaseOlderResponse)
+	olderOutcome := <-olderDone
+	if olderOutcome.err != nil {
+		t.Fatal(olderOutcome.err)
+	}
+	if olderOutcome.result.Applied || olderOutcome.result.ReviewRequestsChanged {
+		t.Fatalf("delayed older result = %+v", olderOutcome.result)
+	}
+	rows := liveReviewRequestRows(t, pool, repository.GitHubID)
+	if len(rows) != 1 || rows[0].Kind != "team" || rows[0].ID != 6001 {
+		t.Fatalf("delayed older fetch clobbered newer set: %+v", rows)
+	}
+}
+
+type reviewRequestTestRow struct {
+	Kind        string
+	ID          int64
+	Login       string
+	RequestedAt *time.Time
+	FirstSeenAt time.Time
+}
+
+func liveReviewRequestRows(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	repoGitHubID int64,
+) []reviewRequestTestRow {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `
+		SELECT request.reviewer_kind, request.reviewer_gh_id,
+		       request.reviewer_login, request.requested_at,
+		       request.first_seen_at
+		FROM pull_request_review_requests AS request
+		JOIN repos ON repos.id = request.repo_id
+		WHERE repos.gh_id = $1
+		  AND request.pr_number = $2
+		  AND request.tombstoned_at IS NULL
+		ORDER BY request.reviewer_kind, request.reviewer_gh_id
+	`, repoGitHubID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []reviewRequestTestRow
+	for rows.Next() {
+		var row reviewRequestTestRow
+		if err := rows.Scan(
+			&row.Kind,
+			&row.ID,
+			&row.Login,
+			&row.RequestedAt,
+			&row.FirstSeenAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func pullRequestChangedEventCount(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	entityKey string,
+) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(t.Context(), `
+		SELECT count(*)
+		FROM change_events
+		WHERE kind = 'pull_request.changed'
+		  AND entity_key = $1
+	`, entityKey).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
 
 func TestWriteRaceBothOrdersNewerWinsConcurrently(t *testing.T) {
 	t.Parallel()

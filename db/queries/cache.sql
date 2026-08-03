@@ -450,6 +450,154 @@ SET last_checked_at = GREATEST(last_checked_at, sqlc.arg(checked_at))
 WHERE repo_id = sqlc.arg(repo_id)
   AND pr_number = sqlc.arg(pr_number);
 
+-- name: ReplacePullRequestReviewRequests :many
+-- The parent pull request's updated_at is the C-C2 observation version for
+-- this timestamp-less GitHub connection. Equal-version replacements remain
+-- eligible so a pure request-set change is not swallowed.
+WITH input AS (
+    SELECT element->>'kind' AS reviewer_kind,
+           (element->>'gh_id')::bigint AS reviewer_gh_id,
+           element->>'node_id' AS reviewer_node_id,
+           element->>'login' AS reviewer_login,
+           (element->>'requested_at')::timestamptz AS requested_at
+    FROM jsonb_array_elements(sqlc.arg(review_requests)::jsonb) AS element
+),
+eligible AS (
+    SELECT pull_requests.repo_id
+    FROM pull_requests
+    WHERE pull_requests.repo_id = sqlc.arg(repo_id)
+      AND pull_requests.number = sqlc.arg(pr_number)
+      AND pull_requests.tombstoned_at IS NULL
+      AND (
+          pull_requests.gh_updated_at IS NULL
+          OR pull_requests.gh_updated_at <= sqlc.arg(gh_updated_at)
+      )
+),
+upserted AS (
+    INSERT INTO pull_request_review_requests (
+        repo_id, pr_number, reviewer_kind, reviewer_gh_id,
+        reviewer_node_id, reviewer_login, requested_at, first_seen_at,
+        gh_updated_at, head_sha, synced_at, last_checked_at, etag,
+        sync_source, tombstoned_at
+    )
+    SELECT sqlc.arg(repo_id), sqlc.arg(pr_number), input.reviewer_kind,
+           input.reviewer_gh_id, input.reviewer_node_id,
+           input.reviewer_login, input.requested_at,
+           sqlc.arg(first_seen_at), sqlc.arg(gh_updated_at),
+           sqlc.arg(head_sha), sqlc.arg(synced_at),
+           sqlc.arg(last_checked_at), sqlc.arg(etag),
+           sqlc.arg(sync_source), NULL
+    FROM input
+    CROSS JOIN eligible
+    ON CONFLICT (repo_id, pr_number, reviewer_kind, reviewer_gh_id)
+    DO UPDATE
+    SET reviewer_node_id = EXCLUDED.reviewer_node_id,
+        reviewer_login = EXCLUDED.reviewer_login,
+        requested_at = CASE
+            WHEN pull_request_review_requests.tombstoned_at IS NOT NULL
+            THEN EXCLUDED.requested_at
+            ELSE COALESCE(
+                EXCLUDED.requested_at,
+                pull_request_review_requests.requested_at
+            )
+        END,
+        first_seen_at = CASE
+            WHEN pull_request_review_requests.tombstoned_at IS NOT NULL
+            THEN EXCLUDED.first_seen_at
+            ELSE pull_request_review_requests.first_seen_at
+        END,
+        gh_updated_at = EXCLUDED.gh_updated_at,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        last_checked_at = EXCLUDED.last_checked_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL
+    WHERE pull_request_review_requests.tombstoned_at IS NOT NULL
+       OR ROW(
+           EXCLUDED.reviewer_node_id,
+           EXCLUDED.reviewer_login,
+           CASE
+               WHEN pull_request_review_requests.tombstoned_at IS NOT NULL
+               THEN EXCLUDED.requested_at
+               ELSE COALESCE(
+                   EXCLUDED.requested_at,
+                   pull_request_review_requests.requested_at
+               )
+           END,
+           EXCLUDED.head_sha
+       ) IS DISTINCT FROM ROW(
+           pull_request_review_requests.reviewer_node_id,
+           pull_request_review_requests.reviewer_login,
+           pull_request_review_requests.requested_at,
+           pull_request_review_requests.head_sha
+       )
+    RETURNING reviewer_kind || ':' || reviewer_gh_id::text AS reviewer_key
+),
+tombstoned AS (
+    UPDATE pull_request_review_requests
+    SET tombstoned_at = sqlc.arg(last_checked_at),
+        synced_at = sqlc.arg(synced_at),
+        last_checked_at = sqlc.arg(last_checked_at),
+        etag = sqlc.arg(etag),
+        sync_source = sqlc.arg(sync_source)
+    WHERE repo_id = sqlc.arg(repo_id)
+      AND pr_number = sqlc.arg(pr_number)
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM input
+          WHERE input.reviewer_kind =
+                    pull_request_review_requests.reviewer_kind
+            AND input.reviewer_gh_id =
+                    pull_request_review_requests.reviewer_gh_id
+      )
+    RETURNING reviewer_kind || ':' || reviewer_gh_id::text AS reviewer_key
+)
+SELECT reviewer_key FROM upserted
+UNION ALL
+SELECT reviewer_key FROM tombstoned;
+
+-- name: TouchPullRequestReviewRequestsCheckedAt :exec
+UPDATE pull_request_review_requests
+SET last_checked_at = GREATEST(
+        pull_request_review_requests.last_checked_at,
+        sqlc.arg(checked_at)
+    ),
+    etag = CASE WHEN sqlc.arg(etag)::text = ''
+                THEN pull_request_review_requests.etag
+                ELSE sqlc.arg(etag)::text END
+WHERE pull_request_review_requests.repo_id = sqlc.arg(repo_id)
+  AND pull_request_review_requests.pr_number = sqlc.arg(pr_number)
+  AND pull_request_review_requests.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM pull_requests
+      WHERE pull_requests.repo_id = sqlc.arg(repo_id)
+        AND pull_requests.number = sqlc.arg(pr_number)
+        AND pull_requests.tombstoned_at IS NULL
+        AND (
+            pull_requests.gh_updated_at IS NULL
+            OR pull_requests.gh_updated_at <= sqlc.arg(gh_updated_at)
+        )
+  );
+
+-- name: TombstonePullRequestReviewRequests :many
+UPDATE pull_request_review_requests
+SET tombstoned_at = sqlc.arg(tombstoned_at),
+    synced_at = sqlc.arg(tombstoned_at),
+    last_checked_at = GREATEST(
+        last_checked_at,
+        sqlc.arg(tombstoned_at)
+    ),
+    etag = '',
+    sync_source = sqlc.arg(sync_source)
+WHERE repo_id = sqlc.arg(repo_id)
+  AND pr_number = sqlc.arg(pr_number)
+  AND tombstoned_at IS NULL
+RETURNING reviewer_kind || ':' || reviewer_gh_id::text AS reviewer_key;
+
 -- name: ReplaceCheckRuns :many
 WITH input AS (
     SELECT (element->>'gh_id')::bigint AS gh_id,

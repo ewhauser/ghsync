@@ -462,6 +462,8 @@ stacks(id, repo_id, number, base_ref, open, entries JSONB,
        gh_updated_at, etag, synced_at, sync_source, tombstoned_at)
 pull_requests(id, repo_id, number, title, state, head_ref, head_sha,
               review_decision, gh_updated_at, etag, synced_at, ...)
+pull_request_review_requests(repo_id, pr_number, reviewer_kind,
+                             reviewer_gh_id, reviewer_node_id, ...)
 review_threads(...), check_runs(...), check_history(...)
 
 -- Derivation

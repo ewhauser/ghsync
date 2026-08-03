@@ -68,6 +68,29 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		data["nodes"] = nodes
 	case strings.Contains(
 		request.Query,
+		"GhsyncPullRequestReviewRequestsPage",
+	):
+		id, after := graphQLCursorVariables(request.Variables)
+		for fixtureIndex := range fixtures {
+			fx := &fixtures[fixtureIndex]
+			for pullIndex := range fx.PullRequests {
+				pull := &fx.PullRequests[pullIndex]
+				if pull.NodeID == id {
+					data["node"] = map[string]any{
+						"reviewRequests": graphQLReviewRequests(
+							pull.ReviewRequests,
+							after,
+						),
+					}
+					break
+				}
+			}
+			if data["node"] != nil {
+				break
+			}
+		}
+	case strings.Contains(
+		request.Query,
 		"GhsyncPullRequestReviewThreadsPage",
 	):
 		id, after := graphQLCursorVariables(request.Variables)
@@ -158,11 +181,47 @@ func graphQLPullRequest(
 				},
 			},
 		},
-		"reviewThreads": graphQLReviewThreads(pull.ReviewThreads, 0),
+		"reviewRequests": graphQLReviewRequests(pull.ReviewRequests, 0),
+		"reviewThreads":  graphQLReviewThreads(pull.ReviewThreads, 0),
 	}
 }
 
 const fakeGraphQLConnectionLimit = 100
+
+func graphQLReviewRequests(
+	requests []ReviewRequest,
+	after int,
+) map[string]any {
+	start, end, pageInfo := graphQLPage(len(requests), after)
+	nodes := make([]map[string]any, 0, end-start)
+	for _, request := range requests[start:end] {
+		var reviewer any
+		switch request.Kind {
+		case "user":
+			reviewer = map[string]any{
+				"__typename": "User", "id": request.NodeID,
+				"databaseId": request.ID, "login": request.Login,
+			}
+		case "team":
+			reviewer = map[string]any{
+				"__typename": "Team", "id": request.NodeID,
+				"databaseId": request.ID, "slug": request.Login,
+			}
+		case "bot":
+			reviewer = map[string]any{"__typename": "Bot"}
+		case "mannequin":
+			reviewer = map[string]any{"__typename": "Mannequin"}
+		case "nil":
+			reviewer = nil
+		default:
+			reviewer = map[string]any{"__typename": request.Kind}
+		}
+		nodes = append(nodes, map[string]any{
+			"requestedReviewer": reviewer,
+		})
+	}
+	return map[string]any{"nodes": nodes, "pageInfo": pageInfo}
+}
 
 func graphQLReviewThreads(
 	threads []ReviewThread,

@@ -250,6 +250,24 @@ type PullRequest struct {
 	DisplayUntil   pgtype.Timestamptz
 }
 
+type PullRequestReviewRequest struct {
+	RepoID         int64
+	PrNumber       int32
+	ReviewerKind   string
+	ReviewerGhID   int64
+	ReviewerNodeID string
+	ReviewerLogin  string
+	RequestedAt    pgtype.Timestamptz
+	FirstSeenAt    pgtype.Timestamptz
+	GhUpdatedAt    pgtype.Timestamptz
+	HeadSha        string
+	SyncedAt       pgtype.Timestamptz
+	Etag           string
+	SyncSource     string
+	TombstonedAt   pgtype.Timestamptz
+	LastCheckedAt  pgtype.Timestamptz
+}
+
 type RefreshIntentGeneration struct {
 	Kind                string
 	RefreshKey          string

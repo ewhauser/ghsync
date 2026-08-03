@@ -26,6 +26,83 @@ func (s *Server) PullRequestWebhookPayload(
 	return payload, nil
 }
 
+// PullRequestReviewRequestedWebhookPayload builds a production-shaped
+// pull_request.review_requested payload for a requested user or team.
+func (s *Server) PullRequestReviewRequestedWebhookPayload(
+	number int,
+	reviewer ReviewRequest,
+) (map[string]any, error) {
+	return s.pullRequestReviewRequestWebhookPayload(
+		"review_requested",
+		number,
+		reviewer,
+	)
+}
+
+// PullRequestReviewRequestRemovedWebhookPayload builds a production-shaped
+// pull_request.review_request_removed payload for a requested user or team.
+func (s *Server) PullRequestReviewRequestRemovedWebhookPayload(
+	number int,
+	reviewer ReviewRequest,
+) (map[string]any, error) {
+	return s.pullRequestReviewRequestWebhookPayload(
+		"review_request_removed",
+		number,
+		reviewer,
+	)
+}
+
+func (s *Server) pullRequestReviewRequestWebhookPayload(
+	action string,
+	number int,
+	reviewer ReviewRequest,
+) (map[string]any, error) {
+	if reviewer.ID <= 0 || reviewer.NodeID == "" || reviewer.Login == "" {
+		return nil, fmt.Errorf("review-request reviewer is incomplete")
+	}
+	payload, err := s.PullRequestWebhookPayload(action, number)
+	if err != nil {
+		return nil, err
+	}
+	switch reviewer.Kind {
+	case "user":
+		wireReviewer, err := payloadObject(payload, "requested_reviewer")
+		if err != nil {
+			return nil, err
+		}
+		wireReviewer["id"] = reviewer.ID
+		wireReviewer["node_id"] = reviewer.NodeID
+		wireReviewer["login"] = reviewer.Login
+		delete(payload, "requested_team")
+	case "team":
+		delete(payload, "requested_reviewer")
+		payload["requested_team"] = reviewRequestTeamPayload(reviewer)
+	default:
+		return nil, fmt.Errorf(
+			"unsupported review-request reviewer kind %q",
+			reviewer.Kind,
+		)
+	}
+	return payload, nil
+}
+
+func reviewRequestTeamPayload(reviewer ReviewRequest) map[string]any {
+	baseURL := "https://api.github.com/teams/" + reviewer.Login
+	return map[string]any{
+		"name":             reviewer.Login,
+		"id":               reviewer.ID,
+		"node_id":          reviewer.NodeID,
+		"slug":             reviewer.Login,
+		"description":      nil,
+		"privacy":          "closed",
+		"url":              baseURL,
+		"html_url":         "https://github.com/orgs/acme/teams/" + reviewer.Login,
+		"members_url":      baseURL + "/members{/member}",
+		"repositories_url": baseURL + "/repos",
+		"permission":       "pull",
+	}
+}
+
 // PullRequestReviewWebhookPayload builds a production-shaped
 // pull_request_review payload from the current fixture and a canonical
 // octokit example.

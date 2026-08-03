@@ -187,22 +187,51 @@ func (s *Server) getPull(w http.ResponseWriter, r *http.Request) {
 	for index := range fx.PullRequests {
 		pull := &fx.PullRequests[index]
 		if pull.Number == number {
+			requestedReviewers, requestedTeams := restReviewRequests(
+				pull.ReviewRequests,
+			)
 			// GitHub's REST pull shape carries the author under user.login.
 			// Keep AuthorLogin out of the fixture's serialized list golden,
 			// but include the real field on authoritative detail fetches.
 			s.writeConditionalJSON(w, r, struct {
 				PullRequest
-				User map[string]string `json:"user"`
+				User               map[string]string `json:"user"`
+				RequestedReviewers []map[string]any  `json:"requested_reviewers"`
+				RequestedTeams     []map[string]any  `json:"requested_teams"`
 			}{
 				PullRequest: *pull,
 				User: map[string]string{
 					"login": pull.AuthorLogin,
 				},
+				RequestedReviewers: requestedReviewers,
+				RequestedTeams:     requestedTeams,
 			})
 			return
 		}
 	}
 	http.NotFound(w, r)
+}
+
+func restReviewRequests(
+	requests []ReviewRequest,
+) ([]map[string]any, []map[string]any) {
+	users := make([]map[string]any, 0, len(requests))
+	teams := make([]map[string]any, 0, len(requests))
+	for _, request := range requests {
+		value := map[string]any{
+			"id":      request.ID,
+			"node_id": request.NodeID,
+		}
+		switch request.Kind {
+		case "user":
+			value["login"] = request.Login
+			users = append(users, value)
+		case "team":
+			value["slug"] = request.Login
+			teams = append(teams, value)
+		}
+	}
+	return users, teams
 }
 
 func (s *Server) listCheckRuns(w http.ResponseWriter, r *http.Request) {

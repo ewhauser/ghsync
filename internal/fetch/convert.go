@@ -81,6 +81,33 @@ func pullRecordFromREST(
 	if pull.UpdatedAt != nil {
 		updatedAt = pull.UpdatedAt.Time
 	}
+	reviewRequests := make(
+		[]store.ReviewRequestRecord,
+		0,
+		len(pull.GetRequestedReviewers())+len(pull.GetRequestedTeams()),
+	)
+	for _, reviewer := range pull.GetRequestedReviewers() {
+		if !gh.IsSupportedReviewRequestUser(reviewer) {
+			continue
+		}
+		reviewRequests = append(reviewRequests, store.ReviewRequestRecord{
+			Kind:     store.ReviewRequestUser,
+			GitHubID: reviewer.GetID(),
+			NodeID:   reviewer.GetNodeID(),
+			Login:    reviewer.GetLogin(),
+		})
+	}
+	for _, team := range pull.GetRequestedTeams() {
+		if !gh.IsSupportedReviewRequestTeam(team) {
+			continue
+		}
+		reviewRequests = append(reviewRequests, store.ReviewRequestRecord{
+			Kind:     store.ReviewRequestTeam,
+			GitHubID: team.GetID(),
+			NodeID:   team.GetNodeID(),
+			Login:    team.GetSlug(),
+		})
+	}
 	return store.PullRequestRecord{
 		Repository:      *repository,
 		GitHubID:        pull.GetID(),
@@ -101,9 +128,12 @@ func pullRecordFromREST(
 		StackSummary:    stackSummary,
 		MembershipKnown: true,
 		GitHubUpdatedAt: updatedAt,
-		ETag:            etag,
-		SyncedAt:        syncedAt,
-		Source:          source,
+		ReviewRequests:  reviewRequests,
+		ReviewRequestsKnown: pull.RequestedReviewers != nil ||
+			pull.RequestedTeams != nil,
+		ETag:     etag,
+		SyncedAt: syncedAt,
+		Source:   source,
 	}
 }
 
@@ -113,6 +143,43 @@ func pullRecordFromNode(
 	installationID int64,
 	orgID int64,
 ) store.PullRequestRecord {
+	reviewRequests := make(
+		[]store.ReviewRequestRecord,
+		0,
+		len(node.ReviewRequests.Nodes),
+	)
+	for _, request := range node.ReviewRequests.Nodes {
+		reviewer := request.RequestedReviewer
+		kind := store.ReviewRequestKind("")
+		login := ""
+		switch reviewer.Typename {
+		case "User":
+			kind = store.ReviewRequestUser
+			login = reviewer.Login
+		case "Team":
+			kind = store.ReviewRequestTeam
+			login = reviewer.Slug
+		default:
+			// RequestedReviewer also permits Bot, Mannequin,
+			// EnterpriseTeam, nil, and future union members. The v1
+			// public contract intentionally exposes only User and Team;
+			// skip other variants instead of emitting an invalid or
+			// mislabeled set member.
+			continue
+		}
+		if reviewer.DatabaseID <= 0 || reviewer.ID == "" || login == "" {
+			// databaseId is nullable in GitHub's GraphQL schema. Without
+			// both stable identities this node cannot satisfy the public
+			// contract, so exclude it without invalidating supported peers.
+			continue
+		}
+		reviewRequests = append(reviewRequests, store.ReviewRequestRecord{
+			Kind:     kind,
+			GitHubID: reviewer.DatabaseID,
+			NodeID:   reviewer.ID,
+			Login:    login,
+		})
+	}
 	threads := make([]store.ReviewThreadRecord, 0, len(node.ReviewThreads.Nodes))
 	for _, thread := range node.ReviewThreads.Nodes {
 		comments := make(
@@ -152,28 +219,30 @@ func pullRecordFromNode(
 			installationID,
 			orgID,
 		),
-		GitHubID:        node.DatabaseID,
-		NodeID:          node.ID,
-		Number:          node.Number,
-		Title:           node.Title,
-		State:           strings.ToLower(node.State),
-		Draft:           node.IsDraft,
-		AuthorLogin:     node.Author.Login,
-		HeadRef:         node.HeadRefName,
-		HeadSHA:         node.HeadRefOID,
-		BaseRef:         node.BaseRefName,
-		BaseSHA:         node.BaseRefOID,
-		ReviewDecision:  node.ReviewDecision,
-		MergeableState:  node.Mergeable,
-		StackNumber:     item.metadata.StackNumber,
-		StackPosition:   item.metadata.StackPosition,
-		MembershipKnown: false,
-		GitHubUpdatedAt: node.UpdatedAt,
-		ReviewThreads:   threads,
-		ThreadsKnown:    true,
-		ETag:            item.metadata.ETag,
-		SyncedAt:        item.startedAt,
-		Source:          item.source,
+		GitHubID:            node.DatabaseID,
+		NodeID:              node.ID,
+		Number:              node.Number,
+		Title:               node.Title,
+		State:               strings.ToLower(node.State),
+		Draft:               node.IsDraft,
+		AuthorLogin:         node.Author.Login,
+		HeadRef:             node.HeadRefName,
+		HeadSHA:             node.HeadRefOID,
+		BaseRef:             node.BaseRefName,
+		BaseSHA:             node.BaseRefOID,
+		ReviewDecision:      node.ReviewDecision,
+		MergeableState:      node.Mergeable,
+		StackNumber:         item.metadata.StackNumber,
+		StackPosition:       item.metadata.StackPosition,
+		MembershipKnown:     false,
+		GitHubUpdatedAt:     node.UpdatedAt,
+		ReviewThreads:       threads,
+		ThreadsKnown:        true,
+		ReviewRequests:      reviewRequests,
+		ReviewRequestsKnown: true,
+		ETag:                item.metadata.ETag,
+		SyncedAt:            item.startedAt,
+		Source:              item.source,
 	}
 }
 
@@ -262,16 +331,21 @@ func pullRecordsFromList(
 		if etags != nil {
 			etag = etags[pulls[index].GetNumber()]
 		}
-		records = append(
-			records,
-			pullRecordFromREST(
-				repository,
-				&pulls[index],
-				etag,
-				source,
-				syncedAt,
-			),
+		record := pullRecordFromREST(
+			repository,
+			&pulls[index],
+			etag,
+			source,
+			syncedAt,
 		)
+		// The list endpoint is discovery input, not an authoritative
+		// replace-set observation. Its response is fetched before the PR
+		// entity observation lock and may omit or lag review requests. The
+		// backfill child refresh writes the complete detail/GraphQL set while
+		// holding that lock.
+		record.ReviewRequests = nil
+		record.ReviewRequestsKnown = false
+		records = append(records, record)
 	}
 	return records
 }

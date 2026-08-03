@@ -880,6 +880,16 @@ type oraclePull struct {
 	UpdatedAt      time.Time
 }
 
+type oracleReviewRequest struct {
+	Pull        int
+	Kind        string
+	ID          int64
+	NodeID      string
+	Login       string
+	RequestedAt *time.Time
+	HeadSHA     string
+}
+
 type oracleStack struct {
 	ID        int64
 	NodeID    string
@@ -973,6 +983,39 @@ func assertFixtureConverged(
 			"pull-request cache mismatch\ntruth=%+v\ncache=%+v",
 			expectedPulls,
 			cachedPulls,
+		)
+	}
+	// Review requests are part of the convergence oracle: stable identity,
+	// current login/slug, request timestamp when available, and observed head
+	// must match fixture truth. first_seen_at is intentionally excluded because
+	// it is a cache-local observation time, not GitHub fixture truth.
+	expectedRequests := make([]oracleReviewRequest, 0)
+	for _, pull := range truth.PullRequests {
+		for _, request := range pull.ReviewRequests {
+			if request.Kind != "user" && request.Kind != "team" {
+				continue
+			}
+			expectedRequests = append(expectedRequests, oracleReviewRequest{
+				Pull:    pull.Number,
+				Kind:    request.Kind,
+				ID:      request.ID,
+				NodeID:  request.NodeID,
+				Login:   request.Login,
+				HeadSHA: pull.Head.SHA,
+			})
+		}
+	}
+	cachedRequests, err := readCachedReviewRequests(ctx, pool, repo)
+	if err != nil {
+		return err
+	}
+	sortOracleReviewRequests(expectedRequests)
+	sortOracleReviewRequests(cachedRequests)
+	if !reflect.DeepEqual(expectedRequests, cachedRequests) {
+		return fmt.Errorf(
+			"pull-request review-request cache mismatch\ntruth=%+v\ncache=%+v",
+			expectedRequests,
+			cachedRequests,
 		)
 	}
 
@@ -1100,6 +1143,18 @@ func sortOraclePulls(pulls []oraclePull) {
 	})
 }
 
+func sortOracleReviewRequests(requests []oracleReviewRequest) {
+	sort.Slice(requests, func(i, j int) bool {
+		if requests[i].Pull != requests[j].Pull {
+			return requests[i].Pull < requests[j].Pull
+		}
+		if requests[i].Kind != requests[j].Kind {
+			return requests[i].Kind < requests[j].Kind
+		}
+		return requests[i].ID < requests[j].ID
+	})
+}
+
 func sortOracleStacks(stacks []oracleStack) {
 	sort.Slice(stacks, func(i, j int) bool {
 		return stacks[i].Number < stacks[j].Number
@@ -1146,6 +1201,33 @@ func readCachedPulls(
 			StackNumber:    pgInt4Pointer(row.StackNumber),
 			StackPosition:  pgInt4Pointer(row.StackPosition),
 			UpdatedAt:      row.GhUpdatedAt.Time.UTC(),
+		})
+	}
+	return result, nil
+}
+
+func readCachedReviewRequests(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	repo string,
+) ([]oracleReviewRequest, error) {
+	rows, err := dbgen.New(pool).ListLoadgenCachedPullRequestReviewRequests(
+		ctx,
+		repo,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query cached PR review requests: %w", err)
+	}
+	result := make([]oracleReviewRequest, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, oracleReviewRequest{
+			Pull:        int(row.PrNumber),
+			Kind:        row.ReviewerKind,
+			ID:          row.ReviewerGhID,
+			NodeID:      row.ReviewerNodeID,
+			Login:       row.ReviewerLogin,
+			RequestedAt: pgTimestampPointer(row.RequestedAt),
+			HeadSHA:     row.HeadSha,
 		})
 	}
 	return result, nil
