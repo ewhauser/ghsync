@@ -650,6 +650,187 @@ func TestWatchDisconnectRemovesSubscriber(t *testing.T) {
 	waitSubscriberCount(t, api.hub, 0)
 }
 
+func TestWatchSnapshotCommitsBeforeSlowClientWrite(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	poolConfig, err := pgxpool.ParseConfig(database.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolConfig.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	seedMirror(t, t.Context(), pool, time.Now().UTC())
+
+	writer := newBlockingSnapshotWriter()
+	defer writer.unblock()
+	result := make(chan error, 1)
+	api := newAPIServer(pool, nil, nil, 0)
+	go func() {
+		_, err := api.writeSnapshot(
+			t.Context(),
+			writer,
+			writer,
+		)
+		result <- err
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("watch snapshot never reached the client write")
+	}
+
+	acquireCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	connection, err := pool.Acquire(acquireCtx)
+	if err != nil {
+		t.Fatalf("snapshot retained the only pooled transaction during client write: %v", err)
+	}
+	connection.Release()
+	writer.unblock()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWatchSnapshotLimitReturnsExplicitResync(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	seedMirror(t, t.Context(), database.Pool, time.Now().UTC())
+	for _, test := range []struct {
+		name    string
+		kind    string
+		maximum int
+	}{
+		{name: "entities", kind: "entities", maximum: 1},
+		{name: "bytes", kind: "bytes", maximum: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			api := newAPIServer(database.Pool, nil, nil, 0)
+			switch test.kind {
+			case "entities":
+				api.snapshotEntityLimit = test.maximum
+			case "bytes":
+				api.snapshotBytesLimit = test.maximum
+			}
+			response := httptest.NewRecorder()
+			request := httptest.NewRequestWithContext(
+				t.Context(),
+				http.MethodGet,
+				"/v1/watch",
+				http.NoBody,
+			)
+			api.serveFreshSnapshot(response, response, request)
+			events := make(chan sseEvent, 2)
+			scanSSE(bytes.NewReader(response.Body.Bytes()), events)
+			event := nextSSE(t, events)
+			if event.name != "resync" {
+				t.Fatalf("snapshot limit event = %#v", event)
+			}
+			var advisory resyncAdvisory
+			decodeSSEData(t, event, &advisory)
+			if advisory.Reason != "snapshot_limit_exceeded" ||
+				advisory.Limit != test.kind || advisory.Maximum != test.maximum {
+				t.Fatalf("snapshot limit advisory = %#v", advisory)
+			}
+		})
+	}
+}
+
+func TestWatchSnapshotMaterializationConcurrencyIsBounded(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	seedMirror(t, t.Context(), database.Pool, time.Now().UTC())
+	api := newAPIServer(database.Pool, nil, nil, 0)
+	api.snapshotSlots = make(chan struct{}, 1)
+	first := newBlockingSnapshotWriter()
+	second := newBlockingSnapshotWriter()
+	defer first.unblock()
+	defer second.unblock()
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := api.writeSnapshot(t.Context(), first, first)
+		firstResult <- err
+	}()
+	select {
+	case <-first.started:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("first snapshot never reached the client write")
+	}
+	secondCtx, cancelSecond := context.WithCancel(t.Context())
+	secondCalled := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		close(secondCalled)
+		_, err := api.writeSnapshot(secondCtx, second, second)
+		secondResult <- err
+	}()
+	<-secondCalled
+	cancelSecond()
+	if err := <-secondResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("second snapshot capacity wait = %v, want context cancellation", err)
+	}
+	select {
+	case <-second.started:
+		t.Fatal("second snapshot materialized while the only slot was occupied")
+	default:
+	}
+	first.unblock()
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+	secondResult = make(chan error, 1)
+	go func() {
+		_, err := api.writeSnapshot(t.Context(), second, second)
+		secondResult <- err
+	}()
+	select {
+	case <-second.started:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("second snapshot did not proceed after capacity was released")
+	}
+	second.unblock()
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingSnapshotWriter struct {
+	header      http.Header
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingSnapshotWriter() *blockingSnapshotWriter {
+	return &blockingSnapshotWriter{
+		header:  make(http.Header),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (w *blockingSnapshotWriter) Header() http.Header { return w.header }
+
+func (*blockingSnapshotWriter) WriteHeader(int) {}
+
+func (w *blockingSnapshotWriter) Write(payload []byte) (int, error) {
+	w.startedOnce.Do(func() { close(w.started) })
+	<-w.release
+	return len(payload), nil
+}
+
+func (*blockingSnapshotWriter) Flush() {}
+
+func (w *blockingSnapshotWriter) unblock() {
+	w.releaseOnce.Do(func() { close(w.release) })
+}
+
 type mirrorFixture struct {
 	safeSeq int64
 	headSHA string

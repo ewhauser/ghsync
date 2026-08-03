@@ -17,13 +17,21 @@ import (
 	"github.com/ewhauser/ghsync/pkg/streamclient"
 )
 
-const sseWriteTimeout = 5 * time.Second
+const (
+	sseWriteTimeout            = 5 * time.Second
+	maximumSnapshotEntities    = 100_000
+	maximumSnapshotEntityBytes = 64 << 20
+	maximumConcurrentSnapshots = 2
+)
 
 type apiServer struct {
-	pool        *pgxpool.Pool
-	hub         *eventHub
-	tailer      *entityTailer
-	replayLimit int
+	pool                *pgxpool.Pool
+	hub                 *eventHub
+	tailer              *entityTailer
+	replayLimit         int
+	snapshotSlots       chan struct{}
+	snapshotEntityLimit int
+	snapshotBytesLimit  int
 }
 
 func newAPIServer(
@@ -37,6 +45,12 @@ func newAPIServer(
 		hub:         hub,
 		tailer:      tailer,
 		replayLimit: replayLimit,
+		snapshotSlots: make(
+			chan struct{},
+			maximumConcurrentSnapshots,
+		),
+		snapshotEntityLimit: maximumSnapshotEntities,
+		snapshotBytesLimit:  maximumSnapshotEntityBytes,
 	}
 }
 
@@ -289,6 +303,16 @@ func (s *apiServer) serveFreshSnapshot(
 		if request.Context().Err() != nil {
 			return
 		}
+		var limitErr *snapshotLimitError
+		if errors.As(err, &limitErr) {
+			slog.Warn("watch snapshot rejected", "error", err)
+			_ = writeSSE(response, flusher, "resync", nil, resyncAdvisory{
+				Reason:  "snapshot_limit_exceeded",
+				Limit:   limitErr.kind,
+				Maximum: limitErr.maximum,
+			})
+			return
+		}
 		slog.Error("read watch snapshot", "error", err)
 		_ = writeSSE(response, flusher, "resync", nil, resyncAdvisory{
 			Reason: "server_error",
@@ -386,6 +410,12 @@ func (s *apiServer) writeSnapshot(
 	response http.ResponseWriter,
 	flusher http.Flusher,
 ) (safeSeq int64, resultErr error) {
+	select {
+	case s.snapshotSlots <- struct{}{}:
+		defer func() { <-s.snapshotSlots }()
+	case <-ctx.Done():
+		return 0, fmt.Errorf("wait for watch snapshot capacity: %w", ctx.Err())
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
@@ -406,16 +436,26 @@ func (s *apiServer) writeSnapshot(
 	`).Scan(&safeSeq); err != nil {
 		return 0, fmt.Errorf("read watch snapshot watermark: %w", err)
 	}
-	if err := writeSnapshotEntities(
+	entities, err := loadSnapshotEntities(
 		ctx,
 		tx,
-		response,
-		flusher,
-	); err != nil {
+		s.snapshotEntityLimit,
+		s.snapshotBytesLimit,
+	)
+	if err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit watch snapshot: %w", err)
+	}
+	// C-C6: the repeatable-read snapshot is fully materialized and committed
+	// before the first potentially slow client write. The bounded entity/byte
+	// limits in loadSnapshotEntities keep this example from trading a database
+	// resource leak for unbounded process memory.
+	for _, event := range entities {
+		if err := writeSSE(response, flusher, "snapshot", nil, event); err != nil {
+			return 0, fmt.Errorf("write watch snapshot entity: %w", err)
+		}
 	}
 	return safeSeq, nil
 }
@@ -575,15 +615,8 @@ func queryStreamEvents(
 	return events, nil
 }
 
-func writeSnapshotEntities(
-	ctx context.Context,
-	tx pgx.Tx,
-	response http.ResponseWriter,
-	flusher http.Flusher,
-) error {
-	rows, err := tx.Query(ctx, `
-		SELECT kind, entity_key, entity
-		FROM (
+const snapshotEntitiesCTE = `
+	WITH snapshot_entities AS (
 		    SELECT 'repository.snapshot'::text AS kind,
 		           'repo:' || installation_id || ':' || gh_id AS entity_key,
 		           to_jsonb(repos) AS entity
@@ -623,28 +656,83 @@ func writeSnapshotEntities(
 		    WHERE check_runs.tombstoned_at IS NULL
 		      AND repos.tombstoned_at IS NULL
 		    GROUP BY repos.installation_id, repos.gh_id, check_runs.head_sha
-		) AS snapshot_entities
+	)
+`
+
+func loadSnapshotEntities(
+	ctx context.Context,
+	tx pgx.Tx,
+	entityLimit int,
+	bytesLimit int,
+) ([]materializedEvent, error) {
+	var entityCount, totalBytes int64
+	if err := tx.QueryRow(ctx, snapshotEntitiesCTE+`
+		SELECT count(*), COALESCE(sum(
+		    octet_length(kind) +
+		    octet_length(entity_key) +
+		    octet_length(entity::text)
+		), 0)
+		FROM snapshot_entities
+	`).Scan(&entityCount, &totalBytes); err != nil {
+		return nil, fmt.Errorf("measure watch snapshot: %w", err)
+	}
+	if entityCount > int64(entityLimit) {
+		return nil, &snapshotLimitError{
+			kind:    "entities",
+			maximum: entityLimit,
+		}
+	}
+	if totalBytes > int64(bytesLimit) {
+		return nil, &snapshotLimitError{
+			kind:    "bytes",
+			maximum: bytesLimit,
+		}
+	}
+
+	rows, err := tx.Query(ctx, snapshotEntitiesCTE+`
+		SELECT kind, entity_key, entity
+		FROM snapshot_entities
 		ORDER BY kind, entity_key
 	`)
 	if err != nil {
-		return fmt.Errorf("query watch snapshot: %w", err)
+		return nil, fmt.Errorf("query watch snapshot: %w", err)
 	}
 	defer rows.Close()
+	result := make([]materializedEvent, 0, int(entityCount))
+	materializedBytes := 0
 	for rows.Next() {
 		var event materializedEvent
 		var entity json.RawMessage
 		if err := rows.Scan(&event.Kind, &event.EntityKey, &entity); err != nil {
-			return fmt.Errorf("scan watch snapshot: %w", err)
+			return nil, fmt.Errorf("scan watch snapshot: %w", err)
 		}
 		event.Entity = append(json.RawMessage(nil), entity...)
-		if err := writeSSE(response, flusher, "snapshot", nil, event); err != nil {
-			return fmt.Errorf("write watch snapshot entity: %w", err)
+		materializedBytes += len(event.Kind) + len(event.EntityKey) + len(event.Entity)
+		if materializedBytes > bytesLimit {
+			return nil, &snapshotLimitError{
+				kind:    "bytes",
+				maximum: bytesLimit,
+			}
 		}
+		result = append(result, event)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate watch snapshot: %w", err)
+		return nil, fmt.Errorf("iterate watch snapshot: %w", err)
 	}
-	return nil
+	return result, nil
+}
+
+type snapshotLimitError struct {
+	kind    string
+	maximum int
+}
+
+func (e *snapshotLimitError) Error() string {
+	return fmt.Sprintf(
+		"watch snapshot exceeds maximum %s (%d)",
+		e.kind,
+		e.maximum,
+	)
 }
 
 func resumeSequence(request *http.Request) (int64, bool, error) {

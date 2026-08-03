@@ -30,6 +30,8 @@ type resyncAdvisory struct {
 	Reason           string `json:"reason"`
 	FromSeq          int64  `json:"from_seq,omitempty"`
 	PrunedThroughSeq int64  `json:"pruned_through_seq,omitempty"`
+	Limit            string `json:"limit,omitempty"`
+	Maximum          int    `json:"maximum,omitempty"`
 }
 
 type subscriberControl struct {

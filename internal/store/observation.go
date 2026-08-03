@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -14,8 +15,10 @@ import (
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
-// Observation owns a session-level advisory lock on one dedicated connection.
-// It is held from before the GitHub call until the writer transaction commits.
+// Observation owns C-C1's narrowly allowed C-C6 exception: a session-level
+// advisory lock on one dedicated connection, held across one entity's GitHub
+// fetch and write. No transaction is open during the network call, and shared
+// repository metadata locks must use a shorter post-fetch scope.
 type Observation struct {
 	conn *pgxpool.Conn
 	key  string
@@ -44,35 +47,76 @@ func (o *Observation) CloseContext(ctx context.Context) error {
 		return nil
 	}
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.closed {
+		o.mu.Unlock()
 		return nil
 	}
 	o.closed = true
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	conn := o.conn
+	o.conn = nil
+	o.mu.Unlock()
+
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		5*time.Second,
+	)
 	defer cancel()
-	err := dbgen.New(o.conn).ReleaseEntitySessionLock(ctx, o.key)
-	o.conn.Release()
-	if err != nil {
-		return fmt.Errorf("release observation lock %s: %w", o.key, err)
+	unlocked, err := dbgen.New(conn).ReleaseEntitySessionLock(cleanupCtx, o.key)
+	if err == nil && unlocked {
+		conn.Release()
+		return nil
 	}
-	return nil
+	if err == nil {
+		err = errors.New("pg_advisory_unlock reported lock not held")
+	}
+
+	// C-C6: an unlock error leaves the session-lock state unknown. Hijack the
+	// physical connection so pgxpool can never lend that session to another
+	// borrower, then close its socket; PostgreSQL releases session locks when
+	// it observes backend teardown. Close always closes the underlying socket,
+	// even if the graceful Terminate exchange itself reports an error.
+	destroyErr := destroyObservationConnection(cleanupCtx, conn)
+	releaseErr := fmt.Errorf("release observation lock %s: %w", o.key, err)
+	if destroyErr != nil {
+		return errors.Join(
+			releaseErr,
+			fmt.Errorf("destroy observation connection %s: %w", o.key, destroyErr),
+		)
+	}
+	return releaseErr
+}
+
+func destroyObservationConnection(
+	ctx context.Context,
+	conn *pgxpool.Conn,
+) error {
+	physical := conn.Hijack()
+	destroyCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		time.Second,
+	)
+	defer cancel()
+	// pgconn.Close defers the underlying net.Conn.Close, so the physical socket
+	// is closed even if its bounded graceful Terminate exchange reports an
+	// error. PostgreSQL then tears down the backend and its session locks.
+	return physical.Close(destroyCtx)
 }
 
 func (o *Observation) begin(ctx context.Context) (pgx.Tx, error) {
-	if o == nil || o.conn == nil {
+	if o == nil {
 		return nil, fmt.Errorf("observation is required")
 	}
 	o.mu.Lock()
 	closed := o.closed
+	conn := o.conn
 	o.mu.Unlock()
-	if closed {
+	if closed || conn == nil {
 		return nil, fmt.Errorf("observation %s is closed", o.key)
 	}
-	return o.conn.Begin(ctx)
+	return conn.Begin(ctx)
 }
 
-// EntityWriter owns C-C1..C-C5. Network fetches never enter this package.
+// EntityWriter owns C-C1..C-C6. Network fetches never enter this package.
 type EntityWriter struct {
 	pool     *pgxpool.Pool
 	now      func() time.Time
@@ -105,7 +149,8 @@ func NewEntityWriter(
 	}
 }
 
-// BeginObservation acquires a session-level advisory lock for entityKey.
+// BeginObservation acquires C-C1's dedicated session-level advisory lock for
+// entityKey. See C-C6 before extending its lifetime or nesting observations.
 func (w *EntityWriter) BeginObservation(
 	ctx context.Context,
 	entityKey string,
@@ -118,8 +163,20 @@ func (w *EntityWriter) BeginObservation(
 		return nil, fmt.Errorf("acquire observation connection: %w", err)
 	}
 	if err := dbgen.New(conn).AcquireEntitySessionLock(ctx, entityKey); err != nil {
-		conn.Release()
-		return nil, fmt.Errorf("lock observation %s: %w", entityKey, err)
+		lockErr := fmt.Errorf("lock observation %s: %w", entityKey, err)
+		// A failed or canceled lock statement has ambiguous server-side state.
+		// Never return that physical session to pgxpool.
+		if destroyErr := destroyObservationConnection(ctx, conn); destroyErr != nil {
+			return nil, errors.Join(
+				lockErr,
+				fmt.Errorf(
+					"destroy failed observation connection %s: %w",
+					entityKey,
+					destroyErr,
+				),
+			)
+		}
+		return nil, lockErr
 	}
 	return &Observation{conn: conn, key: entityKey}, nil
 }

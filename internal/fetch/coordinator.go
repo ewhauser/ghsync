@@ -168,35 +168,13 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	)
 	defer cancel()
 
-	repoObservations := make(map[int64]*store.Observation)
 	var observations []*store.Observation
 	closeObservations := func() {
 		for _, v := range slices.Backward(observations) {
-			_ = v.CloseContext(callCtx)
+			closeObservation(callCtx, v)
 		}
 	}
 	defer closeObservations()
-
-	repoIDs := make([]int64, 0)
-	for _, item := range batch.items {
-		if _, exists := repoObservations[item.metadata.RepoGitHubID]; !exists {
-			repoIDs = append(repoIDs, item.metadata.RepoGitHubID)
-			repoObservations[item.metadata.RepoGitHubID] = nil
-		}
-	}
-	slices.Sort(repoIDs)
-	for _, repoID := range repoIDs {
-		observation, err := c.writer.BeginObservation(
-			callCtx,
-			store.RepositoryEntityKey(c.installationID, repoID),
-		)
-		if err != nil {
-			c.finishAll(batch, nil, err)
-			return
-		}
-		repoObservations[repoID] = observation
-		observations = append(observations, observation)
-	}
 
 	itemObservations := make(map[*pullBatchItem]*store.Observation, len(batch.items))
 	active := make([]*pullBatchItem, 0, len(batch.items))
@@ -240,10 +218,12 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	}
 	nodes, nodeErrors := c.fetchPullRequestNodes(callCtx, active, ids)
 
-	repositoryFailures := make(map[int64]error)
-	applies := make([]store.PullRequestApply, 0, len(active))
-	applyItems := make(map[string]*pullBatchItem, len(active))
-	repositoryApplied := make(map[int64]bool)
+	type preparedPull struct {
+		item   *pullBatchItem
+		record store.PullRequestRecord
+	}
+	prepared := make([]preparedPull, 0, len(active))
+	repositoryCandidates := make(map[int64]preparedPull)
 	for index, node := range nodes {
 		item := active[index]
 		if nodeErr := nodeErrors[index]; nodeErr != nil {
@@ -286,25 +266,61 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		record.ChangeSnapshot = snapshot
 		record.ChangeInputsKnown = true
 		repoID := record.Repository.GitHubID
-		if repoErr := repositoryFailures[repoID]; repoErr != nil {
+		candidate := preparedPull{item: item, record: record}
+		prepared = append(prepared, candidate)
+		if _, exists := repositoryCandidates[repoID]; !exists {
+			repositoryCandidates[repoID] = candidate
+		}
+	}
+
+	// C-C6 lock ordering: every remote fetch and hydration request is complete
+	// before taking a repository observation. PR observations may already be
+	// held, so repository observations are always acquired PR -> repository,
+	// released immediately after ApplyRepositoryObserved, and never retained
+	// into a PR writer transaction. No path may acquire a PR observation while
+	// holding a repository observation. Repository C-C1 serialization remains
+	// intact; C-C2 rejects an older batch that reaches this window last.
+	repositoryFailures := make(map[int64]error)
+	repoIDs := make([]int64, 0, len(repositoryCandidates))
+	for repoID := range repositoryCandidates {
+		repoIDs = append(repoIDs, repoID)
+	}
+	slices.Sort(repoIDs)
+	for _, repoID := range repoIDs {
+		candidate := repositoryCandidates[repoID]
+		err := func() error {
+			repositoryObservation, err := c.writer.BeginObservation(
+				callCtx,
+				store.RepositoryEntityKey(c.installationID, repoID),
+			)
+			if err != nil {
+				return err
+			}
+			defer closeObservation(callCtx, repositoryObservation)
+			_, err = c.writer.ApplyRepositoryObserved(
+				callCtx,
+				repositoryObservation,
+				candidate.record.Repository,
+				candidate.item.source,
+				"",
+				candidate.item.startedAt,
+			)
+			return err
+		}()
+		if err != nil {
+			repositoryFailures[repoID] = err
+		}
+	}
+
+	applies := make([]store.PullRequestApply, 0, len(prepared))
+	applyItems := make(map[string]*pullBatchItem, len(prepared))
+	for index := range prepared {
+		candidate := &prepared[index]
+		item := candidate.item
+		record := &candidate.record
+		if repoErr := repositoryFailures[record.Repository.GitHubID]; repoErr != nil {
 			results[item] = pullBatchResult{err: repoErr}
 			continue
-		}
-		if !repositoryApplied[repoID] {
-			_, repoErr := c.writer.ApplyRepositoryObserved(
-				callCtx,
-				repoObservations[repoID],
-				record.Repository,
-				item.source,
-				"",
-				item.startedAt,
-			)
-			if repoErr != nil {
-				repositoryFailures[repoID] = repoErr
-				results[item] = pullBatchResult{err: repoErr}
-				continue
-			}
-			repositoryApplied[repoID] = true
 		}
 		key := store.PullRequestEntityKey(
 			record.Repository.InstallationID,
@@ -316,7 +332,7 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 				Context: callCtx,
 				values:  item.ctx,
 			},
-			Record:      record,
+			Record:      *record,
 			Observation: itemObservations[item],
 			Hook:        item.hook(record.Repository.FullName),
 		})

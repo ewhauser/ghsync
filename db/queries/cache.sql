@@ -7,7 +7,7 @@ SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg(entity_key)::text, 0));
 -- observation until after the state transaction commits.
 SELECT pg_advisory_lock(hashtextextended(sqlc.arg(entity_key)::text, 0));
 
--- name: ReleaseEntitySessionLock :exec
+-- name: ReleaseEntitySessionLock :one
 SELECT pg_advisory_unlock(hashtextextended(sqlc.arg(entity_key)::text, 0));
 
 -- name: GetRepoByFullName :one

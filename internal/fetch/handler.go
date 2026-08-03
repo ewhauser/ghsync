@@ -118,7 +118,7 @@ func (h *Handler) RefreshRepository(
 	if err != nil {
 		return err
 	}
-	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer closeObservation(ctx, observation)
 	owner, name, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
@@ -203,7 +203,7 @@ func (h *Handler) RefreshRepoRules(
 	if err != nil {
 		return err
 	}
-	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer closeObservation(ctx, observation)
 	owner, name, err := repoutil.Split(key.Repo)
 	if err != nil {
 		return err
@@ -342,7 +342,7 @@ func (h *Handler) refreshPRREST(
 	if err != nil {
 		return err
 	}
-	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer closeObservation(ctx, observation)
 	startedAt := time.Now()
 	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
@@ -509,7 +509,7 @@ func (h *Handler) RefreshStack(
 	if err != nil {
 		return err
 	}
-	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer closeObservation(ctx, observation)
 	startedAt := time.Now()
 	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
@@ -603,7 +603,7 @@ func (h *Handler) RefreshChecks(
 	if err != nil {
 		return err
 	}
-	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer closeObservation(ctx, observation)
 	startedAt := time.Now()
 	owner, repoName, err := repoutil.Split(key.Repo)
 	if err != nil {
@@ -890,7 +890,7 @@ func (h *Handler) ensureRepository(
 	if err != nil {
 		return store.RepositoryRecord{}, err
 	}
-	defer discovery.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer closeObservation(ctx, discovery)
 	if repository, err = h.writer.Repository(ctx, fullName); err == nil {
 		return repository, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {
