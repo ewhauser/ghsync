@@ -117,7 +117,10 @@ func chooseStackParent(
 		if candidate.Number == child.Number {
 			continue
 		}
-		if candidate.Head.SHA != "" &&
+		// An unknown base SHA cannot disambiguate reused branch names. Fall
+		// through to the ref/state recency rule without inventing a value.
+		if child.Base.SHA != "" &&
+			candidate.Head.SHA != "" &&
 			candidate.Head.SHA == child.Base.SHA {
 			return candidate, true
 		}

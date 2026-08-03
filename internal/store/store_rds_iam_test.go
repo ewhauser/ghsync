@@ -339,18 +339,9 @@ func TestRDSIAMRefreshesTokenAndAuthenticatesMigrationLock(t *testing.T) {
 	if err := lockConn.Close(ctx); err != nil {
 		t.Fatalf("close migration lock connection: %v", err)
 	}
-	if err := checker.QueryRow(ctx,
-		`SELECT pg_try_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`).
-		Scan(&acquired); err != nil {
-		t.Fatal(err)
-	}
-	if !acquired {
-		t.Fatal("closing hijacked connection did not release migration advisory lock")
-	}
-	if _, err := checker.Exec(ctx,
-		`SELECT pg_advisory_unlock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
-		t.Fatal(err)
-	}
+	// Session-lock release is asynchronous relative to Close returning;
+	// poll on the pinned checker session with a generous bound.
+	assertMigrationLockAvailableOn(t, ctx, checker)
 
 	requests := provider.Requests()
 	if len(requests) != len(tokens) {

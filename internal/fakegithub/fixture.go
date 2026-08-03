@@ -129,7 +129,7 @@ func DefaultFixture() Fixture {
 			Number: 4810, Title: "Tokenizer rewrite for query parser", State: "closed",
 			AuthorLogin: "octocat", ReviewDecision: "APPROVED", MergeableState: "MERGEABLE",
 			Head:      PullRequestBranch{Ref: "refactor/tokenizer", SHA: "bbbb001"},
-			Base:      PullRequestBranch{Ref: "main", SHA: "aaaa000"},
+			Base:      Base{Ref: "main", SHA: "aaaa000"},
 			UpdatedAt: now, Stack: stackRef(1),
 		},
 		{
@@ -138,7 +138,7 @@ func DefaultFixture() Fixture {
 			AuthorLogin: "octocat", ReviewDecision: "CHANGES_REQUESTED",
 			MergeableState: "CONFLICTING",
 			Head:           PullRequestBranch{Ref: "refactor/bm25f-ranker", SHA: "8f31c2d"},
-			Base:           PullRequestBranch{Ref: "refactor/tokenizer", SHA: "bbbb001"},
+			Base:           Base{Ref: "refactor/tokenizer", SHA: "bbbb001"},
 			UpdatedAt:      now, Stack: stackRef(2),
 			ReviewThreads: []ReviewThread{{
 				ID: "PRRT_kwDOABCDEF4812_1", Path: "internal/ranker.go",
@@ -165,7 +165,7 @@ func DefaultFixture() Fixture {
 			AuthorLogin: "octocat", ReviewDecision: "REVIEW_REQUIRED",
 			MergeableState: "MERGEABLE",
 			Head:           PullRequestBranch{Ref: "feat/relevance-debug", SHA: "bbbb003"},
-			Base:           PullRequestBranch{Ref: "refactor/bm25f-ranker", SHA: "8f31c2d"},
+			Base:           Base{Ref: "refactor/bm25f-ranker", SHA: "8f31c2d"},
 			UpdatedAt:      now, Stack: stackRef(3),
 		},
 		{
@@ -174,7 +174,7 @@ func DefaultFixture() Fixture {
 			AuthorLogin: "octocat", ReviewDecision: "REVIEW_REQUIRED",
 			MergeableState: "MERGEABLE",
 			Head:           PullRequestBranch{Ref: "feat/results-rewire", SHA: "bbbb004"},
-			Base:           PullRequestBranch{Ref: "feat/relevance-debug", SHA: "bbbb003"},
+			Base:           Base{Ref: "feat/relevance-debug", SHA: "bbbb003"},
 			UpdatedAt:      now, Stack: stackRef(4),
 		},
 		{
@@ -183,7 +183,7 @@ func DefaultFixture() Fixture {
 			AuthorLogin: "octocat", ReviewDecision: "REVIEW_REQUIRED",
 			MergeableState: "MERGEABLE",
 			Head:           PullRequestBranch{Ref: "feat/relevance-telemetry", SHA: "bbbb005"},
-			Base:           PullRequestBranch{Ref: "feat/results-rewire", SHA: "bbbb004"},
+			Base:           Base{Ref: "feat/results-rewire", SHA: "bbbb004"},
 			UpdatedAt:      now, Stack: stackRef(5),
 		},
 	}

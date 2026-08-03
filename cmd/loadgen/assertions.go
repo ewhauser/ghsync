@@ -948,6 +948,8 @@ func assertFixtureConverged(
 	repo := truth.Repository.FullName
 	expectedPulls := make([]oraclePull, 0, len(truth.PullRequests))
 	for _, pull := range truth.PullRequests {
+		// Empty is the shared fixture/cache sentinel for a GitHub-null base
+		// SHA, so unknown truth converges instead of oscillating.
 		expected := oraclePull{
 			ID:             pull.ID,
 			NodeID:         pull.NodeID,

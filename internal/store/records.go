@@ -125,8 +125,10 @@ type PullRequestRecord struct {
 	Source              SyncSource
 }
 
-// StackSummaryRecord is the complete stack tuple embedded in an authoritative
-// pull-request response.
+// StackSummaryRecord is the stack tuple embedded in an authoritative
+// pull-request response. BaseSHA is empty when GitHub reports the stack base
+// ref but can no longer resolve its commit, including historical stacks whose
+// base branch was deleted.
 type StackSummaryRecord struct {
 	GitHubID int64
 	Number   int
@@ -147,7 +149,9 @@ type StackEntry struct {
 	HeadSHA   string     `json:"head_sha"`
 }
 
-// StackRecord is the authoritative stack state accepted by the cache.
+// StackRecord is the authoritative stack state accepted by the cache. BaseSHA
+// is empty when GitHub reports the base ref without a resolvable commit. This
+// is authoritative upstream truth, including for open stacks.
 type StackRecord struct {
 	Repository      RepositoryRecord
 	GitHubID        int64
@@ -297,8 +301,7 @@ func validatePullRequest(pull *PullRequestRecord) error {
 			pull.StackSummary.Size <= 0 ||
 			pull.StackSummary.Position != *pull.StackPosition ||
 			pull.StackSummary.Position > pull.StackSummary.Size ||
-			pull.StackSummary.BaseRef == "" ||
-			pull.StackSummary.BaseSHA == "") {
+			pull.StackSummary.BaseRef == "") {
 		return fmt.Errorf("invalid PR stack summary")
 	}
 	seenRequests := make(map[string]struct{}, len(pull.ReviewRequests))

@@ -105,7 +105,7 @@ JSON value may be empty.
 | `stacks` | `node_id` | `text` | no | GitHub GraphQL identity where supplied |
 | `stacks` | `number` | `integer` | no | repository-local stack number |
 | `stacks` | `base_ref` | `text` | no | — |
-| `stacks` | `base_sha` | `text` | no | — |
+| `stacks` | `base_sha` | `text` | no | empty means GitHub reported the base ref but the SHA is unknown |
 | `stacks` | `open` | `boolean` | no | — |
 | `stacks` | `entries` | `jsonb` | no | ordered stack-entry references |
 | `stacks` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
@@ -128,7 +128,7 @@ JSON value may be empty.
 | `pull_requests` | `head_ref` | `text` | no | — |
 | `pull_requests` | `head_sha` | `text` | no | check-run join input |
 | `pull_requests` | `base_ref` | `text` | no | — |
-| `pull_requests` | `base_sha` | `text` | no | — |
+| `pull_requests` | `base_sha` | `text` | no | empty means GitHub reported the base ref but the SHA is unknown |
 | `pull_requests` | `review_decision` | `text` | no | — |
 | `pull_requests` | `mergeable_state` | `text` | no | — |
 | `pull_requests` | `stack_number` | `integer` | yes | null means loose PR |

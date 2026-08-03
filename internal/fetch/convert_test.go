@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -9,6 +10,97 @@ import (
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/store"
 )
+
+func TestNullBaseSHAConvertersPreserveUnknown(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	repository := store.RepositoryRecord{GitHubID: 1001}
+	var restPull gh.PullRequest
+	if err := json.Unmarshal([]byte(`{
+		"id":804810,
+		"node_id":"PR_historical",
+		"number":4810,
+		"title":"Historical stack member",
+		"state":"closed",
+		"user":{"login":"author"},
+		"head":{"ref":"feature/historical","sha":"head-sha"},
+		"base":{"ref":"deleted/pr-base","sha":null},
+		"updated_at":"2026-08-02T12:00:00Z",
+		"stack":{
+			"id":9876543,
+			"number":142,
+			"size":1,
+			"position":1,
+			"base":{"ref":"deleted/stack-base","sha":null}
+		}
+	}`), &restPull); err != nil {
+		t.Fatal(err)
+	}
+	restRecord := pullRecordFromREST(
+		&repository,
+		&restPull,
+		`"rest-etag"`,
+		store.SyncSourceWebhook,
+		now,
+	)
+	if restRecord.BaseRef != "deleted/pr-base" || restRecord.BaseSHA != "" ||
+		restRecord.StackSummary == nil ||
+		restRecord.StackSummary.BaseRef != "deleted/stack-base" ||
+		restRecord.StackSummary.BaseSHA != "" {
+		t.Fatalf("REST null-SHA record = %+v", restRecord)
+	}
+
+	var restStack gh.Stack
+	if err := json.Unmarshal([]byte(`{
+		"id":9876543,
+		"node_id":"S_historical",
+		"number":142,
+		"base":{"ref":"deleted/stack-base","sha":null},
+		"open":false,
+		"created_at":"2026-08-02T11:00:00Z",
+		"updated_at":"2026-08-02T12:00:00Z",
+		"pull_requests":[]
+	}`), &restStack); err != nil {
+		t.Fatal(err)
+	}
+	stackRecord := stackRecordFromREST(
+		&repository,
+		&restStack,
+		`"stack-etag"`,
+		store.SyncSourceWebhook,
+		now,
+	)
+	if stackRecord.BaseRef != "deleted/stack-base" ||
+		stackRecord.BaseSHA != "" {
+		t.Fatalf("REST stack null-SHA record = %+v", stackRecord)
+	}
+
+	var node gh.PullRequestNode
+	if err := json.Unmarshal([]byte(`{
+		"id":"PR_historical",
+		"databaseId":804810,
+		"number":4810,
+		"title":"Historical stack member",
+		"state":"CLOSED",
+		"updatedAt":"2026-08-02T12:00:00Z",
+		"headRefName":"feature/historical",
+		"headRefOid":"head-sha",
+		"baseRefName":"deleted/pr-base",
+		"baseRefOid":null
+	}`), &node); err != nil {
+		t.Fatal(err)
+	}
+	graphQLRecord := pullRecordFromNode(
+		&node,
+		&pullBatchItem{startedAt: now, source: store.SyncSourceBackfill},
+		1,
+		1,
+	)
+	if graphQLRecord.BaseRef != "deleted/pr-base" ||
+		graphQLRecord.BaseSHA != "" {
+		t.Fatalf("GraphQL null-SHA record = %+v", graphQLRecord)
+	}
+}
 
 func TestReviewRequestConvertersExcludeUnsupportedOrIncompleteReviewers(
 	t *testing.T,

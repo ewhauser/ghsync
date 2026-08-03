@@ -321,6 +321,45 @@ func TestCompleteStackSummaryHintRequiresAuthoritativeResolver(t *testing.T) {
 	}
 }
 
+func TestUnknownStackBaseSHARetainsEagerStackFetch(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"action":"synchronize",
+		"number":72787,
+		"repository":{"full_name":"acme/monolith"},
+		"pull_request":{
+			"number":72787,
+			"stack":{
+				"id":46101,
+				"number":72787,
+				"base":{"ref":"deleted/historical-base","sha":null},
+				"size":6,
+				"position":1
+			}
+		}
+	}`)
+	result, err := DefaultClassifier().classify("pull_request", body)
+	if err != nil {
+		t.Fatalf("classify null stack base SHA: %v", err)
+	}
+	if result.stackHint != nil {
+		t.Fatalf("unknown SHA produced suppression hint: %+v", result.stackHint)
+	}
+	want := []Intent{
+		{
+			Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:72787",
+			Priority: PriorityEvent,
+		},
+		{
+			Kind: queue.KindResolveStackMembership,
+			Key:  "pr:acme/monolith:72787", Priority: PriorityEvent,
+		},
+	}
+	if !reflect.DeepEqual(result.intents, want) {
+		t.Fatalf("unknown-SHA intents = %#v, want %#v", result.intents, want)
+	}
+}
+
 func TestClassifierUsesStoredFormContentType(t *testing.T) {
 	t.Parallel()
 	jsonBody := []byte(`{

@@ -20,9 +20,147 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ewhauser/ghsync/internal/conformance"
 	"github.com/ewhauser/ghsync/internal/gh"
 	jwt "github.com/golang-jwt/jwt/v4"
 )
+
+func TestNullBaseSHARoundTripsAcrossRESTGraphQLAndWebhooks(t *testing.T) {
+	t.Parallel()
+	fixture := DefaultFixture()
+	fixture.PullRequests[0].Stack.Base.SHA = ""
+	fixture.Stacks[0].Base.SHA = ""
+	fake := New(fixture, "secret")
+
+	pullResponse := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/pulls/4810",
+		nil,
+	)
+	defer func() { _ = pullResponse.Body.Close() }()
+	if pullResponse.StatusCode != http.StatusOK {
+		t.Fatalf("REST pull status = %d", pullResponse.StatusCode)
+	}
+	var pullWire map[string]any
+	if err := json.NewDecoder(pullResponse.Body).Decode(&pullWire); err != nil {
+		t.Fatal(err)
+	}
+	stackWire, ok := pullWire["stack"].(map[string]any)
+	if !ok {
+		t.Fatalf("REST pull stack = %#v", pullWire["stack"])
+	}
+	stackBase, ok := stackWire["base"].(map[string]any)
+	if !ok || stackBase["ref"] != "main" || stackBase["sha"] != nil {
+		t.Fatalf("REST pull stack base = %#v", stackWire["base"])
+	}
+
+	stackResponse := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/stacks/142",
+		nil,
+	)
+	defer func() { _ = stackResponse.Body.Close() }()
+	if stackResponse.StatusCode != http.StatusOK {
+		t.Fatalf("REST stack status = %d", stackResponse.StatusCode)
+	}
+	var authoritativeStack map[string]any
+	if err := json.NewDecoder(stackResponse.Body).Decode(
+		&authoritativeStack,
+	); err != nil {
+		t.Fatal(err)
+	}
+	authoritativeBase, ok := authoritativeStack["base"].(map[string]any)
+	if !ok || authoritativeBase["sha"] != nil {
+		t.Fatalf("REST authoritative stack base = %#v", authoritativeStack["base"])
+	}
+
+	payload, err := fake.PullRequestWebhookPayload("closed", 4810)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookPull, err := payloadObject(payload, "pull_request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookStack, ok := webhookPull["stack"].(map[string]any)
+	if !ok {
+		t.Fatalf("webhook stack = %#v", webhookPull["stack"])
+	}
+	webhookBase, ok := webhookStack["base"].(map[string]any)
+	if !ok || webhookBase["sha"] != nil {
+		t.Fatalf("webhook stack base = %#v", webhookStack["base"])
+	}
+	payloadBody, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conformance.NewWebhookSchemaValidator().Validate(
+		"pull_request",
+		payloadBody,
+	); err != nil {
+		t.Fatalf("null stack base SHA webhook schema: %v", err)
+	}
+
+	fixture.PullRequests[0].Base.SHA = ""
+	fake.SetFixture(fixture)
+	pullResponse = serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/pulls/4810",
+		nil,
+	)
+	defer func() { _ = pullResponse.Body.Close() }()
+	pullWire = nil
+	if err := json.NewDecoder(pullResponse.Body).Decode(&pullWire); err != nil {
+		t.Fatal(err)
+	}
+	pullBase, ok := pullWire["base"].(map[string]any)
+	if !ok || pullBase["ref"] != "main" || pullBase["sha"] != nil {
+		t.Fatalf("REST pull base = %#v", pullWire["base"])
+	}
+	payload, err = fake.PullRequestWebhookPayload("closed", 4810)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookPull, err = payloadObject(payload, "pull_request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookPullBase, ok := webhookPull["base"].(map[string]any)
+	if !ok || webhookPullBase["sha"] != "" {
+		t.Fatalf("webhook pull base = %#v", webhookPull["base"])
+	}
+	requestBody := bytes.NewBufferString(`{
+		"query":"query($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{baseRefOid}}}",
+		"variables":{"ids":["PR_kwDOABCDEF4810"]}
+	}`)
+	graphQLResponse := serve(
+		fake,
+		http.MethodPost,
+		"http://fake.test/graphql",
+		requestBody,
+	)
+	defer func() { _ = graphQLResponse.Body.Close() }()
+	if graphQLResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GraphQL status = %d", graphQLResponse.StatusCode)
+	}
+	var graphQLWire struct {
+		Data struct {
+			Nodes []map[string]any `json:"nodes"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(graphQLResponse.Body).Decode(
+		&graphQLWire,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(graphQLWire.Data.Nodes) != 1 ||
+		graphQLWire.Data.Nodes[0]["baseRefOid"] != nil {
+		t.Fatalf("GraphQL baseRefOid = %#v", graphQLWire.Data.Nodes)
+	}
+}
 
 func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	received := make(chan *http.Request, 1)
@@ -511,7 +649,7 @@ func truthPullRequest(pull *TruthPullRequest) PullRequest {
 			Ref: pull.Head.Ref,
 			SHA: pull.Head.SHA,
 		},
-		Base: PullRequestBranch{
+		Base: Base{
 			Ref: pull.Base.Ref,
 			SHA: pull.Base.SHA,
 		},

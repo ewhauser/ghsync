@@ -77,7 +77,10 @@ Consequences baked into the design:
    When the complete tuple matches the cached stack ID, base, size, and member
    at that position, dispatch suppresses the eager stack fetch but retains the
    authoritative PR refresh. A resulting membership, position, head, state, or
-   draft change still enqueues the stack transactionally.
+   draft change still enqueues the stack transactionally. A JSON-null base SHA
+   is valid upstream truth for historical and open stacks, but it can never
+   prove a tuple match: unknown fails open to the eager stack fetch even when
+   both the payload and cache use the empty-string unknown sentinel.
 2. **Stacked-PR events escalate scope when needed.** For a PR in a stack,
    `closed`, `synchronize`, and base-edit events always retain an authoritative
    PR refresh. A tuple mismatch or a fetched membership, position, head, state,

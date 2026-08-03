@@ -214,6 +214,47 @@ func (h *driftHarness) divergePullRequest() {
 	h.fake.SetFixture(h.fixture)
 }
 
+func TestDriftTreatsUnknownBaseSHAAsConvergedTruth(t *testing.T) {
+	t.Parallel()
+	harness := newReadyDriftHarness(t)
+	ctx := t.Context()
+	if _, err := harness.pool.Exec(ctx, `
+		UPDATE pull_requests
+		SET base_sha = ''
+		FROM repos
+		WHERE repos.id = pull_requests.repo_id
+		  AND repos.full_name = 'acme/monolith'
+		  AND pull_requests.number = 4812;
+
+		UPDATE stacks
+		SET base_sha = ''
+		FROM repos
+		WHERE repos.id = stacks.repo_id
+		  AND repos.full_name = 'acme/monolith'
+		  AND stacks.number = 142
+	`); err != nil {
+		t.Fatal(err)
+	}
+	harness.fixture.PullRequests[1].Base.SHA = ""
+	if harness.fixture.PullRequests[1].Stack == nil {
+		t.Fatal("drift fixture PR has no stack summary")
+	}
+	harness.fixture.PullRequests[1].Stack.Base.SHA = ""
+	harness.fixture.Stacks[0].Base.SHA = ""
+	harness.fake.SetFixture(harness.fixture)
+
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("unknown base SHA produced unhealable drift: %+v", findings)
+	}
+}
+
 func TestDriftDetectsAndHealsReviewRequestSetDivergence(t *testing.T) {
 	t.Parallel()
 	harness := newReadyDriftHarness(t)

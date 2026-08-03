@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/url"
 	"path"
 	"strings"
@@ -86,6 +87,9 @@ func (v *WebhookSchemaValidator) Validate(
 	if err != nil {
 		return fmt.Errorf("decode %s payload for validation: %w", event, err)
 	}
+	if err := validateAndStripStackPreview(value); err != nil {
+		return fmt.Errorf("validate pull_request stack preview: %w", err)
+	}
 	if err := schema.Validate(value); err != nil {
 		return fmt.Errorf(
 			"validate %s/%s payload: %w",
@@ -95,6 +99,119 @@ func (v *WebhookSchemaValidator) Validate(
 		)
 	}
 	return nil
+}
+
+// validateAndStripStackPreview covers the private-preview field that is
+// present on GitHub's production pull_request payload but intentionally absent
+// from the vendored public webhook schemas. The public remainder still passes
+// through the unmodified upstream schema.
+func validateAndStripStackPreview(value any) error {
+	payload, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	pull, ok := payload["pull_request"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawStack, exists := pull["stack"]
+	if !exists {
+		return nil
+	}
+	if rawStack == nil {
+		delete(pull, "stack")
+		return nil
+	}
+	stack, ok := rawStack.(map[string]any)
+	if !ok {
+		return fmt.Errorf("stack must be an object or null")
+	}
+	if err := requireExactFields(
+		stack,
+		"stack",
+		"id", "number", "size", "position", "base",
+	); err != nil {
+		return err
+	}
+	for _, field := range []string{"id", "number", "size", "position"} {
+		if !positiveJSONInteger(stack[field]) {
+			return fmt.Errorf("stack.%s must be a positive integer", field)
+		}
+	}
+	size, _ := jsonInteger(stack["size"])
+	position, _ := jsonInteger(stack["position"])
+	if position > size {
+		return fmt.Errorf("stack.position must not exceed stack.size")
+	}
+	base, ok := stack["base"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("stack.base must be an object")
+	}
+	if err := requireExactFields(base, "stack.base", "ref", "sha"); err != nil {
+		return err
+	}
+	ref, ok := base["ref"].(string)
+	if !ok || ref == "" {
+		return fmt.Errorf("stack.base.ref must be a non-empty string")
+	}
+	if base["sha"] != nil {
+		sha, ok := base["sha"].(string)
+		if !ok || sha == "" {
+			return fmt.Errorf("stack.base.sha must be a non-empty string or null")
+		}
+	}
+	delete(pull, "stack")
+	return nil
+}
+
+func requireExactFields(
+	object map[string]any,
+	objectPath string,
+	fields ...string,
+) error {
+	allowed := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		allowed[field] = struct{}{}
+		if _, exists := object[field]; !exists {
+			return fmt.Errorf("%s.%s is required", objectPath, field)
+		}
+	}
+	for field := range object {
+		if _, exists := allowed[field]; !exists {
+			return fmt.Errorf("%s.%s is not supported", objectPath, field)
+		}
+	}
+	return nil
+}
+
+func positiveJSONInteger(value any) bool {
+	integer, ok := jsonInteger(value)
+	return ok && integer > 0
+}
+
+func jsonInteger(value any) (int64, bool) {
+	switch number := value.(type) {
+	case json.Number:
+		integer, err := number.Int64()
+		return integer, err == nil
+	case float64:
+		if number != math.Trunc(number) ||
+			number < math.MinInt64 || number > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(number), true
+	case int:
+		return int64(number), true
+	case int64:
+		return number, true
+	case uint64:
+		if number > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(number), true
+	default:
+		return 0, false
+	}
 }
 
 type embeddedSchemaLoader struct{}

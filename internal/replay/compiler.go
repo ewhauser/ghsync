@@ -707,7 +707,7 @@ func fixtureForEvent(repository Repository, event Event) fakegithub.Fixture {
 					Ref: pull.Head.Ref,
 					SHA: pull.Head.SHA,
 				},
-				Base: fakegithub.PullRequestBranch{
+				Base: fakegithub.Base{
 					Ref: pull.Base.Ref,
 					SHA: pull.Base.SHA,
 				},

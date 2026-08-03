@@ -455,10 +455,44 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 	tests := []struct {
 		name         string
 		size         int
+		cachedSHA    string
+		payloadSHA   any
 		wantStackJob bool
 	}{
-		{name: "matching tuple", size: 6},
-		{name: "size mismatch", size: 7, wantStackJob: true},
+		{
+			name:       "matching known tuple",
+			size:       6,
+			cachedSHA:  "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+			payloadSHA: "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+		},
+		{
+			name:         "size mismatch",
+			size:         7,
+			cachedSHA:    "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+			payloadSHA:   "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+			wantStackJob: true,
+		},
+		{
+			name:         "payload SHA unknown",
+			size:         6,
+			cachedSHA:    "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+			payloadSHA:   nil,
+			wantStackJob: true,
+		},
+		{
+			name:         "cached SHA unknown",
+			size:         6,
+			cachedSHA:    "",
+			payloadSHA:   "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+			wantStackJob: true,
+		},
+		{
+			name:         "both SHAs unknown",
+			size:         6,
+			cachedSHA:    "",
+			payloadSHA:   nil,
+			wantStackJob: true,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -498,7 +532,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 					NodeID:          "S_stack_summary",
 					Number:          72787,
 					BaseRef:         "main",
-					BaseSHA:         "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+					BaseSHA:         test.cachedSHA,
 					Open:            true,
 					Entries:         entries,
 					GitHubUpdatedAt: now,
@@ -521,7 +555,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 						"position": 1,
 						"base": map[string]any{
 							"ref": "main",
-							"sha": "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+							"sha": test.payloadSHA,
 						},
 					},
 				},

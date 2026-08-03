@@ -428,6 +428,11 @@ func stackSummaryMatchesCache(
 	queries *dbgen.Queries,
 	hint *stackSummaryHint,
 ) (bool, error) {
+	// Suppression requires positive knowledge of the base commit. Treat an
+	// unknown payload SHA as a mismatch even if the cache is also unknown.
+	if hint.BaseSHA == "" {
+		return false, nil
+	}
 	stack, err := queries.GetStackByKey(
 		ctx,
 		dbgen.GetStackByKeyParams{
@@ -445,6 +450,7 @@ func stackSummaryMatchesCache(
 		!stack.GhID.Valid ||
 		stack.GhID.Int64 != hint.ID ||
 		stack.BaseRef != hint.BaseRef ||
+		stack.BaseSha == "" ||
 		stack.BaseSha != hint.BaseSHA {
 		return false, nil
 	}
