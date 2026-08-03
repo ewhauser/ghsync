@@ -64,14 +64,15 @@ type pendingPullBatch struct {
 // prCoordinator gangs GraphQL transport while preserving one independently
 // locked transaction and one result per entity.
 type prCoordinator struct {
-	mu             sync.Mutex
-	batches        map[pullBatchKey]*pendingPullBatch
-	window         time.Duration
-	max            int
-	graphQL        *gh.GraphQLClient
-	writer         *store.EntityWriter
-	installationID int64
-	orgID          int64
+	mu              sync.Mutex
+	batches         map[pullBatchKey]*pendingPullBatch
+	repositoryLocks *repositoryLockSet
+	window          time.Duration
+	max             int
+	graphQL         *gh.GraphQLClient
+	writer          *store.EntityWriter
+	installationID  int64
+	orgID           int64
 }
 
 func newPRCoordinator(
@@ -85,13 +86,14 @@ func newPRCoordinator(
 		window = defaultBatchWindow
 	}
 	return &prCoordinator{
-		batches:        make(map[pullBatchKey]*pendingPullBatch),
-		window:         window,
-		max:            defaultBatchSize,
-		graphQL:        graphQL,
-		writer:         writer,
-		installationID: installationID,
-		orgID:          orgID,
+		batches:         make(map[pullBatchKey]*pendingPullBatch),
+		repositoryLocks: newRepositoryLockSet(),
+		window:          window,
+		max:             defaultBatchSize,
+		graphQL:         graphQL,
+		writer:          writer,
+		installationID:  installationID,
+		orgID:           orgID,
 	}
 }
 
@@ -158,6 +160,13 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	sort.Slice(batch.items, func(i, j int) bool {
 		return immutablePRKey(batch.items[i]) < immutablePRKey(batch.items[j])
 	})
+	repoIDs := repositoryIDs(batch.items)
+	// Hold repository serialization in-process while the database observation
+	// locks span the GitHub fetch. Without it, overlapping batches for one
+	// repository each occupy a database connection while waiting for the same
+	// session-level advisory lock.
+	unlockRepositories := c.repositoryLocks.lock(repoIDs)
+	defer unlockRepositories()
 	callCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(batch.items[0].ctx),
 		30*time.Second,
@@ -173,14 +182,9 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	}
 	defer closeObservations()
 
-	repoIDs := make([]int64, 0)
-	for _, item := range batch.items {
-		if _, exists := repoObservations[item.metadata.RepoGitHubID]; !exists {
-			repoIDs = append(repoIDs, item.metadata.RepoGitHubID)
-			repoObservations[item.metadata.RepoGitHubID] = nil
-		}
+	for _, repoID := range repoIDs {
+		repoObservations[repoID] = nil
 	}
-	slices.Sort(repoIDs)
 	for _, repoID := range repoIDs {
 		observation, err := c.writer.BeginObservation(
 			callCtx,
