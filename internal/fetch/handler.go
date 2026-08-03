@@ -289,6 +289,7 @@ func (h *Handler) RefreshPR(
 					class,
 					source,
 					request.Queue,
+					true,
 				)
 			}
 			return err
@@ -298,7 +299,7 @@ func (h *Handler) RefreshPR(
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("read PR fetch metadata: %w", err)
 	}
-	return h.refreshPRREST(ctx, key, class, source, request.Queue)
+	return h.refreshPRREST(ctx, key, class, source, request.Queue, true)
 }
 
 func (h *Handler) ResolveStackMembership(
@@ -313,7 +314,7 @@ func (h *Handler) ResolveStackMembership(
 	if err != nil {
 		return err
 	}
-	return h.refreshPRREST(ctx, key, class, source, request.Queue)
+	return h.refreshPRREST(ctx, key, class, source, request.Queue, false)
 }
 
 func (h *Handler) refreshPRREST(
@@ -322,6 +323,7 @@ func (h *Handler) refreshPRREST(
 	class budget.Class,
 	source store.SyncSource,
 	queueName string,
+	hydrateGraphQL bool,
 ) error {
 	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
 	if err != nil {
@@ -400,6 +402,49 @@ func (h *Handler) refreshPRREST(
 		startedAt,
 	)
 	record.MembershipKnown = true
+	if hydrateGraphQL {
+		nodes, _, graphQLErr := h.graphQL.BatchPullRequests(
+			ctx,
+			class,
+			[]string{record.NodeID},
+		)
+		if graphQLErr != nil {
+			return fmt.Errorf(
+				"fetch PR participation %s: %w",
+				requestKey(key),
+				graphQLErr,
+			)
+		}
+		if len(nodes) != 1 || nodes[0] == nil {
+			return fmt.Errorf(
+				"fetch PR participation %s: %w",
+				requestKey(key),
+				errGraphQLNodeNotFound,
+			)
+		}
+		item := pullBatchItem{
+			metadata: store.FetchMetadata{
+				ETag:           response.ETag,
+				StackNumber:    record.StackNumber,
+				StackPosition:  record.StackPosition,
+				HeadSHA:        record.HeadSHA,
+				RepoGitHubID:   repository.GitHubID,
+				InstallationID: repository.InstallationID,
+				RepoFullName:   repository.FullName,
+			},
+			source:    source,
+			startedAt: startedAt,
+		}
+		graphQLRecord := pullRecordFromNode(
+			nodes[0],
+			&item,
+			h.installationID,
+			h.orgID,
+		)
+		graphQLRecord.MembershipKnown = true
+		graphQLRecord.StackSummary = record.StackSummary
+		record = graphQLRecord
+	}
 	_, err = h.writer.ApplyPullRequestObserved(
 		ctx,
 		observation,

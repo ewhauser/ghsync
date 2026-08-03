@@ -145,6 +145,140 @@ func (s *Server) PullRequestReviewThreadWebhookPayload(
 	)
 }
 
+// IssueCommentCreatedWebhookPayload builds a schema-valid PR-associated
+// issue_comment.created delivery.
+func (s *Server) IssueCommentCreatedWebhookPayload(
+	number int,
+	commentID int64,
+) (map[string]any, error) {
+	return s.issueCommentWebhookPayload("created", number, commentID)
+}
+
+// IssueCommentEditedWebhookPayload builds a schema-valid PR-associated
+// issue_comment.edited delivery.
+func (s *Server) IssueCommentEditedWebhookPayload(
+	number int,
+	commentID int64,
+) (map[string]any, error) {
+	return s.issueCommentWebhookPayload("edited", number, commentID)
+}
+
+// IssueCommentDeletedWebhookPayload builds a schema-valid PR-associated
+// issue_comment.deleted delivery.
+func (s *Server) IssueCommentDeletedWebhookPayload(
+	number int,
+	commentID int64,
+) (map[string]any, error) {
+	return s.issueCommentWebhookPayload("deleted", number, commentID)
+}
+
+func (s *Server) issueCommentWebhookPayload(
+	action string,
+	number int,
+	commentID int64,
+) (map[string]any, error) {
+	payload, err := conformance.ExamplePayload("issue_comment", action)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	fixture := cloneFixture(&s.fixture)
+	s.mu.Unlock()
+	var pull *PullRequest
+	var comment *IssueComment
+	for pullIndex := range fixture.PullRequests {
+		candidate := &fixture.PullRequests[pullIndex]
+		if candidate.Number != number {
+			continue
+		}
+		pull = candidate
+		for commentIndex := range candidate.Comments {
+			if candidate.Comments[commentIndex].ID == commentID {
+				comment = &candidate.Comments[commentIndex]
+				break
+			}
+		}
+		break
+	}
+	if pull == nil {
+		return nil, fmt.Errorf("pull request %d is not in the fixture", number)
+	}
+	if comment == nil {
+		return nil, fmt.Errorf(
+			"issue comment %d is not in pull request %d",
+			commentID,
+			number,
+		)
+	}
+	repository, err := payloadObject(payload, "repository")
+	if err != nil {
+		return nil, err
+	}
+	overlayRepositoryPayload(repository, fixture.Repository)
+	issue, err := payloadObject(payload, "issue")
+	if err != nil {
+		return nil, err
+	}
+	issue["number"] = pull.Number
+	issue["title"] = pull.Title
+	issue["state"] = pull.State
+	baseURL := "https://api.github.com/repos/" + fixture.Repository.FullName
+	issue["url"] = fmt.Sprintf("%s/issues/%d", baseURL, pull.Number)
+	issue["html_url"] = fmt.Sprintf(
+		"https://github.com/%s/pull/%d",
+		fixture.Repository.FullName,
+		pull.Number,
+	)
+	issue["comments_url"] = fmt.Sprintf(
+		"%s/issues/%d/comments",
+		baseURL,
+		pull.Number,
+	)
+	issue["events_url"] = fmt.Sprintf(
+		"%s/issues/%d/events",
+		baseURL,
+		pull.Number,
+	)
+	issue["pull_request"] = map[string]any{
+		"url": fmt.Sprintf("%s/pulls/%d", baseURL, pull.Number),
+		"html_url": fmt.Sprintf(
+			"https://github.com/%s/pull/%d",
+			fixture.Repository.FullName,
+			pull.Number,
+		),
+		"diff_url": fmt.Sprintf(
+			"https://github.com/%s/pull/%d.diff",
+			fixture.Repository.FullName,
+			pull.Number,
+		),
+		"patch_url": fmt.Sprintf(
+			"https://github.com/%s/pull/%d.patch",
+			fixture.Repository.FullName,
+			pull.Number,
+		),
+		"merged_at": nil,
+	}
+	wireComment, err := payloadObject(payload, "comment")
+	if err != nil {
+		return nil, err
+	}
+	wireComment["id"] = comment.ID
+	wireComment["node_id"] = comment.NodeID
+	wireComment["body"] = comment.Body
+	wireComment["created_at"] = comment.CreatedAt.UTC().Format(time.RFC3339)
+	wireComment["updated_at"] = comment.UpdatedAt.UTC().Format(time.RFC3339)
+	if user := objectMap(wireComment, "user"); user != nil {
+		user["login"] = comment.Author.Login
+		user["node_id"] = comment.Author.NodeID
+	}
+	return payload, nil
+}
+
+func objectMap(parent map[string]any, key string) map[string]any {
+	value, _ := parent[key].(map[string]any)
+	return value
+}
+
 // CheckRunWebhookPayload builds a production-shaped check_run payload from
 // the current fixture and a canonical octokit example.
 func (s *Server) CheckRunWebhookPayload(
@@ -311,7 +445,7 @@ func nullableTime(value *time.Time) any {
 	if value == nil {
 		return nil
 	}
-	return value.UTC().Format(time.RFC3339)
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 // Some upstream webhook examples predate the schema's RFC 3339 requirement

@@ -409,6 +409,17 @@ func buildFakeWebhookPayload(
 		return fake.PullRequestReviewCommentWebhookPayload(action, 4812)
 	case "pull_request_review_thread":
 		return fake.PullRequestReviewThreadWebhookPayload(action, 4812)
+	case "issue_comment":
+		switch action {
+		case "created":
+			return fake.IssueCommentCreatedWebhookPayload(4812, 8201)
+		case "edited":
+			return fake.IssueCommentEditedWebhookPayload(4812, 8201)
+		case "deleted":
+			return fake.IssueCommentDeletedWebhookPayload(4812, 8201)
+		default:
+			return nil, fmt.Errorf("unsupported issue_comment action %q", action)
+		}
 	case "check_run":
 		checkRunID := int64(99001)
 		if action == "created" {
@@ -631,6 +642,16 @@ func assertFakePayloadMatchesFixture(
 			requiredNestedString(t, wire, "head", "sha") != expected.Head.SHA ||
 			requiredNestedString(t, wire, "base", "sha") != expected.Base.SHA {
 			t.Fatalf("emitted pull request = %#v, want %+v", wire, expected)
+		}
+	case "issue_comment":
+		issue := requiredObject(t, payload, "issue")
+		if jsonInt(t, issue, "number") != 4812 ||
+			issue["pull_request"] == nil {
+			t.Fatalf("emitted issue comment is not PR-associated: %#v", issue)
+		}
+		comment := requiredObject(t, payload, "comment")
+		if jsonInt64(t, comment, "id") != 8201 {
+			t.Fatalf("emitted issue comment = %#v", comment)
 		}
 	case "check_run":
 		wire := requiredObject(t, payload, "check_run")

@@ -69,23 +69,25 @@ func nullableSHA(value string) any {
 
 // PullRequest is fixture truth for REST and GraphQL pull responses.
 type PullRequest struct {
-	ID             int64             `json:"id"`
-	NodeID         string            `json:"node_id"`
-	Number         int               `json:"number"`
-	Title          string            `json:"title"`
-	State          string            `json:"state"`
-	Draft          bool              `json:"draft"`
-	AuthorLogin    string            `json:"-"`
-	ReviewDecision string            `json:"review_decision"`
-	MergeableState string            `json:"mergeable_state"`
-	Head           PullRequestBranch `json:"head"`
-	Base           Base              `json:"base"`
-	UpdatedAt      time.Time         `json:"updated_at"`
-	CreatedAt      time.Time         `json:"-"`
-	MergedAt       *time.Time        `json:"-"`
-	Stack          *StackRef         `json:"stack"`
-	ReviewThreads  []ReviewThread    `json:"-"`
-	ReviewRequests []ReviewRequest   `json:"-"`
+	ID             int64               `json:"id"`
+	NodeID         string              `json:"node_id"`
+	Number         int                 `json:"number"`
+	Title          string              `json:"title"`
+	State          string              `json:"state"`
+	Draft          bool                `json:"draft"`
+	AuthorLogin    string              `json:"-"`
+	ReviewDecision string              `json:"review_decision"`
+	MergeableState string              `json:"mergeable_state"`
+	Head           PullRequestBranch   `json:"head"`
+	Base           Base                `json:"base"`
+	UpdatedAt      time.Time           `json:"updated_at"`
+	CreatedAt      time.Time           `json:"-"`
+	MergedAt       *time.Time          `json:"-"`
+	Stack          *StackRef           `json:"stack"`
+	ReviewThreads  []ReviewThread      `json:"-"`
+	ReviewRequests []ReviewRequest     `json:"-"`
+	Reviews        []PullRequestReview `json:"-"`
+	Comments       []IssueComment      `json:"-"`
 }
 
 // Stack is fixture truth for the gh-stack preview API.
@@ -164,6 +166,37 @@ type ReviewRequest struct {
 	ID     int64  `json:"id"`
 	NodeID string `json:"node_id"`
 	Login  string `json:"login"`
+}
+
+// Actor preserves the GraphQL author union, including non-user participants
+// and deleted authors (Kind "deleted" with empty identity fields).
+type Actor struct {
+	Kind   string `json:"kind"`
+	NodeID string `json:"node_id"`
+	Login  string `json:"login"`
+}
+
+// PullRequestReview is fixture truth for an identity-keyed review fact.
+type PullRequestReview struct {
+	ID          int64      `json:"id"`
+	NodeID      string     `json:"node_id"`
+	Author      Actor      `json:"author"`
+	State       string     `json:"state"`
+	SubmittedAt *time.Time `json:"submitted_at,omitempty"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CommitOID   string     `json:"commit_oid,omitempty"`
+}
+
+// IssueComment is fixture truth for ordinary PR issue-comment participation.
+// Body exists only so webhook constructors can produce schema-valid payloads;
+// authoritative participation fetches never request or persist it.
+type IssueComment struct {
+	ID        int64     `json:"id"`
+	NodeID    string    `json:"node_id"`
+	Author    Actor     `json:"author"`
+	Body      string    `json:"body,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // CheckRun is fixture truth for one check run.
@@ -452,6 +485,14 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server { //n
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks/{number}", s.getStack)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", s.listPulls)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", s.getPull)
+	mux.HandleFunc(
+		"GET /repos/{owner}/{repo}/pulls/{number}/reviews",
+		s.listPullReviews,
+	)
+	mux.HandleFunc(
+		"GET /repos/{owner}/{repo}/issues/{number}/comments",
+		s.listIssueComments,
+	)
 	mux.HandleFunc(
 		"GET /repos/{owner}/{repo}/commits/{sha}/check-runs",
 		s.listCheckRuns,

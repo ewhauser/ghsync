@@ -217,6 +217,8 @@ func TestCrawlerPaginatesAndRecordsTrackTwoTimeline(t *testing.T) {
 		"review_thread/resolved":        false,
 		"review_comment/created":        false,
 		"review_comment/edited":         false,
+		"issue_comment/created":         false,
+		"issue_comment/edited":          false,
 		"check_suite/requested":         false,
 		"check_suite/completed":         false,
 		"check_run/created":             false,
@@ -258,6 +260,7 @@ func TestCrawlerPaginatesAndRecordsTrackTwoTimeline(t *testing.T) {
 			}
 		}
 		if (event.Kind == "review_comment" ||
+			event.Kind == "issue_comment" ||
 			event.Kind == "review_thread") &&
 			event.PullRequest.State != "open" {
 			t.Errorf(
@@ -781,10 +784,13 @@ func fixturePullRequest(number int, after string) map[string]any {
 				map[string]any{
 					"__typename": "PullRequestReview",
 					"id":         "__PRR__", "databaseId": 800,
-					"body": "Looks good.", "state": "APPROVED",
+					"fullDatabaseId": "800",
+					"body":           "Looks good.", "state": "APPROVED",
 					"submittedAt": "2026-07-01T06:00:00Z",
 					"updatedAt":   "2026-07-01T06:00:00Z",
-					"author":      map[string]any{"login": "reviewer"},
+					"author": map[string]any{
+						"__typename": "User", "id": "__USER__", "login": "reviewer",
+					},
 					"commit": map[string]any{
 						"oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 					},
@@ -809,15 +815,30 @@ func fixturePullRequestPageTwo() map[string]any {
 		"nodes": []any{
 			fixtureThread(),
 			map[string]any{
+				"__typename": "IssueComment",
+				"id":         "__IC__", "databaseId": int64(850),
+				"fullDatabaseId": "850",
+				"body":           "Ordinary PR conversation.",
+				"createdAt":      "2026-07-01T06:15:00Z",
+				"updatedAt":      "2026-07-01T06:45:00Z",
+				"author": map[string]any{
+					"__typename": "Bot", "id": "__BOT__",
+					"login": "participant[bot]",
+				},
+			},
+			map[string]any{
 				"__typename":          "ReviewDismissedEvent",
 				"createdAt":           "2026-07-01T07:00:00Z",
 				"previousReviewState": "APPROVED",
 				"review": map[string]any{
 					"id": "__PRR__", "databaseId": int64(800),
-					"body": "Looks good.", "state": "DISMISSED",
+					"fullDatabaseId": "800",
+					"body":           "Looks good.", "state": "DISMISSED",
 					"submittedAt": "2026-07-01T06:00:00Z",
 					"updatedAt":   "2026-07-01T07:00:00Z",
-					"author":      map[string]any{"login": "reviewer"},
+					"author": map[string]any{
+						"__typename": "User", "id": "__USER__", "login": "reviewer",
+					},
 					"commit": map[string]any{
 						"oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 					},

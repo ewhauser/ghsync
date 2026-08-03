@@ -134,6 +134,51 @@ func TestEventManifestMatchesWriterDefinitions(t *testing.T) {
 	}
 }
 
+func TestParticipationContractUsesFactIdentityAndExcludesBodies(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	for _, table := range []string{
+		"pull_request_reviews",
+		"pull_request_comments",
+	} {
+		var identityConstraints string
+		var bodyColumns int
+		if err := database.Pool.QueryRow(t.Context(), `
+			SELECT string_agg(
+			           pg_get_constraintdef(con.oid),
+			           '; ' ORDER BY con.conname
+			       ),
+			       (SELECT count(*)
+			        FROM information_schema.columns
+			        WHERE table_schema = current_schema()
+			          AND table_name = $1
+			          AND column_name IN ('body', 'body_text', 'body_html'))
+			FROM pg_catalog.pg_constraint AS con
+			JOIN pg_catalog.pg_class AS class
+			  ON class.oid = con.conrelid
+			JOIN pg_catalog.pg_namespace AS namespace
+			  ON namespace.oid = class.relnamespace
+			WHERE namespace.nspname = current_schema()
+			  AND class.relname = $1
+			  AND con.contype IN ('p', 'u')
+		`, table).Scan(&identityConstraints, &bodyColumns); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(identityConstraints, "PRIMARY KEY (node_id)") ||
+			!strings.Contains(identityConstraints, "UNIQUE (gh_id)") ||
+			strings.Contains(identityConstraints, "author_") {
+			t.Fatalf(
+				"%s identity constraints = %q",
+				table,
+				identityConstraints,
+			)
+		}
+		if bodyColumns != 0 {
+			t.Fatalf("%s exposes %d body columns", table, bodyColumns)
+		}
+	}
+}
+
 func TestV1EntityKeyConstructors(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{

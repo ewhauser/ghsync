@@ -309,6 +309,98 @@ func TestDriftDetectsAndHealsReviewRequestSetDivergence(t *testing.T) {
 	}
 }
 
+func TestDriftDetectsAndHealsParticipationDivergence(t *testing.T) {
+	t.Parallel()
+	harness := newReadyDriftHarness(t)
+	ctx := t.Context()
+	if _, err := harness.pool.Exec(ctx, `
+		UPDATE pull_request_reviews
+		SET state = 'approved'
+		WHERE node_id = 'PRR_kwDOABCDEF8101';
+		UPDATE pull_request_comments
+		SET author_kind = 'user', author_login = 'wrong-author'
+		WHERE node_id = 'IC_kwDOABCDEF8201'
+	`); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 ||
+		findings[0].EntityKey != "pr:acme/monolith:4812" ||
+		(!strings.Contains(string(findings[0].Diff), "reviews") &&
+			!strings.Contains(string(findings[0].Diff), "comments")) {
+		t.Fatalf("participation drift findings = %+v", findings)
+	}
+	waitForCacheProducers(t, harness.pool)
+	var state, authorKind, authorLogin string
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT state FROM pull_request_reviews
+		WHERE node_id = 'PRR_kwDOABCDEF8101'
+	`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT author_kind, author_login FROM pull_request_comments
+		WHERE node_id = 'IC_kwDOABCDEF8201'
+	`).Scan(&authorKind, &authorLogin); err != nil {
+		t.Fatal(err)
+	}
+	if state != "changes_requested" || authorKind != "mannequin" ||
+		authorLogin != "legacy-contributor" {
+		t.Fatalf(
+			"healed participation = state %q author %q/%q",
+			state,
+			authorKind,
+			authorLogin,
+		)
+	}
+	var deletedKind string
+	var deletedIdentityIsNull bool
+	var snapshot []byte
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT author_kind,
+		       author_node_id IS NULL AND author_login IS NULL
+		FROM pull_request_comments
+		WHERE node_id = 'IC_kwDOABCDEF8202'
+	`).Scan(&deletedKind, &deletedIdentityIsNull); err != nil {
+		t.Fatal(err)
+	}
+	if deletedKind != "deleted" || !deletedIdentityIsNull {
+		t.Fatalf(
+			"deleted-author cache row = %q/null:%v",
+			deletedKind,
+			deletedIdentityIsNull,
+		)
+	}
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT cache_snapshot
+		FROM drift_entities
+		WHERE entity_kind = 'pull_request'
+		  AND entity_key = 'pr:acme/monolith:4812'
+	`).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(snapshot), `"author_kind": "deleted"`) ||
+		strings.Contains(string(snapshot), `"body"`) {
+		t.Fatalf("participation drift snapshot = %s", snapshot)
+	}
+	findings, err = harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("deleted-author participation did not converge: %+v", findings)
+	}
+}
+
 func TestDetectSamplesWithUnrelatedBusySweepQueue(t *testing.T) {
 	t.Parallel()
 	harness := newReadyDriftHarness(t)
@@ -1194,6 +1286,31 @@ func TestSemanticDiffNormalizesReviewRequestsInGo(t *testing.T) {
 	}
 }
 
+func TestSemanticDiffNormalizesNullableDatabaseIDsByNodeIDInGo(
+	t *testing.T,
+) {
+	t.Parallel()
+	cache := []byte(`{
+		"reviews":[
+			{"id":null,"node_id":"review-Z","author_node_id":null},
+			{"id":null,"node_id":"review-a","author_node_id":null}
+		]
+	}`)
+	upstream := []byte(`{
+		"reviews":[
+			{"author_node_id":null,"node_id":"review-a","id":null},
+			{"author_node_id":null,"node_id":"review-Z","id":null}
+		]
+	}`)
+	equal, diff, err := semanticDiff(cache, upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal || string(diff) != "{}" {
+		t.Fatalf("node-ID normalized compare equal=%v diff=%s", equal, diff)
+	}
+}
+
 // The sampler resolves its keyset against drift_entity_keys and then reads
 // the snapshots back out of drift_entities by source_id. That is only
 // equivalent to ordering drift_entities directly while the two views project
@@ -1408,6 +1525,36 @@ func seedCheckRunGroup(t *testing.T, pool *pgxpool.Pool) {
 	`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO pull_request_reviews (
+		    node_id, gh_id, repo_id, pr_number, author_kind,
+		    author_node_id, author_login, state, submitted_at, commit_oid,
+		    gh_updated_at, head_sha, synced_at, sync_source,
+		    last_checked_at, tombstoned_at
+		) VALUES
+		    ('PRR_keyset', 9201, 9001, 11, 'user', 'U_participant',
+		     'reviewer', 'approved', clock_timestamp(), 'aaa',
+		     clock_timestamp(), 'aaa', clock_timestamp(), 'backfill',
+		     clock_timestamp(), NULL),
+		    ('PRR_dead', 9202, 9001, 11, 'user', 'U_removed',
+		     'removed', 'commented', clock_timestamp(), 'aaa',
+		     clock_timestamp(), 'aaa', clock_timestamp(), 'backfill',
+		     clock_timestamp(), clock_timestamp());
+
+		INSERT INTO pull_request_comments (
+		    node_id, gh_id, repo_id, pr_number, author_kind,
+		    author_node_id, author_login, created_at, gh_updated_at,
+		    head_sha, synced_at, sync_source, last_checked_at, tombstoned_at
+		) VALUES
+		    ('IC_keyset', 9301, 9001, 11, 'deleted', NULL, NULL,
+		     clock_timestamp(), clock_timestamp(), 'aaa', clock_timestamp(),
+		     'backfill', clock_timestamp(), NULL),
+		    ('IC_dead', 9302, 9001, 11, 'user', 'U_removed', 'removed',
+		     clock_timestamp(), clock_timestamp(), 'aaa', clock_timestamp(),
+		     'backfill', clock_timestamp(), clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
 
 	var sourceID int64
 	var snapshot []byte
@@ -1440,9 +1587,14 @@ func seedCheckRunGroup(t *testing.T, pool *pgxpool.Pool) {
 	}
 	if got := string(snapshot); !strings.Contains(got, `"id": 9101`) ||
 		!strings.Contains(got, `"id": 9102`) ||
-		strings.Contains(got, `"id": 9103`) {
+		strings.Contains(got, `"id": 9103`) ||
+		!strings.Contains(got, `"node_id": "PRR_keyset"`) ||
+		strings.Contains(got, `"node_id": "PRR_dead"`) ||
+		!strings.Contains(got, `"node_id": "IC_keyset"`) ||
+		strings.Contains(got, `"node_id": "IC_dead"`) ||
+		strings.Contains(got, `"body"`) {
 		t.Fatalf(
-			"pull-request review-request snapshot = %s, want live rows only",
+			"pull-request participation snapshot = %s, want live rows only",
 			got,
 		)
 	}

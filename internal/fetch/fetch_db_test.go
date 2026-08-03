@@ -1544,6 +1544,42 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 		requests[1].Kind != "user" {
 		t.Fatalf("backfilled review requests = %+v", requests)
 	}
+	var reviews, comments, deletedAuthors, commentBodies int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM pull_request_reviews AS review
+		   JOIN repos ON repos.id = review.repo_id
+		   WHERE repos.full_name = 'acme/monolith'
+		     AND review.pr_number = 4812
+		     AND review.tombstoned_at IS NULL),
+		  (SELECT count(*) FROM pull_request_comments AS comment
+		   JOIN repos ON repos.id = comment.repo_id
+		   WHERE repos.full_name = 'acme/monolith'
+		     AND comment.pr_number = 4812
+		     AND comment.tombstoned_at IS NULL),
+		  (SELECT count(*) FROM pull_request_comments AS comment
+		   JOIN repos ON repos.id = comment.repo_id
+		   WHERE repos.full_name = 'acme/monolith'
+		     AND comment.author_kind = 'deleted'
+		     AND comment.author_node_id IS NULL
+		     AND comment.author_login IS NULL),
+		  (SELECT count(*) FROM information_schema.columns
+		   WHERE table_schema = current_schema()
+		     AND table_name = 'pull_request_comments'
+		     AND column_name IN ('body', 'body_text'))
+	`).Scan(&reviews, &comments, &deletedAuthors, &commentBodies); err != nil {
+		t.Fatal(err)
+	}
+	if reviews != 2 || comments != 2 || deletedAuthors != 1 ||
+		commentBodies != 0 {
+		t.Fatalf(
+			"backfilled participation reviews/comments/deleted/body-columns = %d/%d/%d/%d",
+			reviews,
+			comments,
+			deletedAuthors,
+			commentBodies,
+		)
+	}
 	var pendingChildren int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*)
@@ -2044,6 +2080,112 @@ func TestReviewRequestWebhookAddsAndAuthoritativelyRemovesCurrentSet(
 			"identical request-set refresh events = %d, want %d",
 			events,
 			eventsAfterRerequest,
+		)
+	}
+}
+
+func TestIssueCommentWebhookRefreshesAndTombstonesParticipation(t *testing.T) {
+	t.Parallel()
+	const repo = "acme/issue-comment-webhook"
+	harness := newPipelineHarness(t, repo)
+	defer harness.close()
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	comment := fakegithub.IssueComment{
+		ID: 8301, NodeID: "IC_kwDOABCDEF8301",
+		Author: fakegithub.Actor{
+			Kind: "user", NodeID: "U_kwDOABCDEF8301", Login: "participant",
+		},
+		Body:      "not part of the cache contract",
+		CreatedAt: fixture.PullRequests[1].UpdatedAt.Add(time.Minute),
+		UpdatedAt: fixture.PullRequests[1].UpdatedAt.Add(time.Minute),
+	}
+	fixture.PullRequests[1].UpdatedAt = comment.UpdatedAt
+	fixture.PullRequests[1].Comments = append(
+		fixture.PullRequests[1].Comments,
+		comment,
+	)
+	harness.fake.SetFixture(fixture)
+	payload, err := harness.fake.IssueCommentCreatedWebhookPayload(4812, comment.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.emit("issue-comment-created", pipelineEvent{
+		event: "issue_comment", payload: payload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+	var author, updated string
+	var tombstoned bool
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT author_login, gh_updated_at::text, tombstoned_at IS NOT NULL
+		FROM pull_request_comments
+		WHERE node_id = $1
+	`, comment.NodeID).Scan(&author, &updated, &tombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if author != "participant" || tombstoned {
+		t.Fatalf("created issue-comment row = %q/%q/%v", author, updated, tombstoned)
+	}
+
+	comment.Author.Login = "participant-renamed"
+	comment.UpdatedAt = comment.UpdatedAt.Add(time.Minute)
+	fixture.PullRequests[1].Comments[len(fixture.PullRequests[1].Comments)-1] = comment
+	harness.fake.SetFixture(fixture)
+	payload, err = harness.fake.IssueCommentEditedWebhookPayload(4812, comment.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsBeforeEdit := pullChangedEvents(t, harness.pool, repo)
+	harness.emit("issue-comment-edited", pipelineEvent{
+		event: "issue_comment", payload: payload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT author_login FROM pull_request_comments WHERE node_id = $1
+	`, comment.NodeID).Scan(&author); err != nil {
+		t.Fatal(err)
+	}
+	if author != "participant-renamed" {
+		t.Fatalf("edited issue-comment author = %q", author)
+	}
+	if events := pullChangedEvents(t, harness.pool, repo); events <= eventsBeforeEdit {
+		t.Fatalf("edited issue comment events = %d, want > %d", events, eventsBeforeEdit)
+	}
+
+	deletePayload, err := harness.fake.IssueCommentDeletedWebhookPayload(
+		4812,
+		comment.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deletion is visible through absence from the complete GraphQL connection;
+	// neither the deleted comment nor a newer child timestamp is available to
+	// version the tombstone, and the parent PR timestamp may remain unchanged.
+	fixture.PullRequests[1].Comments = fixture.PullRequests[1].Comments[:len(fixture.PullRequests[1].Comments)-1]
+	harness.fake.SetFixture(fixture)
+	eventsBeforeDelete := pullChangedEvents(t, harness.pool, repo)
+	harness.emit("issue-comment-deleted", pipelineEvent{
+		event: "issue_comment", payload: deletePayload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT tombstoned_at IS NOT NULL
+		FROM pull_request_comments
+		WHERE node_id = $1
+	`, comment.NodeID).Scan(&tombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if !tombstoned {
+		t.Fatal("deleted issue comment was not tombstoned")
+	}
+	if events := pullChangedEvents(t, harness.pool, repo); events != eventsBeforeDelete+1 {
+		t.Fatalf(
+			"deleted issue-comment events = %d, want %d",
+			events,
+			eventsBeforeDelete+1,
 		)
 	}
 }

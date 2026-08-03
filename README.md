@@ -107,6 +107,7 @@ Subscribe the App to the events used by the default dispatcher:
 - Pull request reviews
 - Pull request review comments
 - Pull request review threads
+- Issue comments
 - Check runs
 - Check suites
 - Pushes

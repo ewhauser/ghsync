@@ -32,6 +32,7 @@ type FixtureMutation struct {
 	Repository    Repository     `json:"repository"`
 	PullRequest   *PullRequest   `json:"pull_request,omitempty"`
 	Review        *Review        `json:"review,omitempty"`
+	IssueComment  *IssueComment  `json:"issue_comment,omitempty"`
 	ReviewThread  *ReviewThread  `json:"review_thread,omitempty"`
 	ReviewComment *ReviewComment `json:"review_comment,omitempty"`
 	CheckSuite    *CheckSuite    `json:"check_suite,omitempty"`
@@ -221,6 +222,7 @@ func (p *Program) NextLap() ([]Step, error) {
 					Repository:    replayRepository,
 					PullRequest:   renumbered.PullRequest,
 					Review:        renumbered.Review,
+					IssueComment:  renumbered.IssueComment,
 					ReviewThread:  renumbered.Thread,
 					ReviewComment: renumbered.Comment,
 					CheckSuite:    renumbered.CheckSuite,
@@ -372,6 +374,20 @@ func (p *Program) renumberEvent(
 		}
 		result.Review.NodeID = renumberNodeID(result.Review.NodeID, namespace)
 		result.Review.CommitSHA = renumberSHA(result.Review.CommitSHA, namespace)
+	}
+	if result.IssueComment != nil {
+		result.IssueComment.ID, err = addID(result.IssueComment.ID, offsetID)
+		if err != nil {
+			return Event{}, err
+		}
+		result.IssueComment.NodeID = renumberNodeID(
+			result.IssueComment.NodeID,
+			namespace,
+		)
+		result.IssueComment.AuthorNodeID = renumberNodeID(
+			result.IssueComment.AuthorNodeID,
+			namespace,
+		)
 	}
 	if result.Thread != nil {
 		result.Thread.ID = renumberNodeID(result.Thread.ID, namespace)
@@ -628,6 +644,33 @@ func buildPayload(
 			overlayReviewComment(payload, *event.Comment)
 		}
 		return payload, "pull_request_review_comment", err
+	case "issue_comment":
+		switch event.Action {
+		case "created":
+			payload, err = fake.IssueCommentCreatedWebhookPayload(
+				event.PullRequest.Number,
+				event.IssueComment.ID,
+			)
+		case "edited":
+			payload, err = fake.IssueCommentEditedWebhookPayload(
+				event.PullRequest.Number,
+				event.IssueComment.ID,
+			)
+		case "deleted":
+			payload, err = fake.IssueCommentDeletedWebhookPayload(
+				event.PullRequest.Number,
+				event.IssueComment.ID,
+			)
+		default:
+			return nil, "", fmt.Errorf(
+				"unsupported issue_comment action %q",
+				event.Action,
+			)
+		}
+		if err == nil {
+			overlayIssueComment(payload, *event.IssueComment)
+		}
+		return payload, "issue_comment", err
 	case "review_thread":
 		payload, err = fake.PullRequestReviewThreadWebhookPayload(
 			event.Action,
@@ -713,6 +756,24 @@ func fixtureForEvent(repository Repository, event Event) fakegithub.Fixture {
 				},
 				CreatedAt: pull.CreatedAt,
 				UpdatedAt: pull.UpdatedAt,
+			},
+		)
+	}
+	if event.IssueComment != nil && len(fixture.PullRequests) == 1 {
+		comment := event.IssueComment
+		fixture.PullRequests[0].Comments = append(
+			fixture.PullRequests[0].Comments,
+			fakegithub.IssueComment{
+				ID:     comment.ID,
+				NodeID: comment.NodeID,
+				Author: fakegithub.Actor{
+					Kind:   comment.AuthorKind,
+					NodeID: comment.AuthorNodeID,
+					Login:  comment.AuthorLogin,
+				},
+				Body:      comment.Body,
+				CreatedAt: comment.CreatedAt,
+				UpdatedAt: comment.UpdatedAt,
 			},
 		)
 	}
@@ -824,6 +885,22 @@ func overlayReviewComment(payload map[string]any, comment ReviewComment) {
 		return
 	}
 	overlayCommentObject(wire, comment)
+}
+
+func overlayIssueComment(payload map[string]any, comment IssueComment) {
+	wire := object(payload, "comment")
+	if wire == nil {
+		return
+	}
+	wire["id"] = comment.ID
+	wire["node_id"] = comment.NodeID
+	wire["body"] = comment.Body
+	wire["created_at"] = comment.CreatedAt.UTC().Format(time.RFC3339)
+	wire["updated_at"] = comment.UpdatedAt.UTC().Format(time.RFC3339)
+	if user := object(wire, "user"); user != nil {
+		user["login"] = comment.AuthorLogin
+		user["node_id"] = comment.AuthorNodeID
+	}
 }
 
 func overlayReviewThread(payload map[string]any, thread ReviewThread) {
@@ -1136,6 +1213,9 @@ func eventMaximumID(event Event) int64 {
 	}
 	if event.Review != nil {
 		maximum = max(maximum, event.Review.ID)
+	}
+	if event.IssueComment != nil {
+		maximum = max(maximum, event.IssueComment.ID)
 	}
 	if event.Thread != nil {
 		for _, comment := range event.Thread.Comments {

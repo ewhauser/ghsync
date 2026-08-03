@@ -890,6 +890,32 @@ type oracleReviewRequest struct {
 	HeadSHA     string
 }
 
+type oraclePullRequestReview struct {
+	Pull         int
+	ID           int64
+	NodeID       string
+	AuthorKind   string
+	AuthorNodeID string
+	AuthorLogin  string
+	State        string
+	SubmittedAt  *time.Time
+	CommitOID    string
+	UpdatedAt    time.Time
+	HeadSHA      string
+}
+
+type oraclePullRequestComment struct {
+	Pull         int
+	ID           int64
+	NodeID       string
+	AuthorKind   string
+	AuthorNodeID string
+	AuthorLogin  string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	HeadSHA      string
+}
+
 type oracleStack struct {
 	ID        int64
 	NodeID    string
@@ -1018,6 +1044,65 @@ func assertFixtureConverged(
 			"pull-request review-request cache mismatch\ntruth=%+v\ncache=%+v",
 			expectedRequests,
 			cachedRequests,
+		)
+	}
+
+	expectedReviews := make([]oraclePullRequestReview, 0)
+	expectedComments := make([]oraclePullRequestComment, 0)
+	for _, pull := range truth.PullRequests {
+		for _, review := range pull.Reviews {
+			expectedReviews = append(expectedReviews, oraclePullRequestReview{
+				Pull:         pull.Number,
+				ID:           review.ID,
+				NodeID:       review.NodeID,
+				AuthorKind:   review.Author.Kind,
+				AuthorNodeID: review.Author.NodeID,
+				AuthorLogin:  review.Author.Login,
+				State:        review.State,
+				SubmittedAt:  utcTimePointer(review.SubmittedAt),
+				CommitOID:    review.CommitOID,
+				UpdatedAt:    review.UpdatedAt.UTC(),
+				HeadSHA:      pull.Head.SHA,
+			})
+		}
+		for _, comment := range pull.Comments {
+			expectedComments = append(expectedComments, oraclePullRequestComment{
+				Pull:         pull.Number,
+				ID:           comment.ID,
+				NodeID:       comment.NodeID,
+				AuthorKind:   comment.Author.Kind,
+				AuthorNodeID: comment.Author.NodeID,
+				AuthorLogin:  comment.Author.Login,
+				CreatedAt:    comment.CreatedAt.UTC(),
+				UpdatedAt:    comment.UpdatedAt.UTC(),
+				HeadSHA:      pull.Head.SHA,
+			})
+		}
+	}
+	cachedReviews, err := readCachedPullRequestReviews(ctx, pool, repo)
+	if err != nil {
+		return err
+	}
+	cachedComments, err := readCachedPullRequestComments(ctx, pool, repo)
+	if err != nil {
+		return err
+	}
+	sortOraclePullRequestReviews(expectedReviews)
+	sortOraclePullRequestReviews(cachedReviews)
+	sortOraclePullRequestComments(expectedComments)
+	sortOraclePullRequestComments(cachedComments)
+	if !reflect.DeepEqual(expectedReviews, cachedReviews) {
+		return fmt.Errorf(
+			"pull-request review cache mismatch\ntruth=%+v\ncache=%+v",
+			expectedReviews,
+			cachedReviews,
+		)
+	}
+	if !reflect.DeepEqual(expectedComments, cachedComments) {
+		return fmt.Errorf(
+			"pull-request comment cache mismatch\ntruth=%+v\ncache=%+v",
+			expectedComments,
+			cachedComments,
 		)
 	}
 
@@ -1157,6 +1242,24 @@ func sortOracleReviewRequests(requests []oracleReviewRequest) {
 	})
 }
 
+func sortOraclePullRequestReviews(reviews []oraclePullRequestReview) {
+	sort.Slice(reviews, func(i, j int) bool {
+		if reviews[i].Pull != reviews[j].Pull {
+			return reviews[i].Pull < reviews[j].Pull
+		}
+		return reviews[i].NodeID < reviews[j].NodeID
+	})
+}
+
+func sortOraclePullRequestComments(comments []oraclePullRequestComment) {
+	sort.Slice(comments, func(i, j int) bool {
+		if comments[i].Pull != comments[j].Pull {
+			return comments[i].Pull < comments[j].Pull
+		}
+		return comments[i].NodeID < comments[j].NodeID
+	})
+}
+
 func sortOracleStacks(stacks []oracleStack) {
 	sort.Slice(stacks, func(i, j int) bool {
 		return stacks[i].Number < stacks[j].Number
@@ -1230,6 +1333,60 @@ func readCachedReviewRequests(
 			Login:       row.ReviewerLogin,
 			RequestedAt: pgTimestampPointer(row.RequestedAt),
 			HeadSHA:     row.HeadSha,
+		})
+	}
+	return result, nil
+}
+
+func readCachedPullRequestReviews(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	repo string,
+) ([]oraclePullRequestReview, error) {
+	rows, err := dbgen.New(pool).ListLoadgenCachedPullRequestReviews(ctx, repo)
+	if err != nil {
+		return nil, fmt.Errorf("query cached PR reviews: %w", err)
+	}
+	result := make([]oraclePullRequestReview, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, oraclePullRequestReview{
+			Pull:         int(row.PrNumber),
+			ID:           row.GhID.Int64,
+			NodeID:       row.NodeID,
+			AuthorKind:   row.AuthorKind,
+			AuthorNodeID: row.AuthorNodeID.String,
+			AuthorLogin:  row.AuthorLogin.String,
+			State:        row.State,
+			SubmittedAt:  pgTimestampPointer(row.SubmittedAt),
+			CommitOID:    row.CommitOid.String,
+			UpdatedAt:    row.GhUpdatedAt.Time.UTC(),
+			HeadSHA:      row.HeadSha,
+		})
+	}
+	return result, nil
+}
+
+func readCachedPullRequestComments(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	repo string,
+) ([]oraclePullRequestComment, error) {
+	rows, err := dbgen.New(pool).ListLoadgenCachedPullRequestComments(ctx, repo)
+	if err != nil {
+		return nil, fmt.Errorf("query cached PR comments: %w", err)
+	}
+	result := make([]oraclePullRequestComment, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, oraclePullRequestComment{
+			Pull:         int(row.PrNumber),
+			ID:           row.GhID.Int64,
+			NodeID:       row.NodeID,
+			AuthorKind:   row.AuthorKind,
+			AuthorNodeID: row.AuthorNodeID.String,
+			AuthorLogin:  row.AuthorLogin.String,
+			CreatedAt:    row.CreatedAt.Time.UTC(),
+			UpdatedAt:    row.GhUpdatedAt.Time.UTC(),
+			HeadSHA:      row.HeadSha,
 		})
 	}
 	return result, nil

@@ -494,6 +494,22 @@ func TestTruthMutationKindsMatchReplayCompilerAndRejectUnknowns(t *testing.T) {
 			},
 		},
 		{
+			Kind:        "issue_comment",
+			Action:      "created",
+			Repository:  repository,
+			PullRequest: &first,
+			IssueComment: &TruthIssueComment{
+				ID:           15501,
+				NodeID:       "IC_kinds",
+				AuthorKind:   "bot",
+				AuthorNodeID: "BOT_kinds",
+				AuthorLogin:  "participant[bot]",
+				Body:         "fixture-only body",
+				CreatedAt:    now,
+				UpdatedAt:    now.Add(time.Second),
+			},
+		},
+		{
 			Kind:         "review_thread",
 			Repository:   repository,
 			PullRequest:  &first,
@@ -572,6 +588,11 @@ func TestTruthMutationKindsMatchReplayCompilerAndRejectUnknowns(t *testing.T) {
 	}
 	if got := snapshot.ReviewThreads[0].Comments[0].Body; got != "after edit" {
 		t.Fatalf("review-comment mutation body = %q", got)
+	}
+	if len(snapshot.PullRequests[0].Reviews) != 1 ||
+		len(snapshot.PullRequests[0].Comments) != 1 ||
+		snapshot.PullRequests[0].Comments[0].Author.Kind != "bot" {
+		t.Fatalf("participation mutation snapshot = %+v", snapshot.PullRequests[0])
 	}
 	before := cloneFixture(&fake.fixture)
 	if err := fake.applyTruthMutation(TruthMutation{
@@ -750,6 +771,45 @@ func TestServesStacksWithRateHeaders(t *testing.T) {
 	}
 	if len(stacks) != 1 || stacks[0].Number != 142 || len(stacks[0].PullRequests) != 5 {
 		t.Fatalf("unexpected stacks payload: %+v", stacks)
+	}
+}
+
+func TestServesPullRequestParticipationRESTEndpoints(t *testing.T) {
+	t.Parallel()
+	fake := New(DefaultFixture(), "secret")
+	for _, test := range []struct {
+		path       string
+		wantNodeID string
+	}{
+		{
+			path:       "/repos/acme/monolith/pulls/4812/reviews",
+			wantNodeID: "PRR_kwDOABCDEF8101",
+		},
+		{
+			path:       "/repos/acme/monolith/issues/4812/comments",
+			wantNodeID: "IC_kwDOABCDEF8201",
+		},
+	} {
+		response := serve(
+			fake,
+			http.MethodGet,
+			"http://fake.test"+test.path,
+			nil,
+		)
+		var rows []map[string]any
+		decodeErr := json.NewDecoder(response.Body).Decode(&rows)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || decodeErr != nil {
+			t.Fatalf(
+				"GET %s status/decode = %d/%v",
+				test.path,
+				response.StatusCode,
+				decodeErr,
+			)
+		}
+		if len(rows) != 2 || rows[0]["node_id"] != test.wantNodeID {
+			t.Fatalf("GET %s rows = %#v", test.path, rows)
+		}
 	}
 }
 

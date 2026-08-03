@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -86,7 +87,30 @@ type recordedPull struct {
 }
 
 type graphQLActor struct {
-	Login string `json:"login"`
+	Typename string `json:"__typename"`
+	ID       string `json:"id"`
+	Login    string `json:"login"`
+}
+
+type graphQLBigInt int64
+
+func (value *graphQLBigInt) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*value = 0
+		return nil
+	}
+	encoded := string(data)
+	if len(data) > 0 && data[0] == '"' {
+		if err := json.Unmarshal(data, &encoded); err != nil {
+			return err
+		}
+	}
+	parsed, err := strconv.ParseInt(encoded, 10, 64)
+	if err != nil {
+		return fmt.Errorf("decode GraphQL BigInt %q: %w", encoded, err)
+	}
+	*value = graphQLBigInt(parsed)
+	return nil
 }
 
 type oidNode struct {
@@ -102,6 +126,7 @@ type timelineNode struct {
 	Typename        string          `json:"__typename"`
 	ID              string          `json:"id"`
 	DatabaseID      int64           `json:"databaseId"`
+	FullDatabaseID  graphQLBigInt   `json:"fullDatabaseId"`
 	Body            string          `json:"body"`
 	State           string          `json:"state"`
 	SubmittedAt     *time.Time      `json:"submittedAt"`
@@ -123,14 +148,15 @@ type timelineNode struct {
 }
 
 type recordedReview struct {
-	ID          string       `json:"id"`
-	DatabaseID  int64        `json:"databaseId"`
-	Body        string       `json:"body"`
-	State       string       `json:"state"`
-	SubmittedAt *time.Time   `json:"submittedAt"`
-	UpdatedAt   time.Time    `json:"updatedAt"`
-	Author      graphQLActor `json:"author"`
-	Commit      *oidNode     `json:"commit"`
+	ID             string        `json:"id"`
+	DatabaseID     int64         `json:"databaseId"`
+	FullDatabaseID graphQLBigInt `json:"fullDatabaseId"`
+	Body           string        `json:"body"`
+	State          string        `json:"state"`
+	SubmittedAt    *time.Time    `json:"submittedAt"`
+	UpdatedAt      time.Time     `json:"updatedAt"`
+	Author         graphQLActor  `json:"author"`
+	Commit         *oidNode      `json:"commit"`
 }
 
 type recordedCommit struct {
@@ -1055,7 +1081,7 @@ func appendPullEvents(
 	for _, node := range timeline {
 		if node.Typename == "ReviewDismissedEvent" &&
 			node.Review != nil {
-			reviewStatesBeforeDismissal[node.Review.DatabaseID] =
+			reviewStatesBeforeDismissal[recordedReviewDatabaseID(*node.Review)] =
 				strings.ToLower(node.PreviousReview)
 		}
 	}
@@ -1120,7 +1146,7 @@ func appendPullEvents(
 			}
 			rawReview := recordedReview{
 				ID:          node.ID,
-				DatabaseID:  node.DatabaseID,
+				DatabaseID:  timelineDatabaseID(node),
 				Body:        node.Body,
 				State:       node.State,
 				SubmittedAt: node.SubmittedAt,
@@ -1131,17 +1157,55 @@ func appendPullEvents(
 				rawReview.Commit = &oidNode{OID: node.Commit.OID}
 			}
 			review := replayReview(rawReview)
-			if previous := reviewStatesBeforeDismissal[node.DatabaseID]; previous != "" {
+			reviewID := timelineDatabaseID(node)
+			if previous := reviewStatesBeforeDismissal[reviewID]; previous != "" {
 				review.State = previous
 			}
 			applyReviewDecision(&current, review.State)
 			state := current
-			add(*node.SubmittedAt, fmt.Sprintf("pr:%d:review:%d", raw.Number, node.DatabaseID), replay.Event{
+			add(*node.SubmittedAt, fmt.Sprintf("pr:%d:review:%d", raw.Number, reviewID), replay.Event{
 				Kind:        "pull_request_review",
 				Action:      "submitted",
 				PullRequest: &state,
 				Review:      &review,
 			})
+		case "IssueComment":
+			comment := replay.IssueComment{
+				ID:           timelineDatabaseID(node),
+				NodeID:       node.ID,
+				AuthorKind:   recordingActorKind(node.Author),
+				AuthorNodeID: node.Author.ID,
+				AuthorLogin:  node.Author.Login,
+				Body:         truncateText(node.Body),
+				CreatedAt:    node.CreatedAt,
+				UpdatedAt:    node.UpdatedAt,
+			}
+			pullCopy := pullStateAt(raw, final, timeline, node.CreatedAt)
+			created := comment
+			add(node.CreatedAt, fmt.Sprintf(
+				"pr:%d:issue-comment:%d:created",
+				raw.Number,
+				comment.ID,
+			), replay.Event{
+				Kind:         "issue_comment",
+				Action:       "created",
+				PullRequest:  &pullCopy,
+				IssueComment: &created,
+			})
+			if node.UpdatedAt.After(node.CreatedAt) {
+				pullCopy = pullStateAt(raw, final, timeline, node.UpdatedAt)
+				edited := comment
+				add(node.UpdatedAt, fmt.Sprintf(
+					"pr:%d:issue-comment:%d:edited",
+					raw.Number,
+					comment.ID,
+				), replay.Event{
+					Kind:         "issue_comment",
+					Action:       "edited",
+					PullRequest:  &pullCopy,
+					IssueComment: &edited,
+				})
+			}
 		case "ReviewDismissedEvent":
 			if node.Review == nil {
 				continue
@@ -1384,7 +1448,7 @@ func pullStateAt(
 			reviewState := node.State
 			if previous := reviewStateBeforeDismissal(
 				timeline,
-				node.DatabaseID,
+				timelineDatabaseID(node),
 			); previous != "" {
 				reviewState = previous
 			}
@@ -1434,7 +1498,7 @@ func reviewStateBeforeDismissal(
 	for _, node := range timeline {
 		if node.Typename == "ReviewDismissedEvent" &&
 			node.Review != nil &&
-			node.Review.DatabaseID == reviewID {
+			recordedReviewDatabaseID(*node.Review) == reviewID {
 			return node.PreviousReview
 		}
 	}
@@ -1498,12 +1562,15 @@ func firstOIDParentSHA(commit oidNode) string {
 
 func replayReview(raw recordedReview) replay.Review {
 	result := replay.Review{
-		ID:          raw.DatabaseID,
-		NodeID:      raw.ID,
-		State:       strings.ToLower(raw.State),
-		Body:        truncateText(raw.Body),
-		AuthorLogin: raw.Author.Login,
-		SubmittedAt: raw.UpdatedAt.UTC(),
+		ID:           recordedReviewDatabaseID(raw),
+		NodeID:       raw.ID,
+		State:        strings.ToLower(raw.State),
+		Body:         truncateText(raw.Body),
+		AuthorLogin:  raw.Author.Login,
+		AuthorKind:   recordingActorKind(raw.Author),
+		AuthorNodeID: raw.Author.ID,
+		SubmittedAt:  raw.UpdatedAt.UTC(),
+		UpdatedAt:    raw.UpdatedAt.UTC(),
 	}
 	if raw.SubmittedAt != nil {
 		result.SubmittedAt = raw.SubmittedAt.UTC()
@@ -1512,6 +1579,36 @@ func replayReview(raw recordedReview) replay.Review {
 		result.CommitSHA = raw.Commit.OID
 	}
 	return result
+}
+
+func recordedReviewDatabaseID(review recordedReview) int64 {
+	if review.FullDatabaseID != 0 {
+		return int64(review.FullDatabaseID)
+	}
+	return review.DatabaseID
+}
+
+func timelineDatabaseID(node timelineNode) int64 {
+	if node.FullDatabaseID != 0 {
+		return int64(node.FullDatabaseID)
+	}
+	return node.DatabaseID
+}
+
+func recordingActorKind(actor graphQLActor) string {
+	if actor.Typename == "" {
+		return "deleted"
+	}
+	if kind := map[string]string{
+		"User":                  "user",
+		"Bot":                   "bot",
+		"Mannequin":             "mannequin",
+		"Organization":          "organization",
+		"EnterpriseUserAccount": "enterprise_user_account",
+	}[actor.Typename]; kind != "" {
+		return kind
+	}
+	return "unknown"
 }
 
 func appendCheckEvents(

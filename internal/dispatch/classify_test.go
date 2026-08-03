@@ -96,6 +96,32 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 			}},
 		},
 		{
+			name:  "edited pull request review",
+			event: "pull_request_review",
+			body: `{
+				"action":"edited",
+				"repository":{"full_name":"acme/monolith"},
+				"pull_request":{"number":4812}
+			}`,
+			want: []Intent{{
+				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4812",
+				Priority: PriorityEvent,
+			}},
+		},
+		{
+			name:  "dismissed pull request review",
+			event: "pull_request_review",
+			body: `{
+				"action":"dismissed",
+				"repository":{"full_name":"acme/monolith"},
+				"pull_request":{"number":4812}
+			}`,
+			want: []Intent{{
+				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4812",
+				Priority: PriorityEvent,
+			}},
+		},
+		{
 			name:  "pull request review comment",
 			event: "pull_request_review_comment",
 			body: `{
@@ -120,6 +146,30 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4816",
 				Priority: PriorityEvent,
 			}},
+		},
+		{
+			name:  "pull request issue comment",
+			event: "issue_comment",
+			body: `{
+				"action":"created",
+				"number":9999,
+				"repository":{"full_name":"acme/monolith"},
+				"issue":{"number":4816,"pull_request":{"url":"https://api.github.test/pulls/4816"}}
+			}`,
+			want: []Intent{{
+				Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4816",
+				Priority: PriorityEvent,
+			}},
+		},
+		{
+			name:  "plain issue comment is a clean no-op",
+			event: "issue_comment",
+			body: `{
+				"action":"created",
+				"repository":{"full_name":"acme/monolith"},
+				"issue":{"number":99,"pull_request":null}
+			}`,
+			want: []Intent{},
 		},
 		{
 			name:  "check run by SHA",

@@ -83,6 +83,11 @@ func DefaultRules() []Rule {
 			Action: ActionAny,
 			Target: TargetPullRequest,
 		},
+		{
+			Event:  "issue_comment",
+			Action: ActionAny,
+			Target: TargetPullRequest,
+		},
 		{Event: "check_run", Action: ActionAny, Target: TargetChecks},
 		{Event: "check_suite", Action: ActionAny, Target: TargetChecks},
 		{
@@ -211,7 +216,8 @@ func isPullRequestEvent(event string) bool {
 	case "pull_request",
 		"pull_request_review",
 		"pull_request_review_comment",
-		"pull_request_review_thread":
+		"pull_request_review_thread",
+		"issue_comment":
 		return true
 	default:
 		return false
@@ -242,6 +248,10 @@ type payloadEnvelope struct {
 		Number int              `json:"number"`
 		Stack  *payloadStackRef `json:"stack"`
 	} `json:"pull_request"`
+	Issue struct {
+		Number      int       `json:"number"`
+		PullRequest *struct{} `json:"pull_request"`
+	} `json:"issue"`
 	// Stack is populated by synthetic M2 fixtures to model the branch-to-stack
 	// relationship that M3 will resolve from the authoritative cache.
 	Stack *struct {
@@ -414,9 +424,17 @@ func intentKey(
 	}
 	switch target {
 	case TargetPullRequest, TargetResolveStackMembership:
-		number := payload.Number
-		if number == 0 {
-			number = payload.PullRequest.Number
+		var number int
+		if event == "issue_comment" {
+			if payload.Issue.PullRequest == nil {
+				return "", false, nil
+			}
+			number = payload.Issue.Number
+		} else {
+			number = payload.Number
+			if number == 0 {
+				number = payload.PullRequest.Number
+			}
 		}
 		if number <= 0 {
 			return "", false, fmt.Errorf("pull_request payload is missing a PR number")

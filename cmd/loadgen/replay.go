@@ -159,7 +159,7 @@ func (p *replayPlan) recordExpected(
 	}
 	switch mutation.Kind {
 	case "repository", "commit", "push", "check_suite":
-	case "pull_request", "pull_request_review", "review_comment":
+	case "pull_request", "pull_request_review", "review_comment", "issue_comment":
 		if mutation.PullRequest == nil {
 			return fmt.Errorf(
 				"%s mutation is missing pull request",

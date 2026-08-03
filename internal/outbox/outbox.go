@@ -76,8 +76,8 @@ type Definition struct {
 var V1Definitions = []Definition{
 	{EntitiesStream, RepositoryChangedKind, "repo:{installation_id}:{repo_gh_id}", "repos(installation_id,gh_id)", `{"version":1}`},
 	{EntitiesStream, RepositoryTombstonedKind, "repo:{installation_id}:{repo_gh_id}", "repos(installation_id,gh_id)", `{"version":1}`},
-	{EntitiesStream, PullRequestChangedKind, "pr:{installation_id}:{repo_gh_id}:{pr_number}", "pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number)", `{"version":1}`},
-	{EntitiesStream, PullRequestTombstonedKind, "pr:{installation_id}:{repo_gh_id}:{pr_number}", "pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number)", `{"version":1}`},
+	{EntitiesStream, PullRequestChangedKind, "pr:{installation_id}:{repo_gh_id}:{pr_number}", "pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number)", `{"version":1}`},
+	{EntitiesStream, PullRequestTombstonedKind, "pr:{installation_id}:{repo_gh_id}:{pr_number}", "pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number)", `{"version":1}`},
 	{EntitiesStream, StackChangedKind, "stack:{installation_id}:{repo_gh_id}:{stack_number}", "stacks(repos.installation_id,repos.gh_id,number)", `{"version":1}`},
 	{EntitiesStream, StackTombstonedKind, "stack:{installation_id}:{repo_gh_id}:{stack_number}", "stacks(repos.installation_id,repos.gh_id,number)", `{"version":1}`},
 	{EntitiesStream, ChecksChangedKind, "checks:{installation_id}:{repo_gh_id}:{head_sha}", "check_runs(repos.installation_id,repos.gh_id,head_sha)", `{"version":1}`},

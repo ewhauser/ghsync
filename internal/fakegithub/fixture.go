@@ -36,6 +36,19 @@ func cloneFixture(source *Fixture) Fixture {
 			[]ReviewRequest(nil),
 			pull.ReviewRequests...,
 		)
+		clone.PullRequests[index].Reviews = append(
+			[]PullRequestReview(nil),
+			pull.Reviews...,
+		)
+		for reviewIndex := range clone.PullRequests[index].Reviews {
+			clone.PullRequests[index].Reviews[reviewIndex].SubmittedAt = cloneTime(
+				clone.PullRequests[index].Reviews[reviewIndex].SubmittedAt,
+			)
+		}
+		clone.PullRequests[index].Comments = append(
+			[]IssueComment(nil),
+			pull.Comments...,
+		)
 		if pull.Stack != nil {
 			stack := *pull.Stack
 			clone.PullRequests[index].Stack = &stack
@@ -156,6 +169,43 @@ func DefaultFixture() Fixture {
 				{
 					Kind: "team", ID: 6001, NodeID: "T_kwDOABCDEF6001",
 					Login: "search-platform",
+				},
+			},
+			Reviews: []PullRequestReview{
+				{
+					ID: 8101, NodeID: "PRR_kwDOABCDEF8101",
+					Author: Actor{
+						Kind: "user", NodeID: "U_kwDOABCDEF5001",
+						Login: "reviewer",
+					},
+					State: "changes_requested", SubmittedAt: &now,
+					UpdatedAt: now, CommitOID: "8f31c2d",
+				},
+				{
+					ID: 8102, NodeID: "PRR_kwDOABCDEF8102",
+					Author: Actor{
+						Kind: "bot", NodeID: "BOT_kwDOABCDEF8102",
+						Login: "review-bot[bot]",
+					},
+					State: "commented", SubmittedAt: &now,
+					UpdatedAt: now, CommitOID: "8f31c2d",
+				},
+			},
+			Comments: []IssueComment{
+				{
+					ID: 8201, NodeID: "IC_kwDOABCDEF8201",
+					Author: Actor{
+						Kind: "mannequin", NodeID: "M_kwDOABCDEF8201",
+						Login: "legacy-contributor",
+					},
+					Body: "I exercised this branch.", CreatedAt: now,
+					UpdatedAt: now,
+				},
+				{
+					ID: 8202, NodeID: "IC_kwDOABCDEF8202",
+					Author: Actor{Kind: "deleted"},
+					Body:   "Author later deleted.", CreatedAt: now,
+					UpdatedAt: now,
 				},
 			},
 		},
