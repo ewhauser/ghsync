@@ -122,6 +122,46 @@ type PullRequestCommentRecord struct {
 	GitHubUpdatedAt time.Time
 }
 
+// ChangedFileRecord is one member of the bounded current PR diff snapshot.
+type ChangedFileRecord struct {
+	Path         string
+	PreviousPath string
+	ChangeType   string
+}
+
+// FileOwnerRecord is one CODEOWNERS token selected by the last matching rule
+// for a changed path. OwnerType is syntactic; ResolutionState distinguishes a
+// stable identity from an unresolved or explicitly deleted identity.
+type FileOwnerRecord struct {
+	Path            string
+	OwnerToken      string
+	OwnerType       string
+	OwnerName       string
+	ResolutionState string
+	OwnerGitHubID   int64
+	OwnerNodeID     string
+	OwnerLogin      string
+	SourcePattern   string
+	SourceLine      int
+}
+
+// PullRequestChangeSnapshotRecord fences changed files and resolved ownership
+// by the exact base/head pair returned in one PR observation.
+type PullRequestChangeSnapshotRecord struct {
+	BaseSHA          string
+	HeadSHA          string
+	FilesTotalCount  int
+	FilesTruncated   bool
+	CodeownersRef    string
+	CodeownersSHA    string
+	CodeownersPath   string
+	CodeownersState  string
+	CodeownersSource string
+	CodeownersHash   string
+	Files            []ChangedFileRecord
+	Owners           []FileOwnerRecord
+}
+
 // PullRequestRecord is the authoritative pull-request state accepted by the
 // cache.
 type PullRequestRecord struct {
@@ -152,6 +192,8 @@ type PullRequestRecord struct {
 	ReviewsKnown        bool
 	Comments            []PullRequestCommentRecord
 	CommentsKnown       bool
+	ChangeSnapshot      *PullRequestChangeSnapshotRecord
+	ChangeInputsKnown   bool
 	ETag                string
 	SyncedAt            time.Time
 	Source              SyncSource
@@ -249,6 +291,7 @@ type ApplyPullRequestResult struct {
 	ReviewRequestsChanged bool
 	ReviewsChanged        bool
 	CommentsChanged       bool
+	ChangeInputsChanged   bool
 	StackStateChanged     bool
 	OldStackNumber        *int
 	NewStackNumber        *int
@@ -383,7 +426,92 @@ func validatePullRequest(pull *PullRequestRecord) error {
 		}
 		seenComments[comment.NodeID] = struct{}{}
 	}
+	if pull.ChangeInputsKnown {
+		if pull.ChangeSnapshot == nil {
+			return fmt.Errorf("known PR change inputs require a snapshot")
+		}
+		snapshot := pull.ChangeSnapshot
+		if snapshot.HeadSHA == "" || snapshot.HeadSHA != pull.HeadSHA ||
+			snapshot.BaseSHA != pull.BaseSHA || snapshot.FilesTotalCount < 0 ||
+			snapshot.FilesTotalCount < len(snapshot.Files) ||
+			snapshot.CodeownersRef != pull.BaseRef ||
+			snapshot.CodeownersSHA != pull.BaseSHA ||
+			snapshot.CodeownersHash == "" {
+			return fmt.Errorf("invalid PR change-input snapshot fence")
+		}
+		switch snapshot.CodeownersState {
+		case "present":
+			if snapshot.CodeownersPath == "" {
+				return fmt.Errorf("present CODEOWNERS source has no path")
+			}
+		case "missing":
+			if snapshot.CodeownersPath != "" || snapshot.CodeownersSource != "" {
+				return fmt.Errorf("missing CODEOWNERS source has content")
+			}
+		case "unavailable":
+			if snapshot.CodeownersSHA != "" || snapshot.CodeownersPath != "" ||
+				snapshot.CodeownersSource != "" {
+				return fmt.Errorf("unavailable CODEOWNERS source has provenance")
+			}
+		case "oversized":
+			if snapshot.CodeownersPath == "" || snapshot.CodeownersSource != "" {
+				return fmt.Errorf("invalid oversized CODEOWNERS source")
+			}
+		default:
+			return fmt.Errorf("invalid CODEOWNERS source state")
+		}
+		seenFiles := make(map[string]struct{}, len(snapshot.Files))
+		for _, file := range snapshot.Files {
+			if file.Path == "" || !validChangeType(file.ChangeType) {
+				return fmt.Errorf("invalid PR changed file")
+			}
+			if _, duplicate := seenFiles[file.Path]; duplicate {
+				return fmt.Errorf("duplicate PR changed file %s", file.Path)
+			}
+			seenFiles[file.Path] = struct{}{}
+		}
+		seenOwners := make(map[string]struct{}, len(snapshot.Owners))
+		for index := range snapshot.Owners {
+			owner := &snapshot.Owners[index]
+			if _, exists := seenFiles[owner.Path]; !exists ||
+				owner.OwnerToken == "" || owner.SourcePattern == "" ||
+				owner.SourceLine <= 0 || !validFileOwner(owner) {
+				return fmt.Errorf("invalid PR file owner")
+			}
+			key := owner.Path + "\x00" + owner.OwnerToken
+			if _, duplicate := seenOwners[key]; duplicate {
+				return fmt.Errorf("duplicate PR file owner %s", owner.OwnerToken)
+			}
+			seenOwners[key] = struct{}{}
+		}
+	}
 	return nil
+}
+
+func validChangeType(value string) bool {
+	switch value {
+	case "added", "deleted", "renamed", "copied", "modified", "changed":
+		return true
+	default:
+		return false
+	}
+}
+
+func validFileOwner(owner *FileOwnerRecord) bool {
+	switch owner.OwnerType {
+	case "user", "team", "email", "malformed":
+	default:
+		return false
+	}
+	switch owner.ResolutionState {
+	case "resolved":
+		return owner.OwnerNodeID != "" && owner.OwnerLogin != ""
+	case "unresolved", "deleted":
+		return owner.OwnerGitHubID == 0 && owner.OwnerNodeID == "" &&
+			owner.OwnerLogin == ""
+	default:
+		return false
+	}
 }
 
 func validParticipationAuthor(kind, nodeID, login string) bool {

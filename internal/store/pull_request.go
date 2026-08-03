@@ -126,6 +126,30 @@ func (w *EntityWriter) TouchPullRequest(
 			); err != nil {
 				return fmt.Errorf("touch PR comments: %w", err)
 			}
+			changeTouch := dbgen.TouchPullRequestChangeInputsCheckedAtParams{
+				CheckedAt:         timestamp(checkedAt),
+				Etag:              etag,
+				RepoID:            repo.ID,
+				PrNumber:          int32(number),
+				ParentGhUpdatedAt: current.GhUpdatedAt,
+			}
+			if err := queries.TouchPullRequestChangeInputsCheckedAt(
+				ctx, changeTouch,
+			); err != nil {
+				return fmt.Errorf("touch PR change snapshot: %w", err)
+			}
+			if err := queries.TouchPullRequestChangedFilesCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestChangedFilesCheckedAtParams(changeTouch),
+			); err != nil {
+				return fmt.Errorf("touch PR changed files: %w", err)
+			}
+			if err := queries.TouchPullRequestFileOwnersCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestFileOwnersCheckedAtParams(changeTouch),
+			); err != nil {
+				return fmt.Errorf("touch PR file owners: %w", err)
+			}
 		}
 		return nil
 	})
@@ -437,6 +461,108 @@ func (w *EntityWriter) applyPullRequest(
 			}
 		}
 
+		if pull.ChangeInputsKnown {
+			snapshot := pull.ChangeSnapshot
+			changedCount, err := queries.UpsertPullRequestChangeSnapshot(
+				ctx,
+				dbgen.UpsertPullRequestChangeSnapshotParams{
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					HeadSha:           snapshot.HeadSHA,
+					BaseSha:           snapshot.BaseSHA,
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+					FilesTotalCount:   int32(snapshot.FilesTotalCount),
+					FilesTruncated:    snapshot.FilesTruncated,
+					CodeownersRef:     snapshot.CodeownersRef,
+					CodeownersSha:     snapshot.CodeownersSHA,
+					CodeownersPath:    nullableText(snapshot.CodeownersPath),
+					CodeownersState:   snapshot.CodeownersState,
+					CodeownersSource: optionalText(
+						snapshot.CodeownersSource,
+						snapshot.CodeownersState == "present",
+					),
+					CodeownersHash: snapshot.CodeownersHash,
+					SyncedAt:       timestamp(pull.SyncedAt),
+					Etag:           pull.ETag,
+					SyncSource:     string(pull.Source),
+					LastCheckedAt:  timestamp(pull.SyncedAt),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("upsert PR change snapshot: %w", err)
+			}
+			files, err := encodeChangedFiles(snapshot.Files)
+			if err != nil {
+				return err
+			}
+			changedFiles, err := queries.ReplacePullRequestChangedFiles(
+				ctx,
+				dbgen.ReplacePullRequestChangedFilesParams{
+					ChangedFiles:      files,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					BaseSha:           snapshot.BaseSHA,
+					HeadSha:           snapshot.HeadSHA,
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+					SyncedAt:          timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					SyncSource:        string(pull.Source),
+					LastCheckedAt:     timestamp(pull.SyncedAt),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("replace PR changed files: %w", err)
+			}
+			owners, err := encodeFileOwners(snapshot.Owners)
+			if err != nil {
+				return err
+			}
+			changedOwners, err := queries.ReplacePullRequestFileOwners(
+				ctx,
+				dbgen.ReplacePullRequestFileOwnersParams{
+					FileOwners:        owners,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					BaseSha:           snapshot.BaseSHA,
+					HeadSha:           snapshot.HeadSHA,
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+					SyncedAt:          timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					SyncSource:        string(pull.Source),
+					LastCheckedAt:     timestamp(pull.SyncedAt),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("replace PR file owners: %w", err)
+			}
+			result.ChangeInputsChanged = changedCount > 0 ||
+				len(changedFiles) > 0 || len(changedOwners) > 0
+			changeTouch := dbgen.TouchPullRequestChangeInputsCheckedAtParams{
+				CheckedAt:         timestamp(pull.SyncedAt),
+				Etag:              pull.ETag,
+				RepoID:            repo.ID,
+				PrNumber:          int32(pull.Number),
+				ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+			}
+			if err := queries.TouchPullRequestChangeInputsCheckedAt(
+				ctx, changeTouch,
+			); err != nil {
+				return fmt.Errorf("touch PR change snapshot: %w", err)
+			}
+			if err := queries.TouchPullRequestChangedFilesCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestChangedFilesCheckedAtParams(changeTouch),
+			); err != nil {
+				return fmt.Errorf("touch PR changed files: %w", err)
+			}
+			if err := queries.TouchPullRequestFileOwnersCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestFileOwnersCheckedAtParams(changeTouch),
+			); err != nil {
+				return fmt.Errorf("touch PR file owners: %w", err)
+			}
+		}
+
 		threadsChanged := false
 		if pull.ThreadsKnown {
 			threads, err := encodeReviewThreads(pull.ReviewThreads)
@@ -473,7 +599,7 @@ func (w *EntityWriter) applyPullRequest(
 		}
 		result.Applied = result.DomainChanged || threadsChanged ||
 			result.ReviewRequestsChanged || result.ReviewsChanged ||
-			result.CommentsChanged
+			result.CommentsChanged || result.ChangeInputsChanged
 		if result.Applied {
 			scopes := uniqueStrings(
 				derivationScope(
@@ -704,6 +830,29 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 			); err != nil {
 				return fmt.Errorf("tombstone PR comments: %w", err)
 			}
+			changeTombstone := dbgen.TombstonePullRequestChangeSnapshotParams{
+				TombstonedAt: timestamp(at),
+				SyncSource:   string(source),
+				RepoID:       repo.ID,
+				PrNumber:     int32(number),
+			}
+			if _, err := queries.TombstonePullRequestFileOwners(
+				ctx,
+				dbgen.TombstonePullRequestFileOwnersParams(changeTombstone),
+			); err != nil {
+				return fmt.Errorf("tombstone PR file owners: %w", err)
+			}
+			if _, err := queries.TombstonePullRequestChangedFiles(
+				ctx,
+				dbgen.TombstonePullRequestChangedFilesParams(changeTombstone),
+			); err != nil {
+				return fmt.Errorf("tombstone PR changed files: %w", err)
+			}
+			if _, err := queries.TombstonePullRequestChangeSnapshot(
+				ctx, changeTombstone,
+			); err != nil {
+				return fmt.Errorf("tombstone PR change snapshot: %w", err)
+			}
 		}
 		if hook != nil {
 			if txHook := hook(result); txHook != nil {
@@ -820,6 +969,50 @@ func encodePullRequestComments(
 	value, err := json.Marshal(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("encode PR comments: %w", err)
+	}
+	return value, nil
+}
+
+func encodeChangedFiles(files []ChangedFileRecord) ([]byte, error) {
+	type encodedFile struct {
+		Path         string `json:"path"`
+		PreviousPath string `json:"previous_path"`
+		ChangeType   string `json:"change_type"`
+	}
+	encoded := make([]encodedFile, 0, len(files))
+	for _, file := range files {
+		encoded = append(encoded, encodedFile{
+			Path: file.Path, PreviousPath: file.PreviousPath,
+			ChangeType: strings.ToLower(file.ChangeType),
+		})
+	}
+	value, err := json.Marshal(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("encode PR changed files: %w", err)
+	}
+	return value, nil
+}
+
+func encodeFileOwners(owners []FileOwnerRecord) ([]byte, error) {
+	type encodedOwner struct {
+		Path            string `json:"path"`
+		OwnerToken      string `json:"owner_token"`
+		OwnerType       string `json:"owner_type"`
+		OwnerName       string `json:"owner_name"`
+		ResolutionState string `json:"resolution_state"`
+		OwnerGitHubID   int64  `json:"owner_gh_id"`
+		OwnerNodeID     string `json:"owner_node_id"`
+		OwnerLogin      string `json:"owner_login"`
+		SourcePattern   string `json:"source_pattern"`
+		SourceLine      int    `json:"source_line"`
+	}
+	encoded := make([]encodedOwner, 0, len(owners))
+	for index := range owners {
+		encoded = append(encoded, encodedOwner(owners[index]))
+	}
+	value, err := json.Marshal(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("encode PR file owners: %w", err)
 	}
 	return value, nil
 }

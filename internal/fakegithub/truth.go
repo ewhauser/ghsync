@@ -178,22 +178,28 @@ type TruthFixtureSnapshot struct {
 }
 
 type TruthPullRequestSnapshot struct {
-	ID             int64               `json:"id"`
-	NodeID         string              `json:"node_id"`
-	Number         int                 `json:"number"`
-	Title          string              `json:"title"`
-	State          string              `json:"state"`
-	Draft          bool                `json:"draft"`
-	AuthorLogin    string              `json:"author_login"`
-	ReviewDecision string              `json:"review_decision"`
-	MergeableState string              `json:"mergeable_state"`
-	Head           PullRequestBranch   `json:"head"`
-	Base           Base                `json:"base"`
-	UpdatedAt      time.Time           `json:"updated_at"`
-	Stack          *StackRef           `json:"stack"`
-	ReviewRequests []ReviewRequest     `json:"review_requests"`
-	Reviews        []PullRequestReview `json:"reviews"`
-	Comments       []IssueComment      `json:"comments"`
+	ID                  int64               `json:"id"`
+	NodeID              string              `json:"node_id"`
+	Number              int                 `json:"number"`
+	Title               string              `json:"title"`
+	State               string              `json:"state"`
+	Draft               bool                `json:"draft"`
+	AuthorLogin         string              `json:"author_login"`
+	ReviewDecision      string              `json:"review_decision"`
+	MergeableState      string              `json:"mergeable_state"`
+	Head                PullRequestBranch   `json:"head"`
+	Base                Base                `json:"base"`
+	UpdatedAt           time.Time           `json:"updated_at"`
+	Stack               *StackRef           `json:"stack"`
+	ReviewRequests      []ReviewRequest     `json:"review_requests"`
+	Reviews             []PullRequestReview `json:"reviews"`
+	Comments            []IssueComment      `json:"comments"`
+	ChangedFiles        []ChangedFile       `json:"changed_files"`
+	ChangedFilesTotal   int                 `json:"changed_files_total"`
+	ChangedFilesOmitted bool                `json:"changed_files_omitted"`
+	CodeownersPath      string              `json:"codeowners_path,omitempty"`
+	CodeownersSource    string              `json:"codeowners_source,omitempty"`
+	CodeownersState     string              `json:"codeowners_state"`
 }
 
 type TruthReviewThreadSnapshot struct {
@@ -827,7 +833,17 @@ func snapshotFixture(fixture Fixture) TruthFixtureSnapshot {
 					[]IssueComment(nil),
 					pull.Comments...,
 				),
+				ChangedFiles: append(
+					[]ChangedFile(nil), pull.ChangedFiles...,
+				),
+				ChangedFilesTotal:   changedFilesTotal(&pull),
+				ChangedFilesOmitted: pull.ChangedFilesOmitted,
 			},
+		)
+		storedPull := &snapshot.PullRequests[len(snapshot.PullRequests)-1]
+		storedPull.CodeownersPath, storedPull.CodeownersSource,
+			storedPull.CodeownersState = fixtureCodeowners(
+			&fixture, pull.Base.SHA,
 		)
 		for _, thread := range pull.ReviewThreads {
 			updatedAt := pull.UpdatedAt
@@ -894,4 +910,23 @@ func snapshotFixture(fixture Fixture) TruthFixtureSnapshot {
 		return snapshot.ReviewThreads[i].ID < snapshot.ReviewThreads[j].ID
 	})
 	return snapshot
+}
+
+func fixtureCodeowners(fixture *Fixture, ref string) (string, string, string) {
+	if ref == "" {
+		return "", "", "unavailable"
+	}
+	for _, path := range []string{
+		".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS",
+	} {
+		content, ok := fixture.Contents[ref][path]
+		if !ok {
+			continue
+		}
+		if len(content) >= 3<<20 {
+			return path, "", "oversized"
+		}
+		return path, content, "present"
+	}
+	return "", "", "missing"
 }

@@ -643,6 +643,77 @@ func (q *Queries) ListCachedPRMemberships(ctx context.Context, arg ListCachedPRM
 	return items, nil
 }
 
+const listCodeOwnerIdentities = `-- name: ListCodeOwnerIdentities :many
+WITH candidates AS (
+    SELECT request.reviewer_kind AS owner_type,
+           request.reviewer_gh_id AS owner_gh_id,
+           request.reviewer_node_id AS owner_node_id,
+           request.reviewer_login AS owner_login,
+           request.last_checked_at
+    FROM pull_request_review_requests AS request
+    WHERE request.repo_id = $1
+
+    UNION ALL
+
+    SELECT 'user'::text, NULL::bigint, review.author_node_id,
+           review.author_login, review.last_checked_at
+    FROM pull_request_reviews AS review
+    WHERE review.repo_id = $1
+      AND review.author_kind = 'user'
+      AND review.author_node_id IS NOT NULL
+      AND review.author_login IS NOT NULL
+
+    UNION ALL
+
+    SELECT 'user'::text, NULL::bigint, comment.author_node_id,
+           comment.author_login, comment.last_checked_at
+    FROM pull_request_comments AS comment
+    WHERE comment.repo_id = $1
+      AND comment.author_kind = 'user'
+      AND comment.author_node_id IS NOT NULL
+      AND comment.author_login IS NOT NULL
+)
+SELECT DISTINCT ON (owner_type, lower(owner_login))
+       owner_type, COALESCE(owner_gh_id, 0)::bigint AS owner_gh_id,
+       owner_node_id, owner_login
+FROM candidates
+ORDER BY owner_type, lower(owner_login),
+         owner_gh_id IS NOT NULL DESC, last_checked_at DESC,
+         owner_node_id
+`
+
+type ListCodeOwnerIdentitiesRow struct {
+	OwnerType   string
+	OwnerGhID   int64
+	OwnerNodeID string
+	OwnerLogin  string
+}
+
+func (q *Queries) ListCodeOwnerIdentities(ctx context.Context, repoID int64) ([]ListCodeOwnerIdentitiesRow, error) {
+	rows, err := q.db.Query(ctx, listCodeOwnerIdentities, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCodeOwnerIdentitiesRow
+	for rows.Next() {
+		var i ListCodeOwnerIdentitiesRow
+		if err := rows.Scan(
+			&i.OwnerType,
+			&i.OwnerGhID,
+			&i.OwnerNodeID,
+			&i.OwnerLogin,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPRScopesByHeadSHA = `-- name: ListPRScopesByHeadSHA :many
 SELECT pull_requests.number, pull_requests.stack_number,
        repos.gh_id AS repo_gh_id, repos.installation_id
@@ -698,6 +769,7 @@ JOIN repos ON repos.id = pull_requests.repo_id
 JOIN repo_aliases ON repo_aliases.repo_id = repos.id
 WHERE repo_aliases.full_name = $1
   AND pull_requests.tombstoned_at IS NULL
+  AND pull_requests.state = 'open'
   AND (
       pull_requests.head_ref = $2
       OR pull_requests.base_ref = $2
@@ -978,6 +1050,123 @@ func (q *Queries) ReplaceCheckRuns(ctx context.Context, arg ReplaceCheckRunsPara
 	return items, nil
 }
 
+const replacePullRequestChangedFiles = `-- name: ReplacePullRequestChangedFiles :many
+WITH input AS (
+    SELECT element->>'path' AS path,
+           NULLIF(element->>'previous_path', '') AS previous_path,
+           element->>'change_type' AS change_type
+    FROM jsonb_array_elements($1::jsonb) AS element
+),
+eligible AS (
+    SELECT snapshot.repo_id
+    FROM pull_request_change_snapshots AS snapshot
+    WHERE snapshot.repo_id = $2
+      AND snapshot.pr_number = $3
+      AND snapshot.tombstoned_at IS NULL
+      AND snapshot.base_sha = $4
+      AND snapshot.head_sha = $5
+      AND snapshot.parent_gh_updated_at <= $6
+),
+upserted AS (
+    INSERT INTO pull_request_changed_files (
+        repo_id, pr_number, path, previous_path, change_type, base_sha,
+        head_sha, synced_at, etag, sync_source, tombstoned_at,
+        last_checked_at
+    )
+    SELECT $2, $3, input.path,
+           input.previous_path, input.change_type, $4,
+           $5, $7, $8,
+           $9, NULL, $10
+    FROM input
+    CROSS JOIN eligible
+    ON CONFLICT (repo_id, pr_number, path) DO UPDATE
+    SET previous_path = EXCLUDED.previous_path,
+        change_type = EXCLUDED.change_type,
+        base_sha = EXCLUDED.base_sha,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL,
+        last_checked_at = EXCLUDED.last_checked_at
+    WHERE ROW(
+              EXCLUDED.previous_path, EXCLUDED.change_type,
+              EXCLUDED.base_sha, EXCLUDED.head_sha
+          ) IS DISTINCT FROM ROW(
+              pull_request_changed_files.previous_path,
+              pull_request_changed_files.change_type,
+              pull_request_changed_files.base_sha,
+              pull_request_changed_files.head_sha
+          )
+       OR pull_request_changed_files.tombstoned_at IS NOT NULL
+    RETURNING path
+),
+tombstoned AS (
+    UPDATE pull_request_changed_files
+    SET tombstoned_at = $10,
+        synced_at = $7,
+        last_checked_at = $10,
+        etag = $8,
+        sync_source = $9
+    WHERE repo_id = $2
+      AND pr_number = $3
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND NOT EXISTS (
+          SELECT 1 FROM input
+          WHERE input.path = pull_request_changed_files.path
+      )
+    RETURNING path
+)
+SELECT path FROM upserted
+UNION ALL
+SELECT path FROM tombstoned
+`
+
+type ReplacePullRequestChangedFilesParams struct {
+	ChangedFiles      []byte
+	RepoID            int64
+	PrNumber          int32
+	BaseSha           string
+	HeadSha           string
+	ParentGhUpdatedAt pgtype.Timestamptz
+	SyncedAt          pgtype.Timestamptz
+	Etag              string
+	SyncSource        string
+	LastCheckedAt     pgtype.Timestamptz
+}
+
+func (q *Queries) ReplacePullRequestChangedFiles(ctx context.Context, arg ReplacePullRequestChangedFilesParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, replacePullRequestChangedFiles,
+		arg.ChangedFiles,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.BaseSha,
+		arg.HeadSha,
+		arg.ParentGhUpdatedAt,
+		arg.SyncedAt,
+		arg.Etag,
+		arg.SyncSource,
+		arg.LastCheckedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		items = append(items, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const replacePullRequestComments = `-- name: ReplacePullRequestComments :many
 WITH input AS (
     SELECT NULLIF((element->>'gh_id')::bigint, 0) AS gh_id,
@@ -1118,6 +1307,150 @@ func (q *Queries) ReplacePullRequestComments(ctx context.Context, arg ReplacePul
 			return nil, err
 		}
 		items = append(items, node_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const replacePullRequestFileOwners = `-- name: ReplacePullRequestFileOwners :many
+WITH input AS (
+    SELECT element->>'path' AS path,
+           element->>'owner_token' AS owner_token,
+           element->>'owner_type' AS owner_type,
+           element->>'owner_name' AS owner_name,
+           element->>'resolution_state' AS resolution_state,
+           NULLIF((element->>'owner_gh_id')::bigint, 0) AS owner_gh_id,
+           NULLIF(element->>'owner_node_id', '') AS owner_node_id,
+           NULLIF(element->>'owner_login', '') AS owner_login,
+           element->>'source_pattern' AS source_pattern,
+           (element->>'source_line')::integer AS source_line
+    FROM jsonb_array_elements($1::jsonb) AS element
+),
+eligible AS (
+    SELECT snapshot.repo_id
+    FROM pull_request_change_snapshots AS snapshot
+    WHERE snapshot.repo_id = $2
+      AND snapshot.pr_number = $3
+      AND snapshot.tombstoned_at IS NULL
+      AND snapshot.base_sha = $4
+      AND snapshot.head_sha = $5
+      AND snapshot.parent_gh_updated_at <= $6
+),
+upserted AS (
+    INSERT INTO pull_request_file_owners (
+        repo_id, pr_number, path, owner_token, owner_type, owner_name,
+        resolution_state, owner_gh_id, owner_node_id, owner_login,
+        source_pattern, source_line, base_sha, head_sha, synced_at, etag,
+        sync_source, tombstoned_at, last_checked_at
+    )
+    SELECT $2, $3, input.path,
+           input.owner_token, input.owner_type, input.owner_name,
+           input.resolution_state,
+           input.owner_gh_id, input.owner_node_id, input.owner_login,
+           input.source_pattern, input.source_line, $4,
+           $5, $7, $8,
+           $9, NULL, $10
+    FROM input
+    CROSS JOIN eligible
+    ON CONFLICT (repo_id, pr_number, path, owner_token) DO UPDATE
+    SET owner_type = EXCLUDED.owner_type,
+        owner_name = EXCLUDED.owner_name,
+        resolution_state = EXCLUDED.resolution_state,
+        owner_gh_id = EXCLUDED.owner_gh_id,
+        owner_node_id = EXCLUDED.owner_node_id,
+        owner_login = EXCLUDED.owner_login,
+        source_pattern = EXCLUDED.source_pattern,
+        source_line = EXCLUDED.source_line,
+        base_sha = EXCLUDED.base_sha,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL,
+        last_checked_at = EXCLUDED.last_checked_at
+    WHERE ROW(
+              EXCLUDED.owner_type, EXCLUDED.owner_name,
+              EXCLUDED.resolution_state,
+              EXCLUDED.owner_gh_id, EXCLUDED.owner_node_id,
+              EXCLUDED.owner_login, EXCLUDED.source_pattern,
+              EXCLUDED.source_line, EXCLUDED.base_sha, EXCLUDED.head_sha
+          ) IS DISTINCT FROM ROW(
+              pull_request_file_owners.owner_type,
+              pull_request_file_owners.owner_name,
+              pull_request_file_owners.resolution_state,
+              pull_request_file_owners.owner_gh_id,
+              pull_request_file_owners.owner_node_id,
+              pull_request_file_owners.owner_login,
+              pull_request_file_owners.source_pattern,
+              pull_request_file_owners.source_line,
+              pull_request_file_owners.base_sha,
+              pull_request_file_owners.head_sha
+          )
+       OR pull_request_file_owners.tombstoned_at IS NOT NULL
+    RETURNING (path || ':' || owner_token)::text AS owner_key
+),
+tombstoned AS (
+    UPDATE pull_request_file_owners
+    SET tombstoned_at = $10,
+        synced_at = $7,
+        last_checked_at = $10,
+        etag = $8,
+        sync_source = $9
+    WHERE repo_id = $2
+      AND pr_number = $3
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND NOT EXISTS (
+          SELECT 1 FROM input
+          WHERE input.path = pull_request_file_owners.path
+            AND input.owner_token = pull_request_file_owners.owner_token
+      )
+    RETURNING (path || ':' || owner_token)::text AS owner_key
+)
+SELECT owner_key FROM upserted
+UNION ALL
+SELECT owner_key FROM tombstoned
+`
+
+type ReplacePullRequestFileOwnersParams struct {
+	FileOwners        []byte
+	RepoID            int64
+	PrNumber          int32
+	BaseSha           string
+	HeadSha           string
+	ParentGhUpdatedAt pgtype.Timestamptz
+	SyncedAt          pgtype.Timestamptz
+	Etag              string
+	SyncSource        string
+	LastCheckedAt     pgtype.Timestamptz
+}
+
+func (q *Queries) ReplacePullRequestFileOwners(ctx context.Context, arg ReplacePullRequestFileOwnersParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, replacePullRequestFileOwners,
+		arg.FileOwners,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.BaseSha,
+		arg.HeadSha,
+		arg.ParentGhUpdatedAt,
+		arg.SyncedAt,
+		arg.Etag,
+		arg.SyncSource,
+		arg.LastCheckedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var owner_key string
+		if err := rows.Scan(&owner_key); err != nil {
+			return nil, err
+		}
+		items = append(items, owner_key)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1757,6 +2090,70 @@ func (q *Queries) TombstonePullRequest(ctx context.Context, arg TombstonePullReq
 	return i, err
 }
 
+const tombstonePullRequestChangeSnapshot = `-- name: TombstonePullRequestChangeSnapshot :execrows
+UPDATE pull_request_change_snapshots
+SET tombstoned_at = $1,
+    synced_at = $1,
+    last_checked_at = GREATEST(last_checked_at, $1),
+    etag = '',
+    sync_source = $2
+WHERE repo_id = $3
+  AND pr_number = $4
+  AND tombstoned_at IS NULL
+`
+
+type TombstonePullRequestChangeSnapshotParams struct {
+	TombstonedAt pgtype.Timestamptz
+	SyncSource   string
+	RepoID       int64
+	PrNumber     int32
+}
+
+func (q *Queries) TombstonePullRequestChangeSnapshot(ctx context.Context, arg TombstonePullRequestChangeSnapshotParams) (int64, error) {
+	result, err := q.db.Exec(ctx, tombstonePullRequestChangeSnapshot,
+		arg.TombstonedAt,
+		arg.SyncSource,
+		arg.RepoID,
+		arg.PrNumber,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const tombstonePullRequestChangedFiles = `-- name: TombstonePullRequestChangedFiles :execrows
+UPDATE pull_request_changed_files
+SET tombstoned_at = $1,
+    synced_at = $1,
+    last_checked_at = GREATEST(last_checked_at, $1),
+    etag = '',
+    sync_source = $2
+WHERE repo_id = $3
+  AND pr_number = $4
+  AND tombstoned_at IS NULL
+`
+
+type TombstonePullRequestChangedFilesParams struct {
+	TombstonedAt pgtype.Timestamptz
+	SyncSource   string
+	RepoID       int64
+	PrNumber     int32
+}
+
+func (q *Queries) TombstonePullRequestChangedFiles(ctx context.Context, arg TombstonePullRequestChangedFilesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, tombstonePullRequestChangedFiles,
+		arg.TombstonedAt,
+		arg.SyncSource,
+		arg.RepoID,
+		arg.PrNumber,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const tombstonePullRequestComments = `-- name: TombstonePullRequestComments :many
 UPDATE pull_request_comments
 SET tombstoned_at = $1,
@@ -1800,6 +2197,38 @@ func (q *Queries) TombstonePullRequestComments(ctx context.Context, arg Tombston
 		return nil, err
 	}
 	return items, nil
+}
+
+const tombstonePullRequestFileOwners = `-- name: TombstonePullRequestFileOwners :execrows
+UPDATE pull_request_file_owners
+SET tombstoned_at = $1,
+    synced_at = $1,
+    last_checked_at = GREATEST(last_checked_at, $1),
+    etag = '',
+    sync_source = $2
+WHERE repo_id = $3
+  AND pr_number = $4
+  AND tombstoned_at IS NULL
+`
+
+type TombstonePullRequestFileOwnersParams struct {
+	TombstonedAt pgtype.Timestamptz
+	SyncSource   string
+	RepoID       int64
+	PrNumber     int32
+}
+
+func (q *Queries) TombstonePullRequestFileOwners(ctx context.Context, arg TombstonePullRequestFileOwnersParams) (int64, error) {
+	result, err := q.db.Exec(ctx, tombstonePullRequestFileOwners,
+		arg.TombstonedAt,
+		arg.SyncSource,
+		arg.RepoID,
+		arg.PrNumber,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const tombstonePullRequestReviewRequests = `-- name: TombstonePullRequestReviewRequests :many
@@ -2028,6 +2457,79 @@ func (q *Queries) TouchCheckRunsCheckedAt(ctx context.Context, arg TouchCheckRun
 	return err
 }
 
+const touchPullRequestChangeInputsCheckedAt = `-- name: TouchPullRequestChangeInputsCheckedAt :exec
+WITH eligible AS (
+    SELECT snapshot.repo_id
+    FROM pull_request_change_snapshots AS snapshot
+    WHERE snapshot.repo_id = $3
+      AND snapshot.pr_number = $4
+      AND snapshot.tombstoned_at IS NULL
+      AND snapshot.parent_gh_updated_at <= $5
+)
+UPDATE pull_request_change_snapshots AS snapshot
+SET last_checked_at = GREATEST(snapshot.last_checked_at, $1),
+    etag = CASE WHEN $2::text = '' THEN snapshot.etag
+                ELSE $2::text END
+WHERE snapshot.repo_id = $3
+  AND snapshot.pr_number = $4
+  AND EXISTS (SELECT 1 FROM eligible)
+`
+
+type TouchPullRequestChangeInputsCheckedAtParams struct {
+	CheckedAt         pgtype.Timestamptz
+	Etag              string
+	RepoID            int64
+	PrNumber          int32
+	ParentGhUpdatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) TouchPullRequestChangeInputsCheckedAt(ctx context.Context, arg TouchPullRequestChangeInputsCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchPullRequestChangeInputsCheckedAt,
+		arg.CheckedAt,
+		arg.Etag,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.ParentGhUpdatedAt,
+	)
+	return err
+}
+
+const touchPullRequestChangedFilesCheckedAt = `-- name: TouchPullRequestChangedFilesCheckedAt :exec
+UPDATE pull_request_changed_files AS file
+SET last_checked_at = GREATEST(file.last_checked_at, $1),
+    etag = CASE WHEN $2::text = '' THEN file.etag
+                ELSE $2::text END
+WHERE file.repo_id = $3
+  AND file.pr_number = $4
+  AND file.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM pull_request_change_snapshots AS snapshot
+      WHERE snapshot.repo_id = $3
+        AND snapshot.pr_number = $4
+        AND snapshot.tombstoned_at IS NULL
+        AND snapshot.parent_gh_updated_at <= $5
+  )
+`
+
+type TouchPullRequestChangedFilesCheckedAtParams struct {
+	CheckedAt         pgtype.Timestamptz
+	Etag              string
+	RepoID            int64
+	PrNumber          int32
+	ParentGhUpdatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) TouchPullRequestChangedFilesCheckedAt(ctx context.Context, arg TouchPullRequestChangedFilesCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchPullRequestChangedFilesCheckedAt,
+		arg.CheckedAt,
+		arg.Etag,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.ParentGhUpdatedAt,
+	)
+	return err
+}
+
 const touchPullRequestCheckedAt = `-- name: TouchPullRequestCheckedAt :exec
 UPDATE pull_requests
 SET last_checked_at = GREATEST(last_checked_at, $1),
@@ -2087,6 +2589,42 @@ type TouchPullRequestCommentsCheckedAtParams struct {
 
 func (q *Queries) TouchPullRequestCommentsCheckedAt(ctx context.Context, arg TouchPullRequestCommentsCheckedAtParams) error {
 	_, err := q.db.Exec(ctx, touchPullRequestCommentsCheckedAt,
+		arg.CheckedAt,
+		arg.Etag,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.ParentGhUpdatedAt,
+	)
+	return err
+}
+
+const touchPullRequestFileOwnersCheckedAt = `-- name: TouchPullRequestFileOwnersCheckedAt :exec
+UPDATE pull_request_file_owners AS owner
+SET last_checked_at = GREATEST(owner.last_checked_at, $1),
+    etag = CASE WHEN $2::text = '' THEN owner.etag
+                ELSE $2::text END
+WHERE owner.repo_id = $3
+  AND owner.pr_number = $4
+  AND owner.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM pull_request_change_snapshots AS snapshot
+      WHERE snapshot.repo_id = $3
+        AND snapshot.pr_number = $4
+        AND snapshot.tombstoned_at IS NULL
+        AND snapshot.parent_gh_updated_at <= $5
+  )
+`
+
+type TouchPullRequestFileOwnersCheckedAtParams struct {
+	CheckedAt         pgtype.Timestamptz
+	Etag              string
+	RepoID            int64
+	PrNumber          int32
+	ParentGhUpdatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) TouchPullRequestFileOwnersCheckedAt(ctx context.Context, arg TouchPullRequestFileOwnersCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchPullRequestFileOwnersCheckedAt,
 		arg.CheckedAt,
 		arg.Etag,
 		arg.RepoID,
@@ -2259,6 +2797,214 @@ func (q *Queries) TouchStackCheckedAt(ctx context.Context, arg TouchStackChecked
 		arg.StackNumber,
 	)
 	return err
+}
+
+const upsertPullRequestChangeSnapshot = `-- name: UpsertPullRequestChangeSnapshot :one
+WITH eligible AS (
+    SELECT pull_requests.repo_id
+    FROM pull_requests
+    WHERE pull_requests.repo_id = $11
+      AND pull_requests.number = $12
+      AND pull_requests.tombstoned_at IS NULL
+      AND pull_requests.head_sha = $2
+      AND pull_requests.base_sha = $1
+      AND (
+          pull_requests.gh_updated_at IS NULL
+          OR pull_requests.gh_updated_at <= $13
+      )
+),
+prior AS MATERIALIZED (
+    SELECT base_sha, head_sha, files_total_count, files_truncated,
+           codeowners_ref, codeowners_sha, codeowners_path,
+           codeowners_state, codeowners_source, codeowners_hash,
+           tombstoned_at
+    FROM pull_request_change_snapshots
+    WHERE repo_id = $11
+      AND pr_number = $12
+),
+upserted AS (
+    INSERT INTO pull_request_change_snapshots (
+        repo_id, pr_number, base_sha, head_sha, files_total_count,
+        files_truncated, codeowners_ref, codeowners_sha, codeowners_path,
+        codeowners_state, codeowners_source, codeowners_hash,
+        parent_gh_updated_at, synced_at, etag, sync_source, tombstoned_at,
+        last_checked_at
+    )
+    SELECT $11, $12, $1,
+           $2, $3,
+           $4, $5,
+           $6, $7,
+           $8, $9,
+           $10, $13,
+           $14, $15, $16, NULL,
+           $17
+    FROM eligible
+    ON CONFLICT (repo_id, pr_number) DO UPDATE
+    SET base_sha = EXCLUDED.base_sha,
+        head_sha = EXCLUDED.head_sha,
+        files_total_count = EXCLUDED.files_total_count,
+        files_truncated = EXCLUDED.files_truncated,
+        codeowners_ref = EXCLUDED.codeowners_ref,
+        codeowners_sha = EXCLUDED.codeowners_sha,
+        codeowners_path = EXCLUDED.codeowners_path,
+        codeowners_state = EXCLUDED.codeowners_state,
+        codeowners_source = EXCLUDED.codeowners_source,
+        codeowners_hash = EXCLUDED.codeowners_hash,
+        parent_gh_updated_at = EXCLUDED.parent_gh_updated_at,
+        synced_at = CASE
+            WHEN pull_request_change_snapshots.tombstoned_at IS NOT NULL
+              OR ROW(
+                     EXCLUDED.base_sha, EXCLUDED.head_sha,
+                     EXCLUDED.files_total_count, EXCLUDED.files_truncated,
+                     EXCLUDED.codeowners_ref, EXCLUDED.codeowners_sha,
+                     EXCLUDED.codeowners_path, EXCLUDED.codeowners_state,
+                     EXCLUDED.codeowners_source, EXCLUDED.codeowners_hash
+                 ) IS DISTINCT FROM ROW(
+                     pull_request_change_snapshots.base_sha,
+                     pull_request_change_snapshots.head_sha,
+                     pull_request_change_snapshots.files_total_count,
+                     pull_request_change_snapshots.files_truncated,
+                     pull_request_change_snapshots.codeowners_ref,
+                     pull_request_change_snapshots.codeowners_sha,
+                     pull_request_change_snapshots.codeowners_path,
+                     pull_request_change_snapshots.codeowners_state,
+                     pull_request_change_snapshots.codeowners_source,
+                     pull_request_change_snapshots.codeowners_hash
+                 )
+            THEN EXCLUDED.synced_at
+            ELSE pull_request_change_snapshots.synced_at
+        END,
+        etag = EXCLUDED.etag,
+        sync_source = CASE
+            WHEN pull_request_change_snapshots.tombstoned_at IS NOT NULL
+              OR ROW(
+                     EXCLUDED.base_sha, EXCLUDED.head_sha,
+                     EXCLUDED.files_total_count, EXCLUDED.files_truncated,
+                     EXCLUDED.codeowners_ref, EXCLUDED.codeowners_sha,
+                     EXCLUDED.codeowners_path, EXCLUDED.codeowners_state,
+                     EXCLUDED.codeowners_source, EXCLUDED.codeowners_hash
+                 ) IS DISTINCT FROM ROW(
+                     pull_request_change_snapshots.base_sha,
+                     pull_request_change_snapshots.head_sha,
+                     pull_request_change_snapshots.files_total_count,
+                     pull_request_change_snapshots.files_truncated,
+                     pull_request_change_snapshots.codeowners_ref,
+                     pull_request_change_snapshots.codeowners_sha,
+                     pull_request_change_snapshots.codeowners_path,
+                     pull_request_change_snapshots.codeowners_state,
+                     pull_request_change_snapshots.codeowners_source,
+                     pull_request_change_snapshots.codeowners_hash
+                 )
+            THEN EXCLUDED.sync_source
+            ELSE pull_request_change_snapshots.sync_source
+        END,
+        tombstoned_at = NULL,
+        last_checked_at = EXCLUDED.last_checked_at
+    WHERE EXCLUDED.parent_gh_updated_at >
+              pull_request_change_snapshots.parent_gh_updated_at
+       OR (
+           EXCLUDED.parent_gh_updated_at =
+               pull_request_change_snapshots.parent_gh_updated_at
+           AND ROW(
+               EXCLUDED.base_sha, EXCLUDED.head_sha,
+               EXCLUDED.files_total_count, EXCLUDED.files_truncated,
+               EXCLUDED.codeowners_ref, EXCLUDED.codeowners_sha,
+               EXCLUDED.codeowners_path, EXCLUDED.codeowners_state,
+               EXCLUDED.codeowners_source, EXCLUDED.codeowners_hash
+           ) IS DISTINCT FROM ROW(
+               pull_request_change_snapshots.base_sha,
+               pull_request_change_snapshots.head_sha,
+               pull_request_change_snapshots.files_total_count,
+               pull_request_change_snapshots.files_truncated,
+               pull_request_change_snapshots.codeowners_ref,
+               pull_request_change_snapshots.codeowners_sha,
+               pull_request_change_snapshots.codeowners_path,
+               pull_request_change_snapshots.codeowners_state,
+               pull_request_change_snapshots.codeowners_source,
+               pull_request_change_snapshots.codeowners_hash
+           )
+       )
+       OR (
+           pull_request_change_snapshots.tombstoned_at IS NOT NULL
+           AND EXCLUDED.last_checked_at >
+               pull_request_change_snapshots.tombstoned_at
+       )
+    RETURNING repo_id
+)
+SELECT count(*)
+FROM upserted
+WHERE NOT EXISTS (SELECT 1 FROM prior)
+   OR EXISTS (
+       SELECT 1
+       FROM prior
+       WHERE prior.tombstoned_at IS NOT NULL
+          OR ROW(
+                 prior.base_sha, prior.head_sha, prior.files_total_count,
+                 prior.files_truncated, prior.codeowners_ref,
+                 prior.codeowners_sha, prior.codeowners_path,
+                 prior.codeowners_state, prior.codeowners_source,
+                 prior.codeowners_hash
+             ) IS DISTINCT FROM ROW(
+                 $1::text, $2::text,
+                 $3::integer,
+                 $4::boolean,
+                 $5::text,
+                 $6::text,
+                 $7::text,
+                 $8::text,
+                 $9::text,
+                 $10::text
+             )
+   )
+`
+
+type UpsertPullRequestChangeSnapshotParams struct {
+	BaseSha           string
+	HeadSha           string
+	FilesTotalCount   int32
+	FilesTruncated    bool
+	CodeownersRef     string
+	CodeownersSha     string
+	CodeownersPath    pgtype.Text
+	CodeownersState   string
+	CodeownersSource  pgtype.Text
+	CodeownersHash    string
+	RepoID            int64
+	PrNumber          int32
+	ParentGhUpdatedAt pgtype.Timestamptz
+	SyncedAt          pgtype.Timestamptz
+	Etag              string
+	SyncSource        string
+	LastCheckedAt     pgtype.Timestamptz
+}
+
+// C-C2 parent freshness plus explicit base/head identity gates the current
+// changed-file and ownership snapshot. Equal parent versions remain eligible
+// so a base-branch CODEOWNERS push or a later complete listing can heal facts
+// without relying on pull_request.updatedAt changing.
+func (q *Queries) UpsertPullRequestChangeSnapshot(ctx context.Context, arg UpsertPullRequestChangeSnapshotParams) (int64, error) {
+	row := q.db.QueryRow(ctx, upsertPullRequestChangeSnapshot,
+		arg.BaseSha,
+		arg.HeadSha,
+		arg.FilesTotalCount,
+		arg.FilesTruncated,
+		arg.CodeownersRef,
+		arg.CodeownersSha,
+		arg.CodeownersPath,
+		arg.CodeownersState,
+		arg.CodeownersSource,
+		arg.CodeownersHash,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.ParentGhUpdatedAt,
+		arg.SyncedAt,
+		arg.Etag,
+		arg.SyncSource,
+		arg.LastCheckedAt,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const upsertPullRequestWriteIfNewer = `-- name: UpsertPullRequestWriteIfNewer :one
@@ -2508,7 +3254,8 @@ SET installation_id = EXCLUDED.installation_id,
     default_branch = EXCLUDED.default_branch,
     archived = EXCLUDED.archived,
     gh_updated_at = EXCLUDED.gh_updated_at,
-    head_sha = EXCLUDED.head_sha,
+    head_sha = CASE WHEN EXCLUDED.head_sha = '' THEN repos.head_sha
+                    ELSE EXCLUDED.head_sha END,
     synced_at = EXCLUDED.synced_at,
     last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
@@ -2521,7 +3268,9 @@ WHERE repos.gh_updated_at IS NULL
        AND ROW(
            EXCLUDED.installation_id, EXCLUDED.org_id, EXCLUDED.node_id,
            EXCLUDED.owner, EXCLUDED.name, EXCLUDED.full_name,
-           EXCLUDED.default_branch, EXCLUDED.archived, EXCLUDED.head_sha
+           EXCLUDED.default_branch, EXCLUDED.archived,
+           CASE WHEN EXCLUDED.head_sha = '' THEN repos.head_sha
+                ELSE EXCLUDED.head_sha END
        ) IS DISTINCT FROM ROW(
            repos.installation_id, repos.org_id, repos.node_id,
            repos.owner, repos.name, repos.full_name,

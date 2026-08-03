@@ -20,7 +20,9 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 
+	"github.com/ewhauser/ghsync/internal/codeowners"
 	"github.com/ewhauser/ghsync/internal/fakegithub"
+	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/ingress"
 	ghsyncmetrics "github.com/ewhauser/ghsync/internal/metrics"
 	"github.com/ewhauser/ghsync/internal/store"
@@ -916,6 +918,45 @@ type oraclePullRequestComment struct {
 	HeadSHA      string
 }
 
+type oracleChangeSnapshot struct {
+	Pull             int
+	BaseSHA          string
+	HeadSHA          string
+	FilesTotal       int
+	FilesTruncated   bool
+	CodeownersRef    string
+	CodeownersSHA    string
+	CodeownersPath   string
+	CodeownersState  string
+	CodeownersSource string
+	CodeownersHash   string
+}
+
+type oracleChangedFile struct {
+	Pull         int
+	Path         string
+	PreviousPath string
+	ChangeType   string
+	BaseSHA      string
+	HeadSHA      string
+}
+
+type oracleFileOwner struct {
+	Pull            int
+	Path            string
+	Token           string
+	Type            string
+	Name            string
+	ResolutionState string
+	GitHubID        int64
+	NodeID          string
+	Login           string
+	SourcePattern   string
+	SourceLine      int
+	BaseSHA         string
+	HeadSHA         string
+}
+
 type oracleStack struct {
 	ID        int64
 	NodeID    string
@@ -1105,6 +1146,9 @@ func assertFixtureConverged(
 			cachedComments,
 		)
 	}
+	if err := assertChangeInputsConverged(ctx, pool, truth); err != nil {
+		return err
+	}
 
 	expectedStacks := make([]oracleStack, 0, len(truth.Stacks))
 	for _, stack := range truth.Stacks {
@@ -1219,6 +1263,189 @@ func assertFixtureConverged(
 			"review-thread cache mismatch\ntruth=%+v\ncache=%+v",
 			expectedThreads,
 			cachedThreads,
+		)
+	}
+	return nil
+}
+
+func assertChangeInputsConverged(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	truth fakegithub.TruthFixtureSnapshot,
+) error {
+	covered := false
+	for _, pull := range truth.PullRequests {
+		covered = covered || pull.CodeownersState != ""
+	}
+	if !covered {
+		// Additive compatibility for older committed/custom truth payloads.
+		return nil
+	}
+	type identity struct {
+		githubID int64
+		nodeID   string
+		login    string
+	}
+	known := make(map[string]identity)
+	for _, pull := range truth.PullRequests {
+		for _, review := range pull.Reviews {
+			if review.Author.Kind == "user" && review.Author.NodeID != "" &&
+				review.Author.Login != "" {
+				known["user\x00"+strings.ToLower(review.Author.Login)] = identity{
+					nodeID: review.Author.NodeID, login: review.Author.Login,
+				}
+			}
+		}
+		for _, comment := range pull.Comments {
+			if comment.Author.Kind == "user" && comment.Author.NodeID != "" &&
+				comment.Author.Login != "" {
+				known["user\x00"+strings.ToLower(comment.Author.Login)] = identity{
+					nodeID: comment.Author.NodeID, login: comment.Author.Login,
+				}
+			}
+		}
+	}
+	// Review-request identities win in the store because they carry a stable
+	// database ID and sort ahead of participation-only candidates.
+	for _, pull := range truth.PullRequests {
+		for _, request := range pull.ReviewRequests {
+			if request.Kind == "user" || request.Kind == "team" {
+				known[request.Kind+"\x00"+strings.ToLower(request.Login)] = identity{
+					githubID: request.ID,
+					nodeID:   request.NodeID,
+					login:    request.Login,
+				}
+			}
+		}
+	}
+
+	expectedSnapshots := make([]oracleChangeSnapshot, 0, len(truth.PullRequests))
+	expectedFiles := make([]oracleChangedFile, 0)
+	expectedOwners := make([]oracleFileOwner, 0)
+	for _, pull := range truth.PullRequests {
+		total := pull.ChangedFilesTotal
+		if total == 0 {
+			total = len(pull.ChangedFiles)
+		}
+		truncated := oracleChangedFilesTruncated(
+			pull.ChangedFiles,
+			total,
+			pull.ChangedFilesOmitted,
+		)
+		expectedSnapshots = append(expectedSnapshots, oracleChangeSnapshot{
+			Pull:             pull.Number,
+			BaseSHA:          pull.Base.SHA,
+			HeadSHA:          pull.Head.SHA,
+			FilesTotal:       total,
+			FilesTruncated:   truncated,
+			CodeownersRef:    pull.Base.Ref,
+			CodeownersSHA:    pull.Base.SHA,
+			CodeownersPath:   pull.CodeownersPath,
+			CodeownersState:  pull.CodeownersState,
+			CodeownersSource: pull.CodeownersSource,
+			CodeownersHash: codeownersSourceHash(
+				pull.CodeownersState,
+				pull.CodeownersPath,
+				pull.CodeownersSource,
+			),
+		})
+		if pull.ChangedFilesOmitted {
+			continue
+		}
+		rules := codeowners.Parse(pull.CodeownersSource)
+		files := boundedOracleChangedFiles(pull.ChangedFiles)
+		for _, file := range files {
+			expectedFiles = append(expectedFiles, oracleChangedFile{
+				Pull:         pull.Number,
+				Path:         file.Path,
+				PreviousPath: file.PreviousPath,
+				ChangeType:   strings.ToLower(file.ChangeType),
+				BaseSHA:      pull.Base.SHA,
+				HeadSHA:      pull.Head.SHA,
+			})
+			match, ok := codeowners.Resolve(rules, file.Path)
+			if !ok || pull.CodeownersState != "present" {
+				continue
+			}
+			seen := make(map[string]struct{}, len(match.Owners))
+			for _, owner := range match.Owners {
+				if _, duplicate := seen[owner.Token]; duplicate {
+					continue
+				}
+				seen[owner.Token] = struct{}{}
+				value := oracleFileOwner{
+					Pull: pull.Number, Path: file.Path, Token: owner.Token,
+					Type: string(owner.Type), Name: owner.Name,
+					ResolutionState: "unresolved",
+					SourcePattern:   match.Pattern, SourceLine: match.Line,
+					BaseSHA: pull.Base.SHA, HeadSHA: pull.Head.SHA,
+				}
+				lookup := owner.Name
+				if owner.Type == codeowners.OwnerTeam {
+					parts := strings.SplitN(owner.Name, "/", 2)
+					if len(parts) != 2 ||
+						!strings.EqualFold(parts[0], truth.Repository.Owner) {
+						expectedOwners = append(expectedOwners, value)
+						continue
+					}
+					lookup = parts[1]
+				}
+				if owner.Type == codeowners.OwnerUser ||
+					owner.Type == codeowners.OwnerTeam {
+					if found, ok := known[string(owner.Type)+"\x00"+
+						strings.ToLower(lookup)]; ok {
+						value.ResolutionState = "resolved"
+						value.GitHubID = found.githubID
+						value.NodeID = found.nodeID
+						value.Login = found.login
+					}
+				}
+				expectedOwners = append(expectedOwners, value)
+			}
+		}
+	}
+
+	cachedSnapshots, err := readCachedChangeSnapshots(
+		ctx, pool, truth.Repository.FullName,
+	)
+	if err != nil {
+		return err
+	}
+	cachedFiles, err := readCachedChangedFiles(ctx, pool, truth.Repository.FullName)
+	if err != nil {
+		return err
+	}
+	cachedOwners, err := readCachedFileOwners(ctx, pool, truth.Repository.FullName)
+	if err != nil {
+		return err
+	}
+	sort.Slice(expectedSnapshots, func(i, j int) bool {
+		return expectedSnapshots[i].Pull < expectedSnapshots[j].Pull
+	})
+	sort.Slice(expectedFiles, func(i, j int) bool {
+		if expectedFiles[i].Pull == expectedFiles[j].Pull {
+			return expectedFiles[i].Path < expectedFiles[j].Path
+		}
+		return expectedFiles[i].Pull < expectedFiles[j].Pull
+	})
+	sort.Slice(expectedOwners, func(i, j int) bool {
+		if expectedOwners[i].Pull != expectedOwners[j].Pull {
+			return expectedOwners[i].Pull < expectedOwners[j].Pull
+		}
+		if expectedOwners[i].Path != expectedOwners[j].Path {
+			return expectedOwners[i].Path < expectedOwners[j].Path
+		}
+		return expectedOwners[i].Token < expectedOwners[j].Token
+	})
+	if !reflect.DeepEqual(expectedSnapshots, cachedSnapshots) ||
+		!reflect.DeepEqual(expectedFiles, cachedFiles) ||
+		!reflect.DeepEqual(expectedOwners, cachedOwners) {
+		return fmt.Errorf(
+			"pull-request change-input cache mismatch\n"+
+				"truth snapshots=%+v files=%+v owners=%+v\n"+
+				"cache snapshots=%+v files=%+v owners=%+v",
+			expectedSnapshots, expectedFiles, expectedOwners,
+			cachedSnapshots, cachedFiles, cachedOwners,
 		)
 	}
 	return nil
@@ -1389,6 +1616,130 @@ func readCachedPullRequestComments(
 			HeadSHA:      row.HeadSha,
 		})
 	}
+	return result, nil
+}
+
+func readCachedChangeSnapshots(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	repo string,
+) ([]oracleChangeSnapshot, error) {
+	rows, err := dbgen.New(pool).ListLoadgenCachedPullRequestChangeSnapshots(
+		ctx, repo,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query cached PR change snapshots: %w", err)
+	}
+	result := make([]oracleChangeSnapshot, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, oracleChangeSnapshot{
+			Pull: int(row.PrNumber), BaseSHA: row.BaseSha, HeadSHA: row.HeadSha,
+			FilesTotal:     int(row.FilesTotalCount),
+			FilesTruncated: row.FilesTruncated,
+			CodeownersRef:  row.CodeownersRef, CodeownersSHA: row.CodeownersSha,
+			CodeownersPath:   row.CodeownersPath.String,
+			CodeownersState:  row.CodeownersState,
+			CodeownersSource: row.CodeownersSource.String,
+			CodeownersHash:   row.CodeownersHash,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Pull < result[j].Pull
+	})
+	return result, nil
+}
+
+func codeownersSourceHash(state, path, source string) string {
+	digest := sha256.Sum256([]byte(state + "\x00" + path + "\x00" + source))
+	return hex.EncodeToString(digest[:])
+}
+
+func boundedOracleChangedFiles(
+	files []fakegithub.ChangedFile,
+) []fakegithub.ChangedFile {
+	if len(files) > gh.MaxPullRequestFiles {
+		return files[:gh.MaxPullRequestFiles]
+	}
+	return files
+}
+
+func oracleChangedFilesTruncated(
+	files []fakegithub.ChangedFile,
+	total int,
+	omitted bool,
+) bool {
+	if omitted || total != len(files) || total > gh.MaxPullRequestFiles {
+		return true
+	}
+	for _, file := range boundedOracleChangedFiles(files) {
+		if strings.EqualFold(file.ChangeType, "renamed") &&
+			file.PreviousPath == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func readCachedChangedFiles(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	repo string,
+) ([]oracleChangedFile, error) {
+	rows, err := dbgen.New(pool).ListLoadgenCachedPullRequestChangedFiles(
+		ctx, repo,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query cached PR changed files: %w", err)
+	}
+	result := make([]oracleChangedFile, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, oracleChangedFile{
+			Pull: int(row.PrNumber), Path: row.Path,
+			PreviousPath: row.PreviousPath.String, ChangeType: row.ChangeType,
+			BaseSHA: row.BaseSha, HeadSHA: row.HeadSha,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Pull == result[j].Pull {
+			return result[i].Path < result[j].Path
+		}
+		return result[i].Pull < result[j].Pull
+	})
+	return result, nil
+}
+
+func readCachedFileOwners(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	repo string,
+) ([]oracleFileOwner, error) {
+	rows, err := dbgen.New(pool).ListLoadgenCachedPullRequestFileOwners(
+		ctx, repo,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query cached PR file owners: %w", err)
+	}
+	result := make([]oracleFileOwner, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, oracleFileOwner{
+			Pull: int(row.PrNumber), Path: row.Path, Token: row.OwnerToken,
+			Type: row.OwnerType, Name: row.OwnerName,
+			ResolutionState: row.ResolutionState,
+			GitHubID:        row.OwnerGhID.Int64, NodeID: row.OwnerNodeID.String,
+			Login: row.OwnerLogin.String, SourcePattern: row.SourcePattern,
+			SourceLine: int(row.SourceLine), BaseSHA: row.BaseSha,
+			HeadSHA: row.HeadSha,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Pull != result[j].Pull {
+			return result[i].Pull < result[j].Pull
+		}
+		if result[i].Path != result[j].Path {
+			return result[i].Path < result[j].Path
+		}
+		return result[i].Token < result[j].Token
+	})
 	return result, nil
 }
 

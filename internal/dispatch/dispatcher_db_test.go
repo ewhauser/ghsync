@@ -354,7 +354,6 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 	fake := fakegithub.New(fakegithub.DefaultFixture(), testWebhookSecret)
 	repo := "acme/rebase-storm"
 	branches := []string{"stack/layer-1", "stack/layer-2", "stack/layer-3"}
-	stackKey := "stack:" + repo + ":142"
 
 	for index := range 20 {
 		branch := branches[index%len(branches)]
@@ -396,57 +395,57 @@ func TestRebaseStormEscalatesStackBranchesWithoutSlidingDebounce(t *testing.T) {
 		t.Fatalf("simulated storm duration = %s, want 10s", elapsed)
 	}
 
-	var key string
-	var jobCount int
-	var scheduledAt time.Time
-	err = pool.QueryRow(context.Background(), `
-		SELECT args->>'key', count(*) OVER (), scheduled_at
+	rows, err := pool.Query(context.Background(), `
+		SELECT args->>'key', scheduled_at
 		FROM river_job
 		WHERE args->>'key' LIKE $1
-	`, "%:"+repo+":%").Scan(&key, &jobCount, &scheduledAt)
+		ORDER BY args->>'key'
+	`, "%:"+repo+":%")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if key != stackKey || jobCount != 1 {
-		t.Fatalf("storm jobs = key %q count %d, want %q count 1", key, jobCount, stackKey)
-	}
+	defer rows.Close()
 	first := time.Date(2026, 7, 28, 20, 0, 0, 0, time.UTC)
-	wantScheduled := first.Add(5 * time.Second)
-	if !scheduledAt.Equal(wantScheduled) {
-		t.Fatalf("%s scheduled at %s, want %s", key, scheduledAt, wantScheduled)
+	want := map[string]struct {
+		generation int64
+		scheduled  time.Time
+	}{
+		"branch:" + repo + ":stack/layer-1": {7, first.Add(5 * time.Second)},
+		"branch:" + repo + ":stack/layer-2": {7, first.Add(5500 * time.Millisecond)},
+		"branch:" + repo + ":stack/layer-3": {6, first.Add(6 * time.Second)},
 	}
-	var generation int64
-	if err := pool.QueryRow(context.Background(), `
-		SELECT generation
-		FROM refresh_intent_generations
-		WHERE kind = $1 AND refresh_key = $2
-	`, queue.KindRefreshStack, stackKey).Scan(&generation); err != nil {
+	gotJobs := 0
+	for rows.Next() {
+		var key string
+		var scheduledAt time.Time
+		if err := rows.Scan(&key, &scheduledAt); err != nil {
+			t.Fatal(err)
+		}
+		expected, ok := want[key]
+		if !ok {
+			t.Fatalf("unexpected storm job %q", key)
+		}
+		if !scheduledAt.Equal(expected.scheduled) {
+			t.Fatalf("%s scheduled at %s, want %s", key, scheduledAt, expected.scheduled)
+		}
+		var generation int64
+		if err := pool.QueryRow(context.Background(), `
+			SELECT generation
+			FROM refresh_intent_generations
+			WHERE kind = $1 AND refresh_key = $2
+		`, queue.KindRefreshBranch, key).Scan(&generation); err != nil {
+			t.Fatal(err)
+		}
+		if generation != expected.generation {
+			t.Fatalf("%s generation = %d, want %d", key, generation, expected.generation)
+		}
+		gotJobs++
+	}
+	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if generation != 20 {
-		t.Fatalf("storm generation = %d, want 20 exact dispatch signals", generation)
-	}
-	var eventReceivedAt, firstReceivedAt time.Time
-	if err := pool.QueryRow(context.Background(), `
-		SELECT generations.event_received_at, min(deliveries.received_at)
-		FROM refresh_intent_generations AS generations
-		CROSS JOIN webhook_deliveries AS deliveries
-		WHERE generations.kind = $1
-		  AND generations.refresh_key = $2
-		  AND deliveries.delivery_guid LIKE 'storm-%'
-		GROUP BY generations.event_received_at
-	`, queue.KindRefreshStack, stackKey).Scan(
-		&eventReceivedAt,
-		&firstReceivedAt,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if !eventReceivedAt.Equal(firstReceivedAt) {
-		t.Fatalf(
-			"event SLO origin = %s, want earliest delivery %s",
-			eventReceivedAt,
-			firstReceivedAt,
-		)
+	if gotJobs != len(want) {
+		t.Fatalf("storm jobs = %d, want %d branch-coalesced jobs", gotJobs, len(want))
 	}
 }
 

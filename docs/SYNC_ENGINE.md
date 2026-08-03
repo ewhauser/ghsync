@@ -66,6 +66,7 @@ floor for everything.
 | Server-side "Rebase stack" (force-pushes) | ❌ (undocumented) | Branch rewrites are real ref updates: expect `push` per branch and `pull_request.synchronize` per member — treat either on a stack branch as a whole-stack refresh. **Must be verified empirically in Phase 0**; undocumented whether server-generated rebases emit these | Sweep |
 | Unstack / dissolve | ❌ | Next `pull_request` event on any ex-member arrives with `stack: null` → stack-object diff fires | Sweep |
 | Trunk moves (dry-run staleness) | ✅ `push` on base ref | Standard event; enqueue dry-run re-evaluation for stacks based on that ref | — |
+| Effective CODEOWNERS changes | ✅ `push` on default branch | Exact `.github/CODEOWNERS`, root `CODEOWNERS`, or `docs/CODEOWNERS` path change → one coalesced branch refresh, fanning out to the finite cached set of live open stacked and loose PRs based on that branch (no arbitrary count cutoff) | Reconciliation |
 | Stack `open`/closed state | ❌ | Derivable from member PR states | Sweep |
 
 Consequences baked into the design:
@@ -365,7 +366,8 @@ else, so no pipeline stage does per-event work that could be per-batch work.
 - **C-P3 — Fetch results are written set-at-a-time.** One fetch produces one
   transaction, however many rows it touches: a checks refresh upserts all
   check runs for the SHA via a single `unnest`-based upsert (sqlc), review
-  threads likewise. Never row-per-statement, never statement-per-event.
+  threads likewise, and changed files plus owners use two fenced JSONB
+  replace sets. Never row-per-statement, never statement-per-event.
 - **C-P4 — Due fetches gang into GraphQL batches.** The fetcher may claim up
   to K (default 25) due entity-refresh jobs at once and satisfy them with one
   `nodes(ids:)` GraphQL call, then apply results per entity (each under its
@@ -472,6 +474,14 @@ pull_request_reviews(node_id PRIMARY KEY, repo_id, pr_number, author_kind,
                      state, submitted_at, commit_oid, gh_updated_at, ...)
 pull_request_comments(node_id PRIMARY KEY, repo_id, pr_number, author_kind,
                       created_at, gh_updated_at, ...) -- no bodies
+pull_request_change_snapshots(repo_id, pr_number, base_sha, head_sha,
+                              files_total_count, files_truncated,
+                              codeowners_ref, codeowners_sha,
+                              codeowners_path, codeowners_state, ...)
+pull_request_changed_files(repo_id, pr_number, path, previous_path,
+                           change_type, base_sha, head_sha, ...)
+pull_request_file_owners(repo_id, pr_number, path, owner_token, owner_type,
+                         resolution_state, owner_node_id, ...)
 review_threads(...), check_runs(...), check_history(...)
 
 -- Derivation

@@ -363,20 +363,30 @@ func TestMigrationLockWaitFailureClosesHijackedConnection(t *testing.T) {
 		t.Fatal("contended migration lock ignored its context deadline")
 	}
 
-	var remaining int
-	if err := firstPool.QueryRow(ctx, `
-		SELECT count(*)
-		FROM pg_stat_activity
-		WHERE datname = current_database()
-		  AND application_name = $1
-	`, applicationName).Scan(&remaining); err != nil {
-		t.Fatal(err)
-	}
-	if remaining != 0 {
-		t.Fatalf(
-			"failed migration lock leaked %d hijacked database connections",
-			remaining,
-		)
+	// Backend exit is asynchronous relative to the client-side close of the
+	// failed lock connection; poll with a generous bound before declaring a
+	// leak.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var remaining int
+		if err := firstPool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND application_name = $1
+		`, applicationName).Scan(&remaining); err != nil {
+			t.Fatal(err)
+		}
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"failed migration lock leaked %d hijacked database connections",
+				remaining,
+			)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/riverqueue/river"
 
 	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/changeinputs"
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/repoutil"
@@ -72,6 +73,7 @@ func New(options Options) (*Handler, error) {
 	}
 	handler.coordinator = newPRCoordinator(
 		options.GraphQL,
+		options.REST,
 		writer,
 		options.InstallationID,
 		options.OrgID,
@@ -352,8 +354,14 @@ func (h *Handler) refreshPRREST(
 		key.Repo,
 		key.Number,
 	)
+	// A hydration request must observe the PR-scoped GraphQL connections even
+	// if a concurrent stack refresh has just populated the parent and ETag.
+	// Sending that ETag could yield 304 and incorrectly skip changed files,
+	// participation, and ownership on this cold-start path.
 	if metadataErr == nil {
-		etag = metadata.ETag
+		if !hydrateGraphQL {
+			etag = metadata.ETag
+		}
 	} else if !errors.Is(metadataErr, pgx.ErrNoRows) {
 		return fmt.Errorf("read PR ETag: %w", metadataErr)
 	}
@@ -444,6 +452,26 @@ func (h *Handler) refreshPRREST(
 		graphQLRecord.MembershipKnown = true
 		graphQLRecord.StackSummary = record.StackSummary
 		record = graphQLRecord
+		snapshot, hydrateErr := changeinputs.Hydrate(
+			ctx,
+			h.rest,
+			h.writer,
+			class,
+			repository.GitHubID,
+			owner,
+			repoName,
+			record.Number,
+			nodes[0],
+		)
+		if hydrateErr != nil {
+			return fmt.Errorf(
+				"hydrate PR change inputs %s: %w",
+				requestKey(key),
+				hydrateErr,
+			)
+		}
+		record.ChangeSnapshot = snapshot
+		record.ChangeInputsKnown = true
 	}
 	_, err = h.writer.ApplyPullRequestObserved(
 		ctx,

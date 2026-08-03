@@ -31,3 +31,6 @@ rules:
     target: branch
     # Pending real-payload validation: push payloads have no stack object.
     stacked_target: stack
+  - event: push
+    action: "*"
+    target: codeowners

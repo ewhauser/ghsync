@@ -135,6 +135,14 @@ func nullableInt8(value int64) pgtype.Int8 {
 	return pgtype.Int8{Int64: value, Valid: value > 0}
 }
 
+func nullableText(value string) pgtype.Text {
+	return pgtype.Text{String: value, Valid: value != ""}
+}
+
+func optionalText(value string, valid bool) pgtype.Text {
+	return pgtype.Text{String: value, Valid: valid}
+}
+
 func timestamp(value time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: value, Valid: !value.IsZero()}
 }

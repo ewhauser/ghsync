@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -38,14 +39,19 @@ const (
 	TargetStack       Target = "stack"
 	TargetChecks      Target = "checks"
 	TargetBranch      Target = "branch"
+	// TargetCodeowners routes only a default-branch push that touched one of
+	// GitHub's three effective CODEOWNERS locations. It intentionally reuses
+	// refresh_branch so ordinary push and source-change hints coalesce.
+	TargetCodeowners Target = "codeowners"
 	// TargetResolveStackMembership carries only the PR key. Its M3 worker
 	// consults cached membership and refreshes both the old and new stacks.
 	TargetResolveStackMembership Target = "resolve_stack_membership"
 )
 
 // Rule is the config-driven event/action → refresh mapping. StackedTarget
-// escalates a pull request event when its payload carries the stack preview
-// object (SYNC_ENGINE §2.1).
+// adds stack maintenance when a pull request payload carries the stack preview
+// object (SYNC_ENGINE §2.1); the direct PR refresh remains authoritative for
+// PR-scoped connections such as changed files.
 type Rule struct {
 	Event         string `json:"event" yaml:"event"`
 	Action        string `json:"action" yaml:"action"`
@@ -96,6 +102,7 @@ func DefaultRules() []Rule {
 			Target:        TargetBranch,
 			StackedTarget: TargetStack,
 		},
+		{Event: "push", Action: ActionAny, Target: TargetCodeowners},
 	}
 }
 
@@ -189,7 +196,7 @@ func validateRule(rule Rule) error {
 				rule.Target,
 			)
 		}
-	case TargetBranch:
+	case TargetBranch, TargetCodeowners:
 		if rule.Event != "push" {
 			return fmt.Errorf("target %q requires event push", rule.Target)
 		}
@@ -230,6 +237,7 @@ func validTarget(target Target) bool {
 		TargetStack,
 		TargetChecks,
 		TargetBranch,
+		TargetCodeowners,
 		TargetResolveStackMembership:
 		return true
 	default:
@@ -242,8 +250,19 @@ type payloadEnvelope struct {
 	Number     int    `json:"number"`
 	Ref        string `json:"ref"`
 	Repository struct {
-		FullName string `json:"full_name"`
+		FullName      string `json:"full_name"`
+		DefaultBranch string `json:"default_branch"`
 	} `json:"repository"`
+	Commits []struct {
+		Added    []string `json:"added"`
+		Modified []string `json:"modified"`
+		Removed  []string `json:"removed"`
+	} `json:"commits"`
+	HeadCommit *struct {
+		Added    []string `json:"added"`
+		Modified []string `json:"modified"`
+		Removed  []string `json:"removed"`
+	} `json:"head_commit"`
 	PullRequest struct {
 		Number int              `json:"number"`
 		Stack  *payloadStackRef `json:"stack"`
@@ -348,31 +367,34 @@ func (c Classifier) classifyContent(
 			continue
 		}
 		matchedRules++
-		target := rule.Target
-		if rule.StackedTarget != "" && payloadStack(&payload) != nil {
-			target = rule.StackedTarget
+		targets := []Target{rule.Target}
+		if rule.StackedTarget != "" && payloadStack(&payload) != nil &&
+			rule.Target != TargetBranch {
+			targets = append(targets, rule.StackedTarget)
 		}
-		key, emit, err := intentKey(target, event, &payload)
-		if err != nil {
-			return classification{}, err
+		for _, target := range targets {
+			key, emit, err := intentKey(target, event, &payload)
+			if err != nil {
+				return classification{}, err
+			}
+			if !emit {
+				continue
+			}
+			kind, err := jobKind(target)
+			if err != nil {
+				return classification{}, err
+			}
+			identity := kind + "\x00" + key
+			if _, duplicate := seen[identity]; duplicate {
+				continue
+			}
+			seen[identity] = struct{}{}
+			intents = append(intents, Intent{
+				Kind:     kind,
+				Key:      key,
+				Priority: PriorityEvent,
+			})
 		}
-		if !emit {
-			continue
-		}
-		kind, err := jobKind(target)
-		if err != nil {
-			return classification{}, err
-		}
-		identity := kind + "\x00" + key
-		if _, duplicate := seen[identity]; duplicate {
-			continue
-		}
-		seen[identity] = struct{}{}
-		intents = append(intents, Intent{
-			Kind:     kind,
-			Key:      key,
-			Priority: PriorityEvent,
-		})
 	}
 	result := classification{
 		intents:      intents,
@@ -466,6 +488,21 @@ func intentKey(
 			return "", false, fmt.Errorf("push payload has an empty branch ref")
 		}
 		return "branch:" + repo + ":" + branch, true, nil
+	case TargetCodeowners:
+		const branchPrefix = "refs/heads/"
+		if !strings.HasPrefix(payload.Ref, branchPrefix) {
+			return "", false, nil
+		}
+		branch := strings.TrimPrefix(payload.Ref, branchPrefix)
+		if branch == "" {
+			return "", false, fmt.Errorf("push payload has an empty branch ref")
+		}
+		if payload.Repository.DefaultBranch == "" ||
+			branch != payload.Repository.DefaultBranch ||
+			!pushTouchesCodeowners(payload) {
+			return "", false, nil
+		}
+		return "branch:" + repo + ":" + branch, true, nil
 	default:
 		return "", false, fmt.Errorf("unsupported dispatch target %q", target)
 	}
@@ -479,13 +516,45 @@ func jobKind(target Target) (string, error) {
 		return queue.KindRefreshStack, nil
 	case TargetChecks:
 		return queue.KindRefreshChecks, nil
-	case TargetBranch:
+	case TargetBranch, TargetCodeowners:
 		return queue.KindRefreshBranch, nil
 	case TargetResolveStackMembership:
 		return queue.KindResolveStackMembership, nil
 	default:
 		return "", fmt.Errorf("unsupported dispatch target %q", target)
 	}
+}
+
+func pushTouchesCodeowners(payload *payloadEnvelope) bool {
+	isCodeowners := func(path string) bool {
+		switch path {
+		case ".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS":
+			return true
+		default:
+			return false
+		}
+	}
+	for _, commit := range payload.Commits {
+		for _, paths := range [][]string{
+			commit.Added, commit.Modified, commit.Removed,
+		} {
+			if slices.ContainsFunc(paths, isCodeowners) {
+				return true
+			}
+		}
+	}
+	if payload.HeadCommit != nil {
+		for _, paths := range [][]string{
+			payload.HeadCommit.Added,
+			payload.HeadCommit.Modified,
+			payload.HeadCommit.Removed,
+		} {
+			if slices.ContainsFunc(paths, isCodeowners) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type stackPointer struct {

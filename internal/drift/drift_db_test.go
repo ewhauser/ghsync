@@ -2,6 +2,7 @@ package drift
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"reflect"
 	"strings"
@@ -51,6 +52,7 @@ type driftHarness struct {
 	fake        *fakegithub.Server
 	fixture     fakegithub.Fixture
 	service     *Service
+	handler     *fetch.Handler
 	riverClient *river.Client[pgx.Tx]
 }
 
@@ -189,6 +191,20 @@ func newReadyDriftHarness(t *testing.T) *driftHarness {
 			t.Fatal(err)
 		}
 	}
+	for index := range fixture.PullRequests {
+		pull := &fixture.PullRequests[index]
+		if err := handler.RefreshPR(
+			ctx,
+			queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", pull.Number),
+				).RefreshArgs,
+				Queue: queue.QueueSweep,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
 	waitForCacheProducers(t, pool)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO installation_backfill_cursors (
@@ -203,6 +219,7 @@ func newReadyDriftHarness(t *testing.T) *driftHarness {
 		fake:        fake,
 		fixture:     fixture,
 		service:     service,
+		handler:     handler,
 		riverClient: riverClient,
 	}
 }
@@ -242,6 +259,14 @@ func TestDriftTreatsUnknownBaseSHAAsConvergedTruth(t *testing.T) {
 	harness.fixture.PullRequests[1].Stack.Base.SHA = ""
 	harness.fixture.Stacks[0].Base.SHA = ""
 	harness.fake.SetFixture(harness.fixture)
+	if err := harness.handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueSweep,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	findings, err := harness.service.Detect(ctx, DetectArgs{
 		InstallationID: 1,
@@ -398,6 +423,146 @@ func TestDriftDetectsAndHealsParticipationDivergence(t *testing.T) {
 	}
 	if len(findings) != 0 {
 		t.Fatalf("deleted-author participation did not converge: %+v", findings)
+	}
+}
+
+func TestDriftDetectsAndHealsChangeInputDivergence(t *testing.T) {
+	t.Parallel()
+	harness := newReadyDriftHarness(t)
+	ctx := t.Context()
+	if _, err := harness.pool.Exec(ctx, `
+		UPDATE pull_request_change_snapshots AS snapshot
+		SET files_truncated = true,
+		    codeowners_hash = 'corrupt-source-hash'
+		FROM repos
+		WHERE repos.id = snapshot.repo_id
+		  AND repos.full_name = 'acme/monolith'
+		  AND snapshot.pr_number = 4812;
+
+		UPDATE pull_request_changed_files AS file
+		SET change_type = 'added'
+		FROM repos
+		WHERE repos.id = file.repo_id
+		  AND repos.full_name = 'acme/monolith'
+		  AND file.pr_number = 4812
+		  AND file.path = 'internal/ranker.go';
+
+		UPDATE pull_request_file_owners AS owner
+		SET resolution_state = 'unresolved', owner_gh_id = NULL,
+		    owner_node_id = NULL, owner_login = NULL
+		FROM repos
+		WHERE repos.id = owner.repo_id
+		  AND repos.full_name = 'acme/monolith'
+		  AND owner.pr_number = 4812
+		  AND owner.owner_token = '@acme/search-platform'
+	`); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 ||
+		findings[0].EntityKey != "pr:acme/monolith:4812" ||
+		!strings.Contains(string(findings[0].Diff), "change_inputs") {
+		t.Fatalf("change-input drift findings = %+v", findings)
+	}
+	waitForCacheProducers(t, harness.pool)
+	var changeType, resolution, nodeID, codeownersHash string
+	var truncated bool
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT file.change_type, owner.resolution_state, owner.owner_node_id,
+		       snapshot.files_truncated, snapshot.codeowners_hash
+		FROM pull_request_changed_files AS file
+		JOIN pull_request_file_owners AS owner
+		  ON owner.repo_id = file.repo_id
+		 AND owner.pr_number = file.pr_number
+		 AND owner.path = file.path
+		JOIN pull_request_change_snapshots AS snapshot
+		  ON snapshot.repo_id = file.repo_id
+		 AND snapshot.pr_number = file.pr_number
+		WHERE file.pr_number = 4812
+		  AND file.path = 'internal/ranker.go'
+		  AND owner.owner_token = '@acme/search-platform'
+		  AND file.tombstoned_at IS NULL
+		  AND owner.tombstoned_at IS NULL
+	`).Scan(
+		&changeType, &resolution, &nodeID, &truncated, &codeownersHash,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if changeType != "modified" || resolution != "resolved" ||
+		nodeID != "T_kwDOABCDEF6001" || truncated ||
+		codeownersHash == "corrupt-source-hash" {
+		t.Fatalf(
+			"healed change inputs = %q/%q/%q truncated=%v hash=%q",
+			changeType, resolution, nodeID, truncated, codeownersHash,
+		)
+	}
+	if findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	} else if len(findings) != 0 {
+		t.Fatalf("post-heal change-input findings = %+v", findings)
+	}
+}
+
+func TestDriftTreatsTruncatedChangeSnapshotAsConvergedTruth(t *testing.T) {
+	t.Parallel()
+	harness := newReadyDriftHarness(t)
+	ctx := t.Context()
+	pull := &harness.fixture.PullRequests[1]
+	pull.ChangedFiles = make([]fakegithub.ChangedFile, 101)
+	for index := range pull.ChangedFiles {
+		pull.ChangedFiles[index] = fakegithub.ChangedFile{
+			Path:       fmt.Sprintf("src/truncated-%03d.go", index),
+			ChangeType: "modified",
+		}
+	}
+	pull.ChangedFilesTotal = 102
+	harness.fake.SetFixture(harness.fixture)
+	if err := harness.handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueSweep,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var total, files int
+	var truncated bool
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT snapshot.files_total_count, snapshot.files_truncated,
+		       count(file.path)
+		FROM pull_request_change_snapshots AS snapshot
+		LEFT JOIN pull_request_changed_files AS file
+		  ON file.repo_id = snapshot.repo_id
+		 AND file.pr_number = snapshot.pr_number
+		 AND file.tombstoned_at IS NULL
+		WHERE snapshot.pr_number = 4812
+		  AND snapshot.tombstoned_at IS NULL
+		GROUP BY snapshot.files_total_count, snapshot.files_truncated
+	`).Scan(&total, &truncated, &files); err != nil {
+		t.Fatal(err)
+	}
+	if total != 102 || !truncated || files != 101 {
+		t.Fatalf(
+			"truncated snapshot total=%d truncated=%v files=%d",
+			total, truncated, files,
+		)
+	}
+	if findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	} else if len(findings) != 0 {
+		t.Fatalf("truncated truth produced drift loop: %+v", findings)
 	}
 }
 
@@ -766,6 +931,23 @@ func TestStackDriftIgnoresMemberUpdatedAtChurn(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	// Seed every PR-scoped connection before asserting that stack-only
+	// updated_at churn is ignored. Missing change-input snapshots are genuine
+	// drift now, not part of the unrelated-field tolerance under test.
+	for index := range fixture.PullRequests {
+		pull := &fixture.PullRequests[index]
+		if err := handler.RefreshPR(
+			ctx,
+			queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", pull.Number),
+				).RefreshArgs,
+				Queue: queue.QueueSweep,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := handler.RefreshChecks(
 		ctx,
 		queue.RefreshRequest{
@@ -922,6 +1104,20 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 		},
 	); err != nil {
 		t.Fatal(err)
+	}
+	for index := range fixture.PullRequests {
+		pull := &fixture.PullRequests[index]
+		if err := handler.RefreshPR(
+			ctx,
+			queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", pull.Number),
+				).RefreshArgs,
+				Queue: queue.QueueSweep,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := handler.RefreshChecks(
 		ctx,
@@ -1225,7 +1421,8 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 
 func waitForCacheProducers(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		var activeJobs int64
 		var outstandingGenerations int64
@@ -1249,14 +1446,14 @@ func waitForCacheProducers(t *testing.T, pool *pgxpool.Pool) {
 		if activeJobs == 0 && outstandingGenerations == 0 {
 			return
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-ticker.C:
+		case <-t.Context().Done():
 			t.Fatalf(
-				"cache producers did not quiesce: jobs=%d generations=%d",
-				activeJobs,
-				outstandingGenerations,
+				"cache producers did not quiesce before test cancellation: jobs=%d generations=%d",
+				activeJobs, outstandingGenerations,
 			)
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -1308,6 +1505,41 @@ func TestSemanticDiffNormalizesNullableDatabaseIDsByNodeIDInGo(
 	}
 	if !equal || string(diff) != "{}" {
 		t.Fatalf("node-ID normalized compare equal=%v diff=%s", equal, diff)
+	}
+}
+
+func TestSemanticDiffNormalizesChangedFilesAndOwnersInGo(t *testing.T) {
+	t.Parallel()
+	cache := []byte(`{
+		"change_inputs": {
+			"files": [
+				{"path":"z.go","previous_path":null},
+				{"path":"a.go","previous_path":null}
+			],
+			"owners": [
+				{"path":"z.go","owner_token":"@z","owner_gh_id":null},
+				{"path":"a.go","owner_token":"@a","owner_gh_id":null}
+			]
+		}
+	}`)
+	upstream := []byte(`{
+		"change_inputs": {
+			"files": [
+				{"previous_path":null,"path":"a.go"},
+				{"previous_path":null,"path":"z.go"}
+			],
+			"owners": [
+				{"owner_gh_id":null,"owner_token":"@a","path":"a.go"},
+				{"owner_gh_id":null,"owner_token":"@z","path":"z.go"}
+			]
+		}
+	}`)
+	equal, diff, err := semanticDiff(cache, upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal || string(diff) != "{}" {
+		t.Fatalf("Go-sorted change-input compare equal=%v diff=%s", equal, diff)
 	}
 }
 

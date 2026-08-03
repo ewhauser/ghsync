@@ -3,7 +3,7 @@
 Contract version: **v1**. The schema begins in the squashed baseline
 migrations (`0001` tables, `0002` functions and the database-enforced
 writer fence trigger, `0003` views) and is extended only by checksummed,
-append-only migrations such as `0004` through `0007`.
+append-only migrations such as `0004` through `0008`.
 
 Postgres is the ghsync sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
@@ -32,6 +32,9 @@ GRANT SELECT ON TABLE
     pull_request_review_requests,
     pull_request_reviews,
     pull_request_comments,
+    pull_request_change_snapshots,
+    pull_request_changed_files,
+    pull_request_file_owners,
     review_threads,
     check_runs,
     check_history,
@@ -142,6 +145,55 @@ JSON value may be empty.
 | `pull_requests` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
 | `pull_requests` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
 | `pull_requests` | `display_until` | `timestamp with time zone` | yes | closed-row display-retention boundary |
+| `pull_request_change_snapshots` | `repo_id` | `bigint` | no | primary key part; references pull_requests(repo_id,number) |
+| `pull_request_change_snapshots` | `pr_number` | `integer` | no | primary key part; repository-local PR number |
+| `pull_request_change_snapshots` | `base_sha` | `text` | no | exact PR base fence; empty is the upstream-unknown sentinel |
+| `pull_request_change_snapshots` | `head_sha` | `text` | no | exact PR head fence |
+| `pull_request_change_snapshots` | `files_total_count` | `integer` | no | GitHub-reported changed-file total |
+| `pull_request_change_snapshots` | `files_truncated` | `boolean` | no | true means the child file set is incomplete |
+| `pull_request_change_snapshots` | `codeowners_ref` | `text` | no | PR base ref from which ownership applies |
+| `pull_request_change_snapshots` | `codeowners_sha` | `text` | no | exact base commit read; empty when unavailable |
+| `pull_request_change_snapshots` | `codeowners_path` | `text` | yes | effective source path selected by precedence |
+| `pull_request_change_snapshots` | `codeowners_state` | `text` | no | present, missing, oversized, or unavailable |
+| `pull_request_change_snapshots` | `codeowners_source` | `text` | yes | exact effective source; null unless present |
+| `pull_request_change_snapshots` | `codeowners_hash` | `text` | no | source-state/path/content identity |
+| `pull_request_change_snapshots` | `parent_gh_updated_at` | `timestamp with time zone` | no | parent-observation freshness fence |
+| `pull_request_change_snapshots` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `pull_request_change_snapshots` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_change_snapshots` | `sync_source` | `text` | no | provenance enum |
+| `pull_request_change_snapshots` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means snapshot is not live |
+| `pull_request_change_snapshots` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `pull_request_changed_files` | `repo_id` | `bigint` | no | primary key part; snapshot join key |
+| `pull_request_changed_files` | `pr_number` | `integer` | no | primary key part; snapshot join key |
+| `pull_request_changed_files` | `path` | `text` | no | primary key part; current repository-relative path |
+| `pull_request_changed_files` | `previous_path` | `text` | yes | prior path for a rename |
+| `pull_request_changed_files` | `change_type` | `text` | no | added, deleted, renamed, copied, modified, or changed |
+| `pull_request_changed_files` | `base_sha` | `text` | no | copied snapshot base fence |
+| `pull_request_changed_files` | `head_sha` | `text` | no | copied snapshot head fence |
+| `pull_request_changed_files` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `pull_request_changed_files` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_changed_files` | `sync_source` | `text` | no | provenance enum |
+| `pull_request_changed_files` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not in the current file set |
+| `pull_request_changed_files` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `pull_request_file_owners` | `repo_id` | `bigint` | no | primary key part; changed-file join key |
+| `pull_request_file_owners` | `pr_number` | `integer` | no | primary key part; changed-file join key |
+| `pull_request_file_owners` | `path` | `text` | no | primary key part; changed-file join key |
+| `pull_request_file_owners` | `owner_token` | `text` | no | primary key part; exact source token |
+| `pull_request_file_owners` | `owner_type` | `text` | no | user, team, email, or malformed |
+| `pull_request_file_owners` | `owner_name` | `text` | no | normalized lookup name; may be empty when malformed |
+| `pull_request_file_owners` | `resolution_state` | `text` | no | resolved, unresolved, or deleted |
+| `pull_request_file_owners` | `owner_gh_id` | `bigint` | yes | stable database identity when known |
+| `pull_request_file_owners` | `owner_node_id` | `text` | yes | stable GraphQL identity when known |
+| `pull_request_file_owners` | `owner_login` | `text` | yes | known current user login or team slug |
+| `pull_request_file_owners` | `source_pattern` | `text` | no | last matching CODEOWNERS pattern |
+| `pull_request_file_owners` | `source_line` | `integer` | no | one-based source line |
+| `pull_request_file_owners` | `base_sha` | `text` | no | copied snapshot base fence |
+| `pull_request_file_owners` | `head_sha` | `text` | no | copied snapshot head fence |
+| `pull_request_file_owners` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `pull_request_file_owners` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_file_owners` | `sync_source` | `text` | no | provenance enum |
+| `pull_request_file_owners` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means owner is not current for the path |
+| `pull_request_file_owners` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
 | `pull_request_review_requests` | `repo_id` | `bigint` | no | primary key part; references pull_requests(repo_id,number) |
 | `pull_request_review_requests` | `pr_number` | `integer` | no | primary key part; repository-local PR number |
 | `pull_request_review_requests` | `reviewer_kind` | `text` | no | primary key part; user or team |
@@ -282,6 +334,125 @@ covered by the closed-entity C-R1 validation bound.
 `check_history` is append-only transition history retained for at least 90
 days. Other tombstoned mirror skeletons have no v1 expiry.
 
+### Changed files and ownership inputs
+
+`pull_request_change_snapshots` is the completeness and provenance fence for
+two current replace sets. `pull_request_changed_files` mirrors the GraphQL PR
+`files` connection through every cursor, bounded at GitHub's documented 3,000
+file limit. The REST files listing supplies `previous_path` for renames because
+GraphQL does not expose it. The parent and every child row carry the exact
+`base_sha`/`head_sha` pair observed for the diff. A page-to-page or final REST
+fence change rejects the observation and retries it; it never combines pages
+from two heads.
+
+`files_truncated = true` is explicit incomplete truth. It is set when GitHub
+omits the connection, reports a total inconsistent with the returned set,
+leaves a cursor beyond 3,000 files, or fails to supply a rename's previous
+path. The stored rows remain useful positive facts, but consumers MUST NOT
+infer that an absent path or owner is absent upstream. The next webhook,
+backfill/reconciliation pass, or manual refresh replaces the set and may clear
+the flag when GitHub returns a cursor-complete observation. There is no
+out-of-band continuation beyond the cap.
+
+CODEOWNERS is read from the PR base commit, not its head. At the exact
+`codeowners_sha`, ghsync selects `.github/CODEOWNERS`, then root `CODEOWNERS`,
+then `docs/CODEOWNERS`; the first present file is effective and its path,
+base ref, SHA, source, and hash are retained. An effective file at least 3 MiB
+is `oversized` and does not fall through. No file at any location is the
+successful `missing` empty-ownership state. If GitHub reports the base ref but
+not its SHA, `codeowners_sha = ''` and `codeowners_state = 'unavailable'`;
+ghsync does not silently read the moving ref.
+
+The pure resolver is case-sensitive and repository-root-relative. It applies
+CODEOWNERS' gitignore-style pattern behavior, including root anchoring,
+basename patterns, `*`, `?`, `**`, trailing-slash directory matches, escaped
+spaces, and inline comments. The last matching rule wins as a whole. A later
+matching rule with no owner tokens explicitly clears ownership for its matched
+subtree. Negation (`!`), character ranges, and escaped leading `#` are not
+CODEOWNERS features, so such pattern lines are ignored instead of being
+interpreted as gitignore.
+Duplicate owner tokens on the winning line collapse to one fact. Exact source
+tokens are preserved: valid `@user`, `@org/team`, and email tokens receive a
+syntactic type, while malformed tokens remain rows with `owner_type =
+'malformed'`. Path matching is case-sensitive; source owner-token spelling is
+also retained case-for-case, while user and team identity lookup is
+case-insensitive to match GitHub login and slug identity.
+
+User and team tokens resolve only from stable identities already mirrored for
+the repository; ghsync makes no live per-owner lookup. `resolved` carries the
+known node identity, login/slug, and database ID when available. A token with
+no matching identity is `unresolved`; absence alone is never promoted to
+`deleted`. `deleted` is a distinct reserved state for an explicit upstream
+deletion fact, and carries null identity columns, matching participation's
+deleted-actor policy. Email and malformed tokens are always explicit
+unresolved facts. These are ownership inputs, not reviewer scores, workload
+policy, or recommendations.
+
+Consumers can join diff to ownership without Go or another GitHub read:
+
+<!-- diff-to-owner-sql:start -->
+```sql
+SELECT snapshot.base_sha, snapshot.head_sha,
+       snapshot.files_total_count, snapshot.files_truncated,
+       snapshot.codeowners_ref, snapshot.codeowners_sha,
+       snapshot.codeowners_path, snapshot.codeowners_state,
+       file.path, file.previous_path, file.change_type,
+       owner.owner_token, owner.owner_type, owner.resolution_state,
+       owner.owner_gh_id, owner.owner_node_id, owner.owner_login,
+       owner.source_pattern, owner.source_line
+FROM pull_request_change_snapshots AS snapshot
+JOIN pull_request_changed_files AS file
+ ON file.repo_id = snapshot.repo_id
+ AND file.pr_number = snapshot.pr_number
+ AND file.base_sha = snapshot.base_sha
+ AND file.head_sha = snapshot.head_sha
+ AND file.tombstoned_at IS NULL
+LEFT JOIN pull_request_file_owners AS owner
+  ON owner.repo_id = file.repo_id
+ AND owner.pr_number = file.pr_number
+ AND owner.path = file.path
+ AND owner.base_sha = snapshot.base_sha
+ AND owner.head_sha = snapshot.head_sha
+ AND owner.tombstoned_at IS NULL
+WHERE snapshot.repo_id = $1
+  AND snapshot.pr_number = $2
+  AND snapshot.tombstoned_at IS NULL
+ORDER BY file.path, owner.owner_token;
+```
+<!-- diff-to-owner-sql:end -->
+
+ghsync deliberately does not mirror blame: line-by-line history is unbounded
+in changed lines, history depth, and API cost. A lower-cost offline overlap
+input is the fenced changed-path set above, combined with PR authorship,
+identity-keyed review/comment participation below, and commit authorship from
+the consumer's mirrored/local Git objects keyed by `head_sha`. A consumer can
+restrict commits to its chosen recent window, intersect their touched paths
+with `pull_request_changed_files.path`, and then apply its own recency,
+workload, or ranking policy. `pull_request_reviews.commit_oid` supplies an
+additional source-derived commit association for submitted reviewers. This
+keeps the mirror bounded and the engine policy-free while avoiding blame or a
+second independently timed GitHub snapshot.
+
+The replace sets use the participation parent-observation gate: an observation
+older than the current PR `gh_updated_at`, or whose base/head no longer equals
+the parent row, cannot insert, update, tombstone, or merely freshen ownership
+children. Equal parent versions remain eligible so a default-branch
+CODEOWNERS change can update source facts even when GitHub does not change the
+PR timestamp. Queue uniqueness coalesces repeated branch and PR refresh keys;
+the fanout has no arbitrary count cutoff, so every cached open PR on the
+affected branch remains covered. One accepted observation emits at most one
+`pull_request.changed` reference if the snapshot, file set, or owner set
+changes; an identical refresh only advances `last_checked_at` and emits none.
+
+All consumed `pull_request` actions, including synchronize, force-push/base
+change, reopen, and stacked previews, retain a direct PR refresh. Branch pushes
+refresh the finite cached set of live open PRs whose head or base uses that
+branch, including stacked PRs; closed retained rows are outside this fanout. A
+default-branch push that adds, modifies, or removes one of the three effective
+CODEOWNERS paths is also classified explicitly and coalesces onto that branch
+refresh. Backfill, reconciliation, branch refresh, and webhook work all reach
+the same GraphQL/REST hydration path.
+
 `pull_request_review_requests` is the authoritative current request set for a
 pull request. Live reads filter `tombstoned_at IS NULL` and distinguish users
 from teams with `reviewer_kind`; `reviewer_gh_id` and `reviewer_node_id` remain
@@ -413,8 +584,8 @@ constructors used by the entity writer and deriver.
 | --- | --- | --- | --- | --- |
 | `entities` | `repository.changed` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
 | `entities` | `repository.tombstoned` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
-| `entities` | `pull_request.changed` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number)` | `{"version":1}` |
-| `entities` | `pull_request.tombstoned` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number)` | `{"version":1}` |
+| `entities` | `pull_request.changed` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number), pull_request_change_snapshots(repo_id,pr_number), pull_request_changed_files(repo_id,pr_number), pull_request_file_owners(repo_id,pr_number)` | `{"version":1}` |
+| `entities` | `pull_request.tombstoned` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number), pull_request_change_snapshots(repo_id,pr_number), pull_request_changed_files(repo_id,pr_number), pull_request_file_owners(repo_id,pr_number)` | `{"version":1}` |
 | `entities` | `stack.changed` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
 | `entities` | `stack.tombstoned` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
 | `entities` | `checks.changed` | `checks:{installation_id}:{repo_gh_id}:{head_sha}` | `check_runs(repos.installation_id,repos.gh_id,head_sha)` | `{"version":1}` |

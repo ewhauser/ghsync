@@ -21,6 +21,7 @@ import (
 	"github.com/riverqueue/river"
 
 	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/changeinputs"
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/observer"
 	"github.com/ewhauser/ghsync/internal/opsstate"
@@ -870,6 +871,29 @@ func (s *Service) fullFetch(
 		if len(nodes) != 1 || nodes[0] == nil {
 			return tombstoneSnapshot(), spec, nil
 		}
+		if nodes[0].BaseRefOID != pull.GetBase().GetSHA() ||
+			nodes[0].HeadRefOID != pull.GetHead().GetSHA() {
+			return nil, spec, fmt.Errorf(
+				"drift fetch pull request %s: base/head changed during observation",
+				key,
+			)
+		}
+		changeSnapshot, err := changeinputs.Hydrate(
+			ctx,
+			s.rest,
+			s.writer,
+			budget.Sweep,
+			nodes[0].Repository.DatabaseID,
+			owner,
+			name,
+			number,
+			nodes[0],
+		)
+		if err != nil {
+			return nil, spec, fmt.Errorf(
+				"drift fetch PR change inputs %s: %w", key, err,
+			)
+		}
 		return encodeSnapshot(map[string]any{
 			"id":              pull.GetID(),
 			"node_id":         pull.GetNodeID(),
@@ -889,6 +913,7 @@ func (s *Service) fullFetch(
 			"review_requests": semanticReviewRequests(pull),
 			"reviews":         semanticPullRequestReviews(nodes[0]),
 			"comments":        semanticPullRequestComments(nodes[0]),
+			"change_inputs":   changeinputs.Semantic(changeSnapshot),
 		}), spec, nil
 	case "stack":
 		repo, number, err := numberedKey(key, "stack:")
@@ -1357,6 +1382,12 @@ func semanticIdentity(item map[string]any) string {
 	}
 	if id, ok := item["id"].(string); ok && id != "" {
 		return "string:" + id
+	}
+	if path, ok := item["path"].(string); ok && path != "" {
+		if token, ok := item["owner_token"].(string); ok && token != "" {
+			return "owner:" + path + "\x00" + token
+		}
+		return "path:" + path
 	}
 	return ""
 }
