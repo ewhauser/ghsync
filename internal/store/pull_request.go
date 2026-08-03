@@ -79,6 +79,30 @@ func (w *EntityWriter) TouchPullRequest(
 		); err != nil {
 			return fmt.Errorf("touch PR checked_at: %w", err)
 		}
+		current, err := queries.GetPullRequestByIdentity(
+			ctx,
+			dbgen.GetPullRequestByIdentityParams{
+				RepoGhID: repository.GitHubID,
+				PrNumber: int32(number),
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("read touched PR: %w", err)
+		}
+		if current.GhUpdatedAt.Valid {
+			if err := queries.TouchPullRequestReviewRequestsCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestReviewRequestsCheckedAtParams{
+					CheckedAt:   timestamp(checkedAt),
+					Etag:        etag,
+					RepoID:      repo.ID,
+					PrNumber:    int32(number),
+					GhUpdatedAt: current.GhUpdatedAt,
+				},
+			); err != nil {
+				return fmt.Errorf("touch PR review requests: %w", err)
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -277,6 +301,44 @@ func (w *EntityWriter) applyPullRequest(
 			return fmt.Errorf("touch PR: %w", err)
 		}
 
+		if pull.ReviewRequestsKnown {
+			requests, err := encodeReviewRequests(pull.ReviewRequests)
+			if err != nil {
+				return err
+			}
+			changed, err := queries.ReplacePullRequestReviewRequests(
+				ctx,
+				dbgen.ReplacePullRequestReviewRequestsParams{
+					ReviewRequests: requests,
+					RepoID:         repo.ID,
+					PrNumber:       int32(pull.Number),
+					FirstSeenAt:    timestamp(pull.SyncedAt),
+					GhUpdatedAt:    timestamp(pull.GitHubUpdatedAt),
+					HeadSha:        row.HeadSha,
+					SyncedAt:       timestamp(pull.SyncedAt),
+					LastCheckedAt:  timestamp(pull.SyncedAt),
+					Etag:           pull.ETag,
+					SyncSource:     string(pull.Source),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("replace PR review requests: %w", err)
+			}
+			result.ReviewRequestsChanged = len(changed) > 0
+			if err := queries.TouchPullRequestReviewRequestsCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestReviewRequestsCheckedAtParams{
+					CheckedAt:   timestamp(pull.SyncedAt),
+					Etag:        pull.ETag,
+					RepoID:      repo.ID,
+					PrNumber:    int32(pull.Number),
+					GhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+				},
+			); err != nil {
+				return fmt.Errorf("touch PR review requests: %w", err)
+			}
+		}
+
 		threadsChanged := false
 		if pull.ThreadsKnown {
 			threads, err := encodeReviewThreads(pull.ReviewThreads)
@@ -311,7 +373,8 @@ func (w *EntityWriter) applyPullRequest(
 				return fmt.Errorf("touch review threads: %w", err)
 			}
 		}
-		result.Applied = result.DomainChanged || threadsChanged
+		result.Applied = result.DomainChanged || threadsChanged ||
+			result.ReviewRequestsChanged
 		if result.Applied {
 			scopes := uniqueStrings(
 				derivationScope(
@@ -503,6 +566,17 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 			); err != nil {
 				return err
 			}
+			if _, err := queries.TombstonePullRequestReviewRequests(
+				ctx,
+				dbgen.TombstonePullRequestReviewRequestsParams{
+					TombstonedAt: timestamp(at),
+					SyncSource:   string(source),
+					RepoID:       repo.ID,
+					PrNumber:     int32(number),
+				},
+			); err != nil {
+				return fmt.Errorf("tombstone PR review requests: %w", err)
+			}
 		}
 		if hook != nil {
 			if txHook := hook(result); txHook != nil {
@@ -541,6 +615,25 @@ func encodeReviewThreads(threads []ReviewThreadRecord) ([]byte, error) {
 	value, err := json.Marshal(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("encode review threads: %w", err)
+	}
+	return value, nil
+}
+
+func encodeReviewRequests(requests []ReviewRequestRecord) ([]byte, error) {
+	type encodedRequest struct {
+		Kind        ReviewRequestKind `json:"kind"`
+		GitHubID    int64             `json:"gh_id"`
+		NodeID      string            `json:"node_id"`
+		Login       string            `json:"login"`
+		RequestedAt *time.Time        `json:"requested_at"`
+	}
+	encoded := make([]encodedRequest, 0, len(requests))
+	for _, request := range requests {
+		encoded = append(encoded, encodedRequest(request))
+	}
+	value, err := json.Marshal(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("encode PR review requests: %w", err)
 	}
 	return value, nil
 }

@@ -154,6 +154,27 @@ func TestMigrateIdempotent(t *testing.T) {
 			err,
 		)
 	}
+	var reviewRequestIndex string
+	err = pool.QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND tablename = 'pull_request_review_requests'
+		  AND indexname = 'pull_request_review_requests_live_pr_idx'
+	`).Scan(&reviewRequestIndex)
+	if err != nil ||
+		!strings.Contains(
+			reviewRequestIndex,
+			"(repo_id, pr_number, reviewer_kind, reviewer_gh_id)",
+		) ||
+		!strings.Contains(reviewRequestIndex, "INCLUDE") ||
+		!strings.Contains(reviewRequestIndex, "WHERE (tombstoned_at IS NULL)") {
+		t.Fatalf(
+			"live PR review-request index = %q (err=%v)",
+			reviewRequestIndex,
+			err,
+		)
+	}
 
 	var riverTables int
 	err = pool.QueryRow(ctx,

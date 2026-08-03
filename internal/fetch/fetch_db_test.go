@@ -1539,6 +1539,11 @@ func TestBackfillResumesFromDurableCursor(t *testing.T) {
 			emptyPRETags,
 		)
 	}
+	requests := readCachedReviewRequests(t, pool, "acme/monolith", 4812)
+	if len(requests) != 2 || requests[0].Kind != "team" ||
+		requests[1].Kind != "user" {
+		t.Fatalf("backfilled review requests = %+v", requests)
+	}
 	var pendingChildren int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*)
@@ -1933,6 +1938,199 @@ func TestPipelineWaitIdleIncludesKeylessBackfillJobs(t *testing.T) {
 	}
 	if cursor.Phase != "done" || !cursor.CompletedAt.Valid {
 		t.Fatalf("waitIdle returned before keyless backfill completed: %+v", cursor)
+	}
+}
+
+func TestReviewRequestWebhookAddsAndAuthoritativelyRemovesCurrentSet(
+	t *testing.T,
+) {
+	t.Parallel()
+	const repo = "acme/review-request-webhook"
+	harness := newPipelineHarness(t, repo)
+	defer harness.close()
+	user := fakegithub.ReviewRequest{
+		Kind: "user", ID: 5001, NodeID: "U_kwDOABCDEF5001",
+		Login: "reviewer",
+	}
+	requestedPayload, err := harness.fake.
+		PullRequestReviewRequestedWebhookPayload(4812, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.emit("review-request-user-add", pipelineEvent{
+		event:   "pull_request",
+		payload: requestedPayload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+	initial := readCachedReviewRequests(t, harness.pool, repo, 4812)
+	if len(initial) != 2 || initial[0].Kind != "team" ||
+		initial[1].Kind != "user" || initial[0].RequestedAt != nil ||
+		initial[1].RequestedAt != nil ||
+		initial[0].HeadSHA != "8f31c2d" ||
+		initial[1].HeadSHA != "8f31c2d" {
+		t.Fatalf("webhook-added review requests = %+v", initial)
+	}
+
+	eventsBefore := pullChangedEvents(t, harness.pool, repo)
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	fixture.PullRequests[1].ReviewRequests =
+		fixture.PullRequests[1].ReviewRequests[1:]
+	harness.fake.SetFixture(fixture)
+	removedPayload, err := harness.fake.
+		PullRequestReviewRequestRemovedWebhookPayload(4812, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.emit("review-request-user-remove", pipelineEvent{
+		event:   "pull_request",
+		payload: removedPayload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+	remaining := readCachedReviewRequests(t, harness.pool, repo, 4812)
+	if len(remaining) != 1 || remaining[0].Kind != "team" ||
+		remaining[0].Login != "search-platform" {
+		t.Fatalf("review requests after authoritative removal = %+v", remaining)
+	}
+	eventsAfterRemoval := pullChangedEvents(t, harness.pool, repo)
+	if eventsAfterRemoval <= eventsBefore {
+		t.Fatalf(
+			"request-set removal events = %d, want > %d",
+			eventsAfterRemoval,
+			eventsBefore,
+		)
+	}
+
+	fixture.PullRequests[1].ReviewRequests = append(
+		fixture.PullRequests[1].ReviewRequests,
+		user,
+	)
+	harness.fake.SetFixture(fixture)
+	rerequestedPayload, err := harness.fake.
+		PullRequestReviewRequestedWebhookPayload(4812, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.emit("review-request-user-rerequest", pipelineEvent{
+		event:   "pull_request",
+		payload: rerequestedPayload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+	rerequested := readCachedReviewRequests(t, harness.pool, repo, 4812)
+	if len(rerequested) != 2 || rerequested[1].Kind != "user" ||
+		!rerequested[1].FirstSeenAt.After(initial[1].FirstSeenAt) {
+		t.Fatalf("webhook re-request rows = %+v, initial = %+v", rerequested, initial)
+	}
+	eventsAfterRerequest := pullChangedEvents(t, harness.pool, repo)
+	if eventsAfterRerequest <= eventsAfterRemoval {
+		t.Fatalf(
+			"re-request events = %d, want > %d",
+			eventsAfterRerequest,
+			eventsAfterRemoval,
+		)
+	}
+
+	harness.emit("review-request-identical-refresh", pipelineEvent{
+		event:   "pull_request",
+		payload: rerequestedPayload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+	if events := pullChangedEvents(t, harness.pool, repo); events !=
+		eventsAfterRerequest {
+		t.Fatalf(
+			"identical request-set refresh events = %d, want %d",
+			events,
+			eventsAfterRerequest,
+		)
+	}
+}
+
+func TestReviewRequestSetDoesNotOscillateBetweenGraphQLAndREST(t *testing.T) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := t.Context()
+	key := "pr:acme/monolith:4812"
+	resolve := queue.RefreshRequest{
+		Args:  queue.NewResolveStackMembershipArgs(key).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.ResolveStackMembership(ctx, resolve); err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore := pullChangedEvents(t, pool, "acme/monolith")
+	fixture.PullRequests[1].ReviewRequests =
+		fixture.PullRequests[1].ReviewRequests[1:]
+	fake.SetFixture(fixture)
+	if err := handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args:  queue.NewRefreshPRArgs(key).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eventsAfterGraphQL := pullChangedEvents(t, pool, "acme/monolith")
+	if eventsAfterGraphQL != eventsBefore+1 {
+		t.Fatalf(
+			"GraphQL request-set events = %d, want %d",
+			eventsAfterGraphQL,
+			eventsBefore+1,
+		)
+	}
+	if err := handler.ResolveStackMembership(ctx, resolve); err != nil {
+		t.Fatal(err)
+	}
+	if events := pullChangedEvents(t, pool, "acme/monolith"); events !=
+		eventsAfterGraphQL {
+		t.Fatalf(
+			"REST refresh oscillated after GraphQL: events=%d, want %d",
+			events,
+			eventsAfterGraphQL,
+		)
+	}
+	fixture.PullRequests[1].ReviewRequests = append(
+		fixture.PullRequests[1].ReviewRequests,
+		fakegithub.ReviewRequest{
+			Kind: "user", ID: 5001, NodeID: "U_kwDOABCDEF5001",
+			Login: "reviewer",
+		},
+	)
+	fake.SetFixture(fixture)
+	if err := handler.ResolveStackMembership(ctx, resolve); err != nil {
+		t.Fatal(err)
+	}
+	eventsAfterREST := pullChangedEvents(t, pool, "acme/monolith")
+	if eventsAfterREST != eventsAfterGraphQL+1 {
+		t.Fatalf(
+			"REST re-request events = %d, want %d",
+			eventsAfterREST,
+			eventsAfterGraphQL+1,
+		)
+	}
+	if err := handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args:  queue.NewRefreshPRArgs(key).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if events := pullChangedEvents(t, pool, "acme/monolith"); events !=
+		eventsAfterREST {
+		t.Fatalf(
+			"GraphQL refresh oscillated after REST: events=%d, want %d",
+			events,
+			eventsAfterREST,
+		)
 	}
 }
 
@@ -2535,4 +2733,82 @@ func toGHPullRequest(
 func fetchTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	return testdb.New(t).Pool
+}
+
+type cachedReviewRequest struct {
+	Kind        string
+	ID          int64
+	NodeID      string
+	Login       string
+	RequestedAt *time.Time
+	FirstSeenAt time.Time
+	HeadSHA     string
+	Source      string
+}
+
+func readCachedReviewRequests(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	repo string,
+	prNumber int,
+) []cachedReviewRequest {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `
+		SELECT request.reviewer_kind, request.reviewer_gh_id,
+		       request.reviewer_node_id, request.reviewer_login,
+		       request.requested_at, request.first_seen_at,
+		       request.head_sha, request.sync_source
+		FROM pull_request_review_requests AS request
+		JOIN repos ON repos.id = request.repo_id
+		WHERE repos.full_name = $1
+		  AND request.pr_number = $2
+		  AND request.tombstoned_at IS NULL
+		ORDER BY request.reviewer_kind, request.reviewer_gh_id
+	`, repo, prNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []cachedReviewRequest
+	for rows.Next() {
+		var row cachedReviewRequest
+		if err := rows.Scan(
+			&row.Kind,
+			&row.ID,
+			&row.NodeID,
+			&row.Login,
+			&row.RequestedAt,
+			&row.FirstSeenAt,
+			&row.HeadSHA,
+			&row.Source,
+		); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func pullChangedEvents(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	repo string,
+) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(t.Context(), `
+		SELECT count(*)
+		FROM change_events
+		JOIN repos
+		  ON change_events.entity_key =
+		     'pr:' || repos.installation_id || ':' || repos.gh_id || ':4812'
+		WHERE repos.full_name = $1
+		  AND change_events.kind = 'pull_request.changed'
+	`, repo).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
 }

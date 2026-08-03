@@ -71,33 +71,58 @@ type ReviewThreadRecord struct {
 	GitHubUpdatedAt time.Time
 }
 
+// ReviewRequestKind distinguishes GitHub user and team review requests.
+type ReviewRequestKind string
+
+const (
+	ReviewRequestUser ReviewRequestKind = "user"
+	ReviewRequestTeam ReviewRequestKind = "team"
+)
+
+func (k ReviewRequestKind) valid() bool {
+	return k == ReviewRequestUser || k == ReviewRequestTeam
+}
+
+// ReviewRequestRecord is one member of GitHub's authoritative current
+// pull-request reviewRequests set. RequestedAt is nil when GitHub does not
+// expose an authoritative request timestamp.
+type ReviewRequestRecord struct {
+	Kind        ReviewRequestKind
+	GitHubID    int64
+	NodeID      string
+	Login       string
+	RequestedAt *time.Time
+}
+
 // PullRequestRecord is the authoritative pull-request state accepted by the
 // cache.
 type PullRequestRecord struct {
-	Repository      RepositoryRecord
-	GitHubID        int64
-	NodeID          string
-	Number          int
-	Title           string
-	State           string
-	Draft           bool
-	AuthorLogin     string
-	HeadRef         string
-	HeadSHA         string
-	BaseRef         string
-	BaseSHA         string
-	ReviewDecision  string
-	MergeableState  string
-	StackNumber     *int
-	StackPosition   *int
-	StackSummary    *StackSummaryRecord
-	MembershipKnown bool
-	GitHubUpdatedAt time.Time
-	ReviewThreads   []ReviewThreadRecord
-	ThreadsKnown    bool
-	ETag            string
-	SyncedAt        time.Time
-	Source          SyncSource
+	Repository          RepositoryRecord
+	GitHubID            int64
+	NodeID              string
+	Number              int
+	Title               string
+	State               string
+	Draft               bool
+	AuthorLogin         string
+	HeadRef             string
+	HeadSHA             string
+	BaseRef             string
+	BaseSHA             string
+	ReviewDecision      string
+	MergeableState      string
+	StackNumber         *int
+	StackPosition       *int
+	StackSummary        *StackSummaryRecord
+	MembershipKnown     bool
+	GitHubUpdatedAt     time.Time
+	ReviewThreads       []ReviewThreadRecord
+	ThreadsKnown        bool
+	ReviewRequests      []ReviewRequestRecord
+	ReviewRequestsKnown bool
+	ETag                string
+	SyncedAt            time.Time
+	Source              SyncSource
 }
 
 // StackSummaryRecord is the complete stack tuple embedded in an authoritative
@@ -183,13 +208,14 @@ type RepoRulesRecord struct {
 
 // ApplyPullRequestResult describes the accepted pull-request transition.
 type ApplyPullRequestResult struct {
-	Applied           bool
-	DomainChanged     bool
-	StackStateChanged bool
-	OldStackNumber    *int
-	NewStackNumber    *int
-	OldHeadSHA        string
-	NewHeadSHA        string
+	Applied               bool
+	DomainChanged         bool
+	ReviewRequestsChanged bool
+	StackStateChanged     bool
+	OldStackNumber        *int
+	NewStackNumber        *int
+	OldHeadSHA            string
+	NewHeadSHA            string
 }
 
 // ApplyStackResult describes stack membership changes caused by a write.
@@ -274,6 +300,18 @@ func validatePullRequest(pull *PullRequestRecord) error {
 			pull.StackSummary.BaseRef == "" ||
 			pull.StackSummary.BaseSHA == "") {
 		return fmt.Errorf("invalid PR stack summary")
+	}
+	seenRequests := make(map[string]struct{}, len(pull.ReviewRequests))
+	for _, request := range pull.ReviewRequests {
+		if !request.Kind.valid() || request.GitHubID <= 0 ||
+			request.NodeID == "" || request.Login == "" {
+			return fmt.Errorf("invalid PR review request")
+		}
+		key := fmt.Sprintf("%s:%d", request.Kind, request.GitHubID)
+		if _, duplicate := seenRequests[key]; duplicate {
+			return fmt.Errorf("duplicate PR review request %s", key)
+		}
+		seenRequests[key] = struct{}{}
 	}
 	return nil
 }

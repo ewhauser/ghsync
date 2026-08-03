@@ -32,6 +32,10 @@ func cloneFixture(source *Fixture) Fixture {
 		pull := &source.PullRequests[index]
 		clone.PullRequests[index] = *pull
 		clone.PullRequests[index].MergedAt = cloneTime(pull.MergedAt)
+		clone.PullRequests[index].ReviewRequests = append(
+			[]ReviewRequest(nil),
+			pull.ReviewRequests...,
+		)
 		if pull.Stack != nil {
 			stack := *pull.Stack
 			clone.PullRequests[index].Stack = &stack
@@ -144,6 +148,16 @@ func DefaultFixture() Fixture {
 					UpdatedAt: now, AuthorLogin: "reviewer",
 				}},
 			}},
+			ReviewRequests: []ReviewRequest{
+				{
+					Kind: "user", ID: 5001, NodeID: "U_kwDOABCDEF5001",
+					Login: "reviewer",
+				},
+				{
+					Kind: "team", ID: 6001, NodeID: "T_kwDOABCDEF6001",
+					Login: "search-platform",
+				},
+			},
 		},
 		{
 			ID: 804815, NodeID: "PR_kwDOABCDEF4815",

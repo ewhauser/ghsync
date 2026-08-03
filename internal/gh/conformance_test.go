@@ -482,6 +482,28 @@ func TestGraphQLPaginatesReviewThreadsAndNestedComments(t *testing.T) {
 		}
 	}
 	fixture.PullRequests[1].ReviewThreads = threads
+	reviewRequests := make([]fakegithub.ReviewRequest, 101, 104)
+	for index := range reviewRequests {
+		kind := "user"
+		if index%2 == 1 {
+			kind = "team"
+		}
+		reviewRequests[index] = fakegithub.ReviewRequest{
+			Kind:   kind,
+			ID:     int64(70_000 + index),
+			NodeID: fmt.Sprintf("review-request-%03d", index),
+			Login:  fmt.Sprintf("reviewer-%03d", index),
+		}
+	}
+	reviewRequests = append(
+		reviewRequests,
+		fakegithub.ReviewRequest{Kind: "bot", ID: 80_001, NodeID: "bot"},
+		fakegithub.ReviewRequest{
+			Kind: "mannequin", ID: 80_002, NodeID: "mannequin",
+		},
+		fakegithub.ReviewRequest{Kind: "nil"},
+	)
+	fixture.PullRequests[1].ReviewRequests = reviewRequests
 	server, baseURL := startFake(t, fakegithub.WithFixture(fixture))
 	gate := budget.New(server.Client(), budget.Options{})
 	client := newGraphQLClient(t, baseURL, gate)
@@ -499,8 +521,23 @@ func TestGraphQLPaginatesReviewThreadsAndNestedComments(t *testing.T) {
 	if got := len(nodes[0].ReviewThreads.Nodes[0].Comments.Nodes); got != 101 {
 		t.Fatalf("first thread comments = %d, want 101", got)
 	}
-	if got := server.handler.RequestCount(http.MethodPost, "/graphql"); got != 3 {
-		t.Fatalf("GraphQL requests = %d, want initial + two page calls", got)
+	if got := len(nodes[0].ReviewRequests.Nodes); got != 104 {
+		t.Fatalf("review requests = %d, want 104", got)
+	}
+	if nodes[0].ReviewRequests.Nodes[0].RequestedReviewer.Typename != "User" ||
+		nodes[0].ReviewRequests.Nodes[1].RequestedReviewer.Typename != "Team" {
+		t.Fatalf("review-request union nodes = %#v", nodes[0].ReviewRequests.Nodes[:2])
+	}
+	if nodes[0].ReviewRequests.Nodes[101].RequestedReviewer.Typename != "Bot" ||
+		nodes[0].ReviewRequests.Nodes[102].RequestedReviewer.Typename != "Mannequin" ||
+		nodes[0].ReviewRequests.Nodes[103].RequestedReviewer.Typename != "" {
+		t.Fatalf(
+			"unsupported review-request union nodes = %#v",
+			nodes[0].ReviewRequests.Nodes[101:],
+		)
+	}
+	if got := server.handler.RequestCount(http.MethodPost, "/graphql"); got != 4 {
+		t.Fatalf("GraphQL requests = %d, want initial + three page calls", got)
 	}
 }
 

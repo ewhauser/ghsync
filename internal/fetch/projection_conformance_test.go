@@ -62,6 +62,35 @@ func TestPullRequestCorpusProjection(t *testing.T) {
 				"nested": []any{true, nil, "preserved"},
 			}
 			example.Payload["number"] = number
+			var expectedReviewRequests []cachedReviewRequest
+			switch example.Filename {
+			case "review_requested.payload.json":
+				wirePull["requested_reviewers"] = []any{map[string]any{
+					"id": int64(5_346), "node_id": "U_projection_5346",
+					"login": "octocat",
+				}}
+				wirePull["requested_teams"] = []any{map[string]any{
+					"id": int64(6_346), "node_id": "T_projection_6346",
+					"slug": "search-platform",
+				}}
+				headSHA, _ := corpusObject(t, wirePull, "head")["sha"].(string)
+				expectedReviewRequests = []cachedReviewRequest{
+					{
+						Kind: "team", ID: 6_346, NodeID: "T_projection_6346",
+						Login: "search-platform", HeadSHA: headSHA,
+						Source: "webhook",
+					},
+					{
+						Kind: "user", ID: 5_346, NodeID: "U_projection_5346",
+						Login: "octocat", HeadSHA: headSHA,
+						Source: "webhook",
+					},
+				}
+			case "review_request_removed.payload.json":
+				wirePull["requested_reviewers"] = []any{}
+				wirePull["requested_teams"] = []any{}
+				expectedReviewRequests = []cachedReviewRequest{}
+			}
 			if wirePull["body"] == nil {
 				sawNull = true
 			}
@@ -133,6 +162,25 @@ func TestPullRequestCorpusProjection(t *testing.T) {
 				int64(8_000_000_000+index),
 				number,
 			)
+			if expectedReviewRequests != nil {
+				requests := readCachedReviewRequests(
+					t,
+					database.Pool,
+					repo,
+					number,
+				)
+				for index := range requests {
+					requests[index].FirstSeenAt = time.Time{}
+				}
+				if !reflect.DeepEqual(requests, expectedReviewRequests) {
+					t.Fatalf(
+						"%s review-request projection = %+v, want %+v",
+						example.Filename,
+						requests,
+						expectedReviewRequests,
+					)
+				}
+			}
 		})
 	}
 	if !sawNull {

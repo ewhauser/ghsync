@@ -214,6 +214,60 @@ func (h *driftHarness) divergePullRequest() {
 	h.fake.SetFixture(h.fixture)
 }
 
+func TestDriftDetectsAndHealsReviewRequestSetDivergence(t *testing.T) {
+	t.Parallel()
+	harness := newReadyDriftHarness(t)
+	ctx := t.Context()
+	if _, err := harness.pool.Exec(ctx, `
+		UPDATE pull_request_review_requests AS request
+		SET tombstoned_at = clock_timestamp()
+		FROM repos
+		WHERE repos.id = request.repo_id
+		  AND repos.full_name = 'acme/monolith'
+		  AND request.pr_number = 4812
+		  AND request.reviewer_kind = 'user'
+		  AND request.tombstoned_at IS NULL
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 ||
+		findings[0].EntityKey != "pr:acme/monolith:4812" ||
+		!strings.Contains(string(findings[0].Diff), "review_requests") {
+		t.Fatalf("review-request drift findings = %+v", findings)
+	}
+	waitForCacheProducers(t, harness.pool)
+	var live int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pull_request_review_requests AS request
+		JOIN repos ON repos.id = request.repo_id
+		WHERE repos.full_name = 'acme/monolith'
+		  AND request.pr_number = 4812
+		  AND request.tombstoned_at IS NULL
+	`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 2 {
+		t.Fatalf("healed live review requests = %d, want 2", live)
+	}
+	if findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	} else if len(findings) != 0 {
+		t.Fatalf("post-heal review-request findings = %+v", findings)
+	}
+}
+
 func TestDetectSamplesWithUnrelatedBusySweepQueue(t *testing.T) {
 	t.Parallel()
 	harness := newReadyDriftHarness(t)
@@ -1086,6 +1140,19 @@ func TestSemanticDiffNormalizesIDOrderedCollections(t *testing.T) {
 	}
 }
 
+func TestSemanticDiffNormalizesReviewRequestsInGo(t *testing.T) {
+	t.Parallel()
+	cache := []byte(`{"review_requests":[{"kind":"user","id":7},{"kind":"team","id":7}]}`)
+	upstream := []byte(`{"review_requests":[{"id":7,"kind":"team"},{"id":7,"kind":"user"}]}`)
+	equal, diff, err := semanticDiff(cache, upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal || string(diff) != "{}" {
+		t.Fatalf("Go-sorted request compare equal=%v diff=%s", equal, diff)
+	}
+}
+
 // The sampler resolves its keyset against drift_entity_keys and then reads
 // the snapshots back out of drift_entities by source_id. That is only
 // equivalent to ordering drift_entities directly while the two views project
@@ -1280,6 +1347,27 @@ func seedCheckRunGroup(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO pull_request_review_requests (
+		    repo_id, pr_number, reviewer_kind, reviewer_gh_id,
+		    reviewer_node_id, reviewer_login, first_seen_at,
+		    gh_updated_at, head_sha, synced_at, sync_source,
+		    last_checked_at, tombstoned_at
+		) VALUES
+		    (9001, 11, 'user', 9101, 'U_keyset', 'ada',
+		     clock_timestamp(), clock_timestamp(), 'aaa',
+		     clock_timestamp(), 'backfill', clock_timestamp(), NULL),
+		    (9001, 11, 'team', 9102, 'T_keyset', 'platform',
+		     clock_timestamp(), clock_timestamp(), 'aaa',
+		     clock_timestamp(), 'backfill', clock_timestamp(), NULL),
+		    (9001, 11, 'user', 9103, 'U_dead', 'removed',
+		     clock_timestamp(), clock_timestamp(), 'aaa',
+		     clock_timestamp(), 'backfill', clock_timestamp(),
+		     clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+
 	var sourceID int64
 	var snapshot []byte
 	if err := pool.QueryRow(ctx, `
@@ -1299,6 +1387,23 @@ func seedCheckRunGroup(t *testing.T, pool *pgxpool.Pool) {
 		!strings.Contains(got, `"id": 5003`) ||
 		strings.Contains(got, `"id": 5000`) {
 		t.Fatalf("checks snapshot = %s, want the three live runs only", got)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT cache_snapshot
+		FROM drift_entities
+		WHERE installation_id = 1
+		  AND entity_kind = 'pull_request'
+		  AND entity_key = 'pr:acme/monolith:11'
+	`).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(snapshot); !strings.Contains(got, `"id": 9101`) ||
+		!strings.Contains(got, `"id": 9102`) ||
+		strings.Contains(got, `"id": 9103`) {
+		t.Fatalf(
+			"pull-request review-request snapshot = %s, want live rows only",
+			got,
+		)
 	}
 }
 

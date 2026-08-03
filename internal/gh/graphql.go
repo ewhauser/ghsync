@@ -95,11 +95,30 @@ type PullRequestNode struct {
 	Author         struct {
 		Login string `json:"login"`
 	} `json:"author"`
-	Repository    RepositoryNode `json:"repository"`
+	Repository     RepositoryNode `json:"repository"`
+	ReviewRequests struct {
+		Nodes    []ReviewRequestNode `json:"nodes"`
+		PageInfo PageInfo            `json:"pageInfo"`
+	} `json:"reviewRequests"`
 	ReviewThreads struct {
 		Nodes    []ReviewThreadNode `json:"nodes"`
 		PageInfo PageInfo           `json:"pageInfo"`
 	} `json:"reviewThreads"`
+}
+
+// ReviewRequestNode is one current GitHub review request. RequestedReviewer is
+// nullable and the live union also includes Bot, Mannequin, EnterpriseTeam,
+// and potentially future members. The v1 projection consumes only complete
+// User and Team variants; __typename lets the converter exclude the rest
+// without misclassifying them.
+type ReviewRequestNode struct {
+	RequestedReviewer struct {
+		Typename   string `json:"__typename"`
+		ID         string `json:"id"`
+		DatabaseID int64  `json:"databaseId"`
+		Login      string `json:"login"`
+		Slug       string `json:"slug"`
+	} `json:"requestedReviewer"`
 }
 
 // PageInfo is GraphQL connection pagination metadata.
@@ -177,6 +196,16 @@ const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
         owner { login }
         defaultBranchRef { name target { oid } }
       }
+      reviewRequests(first: 100) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User { id databaseId login }
+            ... on Team { id databaseId slug }
+          }
+        }
+      }
       reviewThreads(first: 100) {
         pageInfo { hasNextPage endCursor }
         nodes {
@@ -188,6 +217,27 @@ const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
           comments(first: 100) {
             pageInfo { hasNextPage endCursor }
             nodes { id body updatedAt author { login } }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { cost limit remaining resetAt }
+}`
+
+const pullRequestReviewRequestsPageQuery = `query GhsyncPullRequestReviewRequestsPage(
+  $id: ID!,
+  $after: String
+) {
+  node(id: $id) {
+    ... on PullRequest {
+      reviewRequests(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User { id databaseId login }
+            ... on Team { id databaseId slug }
           }
         }
       }
@@ -293,6 +343,43 @@ func (c *GraphQLClient) completePullRequestReviewConnections(
 	class budget.Class,
 	pull *PullRequestNode,
 ) error {
+	for pull.ReviewRequests.PageInfo.HasNextPage {
+		if pull.ReviewRequests.PageInfo.EndCursor == nil {
+			return fmt.Errorf("reviewRequests hasNextPage without endCursor")
+		}
+		var data struct {
+			Node *struct {
+				ReviewRequests struct {
+					Nodes    []ReviewRequestNode `json:"nodes"`
+					PageInfo PageInfo            `json:"pageInfo"`
+				} `json:"reviewRequests"`
+			} `json:"node"`
+		}
+		_, err := c.Call(
+			ctx,
+			class,
+			pullRequestReviewRequestsPageQuery,
+			map[string]any{
+				"id":    pull.ID,
+				"after": *pull.ReviewRequests.PageInfo.EndCursor,
+			},
+			&data,
+		)
+		if err != nil {
+			return fmt.Errorf("paginate reviewRequests for %s: %w", pull.ID, err)
+		}
+		if data.Node == nil {
+			return fmt.Errorf(
+				"paginate reviewRequests for %s: node disappeared",
+				pull.ID,
+			)
+		}
+		pull.ReviewRequests.Nodes = append(
+			pull.ReviewRequests.Nodes,
+			data.Node.ReviewRequests.Nodes...,
+		)
+		pull.ReviewRequests.PageInfo = data.Node.ReviewRequests.PageInfo
+	}
 	for index := range pull.ReviewThreads.Nodes {
 		if err := c.completeReviewThreadComments(
 			ctx,

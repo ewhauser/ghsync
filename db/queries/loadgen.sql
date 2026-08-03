@@ -82,6 +82,22 @@ WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND pull.tombstoned_at IS NULL
 ORDER BY pull.number;
 
+-- name: ListLoadgenCachedPullRequestReviewRequests :many
+SELECT
+    request.pr_number,
+    request.reviewer_kind,
+    request.reviewer_gh_id,
+    request.reviewer_node_id,
+    request.reviewer_login,
+    request.requested_at,
+    request.head_sha
+FROM pull_request_review_requests AS request
+JOIN repos AS repo ON repo.id = request.repo_id
+WHERE repo.full_name = sqlc.arg(repo_full_name)
+  AND repo.tombstoned_at IS NULL
+  AND request.tombstoned_at IS NULL
+ORDER BY request.pr_number, request.reviewer_kind, request.reviewer_gh_id;
+
 -- name: ListLoadgenCachedStacks :many
 SELECT
     stack.gh_id,

@@ -978,6 +978,160 @@ func (q *Queries) ReplaceCheckRuns(ctx context.Context, arg ReplaceCheckRunsPara
 	return items, nil
 }
 
+const replacePullRequestReviewRequests = `-- name: ReplacePullRequestReviewRequests :many
+WITH input AS (
+    SELECT element->>'kind' AS reviewer_kind,
+           (element->>'gh_id')::bigint AS reviewer_gh_id,
+           element->>'node_id' AS reviewer_node_id,
+           element->>'login' AS reviewer_login,
+           (element->>'requested_at')::timestamptz AS requested_at
+    FROM jsonb_array_elements($1::jsonb) AS element
+),
+eligible AS (
+    SELECT pull_requests.repo_id
+    FROM pull_requests
+    WHERE pull_requests.repo_id = $2
+      AND pull_requests.number = $3
+      AND pull_requests.tombstoned_at IS NULL
+      AND (
+          pull_requests.gh_updated_at IS NULL
+          OR pull_requests.gh_updated_at <= $4
+      )
+),
+upserted AS (
+    INSERT INTO pull_request_review_requests (
+        repo_id, pr_number, reviewer_kind, reviewer_gh_id,
+        reviewer_node_id, reviewer_login, requested_at, first_seen_at,
+        gh_updated_at, head_sha, synced_at, last_checked_at, etag,
+        sync_source, tombstoned_at
+    )
+    SELECT $2, $3, input.reviewer_kind,
+           input.reviewer_gh_id, input.reviewer_node_id,
+           input.reviewer_login, input.requested_at,
+           $5, $4,
+           $6, $7,
+           $8, $9,
+           $10, NULL
+    FROM input
+    CROSS JOIN eligible
+    ON CONFLICT (repo_id, pr_number, reviewer_kind, reviewer_gh_id)
+    DO UPDATE
+    SET reviewer_node_id = EXCLUDED.reviewer_node_id,
+        reviewer_login = EXCLUDED.reviewer_login,
+        requested_at = CASE
+            WHEN pull_request_review_requests.tombstoned_at IS NOT NULL
+            THEN EXCLUDED.requested_at
+            ELSE COALESCE(
+                EXCLUDED.requested_at,
+                pull_request_review_requests.requested_at
+            )
+        END,
+        first_seen_at = CASE
+            WHEN pull_request_review_requests.tombstoned_at IS NOT NULL
+            THEN EXCLUDED.first_seen_at
+            ELSE pull_request_review_requests.first_seen_at
+        END,
+        gh_updated_at = EXCLUDED.gh_updated_at,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        last_checked_at = EXCLUDED.last_checked_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL
+    WHERE pull_request_review_requests.tombstoned_at IS NOT NULL
+       OR ROW(
+           EXCLUDED.reviewer_node_id,
+           EXCLUDED.reviewer_login,
+           CASE
+               WHEN pull_request_review_requests.tombstoned_at IS NOT NULL
+               THEN EXCLUDED.requested_at
+               ELSE COALESCE(
+                   EXCLUDED.requested_at,
+                   pull_request_review_requests.requested_at
+               )
+           END,
+           EXCLUDED.head_sha
+       ) IS DISTINCT FROM ROW(
+           pull_request_review_requests.reviewer_node_id,
+           pull_request_review_requests.reviewer_login,
+           pull_request_review_requests.requested_at,
+           pull_request_review_requests.head_sha
+       )
+    RETURNING reviewer_kind || ':' || reviewer_gh_id::text AS reviewer_key
+),
+tombstoned AS (
+    UPDATE pull_request_review_requests
+    SET tombstoned_at = $8,
+        synced_at = $7,
+        last_checked_at = $8,
+        etag = $9,
+        sync_source = $10
+    WHERE repo_id = $2
+      AND pr_number = $3
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM input
+          WHERE input.reviewer_kind =
+                    pull_request_review_requests.reviewer_kind
+            AND input.reviewer_gh_id =
+                    pull_request_review_requests.reviewer_gh_id
+      )
+    RETURNING reviewer_kind || ':' || reviewer_gh_id::text AS reviewer_key
+)
+SELECT reviewer_key FROM upserted
+UNION ALL
+SELECT reviewer_key FROM tombstoned
+`
+
+type ReplacePullRequestReviewRequestsParams struct {
+	ReviewRequests []byte
+	RepoID         int64
+	PrNumber       int32
+	GhUpdatedAt    pgtype.Timestamptz
+	FirstSeenAt    pgtype.Timestamptz
+	HeadSha        string
+	SyncedAt       pgtype.Timestamptz
+	LastCheckedAt  pgtype.Timestamptz
+	Etag           string
+	SyncSource     string
+}
+
+// The parent pull request's updated_at is the C-C2 observation version for
+// this timestamp-less GitHub connection. Equal-version replacements remain
+// eligible so a pure request-set change is not swallowed.
+func (q *Queries) ReplacePullRequestReviewRequests(ctx context.Context, arg ReplacePullRequestReviewRequestsParams) ([]interface{}, error) {
+	rows, err := q.db.Query(ctx, replacePullRequestReviewRequests,
+		arg.ReviewRequests,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.GhUpdatedAt,
+		arg.FirstSeenAt,
+		arg.HeadSha,
+		arg.SyncedAt,
+		arg.LastCheckedAt,
+		arg.Etag,
+		arg.SyncSource,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []interface{}
+	for rows.Next() {
+		var reviewer_key interface{}
+		if err := rows.Scan(&reviewer_key); err != nil {
+			return nil, err
+		}
+		items = append(items, reviewer_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const replaceRepoRules = `-- name: ReplaceRepoRules :many
 WITH input AS (
     SELECT element->>'rule_key' AS rule_key,
@@ -1256,6 +1410,54 @@ func (q *Queries) TombstonePullRequest(ctx context.Context, arg TombstonePullReq
 	return i, err
 }
 
+const tombstonePullRequestReviewRequests = `-- name: TombstonePullRequestReviewRequests :many
+UPDATE pull_request_review_requests
+SET tombstoned_at = $1,
+    synced_at = $1,
+    last_checked_at = GREATEST(
+        last_checked_at,
+        $1
+    ),
+    etag = '',
+    sync_source = $2
+WHERE repo_id = $3
+  AND pr_number = $4
+  AND tombstoned_at IS NULL
+RETURNING reviewer_kind || ':' || reviewer_gh_id::text AS reviewer_key
+`
+
+type TombstonePullRequestReviewRequestsParams struct {
+	TombstonedAt pgtype.Timestamptz
+	SyncSource   string
+	RepoID       int64
+	PrNumber     int32
+}
+
+func (q *Queries) TombstonePullRequestReviewRequests(ctx context.Context, arg TombstonePullRequestReviewRequestsParams) ([]interface{}, error) {
+	rows, err := q.db.Query(ctx, tombstonePullRequestReviewRequests,
+		arg.TombstonedAt,
+		arg.SyncSource,
+		arg.RepoID,
+		arg.PrNumber,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []interface{}
+	for rows.Next() {
+		var reviewer_key interface{}
+		if err := rows.Scan(&reviewer_key); err != nil {
+			return nil, err
+		}
+		items = append(items, reviewer_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const tombstoneRepository = `-- name: TombstoneRepository :one
 UPDATE repos
 SET tombstoned_at = $1,
@@ -1411,6 +1613,50 @@ func (q *Queries) TouchPullRequestCheckedAt(ctx context.Context, arg TouchPullRe
 		arg.Etag,
 		arg.RepoID,
 		arg.PrNumber,
+	)
+	return err
+}
+
+const touchPullRequestReviewRequestsCheckedAt = `-- name: TouchPullRequestReviewRequestsCheckedAt :exec
+UPDATE pull_request_review_requests
+SET last_checked_at = GREATEST(
+        pull_request_review_requests.last_checked_at,
+        $1
+    ),
+    etag = CASE WHEN $2::text = ''
+                THEN pull_request_review_requests.etag
+                ELSE $2::text END
+WHERE pull_request_review_requests.repo_id = $3
+  AND pull_request_review_requests.pr_number = $4
+  AND pull_request_review_requests.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM pull_requests
+      WHERE pull_requests.repo_id = $3
+        AND pull_requests.number = $4
+        AND pull_requests.tombstoned_at IS NULL
+        AND (
+            pull_requests.gh_updated_at IS NULL
+            OR pull_requests.gh_updated_at <= $5
+        )
+  )
+`
+
+type TouchPullRequestReviewRequestsCheckedAtParams struct {
+	CheckedAt   pgtype.Timestamptz
+	Etag        string
+	RepoID      int64
+	PrNumber    int32
+	GhUpdatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) TouchPullRequestReviewRequestsCheckedAt(ctx context.Context, arg TouchPullRequestReviewRequestsCheckedAtParams) error {
+	_, err := q.db.Exec(ctx, touchPullRequestReviewRequestsCheckedAt,
+		arg.CheckedAt,
+		arg.Etag,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.GhUpdatedAt,
 	)
 	return err
 }

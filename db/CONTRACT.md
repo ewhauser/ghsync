@@ -1,8 +1,9 @@
 # ghsync Postgres delivery contract
 
-Contract version: **v1**. The schema lives in the squashed baseline
+Contract version: **v1**. The schema begins in the squashed baseline
 migrations (`0001` tables, `0002` functions and the database-enforced
-writer fence trigger, `0003` views).
+writer fence trigger, `0003` views) and is extended only by checksummed,
+append-only migrations such as `0004` through `0006`.
 
 Postgres is the ghsync sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
@@ -28,6 +29,7 @@ GRANT SELECT ON TABLE
     repo_rules,
     stacks,
     pull_requests,
+    pull_request_review_requests,
     review_threads,
     check_runs,
     check_history,
@@ -138,6 +140,21 @@ JSON value may be empty.
 | `pull_requests` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
 | `pull_requests` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
 | `pull_requests` | `display_until` | `timestamp with time zone` | yes | closed-row display-retention boundary |
+| `pull_request_review_requests` | `repo_id` | `bigint` | no | primary key part; references pull_requests(repo_id,number) |
+| `pull_request_review_requests` | `pr_number` | `integer` | no | primary key part; repository-local PR number |
+| `pull_request_review_requests` | `reviewer_kind` | `text` | no | primary key part; user or team |
+| `pull_request_review_requests` | `reviewer_gh_id` | `bigint` | no | primary key part; stable GitHub user or team identity |
+| `pull_request_review_requests` | `reviewer_node_id` | `text` | no | stable GitHub GraphQL user or team identity |
+| `pull_request_review_requests` | `reviewer_login` | `text` | no | current user login or team slug |
+| `pull_request_review_requests` | `requested_at` | `timestamp with time zone` | yes | authoritative request time when exposed by GitHub |
+| `pull_request_review_requests` | `first_seen_at` | `timestamp with time zone` | no | fallback age for the current uninterrupted request |
+| `pull_request_review_requests` | `gh_updated_at` | `timestamp with time zone` | no | parent PR write-if-newer observation version |
+| `pull_request_review_requests` | `head_sha` | `text` | no | PR head observed with this snapshot row |
+| `pull_request_review_requests` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `pull_request_review_requests` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_review_requests` | `sync_source` | `text` | no | provenance enum |
+| `pull_request_review_requests` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not in the current request set |
+| `pull_request_review_requests` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
 | `review_threads` | `id` | `text` | no | primary key; GitHub thread node ID |
 | `review_threads` | `repo_id` | `bigint` | no | references repos.id |
 | `review_threads` | `pr_number` | `integer` | no | references pull_requests(repo_id,number) |
@@ -216,7 +233,8 @@ use GitHub IDs plus repository-local numbers.
 
 ### Provenance, freshness, and tombstones
 
-`sync_source` is one of `webhook`, `reconcile`, `backfill`, or `manual`.
+`sync_source` is one of `webhook`, `reconcile`, `backfill`, `manual`, or
+`interactive`.
 `synced_at` records the last accepted domain change; `last_checked_at` records
 the last authoritative validation, including 304 and identical responses. Do
 not use `synced_at` as the freshness check after an unchanged response.
@@ -230,6 +248,45 @@ covered by the closed-entity C-R1 validation bound.
 `check_history` is append-only transition history retained for at least 90
 days. Other tombstoned mirror skeletons have no v1 expiry.
 
+`pull_request_review_requests` is the authoritative current request set for a
+pull request. Live reads filter `tombstoned_at IS NULL` and distinguish users
+from teams with `reviewer_kind`; `reviewer_gh_id` and `reviewer_node_id` remain
+stable when `reviewer_login` changes. GitHub's `reviewRequests` connection does
+not expose a request timestamp, so current GraphQL and REST observations write
+`requested_at = NULL`. Consumers compute request age from
+`COALESCE(requested_at, first_seen_at)`: `requested_at`, when non-null, is the
+authoritative GitHub time; otherwise `first_seen_at` is only the time ghsync
+first observed that uninterrupted current request. Identical refreshes preserve
+`first_seen_at`; removal tombstones the row, and a later re-request starts a new
+`first_seen_at`. This table is a current-state snapshot, not request history.
+
+The v1 table intentionally represents only GraphQL `User` and `Team` union
+members with complete database and node identities. `Bot`, `Mannequin`,
+`EnterpriseTeam`, a null `requestedReviewer`, and future union variants are
+excluded rather than mislabeled as users or teams. A consumer can list the
+current supported requests for one open pull request with the partial live-set
+index by using:
+
+```sql
+SELECT request.reviewer_kind,
+       request.reviewer_gh_id,
+       request.reviewer_node_id,
+       request.reviewer_login,
+       COALESCE(request.requested_at, request.first_seen_at) AS request_age_from,
+       request.requested_at IS NOT NULL AS request_age_is_authoritative,
+       request.head_sha
+FROM pull_requests AS pull
+JOIN pull_request_review_requests AS request
+  ON request.repo_id = pull.repo_id
+ AND request.pr_number = pull.number
+WHERE pull.repo_id = $1
+  AND pull.number = $2
+  AND pull.state = 'open'
+  AND pull.tombstoned_at IS NULL
+  AND request.tombstoned_at IS NULL
+ORDER BY request.reviewer_kind, request.reviewer_gh_id;
+```
+
 ## Event-kind and entity-key grammar
 
 This manifest is normative and schema-tested against the constants and key
@@ -240,8 +297,8 @@ constructors used by the entity writer and deriver.
 | --- | --- | --- | --- | --- |
 | `entities` | `repository.changed` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
 | `entities` | `repository.tombstoned` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
-| `entities` | `pull_request.changed` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
-| `entities` | `pull_request.tombstoned` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
+| `entities` | `pull_request.changed` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number)` | `{"version":1}` |
+| `entities` | `pull_request.tombstoned` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number)` | `{"version":1}` |
 | `entities` | `stack.changed` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
 | `entities` | `stack.tombstoned` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
 | `entities` | `checks.changed` | `checks:{installation_id}:{repo_gh_id}:{head_sha}` | `check_runs(repos.installation_id,repos.gh_id,head_sha)` | `{"version":1}` |

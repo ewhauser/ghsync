@@ -68,6 +68,25 @@ type PullRequest struct {
 	ReviewDecision string    `json:"review_decision,omitempty"`
 }
 
+// IsSupportedReviewRequestUser reports whether a REST requested_reviewer is
+// a complete GitHub User identity covered by the v1 review-request contract.
+// GitHub also uses this shape for Bots and other account types; those are not
+// user requests and must not be mislabeled as one.
+func IsSupportedReviewRequestUser(user *github.User) bool {
+	if user == nil || user.GetID() <= 0 || user.GetNodeID() == "" ||
+		user.GetLogin() == "" {
+		return false
+	}
+	return user.GetType() == "" || user.GetType() == "User"
+}
+
+// IsSupportedReviewRequestTeam reports whether a REST requested_team has the
+// stable identities and slug required by the v1 review-request contract.
+func IsSupportedReviewRequestTeam(team *github.Team) bool {
+	return team != nil && team.GetID() > 0 && team.GetNodeID() != "" &&
+		team.GetSlug() != ""
+}
+
 // UnmarshalJSON preserves the private-preview stack extension.
 func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	var core github.PullRequest

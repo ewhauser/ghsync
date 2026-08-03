@@ -181,6 +181,61 @@ func (q *Queries) ListLoadgenCachedCheckRuns(ctx context.Context, repoFullName s
 	return items, nil
 }
 
+const listLoadgenCachedPullRequestReviewRequests = `-- name: ListLoadgenCachedPullRequestReviewRequests :many
+SELECT
+    request.pr_number,
+    request.reviewer_kind,
+    request.reviewer_gh_id,
+    request.reviewer_node_id,
+    request.reviewer_login,
+    request.requested_at,
+    request.head_sha
+FROM pull_request_review_requests AS request
+JOIN repos AS repo ON repo.id = request.repo_id
+WHERE repo.full_name = $1
+  AND repo.tombstoned_at IS NULL
+  AND request.tombstoned_at IS NULL
+ORDER BY request.pr_number, request.reviewer_kind, request.reviewer_gh_id
+`
+
+type ListLoadgenCachedPullRequestReviewRequestsRow struct {
+	PrNumber       int32
+	ReviewerKind   string
+	ReviewerGhID   int64
+	ReviewerNodeID string
+	ReviewerLogin  string
+	RequestedAt    pgtype.Timestamptz
+	HeadSha        string
+}
+
+func (q *Queries) ListLoadgenCachedPullRequestReviewRequests(ctx context.Context, repoFullName string) ([]ListLoadgenCachedPullRequestReviewRequestsRow, error) {
+	rows, err := q.db.Query(ctx, listLoadgenCachedPullRequestReviewRequests, repoFullName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLoadgenCachedPullRequestReviewRequestsRow
+	for rows.Next() {
+		var i ListLoadgenCachedPullRequestReviewRequestsRow
+		if err := rows.Scan(
+			&i.PrNumber,
+			&i.ReviewerKind,
+			&i.ReviewerGhID,
+			&i.ReviewerNodeID,
+			&i.ReviewerLogin,
+			&i.RequestedAt,
+			&i.HeadSha,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLoadgenCachedPullRequests = `-- name: ListLoadgenCachedPullRequests :many
 SELECT
     pull.gh_id,

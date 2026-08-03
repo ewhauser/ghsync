@@ -176,6 +176,7 @@ type TruthPullRequestSnapshot struct {
 	Base           PullRequestBranch `json:"base"`
 	UpdatedAt      time.Time         `json:"updated_at"`
 	Stack          *StackRef         `json:"stack"`
+	ReviewRequests []ReviewRequest   `json:"review_requests"`
 }
 
 type TruthReviewThreadSnapshot struct {
@@ -418,14 +419,17 @@ func truthRepository(repository TruthRepository) Repository {
 func applyTruthPullRequest(fixture *Fixture, mutation TruthPullRequest) {
 	index := -1
 	var threads []ReviewThread
+	var reviewRequests []ReviewRequest
 	var stack *StackRef
 	for candidate := range fixture.PullRequests {
-		if fixture.PullRequests[candidate].Number == mutation.Number {
-			index = candidate
-			threads = fixture.PullRequests[candidate].ReviewThreads
-			stack = fixture.PullRequests[candidate].Stack
-			break
+		if fixture.PullRequests[candidate].Number != mutation.Number {
+			continue
 		}
+		index = candidate
+		threads = fixture.PullRequests[candidate].ReviewThreads
+		reviewRequests = fixture.PullRequests[candidate].ReviewRequests
+		stack = fixture.PullRequests[candidate].Stack
+		break
 	}
 	pull := PullRequest{
 		ID:             mutation.ID,
@@ -445,11 +449,12 @@ func applyTruthPullRequest(fixture *Fixture, mutation TruthPullRequest) {
 			Ref: mutation.Base.Ref,
 			SHA: mutation.Base.SHA,
 		},
-		UpdatedAt:     mutation.UpdatedAt,
-		CreatedAt:     mutation.CreatedAt,
-		MergedAt:      cloneTime(mutation.MergedAt),
-		Stack:         stack,
-		ReviewThreads: threads,
+		UpdatedAt:      mutation.UpdatedAt,
+		CreatedAt:      mutation.CreatedAt,
+		MergedAt:       cloneTime(mutation.MergedAt),
+		Stack:          stack,
+		ReviewThreads:  threads,
+		ReviewRequests: reviewRequests,
 	}
 	if index >= 0 {
 		fixture.PullRequests[index] = pull
@@ -656,6 +661,10 @@ func snapshotFixture(fixture Fixture) TruthFixtureSnapshot {
 				Base:           pull.Base,
 				UpdatedAt:      pull.UpdatedAt,
 				Stack:          pull.Stack,
+				ReviewRequests: append(
+					[]ReviewRequest(nil),
+					pull.ReviewRequests...,
+				),
 			},
 		)
 		for _, thread := range pull.ReviewThreads {

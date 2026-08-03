@@ -284,6 +284,69 @@ func TestFakeGitHubWebhookEmissionPathsValidateAgainstSchemas(t *testing.T) {
 	})
 }
 
+func TestFakeGitHubReviewRequestPayloadVariantsValidateAgainstSchemas(
+	t *testing.T,
+) {
+	t.Parallel()
+	fake := fakegithub.New(
+		fakegithub.DefaultFixture(),
+		fakeSchemaWebhookSecret,
+	)
+	validator := conformance.NewWebhookSchemaValidator()
+	reviewers := []fakegithub.ReviewRequest{
+		{
+			Kind: "user", ID: 5001, NodeID: "U_kwDOABCDEF5001",
+			Login: "reviewer",
+		},
+		{
+			Kind: "team", ID: 6001, NodeID: "T_kwDOABCDEF6001",
+			Login: "search-platform",
+		},
+	}
+	for _, action := range []string{
+		"review_requested",
+		"review_request_removed",
+	} {
+		for _, reviewer := range reviewers {
+			t.Run(action+"/"+reviewer.Kind, func(t *testing.T) {
+				t.Parallel()
+				var payload map[string]any
+				var err error
+				if action == "review_requested" {
+					payload, err = fake.PullRequestReviewRequestedWebhookPayload(
+						4812,
+						reviewer,
+					)
+				} else {
+					payload, err = fake.
+						PullRequestReviewRequestRemovedWebhookPayload(
+							4812,
+							reviewer,
+						)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := validator.Validate("pull_request", body); err != nil {
+					t.Fatal(err)
+				}
+				field := "requested_reviewer"
+				absent := "requested_team"
+				if reviewer.Kind == "team" {
+					field, absent = absent, field
+				}
+				if payload[field] == nil || payload[absent] != nil {
+					t.Fatalf("reviewer discriminator payload = %+v", payload)
+				}
+			})
+		}
+	}
+}
+
 func buildFakeWebhookPayload(
 	fake *fakegithub.Server,
 	event string,
