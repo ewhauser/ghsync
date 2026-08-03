@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -378,24 +380,62 @@ func TestMigrationLockWaitFailureClosesHijackedConnection(t *testing.T) {
 	}
 }
 
+// assertMigrationLockAvailable polls until the migration advisory lock can
+// be taken: the server releases a closed holder's session lock only when the
+// backend processes the disconnect, which is asynchronous relative to the
+// client's Close returning. Lock and unlock are pinned to one acquired
+// connection because pg_advisory_unlock on a different pooled session is a
+// silent no-op that would leak the lock.
 func assertMigrationLockAvailable(
 	t *testing.T,
 	ctx context.Context,
 	pool *pgxpool.Pool,
 ) {
 	t.Helper()
-	var acquired bool
-	if err := pool.QueryRow(ctx,
-		`SELECT pg_try_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`).
-		Scan(&acquired); err != nil {
+	connection, err := pool.Acquire(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !acquired {
-		t.Fatal("migration session lock remained held after callback exit")
-	}
-	if _, err := pool.Exec(ctx,
-		`SELECT pg_advisory_unlock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
-		t.Fatal(err)
+	defer connection.Release()
+	assertMigrationLockAvailableOn(t, ctx, connection)
+}
+
+// migrationLockSession is one pinned database session: pg_advisory_unlock on
+// a different pooled session is a silent no-op that would leak the lock.
+type migrationLockSession interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// assertMigrationLockAvailableOn polls until the migration advisory lock can
+// be taken on the given session: the server releases a closed holder's
+// session lock only when the backend processes the disconnect, which is
+// asynchronous relative to the client's Close returning.
+func assertMigrationLockAvailableOn(
+	t *testing.T,
+	ctx context.Context,
+	session migrationLockSession,
+) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var acquired bool
+		if err := session.QueryRow(ctx,
+			`SELECT pg_try_advisory_lock(hashtextextended('ghsync_schema_migrations', 0))`).
+			Scan(&acquired); err != nil {
+			t.Fatal(err)
+		}
+		if acquired {
+			if _, err := session.Exec(ctx,
+				`SELECT pg_advisory_unlock(hashtextextended('ghsync_schema_migrations', 0))`); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("migration session lock remained held after holder closed")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
