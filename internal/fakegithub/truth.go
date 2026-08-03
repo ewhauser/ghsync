@@ -16,6 +16,7 @@ type TruthMutation struct {
 	Repository    TruthRepository     `json:"repository"`
 	PullRequest   *TruthPullRequest   `json:"pull_request,omitempty"`
 	Review        *TruthReview        `json:"review,omitempty"`
+	IssueComment  *TruthIssueComment  `json:"issue_comment,omitempty"`
 	ReviewThread  *TruthReviewThread  `json:"review_thread,omitempty"`
 	ReviewComment *TruthReviewComment `json:"review_comment,omitempty"`
 	CheckSuite    *TruthCheckSuite    `json:"check_suite,omitempty"`
@@ -65,13 +66,27 @@ type TruthPullRequest struct {
 }
 
 type TruthReview struct {
-	ID          int64     `json:"id"`
-	NodeID      string    `json:"node_id"`
-	State       string    `json:"state"`
-	Body        string    `json:"body,omitempty"`
-	AuthorLogin string    `json:"author_login"`
-	CommitSHA   string    `json:"commit_sha,omitempty"`
-	SubmittedAt time.Time `json:"submitted_at"`
+	ID           int64     `json:"id"`
+	NodeID       string    `json:"node_id"`
+	State        string    `json:"state"`
+	Body         string    `json:"body,omitempty"`
+	AuthorLogin  string    `json:"author_login"`
+	AuthorKind   string    `json:"author_kind,omitempty"`
+	AuthorNodeID string    `json:"author_node_id,omitempty"`
+	CommitSHA    string    `json:"commit_sha,omitempty"`
+	SubmittedAt  time.Time `json:"submitted_at"`
+	UpdatedAt    time.Time `json:"updated_at,omitzero"`
+}
+
+type TruthIssueComment struct {
+	ID           int64     `json:"id"`
+	NodeID       string    `json:"node_id"`
+	AuthorKind   string    `json:"author_kind"`
+	AuthorNodeID string    `json:"author_node_id,omitempty"`
+	AuthorLogin  string    `json:"author_login,omitempty"`
+	Body         string    `json:"body,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type TruthReviewThread struct {
@@ -163,20 +178,22 @@ type TruthFixtureSnapshot struct {
 }
 
 type TruthPullRequestSnapshot struct {
-	ID             int64             `json:"id"`
-	NodeID         string            `json:"node_id"`
-	Number         int               `json:"number"`
-	Title          string            `json:"title"`
-	State          string            `json:"state"`
-	Draft          bool              `json:"draft"`
-	AuthorLogin    string            `json:"author_login"`
-	ReviewDecision string            `json:"review_decision"`
-	MergeableState string            `json:"mergeable_state"`
-	Head           PullRequestBranch `json:"head"`
-	Base           Base              `json:"base"`
-	UpdatedAt      time.Time         `json:"updated_at"`
-	Stack          *StackRef         `json:"stack"`
-	ReviewRequests []ReviewRequest   `json:"review_requests"`
+	ID             int64               `json:"id"`
+	NodeID         string              `json:"node_id"`
+	Number         int                 `json:"number"`
+	Title          string              `json:"title"`
+	State          string              `json:"state"`
+	Draft          bool                `json:"draft"`
+	AuthorLogin    string              `json:"author_login"`
+	ReviewDecision string              `json:"review_decision"`
+	MergeableState string              `json:"mergeable_state"`
+	Head           PullRequestBranch   `json:"head"`
+	Base           Base                `json:"base"`
+	UpdatedAt      time.Time           `json:"updated_at"`
+	Stack          *StackRef           `json:"stack"`
+	ReviewRequests []ReviewRequest     `json:"review_requests"`
+	Reviews        []PullRequestReview `json:"reviews"`
+	Comments       []IssueComment      `json:"comments"`
 }
 
 type TruthReviewThreadSnapshot struct {
@@ -265,7 +282,16 @@ func (s *Server) applyTruthMutation(mutation TruthMutation) error {
 			candidate.Repository.DefaultBranchSHA = mutation.Push.After
 		}
 		candidate.Repository.PushedAt = mutation.Push.PushedAt
-	case "pull_request", "pull_request_review":
+	case "pull_request":
+	case "pull_request_review":
+		applyTruthReview(&candidate, mutation.PullRequest.Number, *mutation.Review)
+	case "issue_comment":
+		applyTruthIssueComment(
+			&candidate,
+			mutation.PullRequest.Number,
+			mutation.Action,
+			*mutation.IssueComment,
+		)
 	case "review_comment":
 		applyTruthReviewComment(&candidate, *mutation.ReviewComment)
 	case "review_thread":
@@ -317,6 +343,26 @@ func validateTruthMutation(mutation TruthMutation) error {
 	case "pull_request_review":
 		if mutation.PullRequest == nil || mutation.Review == nil {
 			return fmt.Errorf("pull-request-review mutation is incomplete")
+		}
+	case "issue_comment":
+		if mutation.PullRequest == nil || mutation.IssueComment == nil {
+			return fmt.Errorf("issue-comment mutation is incomplete")
+		}
+		if mutation.IssueComment.NodeID == "" ||
+			mutation.IssueComment.CreatedAt.IsZero() ||
+			mutation.IssueComment.UpdatedAt.IsZero() {
+			return fmt.Errorf("issue-comment identity or timestamp is incomplete")
+		}
+		if !validTruthActor(
+			mutation.IssueComment.AuthorKind,
+			mutation.IssueComment.AuthorNodeID,
+			mutation.IssueComment.AuthorLogin,
+		) {
+			return fmt.Errorf("issue-comment author identity is invalid")
+		}
+		if mutation.Action != "created" && mutation.Action != "edited" &&
+			mutation.Action != "deleted" {
+			return fmt.Errorf("unsupported issue-comment action %q", mutation.Action)
 		}
 	case "review_comment":
 		if mutation.PullRequest == nil || mutation.ReviewComment == nil {
@@ -420,6 +466,8 @@ func applyTruthPullRequest(fixture *Fixture, mutation TruthPullRequest) {
 	index := -1
 	var threads []ReviewThread
 	var reviewRequests []ReviewRequest
+	var reviews []PullRequestReview
+	var comments []IssueComment
 	var stack *StackRef
 	for candidate := range fixture.PullRequests {
 		if fixture.PullRequests[candidate].Number != mutation.Number {
@@ -428,6 +476,8 @@ func applyTruthPullRequest(fixture *Fixture, mutation TruthPullRequest) {
 		index = candidate
 		threads = fixture.PullRequests[candidate].ReviewThreads
 		reviewRequests = fixture.PullRequests[candidate].ReviewRequests
+		reviews = fixture.PullRequests[candidate].Reviews
+		comments = fixture.PullRequests[candidate].Comments
 		stack = fixture.PullRequests[candidate].Stack
 		break
 	}
@@ -455,6 +505,8 @@ func applyTruthPullRequest(fixture *Fixture, mutation TruthPullRequest) {
 		Stack:          stack,
 		ReviewThreads:  threads,
 		ReviewRequests: reviewRequests,
+		Reviews:        reviews,
+		Comments:       comments,
 	}
 	if index >= 0 {
 		fixture.PullRequests[index] = pull
@@ -486,6 +538,108 @@ func applyTruthPullRequest(fixture *Fixture, mutation TruthPullRequest) {
 				stack.UpdatedAt = entry.UpdatedAt
 			}
 		}
+	}
+}
+
+func applyTruthReview(
+	fixture *Fixture,
+	pullNumber int,
+	mutation TruthReview,
+) {
+	authorKind := mutation.AuthorKind
+	if authorKind == "" {
+		authorKind = "user"
+	}
+	updatedAt := mutation.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = mutation.SubmittedAt
+	}
+	submittedAt := mutation.SubmittedAt
+	review := PullRequestReview{
+		ID:     mutation.ID,
+		NodeID: mutation.NodeID,
+		Author: Actor{
+			Kind:   authorKind,
+			NodeID: mutation.AuthorNodeID,
+			Login:  mutation.AuthorLogin,
+		},
+		State:       mutation.State,
+		SubmittedAt: &submittedAt,
+		UpdatedAt:   updatedAt,
+		CommitOID:   mutation.CommitSHA,
+	}
+	for pullIndex := range fixture.PullRequests {
+		pull := &fixture.PullRequests[pullIndex]
+		if pull.Number != pullNumber {
+			continue
+		}
+		for reviewIndex := range pull.Reviews {
+			if pull.Reviews[reviewIndex].NodeID == review.NodeID {
+				pull.Reviews[reviewIndex] = review
+				return
+			}
+		}
+		pull.Reviews = append(pull.Reviews, review)
+		return
+	}
+}
+
+func applyTruthIssueComment(
+	fixture *Fixture,
+	pullNumber int,
+	action string,
+	mutation TruthIssueComment,
+) {
+	for pullIndex := range fixture.PullRequests {
+		pull := &fixture.PullRequests[pullIndex]
+		if pull.Number != pullNumber {
+			continue
+		}
+		for commentIndex := range pull.Comments {
+			if pull.Comments[commentIndex].NodeID != mutation.NodeID {
+				continue
+			}
+			if action == "deleted" {
+				pull.Comments = append(
+					pull.Comments[:commentIndex],
+					pull.Comments[commentIndex+1:]...,
+				)
+				return
+			}
+			pull.Comments[commentIndex] = truthIssueComment(mutation)
+			return
+		}
+		if action != "deleted" {
+			pull.Comments = append(pull.Comments, truthIssueComment(mutation))
+		}
+		return
+	}
+}
+
+func truthIssueComment(mutation TruthIssueComment) IssueComment {
+	return IssueComment{
+		ID:     mutation.ID,
+		NodeID: mutation.NodeID,
+		Author: Actor{
+			Kind:   mutation.AuthorKind,
+			NodeID: mutation.AuthorNodeID,
+			Login:  mutation.AuthorLogin,
+		},
+		Body:      mutation.Body,
+		CreatedAt: mutation.CreatedAt,
+		UpdatedAt: mutation.UpdatedAt,
+	}
+}
+
+func validTruthActor(kind, nodeID, login string) bool {
+	switch kind {
+	case "user", "bot", "mannequin", "organization",
+		"enterprise_user_account", "unknown":
+		return true
+	case "deleted":
+		return nodeID == "" && login == ""
+	default:
+		return false
 	}
 }
 
@@ -665,6 +819,14 @@ func snapshotFixture(fixture Fixture) TruthFixtureSnapshot {
 					[]ReviewRequest(nil),
 					pull.ReviewRequests...,
 				),
+				Reviews: append(
+					[]PullRequestReview(nil),
+					pull.Reviews...,
+				),
+				Comments: append(
+					[]IssueComment(nil),
+					pull.Comments...,
+				),
 			},
 		)
 		for _, thread := range pull.ReviewThreads {
@@ -713,6 +875,15 @@ func snapshotFixture(fixture Fixture) TruthFixtureSnapshot {
 		return snapshot.PullRequests[i].Number <
 			snapshot.PullRequests[j].Number
 	})
+	for index := range snapshot.PullRequests {
+		pull := &snapshot.PullRequests[index]
+		sort.Slice(pull.Reviews, func(i, j int) bool {
+			return pull.Reviews[i].NodeID < pull.Reviews[j].NodeID
+		})
+		sort.Slice(pull.Comments, func(i, j int) bool {
+			return pull.Comments[i].NodeID < pull.Comments[j].NodeID
+		})
+	}
 	sort.Slice(snapshot.Stacks, func(i, j int) bool {
 		return snapshot.Stacks[i].Number < snapshot.Stacks[j].Number
 	})

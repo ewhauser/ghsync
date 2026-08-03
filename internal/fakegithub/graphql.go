@@ -89,6 +89,40 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+	case strings.Contains(request.Query, "GhsyncPullRequestReviewsPage"):
+		id, after := graphQLCursorVariables(request.Variables)
+		for fixtureIndex := range fixtures {
+			fx := &fixtures[fixtureIndex]
+			for pullIndex := range fx.PullRequests {
+				pull := &fx.PullRequests[pullIndex]
+				if pull.NodeID == id {
+					data["node"] = map[string]any{
+						"reviews": graphQLReviews(pull.Reviews, after),
+					}
+					break
+				}
+			}
+			if data["node"] != nil {
+				break
+			}
+		}
+	case strings.Contains(request.Query, "GhsyncPullRequestCommentsPage"):
+		id, after := graphQLCursorVariables(request.Variables)
+		for fixtureIndex := range fixtures {
+			fx := &fixtures[fixtureIndex]
+			for pullIndex := range fx.PullRequests {
+				pull := &fx.PullRequests[pullIndex]
+				if pull.NodeID == id {
+					data["node"] = map[string]any{
+						"comments": graphQLIssueComments(pull.Comments, after),
+					}
+					break
+				}
+			}
+			if data["node"] != nil {
+				break
+			}
+		}
 	case strings.Contains(
 		request.Query,
 		"GhsyncPullRequestReviewThreadsPage",
@@ -182,6 +216,8 @@ func graphQLPullRequest(
 			},
 		},
 		"reviewRequests": graphQLReviewRequests(pull.ReviewRequests, 0),
+		"reviews":        graphQLReviews(pull.Reviews, 0),
+		"comments":       graphQLIssueComments(pull.Comments, 0),
 		"reviewThreads":  graphQLReviewThreads(pull.ReviewThreads, 0),
 	}
 }
@@ -221,6 +257,86 @@ func graphQLReviewRequests(
 		})
 	}
 	return map[string]any{"nodes": nodes, "pageInfo": pageInfo}
+}
+
+func graphQLReviews(reviews []PullRequestReview, after int) map[string]any {
+	start, end, pageInfo := graphQLPage(len(reviews), after)
+	nodes := make([]map[string]any, 0, end-start)
+	for index := start; index < end; index++ {
+		review := &reviews[index]
+		var commit any
+		if review.CommitOID != "" {
+			commit = map[string]any{"oid": review.CommitOID}
+		}
+		nodes = append(nodes, map[string]any{
+			"id":             review.NodeID,
+			"fullDatabaseId": nullableGraphQLBigInt(review.ID),
+			"state":          strings.ToUpper(review.State),
+			"submittedAt":    nullableTime(review.SubmittedAt),
+			"updatedAt":      review.UpdatedAt.Format(time.RFC3339Nano),
+			"author":         graphQLActor(review.Author),
+			"commit":         commit,
+		})
+	}
+	return map[string]any{"nodes": nodes, "pageInfo": pageInfo}
+}
+
+func nullableGraphQLBigInt(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func graphQLIssueComments(comments []IssueComment, after int) map[string]any {
+	start, end, pageInfo := graphQLPage(len(comments), after)
+	nodes := make([]map[string]any, 0, end-start)
+	for index := start; index < end; index++ {
+		comment := &comments[index]
+		nodes = append(nodes, map[string]any{
+			"id":             comment.NodeID,
+			"fullDatabaseId": nullableGraphQLBigInt(comment.ID),
+			"createdAt":      comment.CreatedAt.Format(time.RFC3339Nano),
+			"updatedAt":      comment.UpdatedAt.Format(time.RFC3339Nano),
+			"author":         graphQLActor(comment.Author),
+		})
+	}
+	return map[string]any{"nodes": nodes, "pageInfo": pageInfo}
+}
+
+func graphQLActor(actor Actor) any {
+	if actor.Kind == "deleted" {
+		return nil
+	}
+	typename := map[string]string{
+		"user":                    "User",
+		"bot":                     "Bot",
+		"mannequin":               "Mannequin",
+		"organization":            "Organization",
+		"enterprise_user_account": "EnterpriseUserAccount",
+	}[actor.Kind]
+	if typename == "" {
+		typename = "UnknownActor"
+	}
+	return map[string]any{
+		"__typename": typename,
+		"id":         nullableString(actor.NodeID),
+		"login":      nullableString(actor.Login),
+	}
+}
+
+func nullableDatabaseID(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func graphQLReviewThreads(

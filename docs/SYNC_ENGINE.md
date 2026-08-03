@@ -166,7 +166,8 @@ Consequences baked into the design:
   must be the common case for sweeps. A sweep that hits < 80% 304 rate on a
   quiet org indicates an ETag-handling bug.
 - **C-B5 — GraphQL is a separate budget with separate accounting.** Batched
-  reads (the per-PR fan-out: reviews, threads, check suites) go to GraphQL in
+  reads (the per-PR fan-out: reviews, ordinary issue comments, threads, check
+  suites) go to GraphQL in
   `nodes(ids:)` batches; the budgeter tracks point cost from the response's
   `rateLimit` block. REST is for what GraphQL can't do (stacks endpoints,
   Actions logs) and for conditional cheapness.
@@ -467,6 +468,10 @@ pull_requests(id, repo_id, number, title, state, head_ref, head_sha,
               review_decision, gh_updated_at, etag, synced_at, ...)
 pull_request_review_requests(repo_id, pr_number, reviewer_kind,
                              reviewer_gh_id, reviewer_node_id, ...)
+pull_request_reviews(node_id PRIMARY KEY, repo_id, pr_number, author_kind,
+                     state, submitted_at, commit_oid, gh_updated_at, ...)
+pull_request_comments(node_id PRIMARY KEY, repo_id, pr_number, author_kind,
+                      created_at, gh_updated_at, ...) -- no bodies
 review_threads(...), check_runs(...), check_history(...)
 
 -- Derivation

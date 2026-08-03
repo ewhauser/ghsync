@@ -181,6 +181,60 @@ func (q *Queries) ListLoadgenCachedCheckRuns(ctx context.Context, repoFullName s
 	return items, nil
 }
 
+const listLoadgenCachedPullRequestComments = `-- name: ListLoadgenCachedPullRequestComments :many
+SELECT comment.pr_number, comment.gh_id, comment.node_id,
+       comment.author_kind, comment.author_node_id, comment.author_login,
+       comment.created_at, comment.gh_updated_at, comment.head_sha
+FROM pull_request_comments AS comment
+JOIN repos AS repo ON repo.id = comment.repo_id
+WHERE repo.full_name = $1
+  AND repo.tombstoned_at IS NULL
+  AND comment.tombstoned_at IS NULL
+ORDER BY comment.pr_number, comment.node_id
+`
+
+type ListLoadgenCachedPullRequestCommentsRow struct {
+	PrNumber     int32
+	GhID         pgtype.Int8
+	NodeID       string
+	AuthorKind   string
+	AuthorNodeID pgtype.Text
+	AuthorLogin  pgtype.Text
+	CreatedAt    pgtype.Timestamptz
+	GhUpdatedAt  pgtype.Timestamptz
+	HeadSha      string
+}
+
+func (q *Queries) ListLoadgenCachedPullRequestComments(ctx context.Context, repoFullName string) ([]ListLoadgenCachedPullRequestCommentsRow, error) {
+	rows, err := q.db.Query(ctx, listLoadgenCachedPullRequestComments, repoFullName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLoadgenCachedPullRequestCommentsRow
+	for rows.Next() {
+		var i ListLoadgenCachedPullRequestCommentsRow
+		if err := rows.Scan(
+			&i.PrNumber,
+			&i.GhID,
+			&i.NodeID,
+			&i.AuthorKind,
+			&i.AuthorNodeID,
+			&i.AuthorLogin,
+			&i.CreatedAt,
+			&i.GhUpdatedAt,
+			&i.HeadSha,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLoadgenCachedPullRequestReviewRequests = `-- name: ListLoadgenCachedPullRequestReviewRequests :many
 SELECT
     request.pr_number,
@@ -224,6 +278,65 @@ func (q *Queries) ListLoadgenCachedPullRequestReviewRequests(ctx context.Context
 			&i.ReviewerNodeID,
 			&i.ReviewerLogin,
 			&i.RequestedAt,
+			&i.HeadSha,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLoadgenCachedPullRequestReviews = `-- name: ListLoadgenCachedPullRequestReviews :many
+SELECT review.pr_number, review.gh_id, review.node_id,
+       review.author_kind, review.author_node_id, review.author_login,
+       review.state, review.submitted_at, review.commit_oid,
+       review.gh_updated_at, review.head_sha
+FROM pull_request_reviews AS review
+JOIN repos AS repo ON repo.id = review.repo_id
+WHERE repo.full_name = $1
+  AND repo.tombstoned_at IS NULL
+  AND review.tombstoned_at IS NULL
+ORDER BY review.pr_number, review.node_id
+`
+
+type ListLoadgenCachedPullRequestReviewsRow struct {
+	PrNumber     int32
+	GhID         pgtype.Int8
+	NodeID       string
+	AuthorKind   string
+	AuthorNodeID pgtype.Text
+	AuthorLogin  pgtype.Text
+	State        string
+	SubmittedAt  pgtype.Timestamptz
+	CommitOid    pgtype.Text
+	GhUpdatedAt  pgtype.Timestamptz
+	HeadSha      string
+}
+
+func (q *Queries) ListLoadgenCachedPullRequestReviews(ctx context.Context, repoFullName string) ([]ListLoadgenCachedPullRequestReviewsRow, error) {
+	rows, err := q.db.Query(ctx, listLoadgenCachedPullRequestReviews, repoFullName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLoadgenCachedPullRequestReviewsRow
+	for rows.Next() {
+		var i ListLoadgenCachedPullRequestReviewsRow
+		if err := rows.Scan(
+			&i.PrNumber,
+			&i.GhID,
+			&i.NodeID,
+			&i.AuthorKind,
+			&i.AuthorNodeID,
+			&i.AuthorLogin,
+			&i.State,
+			&i.SubmittedAt,
+			&i.CommitOid,
+			&i.GhUpdatedAt,
 			&i.HeadSha,
 		); err != nil {
 			return nil, err

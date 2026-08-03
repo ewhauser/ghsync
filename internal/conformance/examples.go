@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-//go:embed corpus/pull_request/*payload*.json corpus/pull_request/opened.with-null-body.json corpus/pull_request_review/*payload*.json corpus/pull_request_review_comment/*payload*.json corpus/pull_request_review_thread/*payload*.json corpus/check_run/*payload*.json corpus/check_suite/*payload*.json corpus/push/*payload*.json
+//go:embed corpus/pull_request/*payload*.json corpus/pull_request/opened.with-null-body.json corpus/pull_request_review/*payload*.json corpus/pull_request_review_comment/*payload*.json corpus/pull_request_review_thread/*payload*.json corpus/issue_comment/*payload*.json corpus/check_run/*payload*.json corpus/check_suite/*payload*.json corpus/push/*payload*.json
 var payloadExamples embed.FS
 
 // PayloadExample is one vendored octokit webhook example.

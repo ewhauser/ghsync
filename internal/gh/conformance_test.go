@@ -504,6 +504,33 @@ func TestGraphQLPaginatesReviewThreadsAndNestedComments(t *testing.T) {
 		fakegithub.ReviewRequest{Kind: "nil"},
 	)
 	fixture.PullRequests[1].ReviewRequests = reviewRequests
+	reviews := make([]fakegithub.PullRequestReview, 101)
+	comments := make([]fakegithub.IssueComment, 101)
+	for index := range reviews {
+		submittedAt := now.Add(time.Duration(index) * time.Minute)
+		reviews[index] = fakegithub.PullRequestReview{
+			ID:     int64(90_000 + index),
+			NodeID: fmt.Sprintf("review-%03d", index),
+			Author: fakegithub.Actor{
+				Kind: "user", NodeID: fmt.Sprintf("user-%03d", index),
+				Login: fmt.Sprintf("reviewer-%03d", index),
+			},
+			State: "approved", SubmittedAt: &submittedAt,
+			UpdatedAt: submittedAt, CommitOID: "8f31c2d",
+		}
+		comments[index] = fakegithub.IssueComment{
+			ID:     int64(5_000_000_000 + index),
+			NodeID: fmt.Sprintf("issue-comment-%03d", index),
+			Author: fakegithub.Actor{
+				Kind: "bot", NodeID: fmt.Sprintf("bot-%03d", index),
+				Login: fmt.Sprintf("bot-%03d[bot]", index),
+			},
+			CreatedAt: submittedAt, UpdatedAt: submittedAt,
+		}
+	}
+	comments[100].Author = fakegithub.Actor{Kind: "deleted"}
+	fixture.PullRequests[1].Reviews = reviews
+	fixture.PullRequests[1].Comments = comments
 	server, baseURL := startFake(t, fakegithub.WithFixture(fixture))
 	gate := budget.New(server.Client(), budget.Options{})
 	client := newGraphQLClient(t, baseURL, gate)
@@ -524,6 +551,21 @@ func TestGraphQLPaginatesReviewThreadsAndNestedComments(t *testing.T) {
 	if got := len(nodes[0].ReviewRequests.Nodes); got != 104 {
 		t.Fatalf("review requests = %d, want 104", got)
 	}
+	if got := len(nodes[0].Reviews.Nodes); got != 101 {
+		t.Fatalf("reviews = %d, want 101", got)
+	}
+	if id := nodes[0].Reviews.Nodes[100].FullDatabaseID; id == nil || int64(*id) != 90_100 {
+		t.Fatalf("review fullDatabaseId = %v, want 90100", id)
+	}
+	if got := len(nodes[0].Comments.Nodes); got != 101 {
+		t.Fatalf("comments = %d, want 101", got)
+	}
+	if id := nodes[0].Comments.Nodes[100].FullDatabaseID; id == nil || int64(*id) != 5_000_000_100 {
+		t.Fatalf("comment fullDatabaseId = %v, want 5000000100", id)
+	}
+	if nodes[0].Comments.Nodes[100].Author != nil {
+		t.Fatalf("deleted comment author = %#v, want nil", nodes[0].Comments.Nodes[100].Author)
+	}
 	if nodes[0].ReviewRequests.Nodes[0].RequestedReviewer.Typename != "User" ||
 		nodes[0].ReviewRequests.Nodes[1].RequestedReviewer.Typename != "Team" {
 		t.Fatalf("review-request union nodes = %#v", nodes[0].ReviewRequests.Nodes[:2])
@@ -536,8 +578,8 @@ func TestGraphQLPaginatesReviewThreadsAndNestedComments(t *testing.T) {
 			nodes[0].ReviewRequests.Nodes[101:],
 		)
 	}
-	if got := server.handler.RequestCount(http.MethodPost, "/graphql"); got != 4 {
-		t.Fatalf("GraphQL requests = %d, want initial + three page calls", got)
+	if got := server.handler.RequestCount(http.MethodPost, "/graphql"); got != 6 {
+		t.Fatalf("GraphQL requests = %d, want initial + five page calls", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"time"
 )
 
 func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) (Fixture, bool) {
@@ -210,6 +211,80 @@ func (s *Server) getPull(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	http.NotFound(w, r)
+}
+
+func (s *Server) listPullReviews(w http.ResponseWriter, r *http.Request) {
+	pull, ok := s.pullForRequest(w, r)
+	if !ok {
+		return
+	}
+	values := make([]map[string]any, 0, len(pull.Reviews))
+	for index := range pull.Reviews {
+		review := &pull.Reviews[index]
+		values = append(values, map[string]any{
+			"id":           nullableDatabaseID(review.ID),
+			"node_id":      review.NodeID,
+			"user":         restActor(review.Author),
+			"state":        review.State,
+			"submitted_at": nullableTime(review.SubmittedAt),
+			"updated_at":   review.UpdatedAt.Format(time.RFC3339Nano),
+			"commit_id":    nullableString(review.CommitOID),
+		})
+	}
+	s.writeConditionalJSON(w, r, paginate(values, r, w))
+}
+
+func (s *Server) listIssueComments(w http.ResponseWriter, r *http.Request) {
+	pull, ok := s.pullForRequest(w, r)
+	if !ok {
+		return
+	}
+	values := make([]map[string]any, 0, len(pull.Comments))
+	for index := range pull.Comments {
+		comment := &pull.Comments[index]
+		values = append(values, map[string]any{
+			"id":         nullableDatabaseID(comment.ID),
+			"node_id":    comment.NodeID,
+			"user":       restActor(comment.Author),
+			"body":       comment.Body,
+			"created_at": comment.CreatedAt.Format(time.RFC3339Nano),
+			"updated_at": comment.UpdatedAt.Format(time.RFC3339Nano),
+		})
+	}
+	s.writeConditionalJSON(w, r, paginate(values, r, w))
+}
+
+func (s *Server) pullForRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+) (*PullRequest, bool) {
+	fx, ok := s.checkRepo(w, r)
+	if !ok {
+		return nil, false
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		http.Error(w, "bad pull request number", http.StatusBadRequest)
+		return nil, false
+	}
+	for index := range fx.PullRequests {
+		if fx.PullRequests[index].Number == number {
+			return &fx.PullRequests[index], true
+		}
+	}
+	http.NotFound(w, r)
+	return nil, false
+}
+
+func restActor(actor Actor) any {
+	if actor.Kind == "deleted" {
+		return nil
+	}
+	return map[string]any{
+		"node_id": nullableString(actor.NodeID),
+		"login":   nullableString(actor.Login),
+		"type":    actor.Kind,
+	}
 }
 
 func restReviewRequests(

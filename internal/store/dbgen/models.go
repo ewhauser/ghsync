@@ -141,6 +141,16 @@ type DerivationDirty struct {
 	MarkedAt pgtype.Timestamptz
 }
 
+type DriftEntitiesWithoutParticipation struct {
+	InstallationID int64
+	EntityKind     string
+	SourceID       int64
+	EntityKey      string
+	LockKey        string
+	CacheSnapshot  []byte
+	LastCheckedAt  pgtype.Timestamptz
+}
+
 type DriftEntity struct {
 	InstallationID int64
 	EntityKind     string
@@ -248,6 +258,44 @@ type PullRequest struct {
 	TombstonedAt   pgtype.Timestamptz
 	LastCheckedAt  pgtype.Timestamptz
 	DisplayUntil   pgtype.Timestamptz
+}
+
+type PullRequestComment struct {
+	NodeID        string
+	GhID          pgtype.Int8
+	RepoID        int64
+	PrNumber      int32
+	AuthorKind    string
+	AuthorNodeID  pgtype.Text
+	AuthorLogin   pgtype.Text
+	CreatedAt     pgtype.Timestamptz
+	GhUpdatedAt   pgtype.Timestamptz
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
+	TombstonedAt  pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+}
+
+type PullRequestReview struct {
+	NodeID        string
+	GhID          pgtype.Int8
+	RepoID        int64
+	PrNumber      int32
+	AuthorKind    string
+	AuthorNodeID  pgtype.Text
+	AuthorLogin   pgtype.Text
+	State         string
+	SubmittedAt   pgtype.Timestamptz
+	CommitOid     pgtype.Text
+	GhUpdatedAt   pgtype.Timestamptz
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
+	TombstonedAt  pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
 }
 
 type PullRequestReviewRequest struct {

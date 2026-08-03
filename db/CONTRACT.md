@@ -3,7 +3,7 @@
 Contract version: **v1**. The schema begins in the squashed baseline
 migrations (`0001` tables, `0002` functions and the database-enforced
 writer fence trigger, `0003` views) and is extended only by checksummed,
-append-only migrations such as `0004` through `0006`.
+append-only migrations such as `0004` through `0007`.
 
 Postgres is the ghsync sync engine’s public delivery interface. Consumers
 read snapshot-consistent cache rows and follow reference events through
@@ -30,6 +30,8 @@ GRANT SELECT ON TABLE
     stacks,
     pull_requests,
     pull_request_review_requests,
+    pull_request_reviews,
+    pull_request_comments,
     review_threads,
     check_runs,
     check_history,
@@ -155,6 +157,38 @@ JSON value may be empty.
 | `pull_request_review_requests` | `sync_source` | `text` | no | provenance enum |
 | `pull_request_review_requests` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not in the current request set |
 | `pull_request_review_requests` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `pull_request_reviews` | `node_id` | `text` | no | primary key; stable GitHub GraphQL review identity |
+| `pull_request_reviews` | `gh_id` | `bigint` | yes | unique GitHub `fullDatabaseId` when exposed |
+| `pull_request_reviews` | `repo_id` | `bigint` | no | references pull_requests(repo_id,number) |
+| `pull_request_reviews` | `pr_number` | `integer` | no | repository-local PR number |
+| `pull_request_reviews` | `author_kind` | `text` | no | normalized GraphQL actor kind or deleted |
+| `pull_request_reviews` | `author_node_id` | `text` | yes | stable actor identity when exposed |
+| `pull_request_reviews` | `author_login` | `text` | yes | actor login when exposed |
+| `pull_request_reviews` | `state` | `text` | no | current normalized GitHub review state |
+| `pull_request_reviews` | `submitted_at` | `timestamp with time zone` | yes | GitHub submission time; null for pending reviews |
+| `pull_request_reviews` | `commit_oid` | `text` | yes | commit observed by the review when resolvable |
+| `pull_request_reviews` | `gh_updated_at` | `timestamp with time zone` | no | per-review write-if-newer version |
+| `pull_request_reviews` | `head_sha` | `text` | no | PR head observed with this fact |
+| `pull_request_reviews` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `pull_request_reviews` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_reviews` | `sync_source` | `text` | no | provenance enum |
+| `pull_request_reviews` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means GitHub no longer returned the review |
+| `pull_request_reviews` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
+| `pull_request_comments` | `node_id` | `text` | no | primary key; stable GitHub GraphQL issue-comment identity |
+| `pull_request_comments` | `gh_id` | `bigint` | yes | unique GitHub database identity when exposed |
+| `pull_request_comments` | `repo_id` | `bigint` | no | references pull_requests(repo_id,number) |
+| `pull_request_comments` | `pr_number` | `integer` | no | repository-local PR number |
+| `pull_request_comments` | `author_kind` | `text` | no | normalized GraphQL actor kind or deleted |
+| `pull_request_comments` | `author_node_id` | `text` | yes | stable actor identity when exposed |
+| `pull_request_comments` | `author_login` | `text` | yes | actor login when exposed |
+| `pull_request_comments` | `created_at` | `timestamp with time zone` | no | GitHub creation time |
+| `pull_request_comments` | `gh_updated_at` | `timestamp with time zone` | no | GitHub updated_at and per-comment write-if-newer version |
+| `pull_request_comments` | `head_sha` | `text` | no | PR head observed with this fact |
+| `pull_request_comments` | `synced_at` | `timestamp with time zone` | no | domain-change time |
+| `pull_request_comments` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_comments` | `sync_source` | `text` | no | provenance enum |
+| `pull_request_comments` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means GitHub no longer returned the comment |
+| `pull_request_comments` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
 | `review_threads` | `id` | `text` | no | primary key; GitHub thread node ID |
 | `review_threads` | `repo_id` | `bigint` | no | references repos.id |
 | `review_threads` | `pr_number` | `integer` | no | references pull_requests(repo_id,number) |
@@ -287,6 +321,88 @@ WHERE pull.repo_id = $1
 ORDER BY request.reviewer_kind, request.reviewer_gh_id;
 ```
 
+`pull_request_reviews` and `pull_request_comments` are identity-keyed fact
+histories, not replace-set identities. `node_id` is the stable row identity;
+`gh_id` carries GitHub's 64-bit `fullDatabaseId` when that identity is exposed;
+the deprecated 32-bit `databaseId` is not used. Consumers must use `node_id`
+as the stable cross-delivery identity because GitHub may omit the database ID.
+A review's monotonic basis is lifecycle state plus timestamps: `dismissed` is
+terminal for that review node, submitted rows outrank pending rows, and edits
+within the same lifecycle advance on `submitted_at` and `gh_updated_at`. This
+lets a dismissal replace an edited row even when GitHub leaves or regresses the
+review's `updatedAt`, while preventing an older submitted snapshot from
+resurrecting the review. A comment advances on GitHub `updatedAt`, stored as
+`gh_updated_at`.
+
+Every participation write is additionally fenced by the authoritative parent
+PR observation. The complete connection is accepted only when its parent
+`gh_updated_at` is at least as new as the cached PR. A delayed parent snapshot
+therefore cannot insert, update, or tombstone child facts learned by a newer
+observation. Within an accepted complete observation, absence is authoritative
+and tombstones a missing node without comparing unrelated child and parent
+timestamps. Dismissal is an update: the review remains live with
+`state = 'dismissed'`; it is not tombstoned.
+
+Review lifecycle values are normalized to lowercase. `pending` is an
+unsubmitted draft and has no authoritative `submitted_at`. A submitted review
+has a non-null `submitted_at` and normally has state `approved`,
+`changes_requested`, or `commented`; `dismissed` means GitHub later invalidated
+that already-submitted review while retaining its author, submission time, and
+observed commit. Webhook action `submitted` is therefore a lifecycle action,
+not a separate stored review state. Consumers should preserve unknown future
+states as facts rather than classifying them.
+
+Author policy is lossless across the two normalized tables. `author_kind` is
+`user`, `bot`, `mannequin`, `organization`, `enterprise_user_account`,
+`unknown`, or `deleted`. Non-user actors are retained because excluding them
+would falsify participation. For a deleted author, `author_kind = 'deleted'`
+and both identity columns are null. Other kinds retain GraphQL node ID and
+login whenever GitHub supplies them; either identity column may be null when
+upstream omits it. Ordinary issue-comment bodies are deliberately not stored.
+
+To derive PR participants, union authorship, submitted review authors,
+review-thread comment authors, and ordinary issue-comment authors. The query
+below returns facts rather than a score or workflow classification; consumers
+may group the result into their own participant set. Review-thread comments
+are the existing embedded `review_threads.comments` facts, while ordinary PR
+conversation is in `pull_request_comments`:
+
+```sql
+SELECT 'authored' AS participation, 'user' AS actor_kind,
+       NULL::text AS actor_node_id, pull.author_login AS actor_login
+FROM pull_requests AS pull
+WHERE pull.repo_id = $1 AND pull.number = $2
+  AND pull.tombstoned_at IS NULL
+UNION ALL
+SELECT 'reviewed', review.author_kind,
+       review.author_node_id, review.author_login
+FROM pull_request_reviews AS review
+WHERE review.repo_id = $1 AND review.pr_number = $2
+  AND review.tombstoned_at IS NULL
+  AND review.submitted_at IS NOT NULL
+UNION ALL
+SELECT 'commented',
+       CASE WHEN NULLIF(comment->>'author_login', '') IS NULL
+            THEN 'deleted' ELSE 'user' END,
+       NULL::text, NULLIF(comment->>'author_login', '')
+FROM review_threads AS thread
+CROSS JOIN LATERAL jsonb_array_elements(thread.comments) AS comment
+WHERE thread.repo_id = $1 AND thread.pr_number = $2
+  AND thread.tombstoned_at IS NULL
+UNION ALL
+SELECT 'commented', comment.author_kind,
+       comment.author_node_id, comment.author_login
+FROM pull_request_comments AS comment
+WHERE comment.repo_id = $1 AND comment.pr_number = $2
+  AND comment.tombstoned_at IS NULL;
+```
+
+When the parent PR closes, participation rows follow the existing
+`pull_requests.display_until` display posture: they remain queryable facts,
+while the parent controls whether the closed PR is still display-eligible.
+Tombstoned participation skeletons have no v1 expiry, matching other mirror
+rows; live reads always filter `tombstoned_at IS NULL`.
+
 ## Event-kind and entity-key grammar
 
 This manifest is normative and schema-tested against the constants and key
@@ -297,8 +413,8 @@ constructors used by the entity writer and deriver.
 | --- | --- | --- | --- | --- |
 | `entities` | `repository.changed` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
 | `entities` | `repository.tombstoned` | `repo:{installation_id}:{repo_gh_id}` | `repos(installation_id,gh_id)` | `{"version":1}` |
-| `entities` | `pull_request.changed` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number)` | `{"version":1}` |
-| `entities` | `pull_request.tombstoned` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number)` | `{"version":1}` |
+| `entities` | `pull_request.changed` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number)` | `{"version":1}` |
+| `entities` | `pull_request.tombstoned` | `pr:{installation_id}:{repo_gh_id}:{pr_number}` | `pull_requests(repos.installation_id,repos.gh_id,number), pull_request_review_requests(repo_id,pr_number), pull_request_reviews(repo_id,pr_number), pull_request_comments(repo_id,pr_number)` | `{"version":1}` |
 | `entities` | `stack.changed` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
 | `entities` | `stack.tombstoned` | `stack:{installation_id}:{repo_gh_id}:{stack_number}` | `stacks(repos.installation_id,repos.gh_id,number)` | `{"version":1}` |
 | `entities` | `checks.changed` | `checks:{installation_id}:{repo_gh_id}:{head_sha}` | `check_runs(repos.installation_id,repos.gh_id,head_sha)` | `{"version":1}` |

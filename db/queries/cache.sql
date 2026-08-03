@@ -598,6 +598,335 @@ WHERE repo_id = sqlc.arg(repo_id)
   AND tombstoned_at IS NULL
 RETURNING reviewer_kind || ':' || reviewer_gh_id::text AS reviewer_key;
 
+-- name: ReplacePullRequestReviews :many
+WITH input AS (
+    SELECT NULLIF((element->>'gh_id')::bigint, 0) AS gh_id,
+           element->>'node_id' AS node_id,
+           element->>'author_kind' AS author_kind,
+           NULLIF(element->>'author_node_id', '') AS author_node_id,
+           NULLIF(element->>'author_login', '') AS author_login,
+           element->>'state' AS state,
+           (element->>'submitted_at')::timestamptz AS submitted_at,
+           NULLIF(element->>'commit_oid', '') AS commit_oid,
+           (element->>'gh_updated_at')::timestamptz AS gh_updated_at
+    FROM jsonb_array_elements(sqlc.arg(reviews)::jsonb) AS element
+),
+eligible AS (
+    SELECT pull_requests.repo_id
+    FROM pull_requests
+    WHERE pull_requests.repo_id = sqlc.arg(repo_id)
+      AND pull_requests.number = sqlc.arg(pr_number)
+      AND pull_requests.tombstoned_at IS NULL
+      AND (
+          pull_requests.gh_updated_at IS NULL
+          OR pull_requests.gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+      )
+),
+upserted AS (
+    INSERT INTO pull_request_reviews (
+        gh_id, node_id, repo_id, pr_number, author_kind, author_node_id,
+        author_login, state, submitted_at, commit_oid, gh_updated_at,
+        head_sha, synced_at, etag, sync_source, tombstoned_at,
+        last_checked_at
+    )
+    SELECT input.gh_id, input.node_id, sqlc.arg(repo_id),
+           sqlc.arg(pr_number), input.author_kind, input.author_node_id,
+           input.author_login, input.state, input.submitted_at,
+           input.commit_oid, input.gh_updated_at, sqlc.arg(head_sha),
+           sqlc.arg(synced_at), sqlc.arg(etag), sqlc.arg(sync_source), NULL,
+           sqlc.arg(last_checked_at)
+    FROM input
+    WHERE EXISTS (SELECT 1 FROM eligible)
+    ON CONFLICT (node_id) DO UPDATE
+    SET gh_id = EXCLUDED.gh_id,
+        repo_id = EXCLUDED.repo_id,
+        pr_number = EXCLUDED.pr_number,
+        author_kind = EXCLUDED.author_kind,
+        author_node_id = EXCLUDED.author_node_id,
+        author_login = EXCLUDED.author_login,
+        state = EXCLUDED.state,
+        submitted_at = EXCLUDED.submitted_at,
+        commit_oid = EXCLUDED.commit_oid,
+        gh_updated_at = EXCLUDED.gh_updated_at,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        last_checked_at = EXCLUDED.last_checked_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL
+    WHERE ROW(
+              CASE
+                  WHEN EXCLUDED.state = 'dismissed' THEN 2
+                  WHEN EXCLUDED.submitted_at IS NOT NULL THEN 1
+                  ELSE 0
+              END,
+              COALESCE(
+                  EXCLUDED.submitted_at,
+                  '-infinity'::timestamptz
+              ),
+              EXCLUDED.gh_updated_at
+          ) > ROW(
+              CASE
+                  WHEN pull_request_reviews.state = 'dismissed' THEN 2
+                  WHEN pull_request_reviews.submitted_at IS NOT NULL THEN 1
+                  ELSE 0
+              END,
+              COALESCE(
+                  pull_request_reviews.submitted_at,
+                  '-infinity'::timestamptz
+              ),
+              pull_request_reviews.gh_updated_at
+          )
+       OR (
+           ROW(
+               CASE
+                   WHEN EXCLUDED.state = 'dismissed' THEN 2
+                   WHEN EXCLUDED.submitted_at IS NOT NULL THEN 1
+                   ELSE 0
+               END,
+               COALESCE(
+                   EXCLUDED.submitted_at,
+                   '-infinity'::timestamptz
+               ),
+               EXCLUDED.gh_updated_at
+           ) = ROW(
+               CASE
+                   WHEN pull_request_reviews.state = 'dismissed' THEN 2
+                   WHEN pull_request_reviews.submitted_at IS NOT NULL THEN 1
+                   ELSE 0
+               END,
+               COALESCE(
+                   pull_request_reviews.submitted_at,
+                   '-infinity'::timestamptz
+               ),
+               pull_request_reviews.gh_updated_at
+           )
+           AND (
+               (
+                   pull_request_reviews.tombstoned_at IS NULL
+                   AND ROW(
+                   EXCLUDED.gh_id, EXCLUDED.repo_id, EXCLUDED.pr_number,
+                   EXCLUDED.author_kind, EXCLUDED.author_node_id,
+                   EXCLUDED.author_login, EXCLUDED.state,
+                   EXCLUDED.submitted_at, EXCLUDED.commit_oid,
+                   EXCLUDED.head_sha
+                   ) IS DISTINCT FROM ROW(
+                   pull_request_reviews.gh_id,
+                   pull_request_reviews.repo_id,
+                   pull_request_reviews.pr_number,
+                   pull_request_reviews.author_kind,
+                   pull_request_reviews.author_node_id,
+                   pull_request_reviews.author_login,
+                   pull_request_reviews.state,
+                   pull_request_reviews.submitted_at,
+                   pull_request_reviews.commit_oid,
+                       pull_request_reviews.head_sha
+                   )
+               )
+               OR (
+                   pull_request_reviews.tombstoned_at IS NOT NULL
+                   AND EXCLUDED.last_checked_at >
+                       pull_request_reviews.tombstoned_at
+                   AND EXISTS (SELECT 1 FROM eligible)
+               )
+           )
+       )
+    RETURNING node_id
+),
+tombstoned AS (
+    UPDATE pull_request_reviews
+    SET tombstoned_at = sqlc.arg(last_checked_at),
+        synced_at = sqlc.arg(synced_at),
+        last_checked_at = sqlc.arg(last_checked_at),
+        etag = sqlc.arg(etag),
+        sync_source = sqlc.arg(sync_source)
+    WHERE repo_id = sqlc.arg(repo_id)
+      AND pr_number = sqlc.arg(pr_number)
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND last_checked_at <= sqlc.arg(last_checked_at)
+      AND NOT EXISTS (
+          SELECT 1 FROM input
+          WHERE input.node_id = pull_request_reviews.node_id
+      )
+    RETURNING node_id
+)
+SELECT node_id FROM upserted
+UNION ALL
+SELECT node_id FROM tombstoned;
+
+-- name: TouchPullRequestReviewsCheckedAt :exec
+UPDATE pull_request_reviews
+SET last_checked_at = GREATEST(
+        pull_request_reviews.last_checked_at,
+        sqlc.arg(checked_at)
+    ),
+    etag = CASE WHEN sqlc.arg(etag)::text = '' THEN etag
+                ELSE sqlc.arg(etag)::text END
+WHERE pull_request_reviews.repo_id = sqlc.arg(repo_id)
+  AND pull_request_reviews.pr_number = sqlc.arg(pr_number)
+  AND pull_request_reviews.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM pull_requests
+      WHERE pull_requests.repo_id = sqlc.arg(repo_id)
+        AND pull_requests.number = sqlc.arg(pr_number)
+        AND pull_requests.tombstoned_at IS NULL
+        AND (
+            pull_requests.gh_updated_at IS NULL
+            OR pull_requests.gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+        )
+  );
+
+-- name: TombstonePullRequestReviews :many
+UPDATE pull_request_reviews
+SET tombstoned_at = sqlc.arg(tombstoned_at),
+    synced_at = sqlc.arg(tombstoned_at),
+    last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    etag = '',
+    sync_source = sqlc.arg(sync_source)
+WHERE repo_id = sqlc.arg(repo_id)
+  AND pr_number = sqlc.arg(pr_number)
+  AND tombstoned_at IS NULL
+RETURNING node_id;
+
+-- name: ReplacePullRequestComments :many
+WITH input AS (
+    SELECT NULLIF((element->>'gh_id')::bigint, 0) AS gh_id,
+           element->>'node_id' AS node_id,
+           element->>'author_kind' AS author_kind,
+           NULLIF(element->>'author_node_id', '') AS author_node_id,
+           NULLIF(element->>'author_login', '') AS author_login,
+           (element->>'created_at')::timestamptz AS created_at,
+           (element->>'gh_updated_at')::timestamptz AS gh_updated_at
+    FROM jsonb_array_elements(sqlc.arg(comments)::jsonb) AS element
+),
+eligible AS (
+    SELECT pull_requests.repo_id
+    FROM pull_requests
+    WHERE pull_requests.repo_id = sqlc.arg(repo_id)
+      AND pull_requests.number = sqlc.arg(pr_number)
+      AND pull_requests.tombstoned_at IS NULL
+      AND (
+          pull_requests.gh_updated_at IS NULL
+          OR pull_requests.gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+      )
+),
+upserted AS (
+    INSERT INTO pull_request_comments (
+        gh_id, node_id, repo_id, pr_number, author_kind, author_node_id,
+        author_login, created_at, gh_updated_at, head_sha, synced_at, etag,
+        sync_source, tombstoned_at, last_checked_at
+    )
+    SELECT input.gh_id, input.node_id, sqlc.arg(repo_id),
+           sqlc.arg(pr_number), input.author_kind, input.author_node_id,
+           input.author_login, input.created_at, input.gh_updated_at,
+           sqlc.arg(head_sha), sqlc.arg(synced_at), sqlc.arg(etag),
+           sqlc.arg(sync_source), NULL, sqlc.arg(last_checked_at)
+    FROM input
+    WHERE EXISTS (SELECT 1 FROM eligible)
+    ON CONFLICT (node_id) DO UPDATE
+    SET gh_id = EXCLUDED.gh_id,
+        repo_id = EXCLUDED.repo_id,
+        pr_number = EXCLUDED.pr_number,
+        author_kind = EXCLUDED.author_kind,
+        author_node_id = EXCLUDED.author_node_id,
+        author_login = EXCLUDED.author_login,
+        created_at = EXCLUDED.created_at,
+        gh_updated_at = EXCLUDED.gh_updated_at,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        last_checked_at = EXCLUDED.last_checked_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL
+    WHERE EXCLUDED.gh_updated_at > pull_request_comments.gh_updated_at
+       OR (
+           EXCLUDED.gh_updated_at = pull_request_comments.gh_updated_at
+           AND (
+               (
+                   pull_request_comments.tombstoned_at IS NULL
+                   AND ROW(
+                   EXCLUDED.gh_id, EXCLUDED.repo_id, EXCLUDED.pr_number,
+                   EXCLUDED.author_kind, EXCLUDED.author_node_id,
+                   EXCLUDED.author_login, EXCLUDED.created_at,
+                   EXCLUDED.head_sha
+                   ) IS DISTINCT FROM ROW(
+                   pull_request_comments.gh_id,
+                   pull_request_comments.repo_id,
+                   pull_request_comments.pr_number,
+                   pull_request_comments.author_kind,
+                   pull_request_comments.author_node_id,
+                   pull_request_comments.author_login,
+                   pull_request_comments.created_at,
+                       pull_request_comments.head_sha
+                   )
+               )
+               OR (
+                   pull_request_comments.tombstoned_at IS NOT NULL
+                   AND EXCLUDED.last_checked_at >
+                       pull_request_comments.tombstoned_at
+                   AND EXISTS (SELECT 1 FROM eligible)
+               )
+           )
+       )
+    RETURNING node_id
+),
+tombstoned AS (
+    UPDATE pull_request_comments
+    SET tombstoned_at = sqlc.arg(last_checked_at),
+        synced_at = sqlc.arg(synced_at),
+        last_checked_at = sqlc.arg(last_checked_at),
+        etag = sqlc.arg(etag),
+        sync_source = sqlc.arg(sync_source)
+    WHERE repo_id = sqlc.arg(repo_id)
+      AND pr_number = sqlc.arg(pr_number)
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND last_checked_at <= sqlc.arg(last_checked_at)
+      AND NOT EXISTS (
+          SELECT 1 FROM input
+          WHERE input.node_id = pull_request_comments.node_id
+      )
+    RETURNING node_id
+)
+SELECT node_id FROM upserted
+UNION ALL
+SELECT node_id FROM tombstoned;
+
+-- name: TouchPullRequestCommentsCheckedAt :exec
+UPDATE pull_request_comments
+SET last_checked_at = GREATEST(
+        pull_request_comments.last_checked_at,
+        sqlc.arg(checked_at)
+    ),
+    etag = CASE WHEN sqlc.arg(etag)::text = '' THEN etag
+                ELSE sqlc.arg(etag)::text END
+WHERE pull_request_comments.repo_id = sqlc.arg(repo_id)
+  AND pull_request_comments.pr_number = sqlc.arg(pr_number)
+  AND pull_request_comments.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM pull_requests
+      WHERE pull_requests.repo_id = sqlc.arg(repo_id)
+        AND pull_requests.number = sqlc.arg(pr_number)
+        AND pull_requests.tombstoned_at IS NULL
+        AND (
+            pull_requests.gh_updated_at IS NULL
+            OR pull_requests.gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+        )
+  );
+
+-- name: TombstonePullRequestComments :many
+UPDATE pull_request_comments
+SET tombstoned_at = sqlc.arg(tombstoned_at),
+    synced_at = sqlc.arg(tombstoned_at),
+    last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    etag = '',
+    sync_source = sqlc.arg(sync_source)
+WHERE repo_id = sqlc.arg(repo_id)
+  AND pr_number = sqlc.arg(pr_number)
+  AND tombstoned_at IS NULL
+RETURNING node_id;
+
 -- name: ReplaceCheckRuns :many
 WITH input AS (
     SELECT (element->>'gh_id')::bigint AS gh_id,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/ewhauser/ghsync/internal/budget"
@@ -100,10 +101,73 @@ type PullRequestNode struct {
 		Nodes    []ReviewRequestNode `json:"nodes"`
 		PageInfo PageInfo            `json:"pageInfo"`
 	} `json:"reviewRequests"`
+	Reviews struct {
+		Nodes    []PullRequestReviewNode `json:"nodes"`
+		PageInfo PageInfo                `json:"pageInfo"`
+	} `json:"reviews"`
+	Comments struct {
+		Nodes    []IssueCommentNode `json:"nodes"`
+		PageInfo PageInfo           `json:"pageInfo"`
+	} `json:"comments"`
 	ReviewThreads struct {
 		Nodes    []ReviewThreadNode `json:"nodes"`
 		PageInfo PageInfo           `json:"pageInfo"`
 	} `json:"reviewThreads"`
+}
+
+// ActorNode preserves every GraphQL Actor variant instead of projecting only
+// users. Author is nil when GitHub retains the fact but no longer exposes the
+// deleted actor.
+type ActorNode struct {
+	Typename string `json:"__typename"`
+	ID       string `json:"id"`
+	Login    string `json:"login"`
+}
+
+// BigInt decodes GitHub's GraphQL BigInt scalar, which is serialized as a
+// decimal string because it may exceed GraphQL's 32-bit Int range.
+type BigInt int64
+
+func (value *BigInt) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		*value = 0
+		return nil
+	}
+	encoded := string(data)
+	if len(data) > 0 && data[0] == '"' {
+		if err := json.Unmarshal(data, &encoded); err != nil {
+			return fmt.Errorf("decode GraphQL BigInt string: %w", err)
+		}
+	}
+	parsed, err := strconv.ParseInt(encoded, 10, 64)
+	if err != nil {
+		return fmt.Errorf("decode GraphQL BigInt %q: %w", encoded, err)
+	}
+	*value = BigInt(parsed)
+	return nil
+}
+
+// PullRequestReviewNode is one identity-keyed review fact.
+type PullRequestReviewNode struct {
+	ID             string     `json:"id"`
+	FullDatabaseID *BigInt    `json:"fullDatabaseId"`
+	State          string     `json:"state"`
+	SubmittedAt    *time.Time `json:"submittedAt"`
+	UpdatedAt      time.Time  `json:"updatedAt"`
+	Author         *ActorNode `json:"author"`
+	Commit         *struct {
+		OID string `json:"oid"`
+	} `json:"commit"`
+}
+
+// IssueCommentNode is one ordinary pull-request issue comment. Body is
+// intentionally not queried because participation is the public contract.
+type IssueCommentNode struct {
+	ID             string     `json:"id"`
+	FullDatabaseID *BigInt    `json:"fullDatabaseId"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	UpdatedAt      time.Time  `json:"updatedAt"`
+	Author         *ActorNode `json:"author"`
 }
 
 // ReviewRequestNode is one current GitHub review request. RequestedReviewer is
@@ -206,6 +270,28 @@ const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
           }
         }
       }
+      reviews(first: 100) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          fullDatabaseId
+          state
+          submittedAt
+          updatedAt
+          commit { oid }
+          author { __typename login ... on Node { id } }
+        }
+      }
+      comments(first: 100) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          fullDatabaseId
+          createdAt
+          updatedAt
+          author { __typename login ... on Node { id } }
+        }
+      }
       reviewThreads(first: 100) {
         pageInfo { hasNextPage endCursor }
         nodes {
@@ -218,6 +304,50 @@ const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
             pageInfo { hasNextPage endCursor }
             nodes { id body updatedAt author { login } }
           }
+        }
+      }
+    }
+  }
+  rateLimit { cost limit remaining resetAt }
+}`
+
+const pullRequestReviewsPageQuery = `query GhsyncPullRequestReviewsPage(
+  $id: ID!,
+  $after: String
+) {
+  node(id: $id) {
+    ... on PullRequest {
+      reviews(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          fullDatabaseId
+          state
+          submittedAt
+          updatedAt
+          commit { oid }
+          author { __typename login ... on Node { id } }
+        }
+      }
+    }
+  }
+  rateLimit { cost limit remaining resetAt }
+}`
+
+const pullRequestCommentsPageQuery = `query GhsyncPullRequestCommentsPage(
+  $id: ID!,
+  $after: String
+) {
+  node(id: $id) {
+    ... on PullRequest {
+      comments(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          fullDatabaseId
+          createdAt
+          updatedAt
+          author { __typename login ... on Node { id } }
         }
       }
     }
@@ -379,6 +509,71 @@ func (c *GraphQLClient) completePullRequestReviewConnections(
 			data.Node.ReviewRequests.Nodes...,
 		)
 		pull.ReviewRequests.PageInfo = data.Node.ReviewRequests.PageInfo
+	}
+	for pull.Reviews.PageInfo.HasNextPage {
+		if pull.Reviews.PageInfo.EndCursor == nil {
+			return fmt.Errorf("reviews hasNextPage without endCursor")
+		}
+		var data struct {
+			Node *struct {
+				Reviews struct {
+					Nodes    []PullRequestReviewNode `json:"nodes"`
+					PageInfo PageInfo                `json:"pageInfo"`
+				} `json:"reviews"`
+			} `json:"node"`
+		}
+		_, err := c.Call(
+			ctx,
+			class,
+			pullRequestReviewsPageQuery,
+			map[string]any{
+				"id":    pull.ID,
+				"after": *pull.Reviews.PageInfo.EndCursor,
+			},
+			&data,
+		)
+		if err != nil {
+			return fmt.Errorf("paginate reviews for %s: %w", pull.ID, err)
+		}
+		if data.Node == nil {
+			return fmt.Errorf("paginate reviews for %s: node disappeared", pull.ID)
+		}
+		pull.Reviews.Nodes = append(pull.Reviews.Nodes, data.Node.Reviews.Nodes...)
+		pull.Reviews.PageInfo = data.Node.Reviews.PageInfo
+	}
+	for pull.Comments.PageInfo.HasNextPage {
+		if pull.Comments.PageInfo.EndCursor == nil {
+			return fmt.Errorf("comments hasNextPage without endCursor")
+		}
+		var data struct {
+			Node *struct {
+				Comments struct {
+					Nodes    []IssueCommentNode `json:"nodes"`
+					PageInfo PageInfo           `json:"pageInfo"`
+				} `json:"comments"`
+			} `json:"node"`
+		}
+		_, err := c.Call(
+			ctx,
+			class,
+			pullRequestCommentsPageQuery,
+			map[string]any{
+				"id":    pull.ID,
+				"after": *pull.Comments.PageInfo.EndCursor,
+			},
+			&data,
+		)
+		if err != nil {
+			return fmt.Errorf("paginate comments for %s: %w", pull.ID, err)
+		}
+		if data.Node == nil {
+			return fmt.Errorf("paginate comments for %s: node disappeared", pull.ID)
+		}
+		pull.Comments.Nodes = append(
+			pull.Comments.Nodes,
+			data.Node.Comments.Nodes...,
+		)
+		pull.Comments.PageInfo = data.Node.Comments.PageInfo
 	}
 	for index := range pull.ReviewThreads.Nodes {
 		if err := c.completeReviewThreadComments(

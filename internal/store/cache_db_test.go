@@ -510,6 +510,234 @@ func TestDelayedOlderReviewRequestFetchCannotClobberNewerSet(t *testing.T) {
 	}
 }
 
+func TestPullRequestParticipationRowsAreMonotonicAndEmitOneEvent(t *testing.T) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := t.Context()
+	version := time.Date(2026, 8, 2, 13, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/participation", 9300, version)
+	pull := storeTestPull(&repository, version, "participation-head")
+	submittedAt := version.Add(-time.Hour)
+	pull.ReviewsKnown = true
+	pull.CommentsKnown = true
+	for index := range 50 {
+		review := PullRequestReviewRecord{
+			GitHubID:   int64(7101 + index),
+			NodeID:     fmt.Sprintf("review-node-%d", 7101+index),
+			AuthorKind: "bot", AuthorNodeID: fmt.Sprintf("bot-node-%d", index),
+			AuthorLogin: "reviewer[bot]", State: "approved",
+			SubmittedAt: &submittedAt, CommitOID: "observed-commit",
+			GitHubUpdatedAt: version,
+		}
+		comment := PullRequestCommentRecord{
+			GitHubID:   int64(7201 + index),
+			NodeID:     fmt.Sprintf("comment-node-%d", 7201+index),
+			AuthorKind: "user", AuthorNodeID: fmt.Sprintf("user-node-%d", index),
+			AuthorLogin: "participant", CreatedAt: submittedAt,
+			GitHubUpdatedAt: version,
+		}
+		if index == 0 {
+			comment.AuthorKind = "deleted"
+			comment.AuthorNodeID = ""
+			comment.AuthorLogin = ""
+		}
+		pull.Reviews = append(pull.Reviews, review)
+		pull.Comments = append(pull.Comments, comment)
+	}
+	initial, err := writer.ApplyPullRequest(ctx, pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initial.ReviewsChanged || !initial.CommentsChanged || !initial.Applied {
+		t.Fatalf("initial participation result = %+v", initial)
+	}
+	entityKey := PullRequestEntityKey(1, repository.GitHubID, pull.Number)
+	events := pullRequestChangedEventCount(t, pool, entityKey)
+	if events != 1 {
+		t.Fatalf("initial events = %d, want one atomic event", events)
+	}
+
+	identical := pull
+	identical.SyncedAt = pull.SyncedAt.Add(time.Minute)
+	result, err := writer.ApplyPullRequest(ctx, identical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied || result.ReviewsChanged || result.CommentsChanged {
+		t.Fatalf("identical participation result = %+v", result)
+	}
+	if got := pullRequestChangedEventCount(t, pool, entityKey); got != events {
+		t.Fatalf("identical participation emitted event: got %d want %d", got, events)
+	}
+
+	dismissed := pull
+	dismissed.GitHubUpdatedAt = version.Add(time.Minute)
+	dismissed.Reviews = append([]PullRequestReviewRecord(nil), pull.Reviews...)
+	dismissed.Reviews[0].State = "dismissed"
+	// GitHub does not reliably bump review.updatedAt for dismissal. The
+	// terminal state must outrank the later edit timestamp already cached.
+	dismissed.Reviews[0].GitHubUpdatedAt = version.Add(-time.Minute)
+	dismissed.Comments = nil
+	result, err = writer.ApplyPullRequest(ctx, dismissed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ReviewsChanged || !result.CommentsChanged || !result.Applied {
+		t.Fatalf("dismiss/remove result = %+v", result)
+	}
+	var state string
+	var reviewTombstoned, commentTombstoned bool
+	if err := pool.QueryRow(ctx, `
+		SELECT state, tombstoned_at IS NOT NULL
+		FROM pull_request_reviews
+		WHERE node_id = 'review-node-7101'
+	`).Scan(&state, &reviewTombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT tombstoned_at IS NOT NULL
+		FROM pull_request_comments
+		WHERE node_id = 'comment-node-7201'
+	`).Scan(&commentTombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if state != "dismissed" || reviewTombstoned || !commentTombstoned {
+		t.Fatalf(
+			"dismissal/tombstone state = %q/%v/%v",
+			state,
+			reviewTombstoned,
+			commentTombstoned,
+		)
+	}
+
+	older := pull
+	older.Reviews = append(
+		append([]PullRequestReviewRecord(nil), pull.Reviews...),
+		PullRequestReviewRecord{
+			NodeID: "stale-review", AuthorKind: "user",
+			AuthorLogin: "stale", State: "approved",
+			SubmittedAt: &submittedAt, GitHubUpdatedAt: version,
+		},
+	)
+	older.Comments = append(
+		append([]PullRequestCommentRecord(nil), pull.Comments...),
+		PullRequestCommentRecord{
+			NodeID: "stale-comment", AuthorKind: "user",
+			AuthorLogin: "stale", CreatedAt: submittedAt,
+			GitHubUpdatedAt: version,
+		},
+	)
+	result, err = writer.ApplyPullRequest(ctx, older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied || result.ReviewsChanged || result.CommentsChanged {
+		t.Fatalf("older participation observation applied = %+v", result)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT state FROM pull_request_reviews WHERE node_id = 'review-node-7101'
+	`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "dismissed" {
+		t.Fatalf("older review resurrected state %q", state)
+	}
+	var stale int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM pull_request_reviews
+		     WHERE node_id = 'stale-review') +
+		    (SELECT count(*) FROM pull_request_comments
+		     WHERE node_id = 'stale-comment')
+	`).Scan(&stale); err != nil {
+		t.Fatal(err)
+	}
+	if stale != 0 {
+		t.Fatalf("older parent observation inserted %d unknown facts", stale)
+	}
+}
+
+func TestPullRequestReviewLifecycleConvergesAcrossObservationOrders(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := t.Context()
+	base := time.Date(2026, 8, 2, 14, 0, 0, 0, time.UTC)
+	orders := [][]int{
+		{0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+		{1, 2, 0}, {2, 0, 1}, {2, 1, 0},
+	}
+	for orderIndex, order := range orders {
+		repository := storeTestRepository(
+			fmt.Sprintf("acme/review-order-%d", orderIndex),
+			int64(9400+orderIndex),
+			base,
+		)
+		submittedAt := base
+		observations := []struct {
+			parentAt time.Time
+			state    string
+			updated  time.Time
+		}{
+			{parentAt: base, state: "approved", updated: base},
+			{
+				parentAt: base.Add(time.Minute),
+				state:    "approved",
+				updated:  base.Add(time.Minute),
+			},
+			{
+				parentAt: base.Add(2 * time.Minute),
+				state:    "dismissed",
+				updated:  base,
+			},
+		}
+		for _, observationIndex := range order {
+			observation := observations[observationIndex]
+			pull := storeTestPull(
+				&repository,
+				observation.parentAt,
+				fmt.Sprintf("order-head-%d", orderIndex),
+			)
+			pull.ReviewsKnown = true
+			pull.Reviews = []PullRequestReviewRecord{{
+				GitHubID:   int64(9500 + orderIndex),
+				NodeID:     fmt.Sprintf("review-order-node-%d", orderIndex),
+				AuthorKind: "user", AuthorNodeID: "reviewer-node",
+				AuthorLogin: "reviewer", State: observation.state,
+				SubmittedAt: &submittedAt, CommitOID: "order-head",
+				GitHubUpdatedAt: observation.updated,
+			}}
+			if _, err := writer.ApplyPullRequest(ctx, pull); err != nil {
+				t.Fatalf("order %v observation %d: %v", order, observationIndex, err)
+			}
+		}
+		var state string
+		var updatedAt time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT state, gh_updated_at
+			FROM pull_request_reviews
+			WHERE node_id = $1
+		`, fmt.Sprintf("review-order-node-%d", orderIndex)).Scan(
+			&state,
+			&updatedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if state != "dismissed" || !updatedAt.Equal(base) {
+			t.Fatalf(
+				"order %v converged to %q at %s, want dismissed at %s",
+				order,
+				state,
+				updatedAt,
+				base,
+			)
+		}
+	}
+}
+
 type reviewRequestTestRow struct {
 	Kind        string
 	ID          int64

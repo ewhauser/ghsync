@@ -61,7 +61,12 @@ func TestDispatchCorpus(t *testing.T) {
 	}
 
 	actual := make(map[string]dispatchGoldenEntry)
-	for _, payload := range loadCorpusPayloads(t) {
+	payloads := loadCorpusPayloads(t)
+	payloads = append(payloads, pullRequestIssueCommentGoldenPayload(t, payloads))
+	sort.Slice(payloads, func(i, j int) bool {
+		return payloads[i].Filename < payloads[j].Filename
+	})
+	for _, payload := range payloads {
 		var outcomes [2]dispatchGoldenOutcome
 		formBody := []byte(url.Values{
 			"payload": {string(payload.Body)},
@@ -115,6 +120,41 @@ func TestDispatchCorpus(t *testing.T) {
 			expected,
 		)
 	}
+}
+
+func pullRequestIssueCommentGoldenPayload(
+	t *testing.T,
+	payloads []corpusPayload,
+) corpusPayload {
+	t.Helper()
+	for _, payload := range payloads {
+		if payload.Event != "issue_comment" {
+			continue
+		}
+		var envelope map[string]any
+		if err := json.Unmarshal(payload.Body, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		issue, ok := envelope["issue"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s has no issue object", payload.Filename)
+		}
+		issue["number"] = float64(4812)
+		issue["pull_request"] = map[string]any{
+			"url": "https://api.github.com/repos/Codertocat/Hello-World/pulls/4812",
+		}
+		body, err := json.Marshal(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return corpusPayload{
+			Event:    "issue_comment",
+			Filename: "issue_comment/pr-associated.created.synthetic.json",
+			Body:     body,
+		}
+	}
+	t.Fatal("issue_comment corpus has no payload")
+	return corpusPayload{}
 }
 
 func classifyCorpusPayload(

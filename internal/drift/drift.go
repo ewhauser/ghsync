@@ -855,6 +855,21 @@ func (s *Service) fullFetch(
 		// JSON null decodes through go-github as "", the public cache
 		// contract's sentinel for an upstream-unknown base SHA.
 		baseSHA := pull.GetBase().GetSHA()
+		nodes, _, err := s.graphQL.BatchPullRequests(
+			ctx,
+			budget.Sweep,
+			[]string{pull.GetNodeID()},
+		)
+		if err != nil {
+			return nil, spec, fmt.Errorf(
+				"drift fetch pull-request participation %s: %w",
+				key,
+				err,
+			)
+		}
+		if len(nodes) != 1 || nodes[0] == nil {
+			return tombstoneSnapshot(), spec, nil
+		}
 		return encodeSnapshot(map[string]any{
 			"id":              pull.GetID(),
 			"node_id":         pull.GetNodeID(),
@@ -872,6 +887,8 @@ func (s *Service) fullFetch(
 			"stack_number":    stackNumber,
 			"stack_position":  stackPosition,
 			"review_requests": semanticReviewRequests(pull),
+			"reviews":         semanticPullRequestReviews(nodes[0]),
+			"comments":        semanticPullRequestComments(nodes[0]),
 		}), spec, nil
 	case "stack":
 		repo, number, err := numberedKey(key, "stack:")
@@ -1180,6 +1197,96 @@ func semanticReviewRequests(pull *gh.PullRequest) []map[string]any {
 	return requests
 }
 
+func semanticPullRequestReviews(pull *gh.PullRequestNode) []map[string]any {
+	reviews := make([]map[string]any, 0, len(pull.Reviews.Nodes))
+	for _, review := range pull.Reviews.Nodes {
+		authorKind, authorNodeID, authorLogin := semanticActor(review.Author)
+		var commitOID any
+		if review.Commit != nil && review.Commit.OID != "" {
+			commitOID = review.Commit.OID
+		}
+		reviews = append(reviews, map[string]any{
+			"id":             semanticGraphQLDatabaseID(review.FullDatabaseID),
+			"node_id":        review.ID,
+			"author_kind":    authorKind,
+			"author_node_id": authorNodeID,
+			"author_login":   authorLogin,
+			"state":          strings.ToLower(review.State),
+			"submitted_at":   semanticOptionalTime(review.SubmittedAt),
+			"commit_oid":     commitOID,
+			"updated_at":     semanticTime(review.UpdatedAt),
+			"head_sha":       pull.HeadRefOID,
+		})
+	}
+	sort.Slice(reviews, func(i, j int) bool {
+		return reviews[i]["node_id"].(string) < reviews[j]["node_id"].(string)
+	})
+	return reviews
+}
+
+func semanticGraphQLDatabaseID(id *gh.BigInt) any {
+	if id == nil || *id == 0 {
+		return nil
+	}
+	return int64(*id)
+}
+
+func semanticPullRequestComments(pull *gh.PullRequestNode) []map[string]any {
+	comments := make([]map[string]any, 0, len(pull.Comments.Nodes))
+	for _, comment := range pull.Comments.Nodes {
+		authorKind, authorNodeID, authorLogin := semanticActor(comment.Author)
+		comments = append(comments, map[string]any{
+			"id":             semanticGraphQLDatabaseID(comment.FullDatabaseID),
+			"node_id":        comment.ID,
+			"author_kind":    authorKind,
+			"author_node_id": authorNodeID,
+			"author_login":   authorLogin,
+			"created_at":     semanticTime(comment.CreatedAt),
+			"updated_at":     semanticTime(comment.UpdatedAt),
+			"head_sha":       pull.HeadRefOID,
+		})
+	}
+	sort.Slice(comments, func(i, j int) bool {
+		return comments[i]["node_id"].(string) < comments[j]["node_id"].(string)
+	})
+	return comments
+}
+
+func semanticActor(actor *gh.ActorNode) (string, any, any) {
+	if actor == nil {
+		return "deleted", nil, nil
+	}
+	kind := map[string]string{
+		"User":                  "user",
+		"Bot":                   "bot",
+		"Mannequin":             "mannequin",
+		"Organization":          "organization",
+		"EnterpriseUserAccount": "enterprise_user_account",
+	}[actor.Typename]
+	if kind == "" {
+		kind = "unknown"
+	}
+	var nodeID, login any
+	if actor.ID != "" {
+		nodeID = actor.ID
+	}
+	if actor.Login != "" {
+		login = actor.Login
+	}
+	return kind, nodeID, login
+}
+
+func semanticTime(value time.Time) int64 {
+	return value.UTC().UnixMicro()
+}
+
+func semanticOptionalTime(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return semanticTime(*value)
+}
+
 func semanticDiff(cache, upstream []byte) (bool, []byte, error) {
 	var cachedValue, upstreamValue any
 	if err := json.Unmarshal(cache, &cachedValue); err != nil {
@@ -1211,21 +1318,19 @@ func normalizeSemantic(value any) any {
 		return normalized
 	case []any:
 		normalized := make([]any, len(typed))
-		allHaveID := len(typed) > 0
+		allHaveIdentity := len(typed) > 0
 		for index, child := range typed {
 			normalized[index] = normalizeSemantic(child)
 			item, ok := normalized[index].(map[string]any)
 			if !ok {
-				allHaveID = false
+				allHaveIdentity = false
 				continue
 			}
-			if _, ok := item["id"].(string); !ok {
-				if _, numeric := item["id"].(float64); !numeric {
-					allHaveID = false
-				}
+			if semanticIdentity(item) == "" {
+				allHaveIdentity = false
 			}
 		}
-		if allHaveID {
+		if allHaveIdentity {
 			sort.SliceStable(normalized, func(i, j int) bool {
 				left := normalized[i].(map[string]any)
 				right := normalized[j].(map[string]any)
@@ -1234,18 +1339,26 @@ func normalizeSemantic(value any) any {
 				if leftKind != rightKind {
 					return leftKind < rightKind
 				}
-				leftNumber, leftNumeric := left["id"].(float64)
-				rightNumber, rightNumeric := right["id"].(float64)
-				if leftNumeric && rightNumeric {
-					return leftNumber < rightNumber
-				}
-				return fmt.Sprint(left["id"]) < fmt.Sprint(right["id"])
+				return semanticIdentity(left) < semanticIdentity(right)
 			})
 		}
 		return normalized
 	default:
 		return value
 	}
+}
+
+func semanticIdentity(item map[string]any) string {
+	if nodeID, ok := item["node_id"].(string); ok && nodeID != "" {
+		return "node:" + nodeID
+	}
+	if id, ok := item["id"].(float64); ok {
+		return fmt.Sprintf("number:%020.0f", id)
+	}
+	if id, ok := item["id"].(string); ok && id != "" {
+		return "string:" + id
+	}
+	return ""
 }
 
 func diffValue(cached, upstream any) any {

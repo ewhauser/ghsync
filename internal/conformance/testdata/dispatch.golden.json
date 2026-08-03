@@ -383,6 +383,126 @@
       ]
     }
   },
+  "issue_comment/created.1.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/created.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/created.with-installation.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/created.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/deleted.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/deleted.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/edited.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/edited.with-organization.payload.json": {
+    "default_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    },
+    "dispatcher_rules": {
+      "disposition": "no_op",
+      "matched_rule": true,
+      "intents": []
+    }
+  },
+  "issue_comment/pr-associated.created.synthetic.json": {
+    "default_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:4812",
+          "priority": "event"
+        }
+      ]
+    },
+    "dispatcher_rules": {
+      "disposition": "dispatch",
+      "matched_rule": true,
+      "intents": [
+        {
+          "kind": "refresh_pr",
+          "key": "pr:Codertocat/Hello-World:4812",
+          "priority": "event"
+        }
+      ]
+    }
+  },
   "pull_request/assigned.payload.json": {
     "default_rules": {
       "disposition": "dispatch",

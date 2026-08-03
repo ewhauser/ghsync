@@ -7,6 +7,7 @@ pull_request
 pull_request_review
 pull_request_review_comment
 pull_request_review_thread
+issue_comment
 check_run
 check_suite
 push

@@ -17,6 +17,9 @@ rules:
   - event: pull_request_review_thread
     action: "*"
     target: pull_request
+  - event: issue_comment
+    action: "*"
+    target: pull_request
   - event: check_run
     action: "*"
     target: checks

@@ -69,13 +69,27 @@ type PullRequest struct {
 }
 
 type Review struct {
-	ID          int64     `json:"id"`
-	NodeID      string    `json:"node_id"`
-	State       string    `json:"state"`
-	Body        string    `json:"body,omitempty"`
-	AuthorLogin string    `json:"author_login"`
-	CommitSHA   string    `json:"commit_sha,omitempty"`
-	SubmittedAt time.Time `json:"submitted_at"`
+	ID           int64     `json:"id"`
+	NodeID       string    `json:"node_id"`
+	State        string    `json:"state"`
+	Body         string    `json:"body,omitempty"`
+	AuthorLogin  string    `json:"author_login"`
+	AuthorKind   string    `json:"author_kind,omitempty"`
+	AuthorNodeID string    `json:"author_node_id,omitempty"`
+	CommitSHA    string    `json:"commit_sha,omitempty"`
+	SubmittedAt  time.Time `json:"submitted_at"`
+	UpdatedAt    time.Time `json:"updated_at,omitzero"`
+}
+
+type IssueComment struct {
+	ID           int64     `json:"id"`
+	NodeID       string    `json:"node_id"`
+	AuthorKind   string    `json:"author_kind"`
+	AuthorNodeID string    `json:"author_node_id,omitempty"`
+	AuthorLogin  string    `json:"author_login,omitempty"`
+	Body         string    `json:"body,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type ReviewThread struct {
@@ -158,6 +172,7 @@ type Event struct {
 	Repository   *Repository    `json:"repository,omitempty"`
 	PullRequest  *PullRequest   `json:"pull_request,omitempty"`
 	Review       *Review        `json:"review,omitempty"`
+	IssueComment *IssueComment  `json:"issue_comment,omitempty"`
 	Thread       *ReviewThread  `json:"review_thread,omitempty"`
 	Comment      *ReviewComment `json:"review_comment,omitempty"`
 	CheckSuite   *CheckSuite    `json:"check_suite,omitempty"`
@@ -373,6 +388,25 @@ func validateEvent(event Event) error {
 				event.Action,
 			)
 		}
+	case "issue_comment":
+		if err := validatePullRequest(event.PullRequest); err != nil {
+			return err
+		}
+		if event.IssueComment == nil || event.IssueComment.NodeID == "" ||
+			event.IssueComment.CreatedAt.IsZero() ||
+			event.IssueComment.UpdatedAt.IsZero() {
+			return fmt.Errorf("issue comment identity or timestamp is incomplete")
+		}
+		if !validParticipantActor(
+			event.IssueComment.AuthorKind,
+			event.IssueComment.AuthorNodeID,
+			event.IssueComment.AuthorLogin,
+		) {
+			return fmt.Errorf("issue comment author identity is invalid")
+		}
+		if !oneOf(event.Action, "created", "edited", "deleted") {
+			return fmt.Errorf("unsupported issue_comment action %q", event.Action)
+		}
 	case "review_thread":
 		if err := validatePullRequest(event.PullRequest); err != nil {
 			return err
@@ -472,6 +506,18 @@ func validateEvent(event Event) error {
 	return nil
 }
 
+func validParticipantActor(kind, nodeID, login string) bool {
+	switch kind {
+	case "user", "bot", "mannequin", "organization",
+		"enterprise_user_account", "unknown":
+		return true
+	case "deleted":
+		return nodeID == "" && login == ""
+	default:
+		return false
+	}
+}
+
 func validatePullRequest(pull *PullRequest) error {
 	if pull == nil || pull.ID <= 0 || pull.NodeID == "" ||
 		pull.Number <= 0 || pull.Head.Ref == "" ||
@@ -548,6 +594,8 @@ func eventOrder(event Event) int {
 		return 40
 	case "review_comment":
 		return 50
+	case "issue_comment":
+		return 55
 	case "review_thread":
 		return 60
 	case "check_suite":

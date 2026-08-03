@@ -1315,3 +1315,36 @@ func TestCommittedRecordingCompilesToSchemaValidDeliveries(t *testing.T) {
 		}
 	}
 }
+
+func TestIssueCommentRecordingCompilesSchemaValidDelivery(t *testing.T) {
+	t.Parallel()
+	recording := testRecording()
+	pull := *recording.Events[1].PullRequest
+	comment := replay.IssueComment{
+		ID: 9901, NodeID: "IC_recorded_9901",
+		AuthorKind: "bot", AuthorNodeID: "BOT_recorded_9901",
+		AuthorLogin: "participant[bot]", Body: "fixture-only body",
+		CreatedAt: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 7, 1, 12, 1, 0, 0, time.UTC),
+	}
+	recording.Events = append(recording.Events, replay.Event{
+		Seq:          int64(len(recording.Events) + 1),
+		AtMS:         recording.Events[len(recording.Events)-1].AtMS + 1000,
+		Kind:         "issue_comment",
+		Action:       "created",
+		PullRequest:  &pull,
+		IssueComment: &comment,
+	})
+	steps, err := replay.FirstLap(recording, replay.CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) == 0 {
+		t.Fatal("issue-comment recording compiled no steps")
+	}
+	step := steps[len(steps)-1]
+	if step.Mutation.IssueComment == nil || len(step.Deliveries) != 1 ||
+		step.Deliveries[0].Event != "issue_comment" {
+		t.Fatalf("compiled issue-comment step = %+v", step)
+	}
+}

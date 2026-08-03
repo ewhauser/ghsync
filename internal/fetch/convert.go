@@ -180,6 +180,46 @@ func pullRecordFromNode(
 			Login:    login,
 		})
 	}
+	reviews := make(
+		[]store.PullRequestReviewRecord,
+		0,
+		len(node.Reviews.Nodes),
+	)
+	for _, review := range node.Reviews.Nodes {
+		authorKind, authorNodeID, authorLogin := actorIdentity(review.Author)
+		commitOID := ""
+		if review.Commit != nil {
+			commitOID = review.Commit.OID
+		}
+		reviews = append(reviews, store.PullRequestReviewRecord{
+			GitHubID:        graphQLDatabaseID(review.FullDatabaseID),
+			NodeID:          review.ID,
+			AuthorKind:      authorKind,
+			AuthorNodeID:    authorNodeID,
+			AuthorLogin:     authorLogin,
+			State:           strings.ToLower(review.State),
+			SubmittedAt:     review.SubmittedAt,
+			CommitOID:       commitOID,
+			GitHubUpdatedAt: review.UpdatedAt,
+		})
+	}
+	comments := make(
+		[]store.PullRequestCommentRecord,
+		0,
+		len(node.Comments.Nodes),
+	)
+	for _, comment := range node.Comments.Nodes {
+		authorKind, authorNodeID, authorLogin := actorIdentity(comment.Author)
+		comments = append(comments, store.PullRequestCommentRecord{
+			GitHubID:        graphQLDatabaseID(comment.FullDatabaseID),
+			NodeID:          comment.ID,
+			AuthorKind:      authorKind,
+			AuthorNodeID:    authorNodeID,
+			AuthorLogin:     authorLogin,
+			CreatedAt:       comment.CreatedAt,
+			GitHubUpdatedAt: comment.UpdatedAt,
+		})
+	}
 	threads := make([]store.ReviewThreadRecord, 0, len(node.ReviewThreads.Nodes))
 	for _, thread := range node.ReviewThreads.Nodes {
 		comments := make(
@@ -240,10 +280,38 @@ func pullRecordFromNode(
 		ThreadsKnown:        true,
 		ReviewRequests:      reviewRequests,
 		ReviewRequestsKnown: true,
+		Reviews:             reviews,
+		ReviewsKnown:        true,
+		Comments:            comments,
+		CommentsKnown:       true,
 		ETag:                item.metadata.ETag,
 		SyncedAt:            item.startedAt,
 		Source:              item.source,
 	}
+}
+
+func graphQLDatabaseID(id *gh.BigInt) int64 {
+	if id == nil {
+		return 0
+	}
+	return int64(*id)
+}
+
+func actorIdentity(actor *gh.ActorNode) (string, string, string) {
+	if actor == nil {
+		return "deleted", "", ""
+	}
+	kind := map[string]string{
+		"User":                  "user",
+		"Bot":                   "bot",
+		"Mannequin":             "mannequin",
+		"Organization":          "organization",
+		"EnterpriseUserAccount": "enterprise_user_account",
+	}[actor.Typename]
+	if kind == "" {
+		kind = "unknown"
+	}
+	return kind, actor.ID, actor.Login
 }
 
 func stackRecordFromREST(

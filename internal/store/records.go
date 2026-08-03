@@ -94,6 +94,34 @@ type ReviewRequestRecord struct {
 	RequestedAt *time.Time
 }
 
+// PullRequestReviewRecord is one identity-keyed GitHub pull-request review.
+// Lifecycle state plus SubmittedAt and GitHubUpdatedAt form the per-row
+// monotonic basis; a dismissed review remains present with State set to
+// "dismissed".
+type PullRequestReviewRecord struct {
+	GitHubID        int64
+	NodeID          string
+	AuthorKind      string
+	AuthorNodeID    string
+	AuthorLogin     string
+	State           string
+	SubmittedAt     *time.Time
+	CommitOID       string
+	GitHubUpdatedAt time.Time
+}
+
+// PullRequestCommentRecord is one identity-keyed ordinary issue comment on a
+// pull request. Bodies are deliberately absent from the public fact record.
+type PullRequestCommentRecord struct {
+	GitHubID        int64
+	NodeID          string
+	AuthorKind      string
+	AuthorNodeID    string
+	AuthorLogin     string
+	CreatedAt       time.Time
+	GitHubUpdatedAt time.Time
+}
+
 // PullRequestRecord is the authoritative pull-request state accepted by the
 // cache.
 type PullRequestRecord struct {
@@ -120,6 +148,10 @@ type PullRequestRecord struct {
 	ThreadsKnown        bool
 	ReviewRequests      []ReviewRequestRecord
 	ReviewRequestsKnown bool
+	Reviews             []PullRequestReviewRecord
+	ReviewsKnown        bool
+	Comments            []PullRequestCommentRecord
+	CommentsKnown       bool
 	ETag                string
 	SyncedAt            time.Time
 	Source              SyncSource
@@ -215,6 +247,8 @@ type ApplyPullRequestResult struct {
 	Applied               bool
 	DomainChanged         bool
 	ReviewRequestsChanged bool
+	ReviewsChanged        bool
+	CommentsChanged       bool
 	StackStateChanged     bool
 	OldStackNumber        *int
 	NewStackNumber        *int
@@ -316,7 +350,52 @@ func validatePullRequest(pull *PullRequestRecord) error {
 		}
 		seenRequests[key] = struct{}{}
 	}
+	seenReviews := make(map[string]struct{}, len(pull.Reviews))
+	for index := range pull.Reviews {
+		review := &pull.Reviews[index]
+		if review.GitHubID < 0 || review.NodeID == "" ||
+			!validParticipationAuthor(
+				review.AuthorKind,
+				review.AuthorNodeID,
+				review.AuthorLogin,
+			) || review.State == "" ||
+			review.GitHubUpdatedAt.IsZero() {
+			return fmt.Errorf("invalid PR review")
+		}
+		if _, duplicate := seenReviews[review.NodeID]; duplicate {
+			return fmt.Errorf("duplicate PR review %s", review.NodeID)
+		}
+		seenReviews[review.NodeID] = struct{}{}
+	}
+	seenComments := make(map[string]struct{}, len(pull.Comments))
+	for _, comment := range pull.Comments {
+		if comment.GitHubID < 0 || comment.NodeID == "" ||
+			!validParticipationAuthor(
+				comment.AuthorKind,
+				comment.AuthorNodeID,
+				comment.AuthorLogin,
+			) || comment.CreatedAt.IsZero() ||
+			comment.GitHubUpdatedAt.IsZero() {
+			return fmt.Errorf("invalid PR issue comment")
+		}
+		if _, duplicate := seenComments[comment.NodeID]; duplicate {
+			return fmt.Errorf("duplicate PR issue comment %s", comment.NodeID)
+		}
+		seenComments[comment.NodeID] = struct{}{}
+	}
 	return nil
+}
+
+func validParticipationAuthor(kind, nodeID, login string) bool {
+	switch kind {
+	case "user", "bot", "mannequin", "organization",
+		"enterprise_user_account", "unknown":
+		return true
+	case "deleted":
+		return nodeID == "" && login == ""
+	default:
+		return false
+	}
 }
 
 func validateStack(stack *StackRecord) error {

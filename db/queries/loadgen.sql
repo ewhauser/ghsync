@@ -116,6 +116,29 @@ WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND stack.tombstoned_at IS NULL
 ORDER BY stack.number;
 
+-- name: ListLoadgenCachedPullRequestReviews :many
+SELECT review.pr_number, review.gh_id, review.node_id,
+       review.author_kind, review.author_node_id, review.author_login,
+       review.state, review.submitted_at, review.commit_oid,
+       review.gh_updated_at, review.head_sha
+FROM pull_request_reviews AS review
+JOIN repos AS repo ON repo.id = review.repo_id
+WHERE repo.full_name = sqlc.arg(repo_full_name)
+  AND repo.tombstoned_at IS NULL
+  AND review.tombstoned_at IS NULL
+ORDER BY review.pr_number, review.node_id;
+
+-- name: ListLoadgenCachedPullRequestComments :many
+SELECT comment.pr_number, comment.gh_id, comment.node_id,
+       comment.author_kind, comment.author_node_id, comment.author_login,
+       comment.created_at, comment.gh_updated_at, comment.head_sha
+FROM pull_request_comments AS comment
+JOIN repos AS repo ON repo.id = comment.repo_id
+WHERE repo.full_name = sqlc.arg(repo_full_name)
+  AND repo.tombstoned_at IS NULL
+  AND comment.tombstoned_at IS NULL
+ORDER BY comment.pr_number, comment.node_id;
+
 -- name: ListLoadgenCachedCheckRuns :many
 SELECT
     run.gh_id,

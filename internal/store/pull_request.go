@@ -102,6 +102,30 @@ func (w *EntityWriter) TouchPullRequest(
 			); err != nil {
 				return fmt.Errorf("touch PR review requests: %w", err)
 			}
+			if err := queries.TouchPullRequestReviewsCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestReviewsCheckedAtParams{
+					CheckedAt:         timestamp(checkedAt),
+					Etag:              etag,
+					RepoID:            repo.ID,
+					PrNumber:          int32(number),
+					ParentGhUpdatedAt: current.GhUpdatedAt,
+				},
+			); err != nil {
+				return fmt.Errorf("touch PR reviews: %w", err)
+			}
+			if err := queries.TouchPullRequestCommentsCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestCommentsCheckedAtParams{
+					CheckedAt:         timestamp(checkedAt),
+					Etag:              etag,
+					RepoID:            repo.ID,
+					PrNumber:          int32(number),
+					ParentGhUpdatedAt: current.GhUpdatedAt,
+				},
+			); err != nil {
+				return fmt.Errorf("touch PR comments: %w", err)
+			}
 		}
 		return nil
 	})
@@ -339,6 +363,80 @@ func (w *EntityWriter) applyPullRequest(
 			}
 		}
 
+		if pull.ReviewsKnown {
+			reviews, err := encodePullRequestReviews(pull.Reviews)
+			if err != nil {
+				return err
+			}
+			changed, err := queries.ReplacePullRequestReviews(
+				ctx,
+				dbgen.ReplacePullRequestReviewsParams{
+					Reviews:           reviews,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+					HeadSha:           row.HeadSha,
+					SyncedAt:          timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					SyncSource:        string(pull.Source),
+					LastCheckedAt:     timestamp(pull.SyncedAt),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("replace PR reviews: %w", err)
+			}
+			result.ReviewsChanged = len(changed) > 0
+			if err := queries.TouchPullRequestReviewsCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestReviewsCheckedAtParams{
+					CheckedAt:         timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+				},
+			); err != nil {
+				return fmt.Errorf("touch PR reviews: %w", err)
+			}
+		}
+
+		if pull.CommentsKnown {
+			comments, err := encodePullRequestComments(pull.Comments)
+			if err != nil {
+				return err
+			}
+			changed, err := queries.ReplacePullRequestComments(
+				ctx,
+				dbgen.ReplacePullRequestCommentsParams{
+					Comments:          comments,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+					HeadSha:           row.HeadSha,
+					SyncedAt:          timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					SyncSource:        string(pull.Source),
+					LastCheckedAt:     timestamp(pull.SyncedAt),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("replace PR comments: %w", err)
+			}
+			result.CommentsChanged = len(changed) > 0
+			if err := queries.TouchPullRequestCommentsCheckedAt(
+				ctx,
+				dbgen.TouchPullRequestCommentsCheckedAtParams{
+					CheckedAt:         timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+				},
+			); err != nil {
+				return fmt.Errorf("touch PR comments: %w", err)
+			}
+		}
+
 		threadsChanged := false
 		if pull.ThreadsKnown {
 			threads, err := encodeReviewThreads(pull.ReviewThreads)
@@ -374,7 +472,8 @@ func (w *EntityWriter) applyPullRequest(
 			}
 		}
 		result.Applied = result.DomainChanged || threadsChanged ||
-			result.ReviewRequestsChanged
+			result.ReviewRequestsChanged || result.ReviewsChanged ||
+			result.CommentsChanged
 		if result.Applied {
 			scopes := uniqueStrings(
 				derivationScope(
@@ -583,6 +682,28 @@ func (w *EntityWriter) TombstonePullRequestObserved(
 			); err != nil {
 				return fmt.Errorf("tombstone PR review requests: %w", err)
 			}
+			if _, err := queries.TombstonePullRequestReviews(
+				ctx,
+				dbgen.TombstonePullRequestReviewsParams{
+					TombstonedAt: timestamp(at),
+					SyncSource:   string(source),
+					RepoID:       repo.ID,
+					PrNumber:     int32(number),
+				},
+			); err != nil {
+				return fmt.Errorf("tombstone PR reviews: %w", err)
+			}
+			if _, err := queries.TombstonePullRequestComments(
+				ctx,
+				dbgen.TombstonePullRequestCommentsParams{
+					TombstonedAt: timestamp(at),
+					SyncSource:   string(source),
+					RepoID:       repo.ID,
+					PrNumber:     int32(number),
+				},
+			); err != nil {
+				return fmt.Errorf("tombstone PR comments: %w", err)
+			}
 		}
 		if hook != nil {
 			if txHook := hook(result); txHook != nil {
@@ -640,6 +761,65 @@ func encodeReviewRequests(requests []ReviewRequestRecord) ([]byte, error) {
 	value, err := json.Marshal(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("encode PR review requests: %w", err)
+	}
+	return value, nil
+}
+
+func encodePullRequestReviews(
+	reviews []PullRequestReviewRecord,
+) ([]byte, error) {
+	type encodedReview struct {
+		GitHubID        int64      `json:"gh_id"`
+		NodeID          string     `json:"node_id"`
+		AuthorKind      string     `json:"author_kind"`
+		AuthorNodeID    string     `json:"author_node_id"`
+		AuthorLogin     string     `json:"author_login"`
+		State           string     `json:"state"`
+		SubmittedAt     *time.Time `json:"submitted_at"`
+		CommitOID       string     `json:"commit_oid"`
+		GitHubUpdatedAt time.Time  `json:"gh_updated_at"`
+	}
+	encoded := make([]encodedReview, 0, len(reviews))
+	for index := range reviews {
+		review := reviews[index]
+		encoded = append(encoded, encodedReview{
+			GitHubID:        review.GitHubID,
+			NodeID:          review.NodeID,
+			AuthorKind:      review.AuthorKind,
+			AuthorNodeID:    review.AuthorNodeID,
+			AuthorLogin:     review.AuthorLogin,
+			State:           strings.ToLower(review.State),
+			SubmittedAt:     review.SubmittedAt,
+			CommitOID:       review.CommitOID,
+			GitHubUpdatedAt: review.GitHubUpdatedAt,
+		})
+	}
+	value, err := json.Marshal(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("encode PR reviews: %w", err)
+	}
+	return value, nil
+}
+
+func encodePullRequestComments(
+	comments []PullRequestCommentRecord,
+) ([]byte, error) {
+	type encodedComment struct {
+		GitHubID        int64     `json:"gh_id"`
+		NodeID          string    `json:"node_id"`
+		AuthorKind      string    `json:"author_kind"`
+		AuthorNodeID    string    `json:"author_node_id"`
+		AuthorLogin     string    `json:"author_login"`
+		CreatedAt       time.Time `json:"created_at"`
+		GitHubUpdatedAt time.Time `json:"gh_updated_at"`
+	}
+	encoded := make([]encodedComment, 0, len(comments))
+	for _, comment := range comments {
+		encoded = append(encoded, encodedComment(comment))
+	}
+	value, err := json.Marshal(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("encode PR comments: %w", err)
 	}
 	return value, nil
 }

@@ -190,6 +190,44 @@ func TestReviewRequestConvertersExcludeUnsupportedOrIncompleteReviewers(
 	assertSupportedReviewRequests(t, graphQLRecord.ReviewRequests)
 }
 
+func TestActorIdentityRetainsEveryDocumentedKind(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typename string
+		kind     string
+	}{
+		{typename: "User", kind: "user"},
+		{typename: "Bot", kind: "bot"},
+		{typename: "Mannequin", kind: "mannequin"},
+		{typename: "Organization", kind: "organization"},
+		{
+			typename: "EnterpriseUserAccount",
+			kind:     "enterprise_user_account",
+		},
+		{typename: "FutureActor", kind: "unknown"},
+	}
+	for _, test := range tests {
+		kind, nodeID, login := actorIdentity(&gh.ActorNode{
+			Typename: test.typename,
+			ID:       "actor-node",
+			Login:    "actor-login",
+		})
+		if kind != test.kind || nodeID != "actor-node" ||
+			login != "actor-login" {
+			t.Fatalf(
+				"%s actor identity = %q/%q/%q",
+				test.typename,
+				kind,
+				nodeID,
+				login,
+			)
+		}
+	}
+	if kind, nodeID, login := actorIdentity(nil); kind != "deleted" || nodeID != "" || login != "" {
+		t.Fatalf("deleted actor identity = %q/%q/%q", kind, nodeID, login)
+	}
+}
+
 func assertSupportedReviewRequests(
 	t *testing.T,
 	requests []store.ReviewRequestRecord,

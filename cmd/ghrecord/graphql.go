@@ -353,13 +353,21 @@ const pullRequestTimelineQuery = `query GhsyncRecordingPull(
           }
           ... on PullRequestReview {
             id
-            databaseId
+            fullDatabaseId
             body
             state
             submittedAt
             updatedAt
-            author { login }
+            author { __typename login ... on Node { id } }
             commit { oid }
+          }
+          ... on IssueComment {
+            id
+            fullDatabaseId
+            body
+            createdAt
+            updatedAt
+            author { __typename login ... on Node { id } }
           }
           ... on PullRequestReviewThread {
             id
@@ -387,12 +395,12 @@ const pullRequestTimelineQuery = `query GhsyncRecordingPull(
             previousReviewState
             review {
               id
-              databaseId
+              fullDatabaseId
               body
               state
               submittedAt
               updatedAt
-              author { login }
+              author { __typename login ... on Node { id } }
               commit { oid }
             }
           }
