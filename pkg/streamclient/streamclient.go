@@ -68,8 +68,9 @@ type Event struct {
 
 // Handler applies one event using tx. Database effects written through tx
 // commit atomically with the durable cursor advance. Returning an error rolls
-// the entire page back, so a restart receives the page again. External I/O
-// cannot share this exactly-once transaction and must use its own idempotency.
+// the entire page back, so a restart receives the page again. C-C6 forbids
+// network I/O in Handler: external effects cannot share this exactly-once
+// transaction and must run after commit with their own idempotency.
 type Handler func(context.Context, pgx.Tx, Event) error
 
 // ErrResyncRequired is returned when a cursor is behind its stream's pruned
@@ -175,9 +176,10 @@ func IsRetryable(err error) bool {
 // Bootstrap DISCARDS every undelivered event at or below SafeSeq for this
 // consumer when Commit succeeds. Ignoring both Commit and Close silently skips
 // that cursor reset and leaks a pooled connection while retaining the cursor
-// row lock, which can block the consumer and eventually exhaust the pool. Tx
-// remains exported for compatibility; prefer Commit and Close for lifecycle
-// management.
+// row lock, which can block the consumer and eventually exhaust the pool.
+// C-C6 forbids network I/O while Tx is open: projection replacement must use
+// only database and CPU work, then commit before any external effect. Tx remains
+// exported for compatibility; prefer Commit and Close for lifecycle management.
 type Snapshot struct {
 	// SafeSeq is the sequence after which Tail resumes.
 	SafeSeq int64

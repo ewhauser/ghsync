@@ -322,7 +322,7 @@ type FetchMetadata struct {
 
 // TransactionHook runs after the accepted cache mutation, dirty marking, and
 // event insert but before commit. Fetch workers use it for durable generation
-// bumps and River follow-ups (C-C3).
+// bumps and River follow-ups (C-C3). C-C6 forbids network I/O in this callback.
 type TransactionHook func(context.Context, pgx.Tx) error
 
 // PullRequestHook derives transaction work from a pull-request write result.

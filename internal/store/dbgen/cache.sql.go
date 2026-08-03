@@ -909,13 +909,15 @@ func (q *Queries) MarkDerivationDirty(ctx context.Context, arg MarkDerivationDir
 	return err
 }
 
-const releaseEntitySessionLock = `-- name: ReleaseEntitySessionLock :exec
+const releaseEntitySessionLock = `-- name: ReleaseEntitySessionLock :one
 SELECT pg_advisory_unlock(hashtextextended($1::text, 0))
 `
 
-func (q *Queries) ReleaseEntitySessionLock(ctx context.Context, entityKey string) error {
-	_, err := q.db.Exec(ctx, releaseEntitySessionLock, entityKey)
-	return err
+func (q *Queries) ReleaseEntitySessionLock(ctx context.Context, entityKey string) (bool, error) {
+	row := q.db.QueryRow(ctx, releaseEntitySessionLock, entityKey)
+	var pg_advisory_unlock bool
+	err := row.Scan(&pg_advisory_unlock)
+	return pg_advisory_unlock, err
 }
 
 const replaceCheckRuns = `-- name: ReplaceCheckRuns :many

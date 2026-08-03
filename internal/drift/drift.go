@@ -459,7 +459,16 @@ func (s *Service) inspectSample(
 			err,
 		)
 	}
-	defer observation.CloseContext(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer func() {
+		if closeErr := observation.CloseContext(ctx); closeErr != nil {
+			slog.WarnContext(
+				context.WithoutCancel(ctx),
+				"drift observation cleanup failed; connection destroyed",
+				"entity_key", observation.Key(),
+				"error", closeErr,
+			)
+		}
+	}()
 	current, err := dbgen.New(s.pool).GetCachedEntitySnapshot(
 		ctx,
 		dbgen.GetCachedEntitySnapshotParams{

@@ -41,7 +41,9 @@ type sequenceAllocationHookKey struct{}
 // WithSequenceAllocationHook installs a test-only transaction pause/failure
 // seam that runs immediately after a real change_events sequence allocation.
 // It lives beside the fence protocol so tests cannot replace the production
-// entity-writer or deriver transaction with a synthetic writer.
+// entity-writer or deriver transaction with a synthetic writer. C-C6 still
+// applies: the hook may coordinate or fail a test, but must not perform network
+// I/O while the transaction and writer fence are open.
 func WithSequenceAllocationHook(
 	ctx context.Context,
 	hook func(origin string, seq int64) error,

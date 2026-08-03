@@ -247,9 +247,9 @@ func TestTailRetriesConcurrentCursorFirstTouchRace(t *testing.T) {
 			func(context.Context, pgx.Tx, Event) error { return nil },
 		)
 	}()
-	// The second INSERT is now waiting on the first transaction's unique-key
-	// decision with an older REPEATABLE READ snapshot.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until the second INSERT is demonstrably waiting on the first
+	// transaction's unique-key decision with an older REPEATABLE READ snapshot.
+	waitForCursorFirstTouchLockWait(t, pool)
 	close(releaseFirst)
 
 	select {
@@ -268,6 +268,34 @@ func TestTailRetriesConcurrentCursorFirstTouchRace(t *testing.T) {
 	if err := <-firstErr; !errors.Is(err, context.Canceled) {
 		t.Fatalf("first Tail exit = %v", err)
 	}
+}
+
+func waitForCursorFirstTouchLockWait(
+	t *testing.T,
+	pool *pgxpool.Pool,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var blocked bool
+		if err := pool.QueryRow(context.Background(), `
+			SELECT EXISTS (
+			    SELECT 1
+			    FROM pg_stat_activity
+			    WHERE pid <> pg_backend_pid()
+			      AND datname = current_database()
+			      AND wait_event_type = 'Lock'
+			      AND query LIKE '%INSERT INTO consumer_cursors%'
+			)
+		`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("second Tail did not block on the cursor first-touch race")
 }
 
 func TestSnapshotCommitPriorSeqAndIdempotentClose(t *testing.T) {

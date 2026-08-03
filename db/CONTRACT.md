@@ -651,6 +651,17 @@ an as-yet-unknown repository is fetched. Do not introduce a new producer or
 change a grammar without checking every producer that participates in this
 shared lock space.
 
+When one operation must hold multiple distinct entity locks, it acquires their
+complete key strings in ascending lexical order and releases them in reverse.
+The two intentional nested paths are repository discovery followed by the
+repository writer's transaction lock (`repo-discovery:...` then `repo:...`),
+and the GraphQL PR coordinator's sorted PR observations followed by its short,
+post-hydration repository apply (`pr:...` then `repo:...`). The coordinator
+releases the repository observation before opening any PR writer transaction;
+no production path acquires a PR observation while holding a repository
+observation. Sweeps and backfills only enqueue those refreshes after their
+network reads and never hold entity locks themselves.
+
 ## Writer fence and visibility watermark
 
 Every transaction that inserts `change_events` has a mandatory obligation:

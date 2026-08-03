@@ -67,6 +67,12 @@ func runContext(ctx context.Context, cfg *apiConfig) error {
 	tailerCtx, stopTailer := context.WithCancel(ctx)
 	defer stopTailer()
 	if err := tailer.start(tailerCtx); err != nil {
+		// A shutdown can race the Bootstrap COMMIT acknowledgement after
+		// PostgreSQL has made the cursor visible. Startup cancellation is a
+		// requested stop, not an operational tailer failure.
+		if ctx.Err() != nil {
+			return nil
+		}
 		return fmt.Errorf("start entity tailer: %w", err)
 	}
 

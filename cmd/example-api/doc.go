@@ -6,6 +6,10 @@
 // bounded recent-event ring used for SSE catch-up. Each subscriber also has a
 // bounded queue. A subscriber that cannot keep up receives a resync advisory
 // and is disconnected instead of backpressuring the single process tailer.
+// Fresh snapshots are materialized only after enforcing 100k-entity/64MiB
+// limits, with at most two materializations resident concurrently. A snapshot
+// above either limit receives an explicit snapshot_limit_exceeded advisory;
+// entities are never silently truncated.
 // A deployment would connect with the ghsync_consumer-grade role described in
 // db/CONTRACT.md, or another role with the same public-contract grants.
 package main

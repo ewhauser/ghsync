@@ -377,6 +377,21 @@ func WithResponseDelay(delay time.Duration) Option {
 	}
 }
 
+// WithResponseGate blocks one counted API route until gate is closed. The gate
+// belongs to this Server instance, making concurrent-response tests
+// deterministic without process-global hooks that can leak across tests.
+func WithResponseGate(method, path string, gate <-chan struct{}) Option {
+	if method == "" || path == "" || gate == nil {
+		panic("response gate requires method, path, and channel")
+	}
+	return func(s *Server) {
+		if s.responseGates == nil {
+			s.responseGates = make(map[string]<-chan struct{})
+		}
+		s.responseGates[method+" "+path] = gate
+	}
+}
+
 // WithInstallationTokenTTL sets the fake token lifetime.
 func WithInstallationTokenTTL(ttl time.Duration) Option {
 	if ttl <= 0 {
@@ -422,6 +437,7 @@ type Server struct {
 	restStep           int
 	graphQLStep        int
 	responseDelay      time.Duration
+	responseGates      map[string]<-chan struct{}
 	active             int
 	maxActive          int
 	tokenMaxActive     int
@@ -551,6 +567,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	responseGate := s.responseGates[requestKey]
 	s.mu.Unlock()
 
 	if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/_ghsync/") {
@@ -559,6 +576,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	delay := s.beginRequest(r.URL.Path)
 	defer s.endRequest()
+	if responseGate != nil {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-responseGate:
+		}
+	}
 	if delay > 0 {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()

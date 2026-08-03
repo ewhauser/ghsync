@@ -142,6 +142,45 @@ Consequences baked into the design:
 - **C-C5 — Provenance on every row.** `synced_at`, `etag`, `sync_source`
   (webhook | reconcile | backfill | manual). Required for conditional
   requests (C-B4), staleness metrics (C-R1), and debugging.
+- **C-C6 — No transaction or contended lock across external I/O.** A database
+  transaction, contended advisory lock, or shared in-process lock must never
+  overlap an HTTP/GraphQL/REST call or client network read/write. External
+  fetches complete first; database-backed response data is fully materialized
+  and the transaction committed before the first client write. Transaction
+  callbacks are database/CPU-only. Otherwise a slow or cyclic network
+  dependency can retain row/advisory locks, make peers hit `statement_timeout`,
+  and exhaust the connection pool through retries.
+  The one narrow exception is C-C1's per-entity observation: one dedicated
+  pgx session (never an open transaction) holds that entity's session advisory
+  lock across its authoritative GitHub fetch and write because serializing the
+  complete fetch+write observation is the correctness boundary. It is keyed
+  to one entity rather than shared across a repository batch. The session is
+  returned to pgxpool only after a confirmed unlock; an unlock failure or
+  cleanup timeout hijacks and closes the physical connection so PostgreSQL
+  releases the session lock on backend teardown. Repository metadata found by
+  a PR batch is different: its repository lock is acquired only after all
+  fetch and hydration calls, held solely around `ApplyRepositoryObserved`, and
+  released before any PR writer transaction. C-C2 makes two such narrowed
+  windows converge when the older response arrives last. This separation and
+  fail-closed cleanup are the durable lessons from
+  [#18](https://github.com/ewhauser/ghsync/issues/18) and
+  [#19](https://github.com/ewhauser/ghsync/issues/19).
+
+The implementation audit is kept here so a new transaction or lock has an
+explicit review checklist rather than relying on call-site folklore:
+
+| Sites | Transaction / contended-lock window | External-I/O verdict |
+|---|---|---|
+| `fetch.Handler` entity refreshes and `ensureRepository` | A per-entity session observation spans that entity's fetch and write; no transaction is open during the fetch. Discovery's nested direct repository write is ordered `repo-discovery:...` then `repo:...`. | The documented C-C1 exception. Each lock protects one authoritative observation, never a repository batch. |
+| `fetch.prCoordinator.execute` | Sorted `pr:...` observations span GraphQL and hydration. After every remote call, it briefly acquires `repo:...`, applies repository metadata, and releases it before PR writer transactions. | The only PR+repository site; ordering is `pr:...` then `repo:...`. There is no `repo:...` then `pr:...` site. |
+| `drift.inspectSample` / `recordAndHeal` | The upstream read completes before the drift observation. The later finding transaction performs SQL and River `InsertTx` only. | No external call under the observation or transaction. |
+| Entity-writer transactions and `TransactionHook` implementations | `withEntityTx` holds the entity/write fences around cache, dirty, outbox, and hook DB work. Fetch hooks close only over refresh specs and a River client, then call `queue.InsertRefreshesTx`. | River inserts are PostgreSQL work through the supplied transaction; no hook reaches the GitHub budget gate or another network client. |
+| Dispatcher and deriver (`DispatchBatch`, `derive.runOnce`) | Claim/classify/insert and snapshot/derive/write respectively remain inside their transactions. Classification and derivation are CPU-only. | No network client is reachable from either transactional callback path. |
+| Backfill and sweep cursor transactions | `advance*`, `persistPage`, `startOrResumeScope`, gap-window updates, pruning, and enqueue helpers run after list/redelivery calls return or before the next call begins. | REST/delivery reads and redeliveries are outside transactions; River `InsertTx` calls are DB-only. |
+| Budget lease, refresh completion, retention, and watermarker transactions | Short row/advisory-lock windows contain only generated SQL, River DB operations, and bookkeeping. | No HTTP/GraphQL/client response I/O occurs in these windows. |
+| Migration session lock and per-file transactions | The process-wide lock spans embedded River/application DDL against the same Postgres service. | Deliberate startup-only DB coordination; it performs no HTTP/GraphQL/client response I/O. |
+| `streamclient.Bootstrap` and `deliverPage` | Cursor row locks and repeatable-read snapshots encompass caller projection/handler callbacks. | Their public contracts forbid network I/O; callers commit/close before external effects. Retry/backoff behavior is outside the transaction and unchanged. |
+| `example-api` watch snapshot and replay | Rows/events are bounded and fully materialized, then the read transaction commits before SSE. Snapshot materialization is capped at two concurrent 64 MiB/100k-entity buffers. | Above-limit snapshots emit `snapshot_limit_exceeded`; there is no truncation, unbounded per-subscriber allocation, or client write under a transaction. |
 
 ### Budget (C-B)
 

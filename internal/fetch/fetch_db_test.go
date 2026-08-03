@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -781,6 +782,185 @@ func TestCoordinatorStampsEveryGangedItemEventContext(t *testing.T) {
 		"/graphql",
 	) - baseline; got != 1 {
 		t.Fatalf("coordinator GraphQL batches = %d, want 1", got)
+	}
+}
+
+func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	waiterPool := fetchPoolWithStatementTimeout(
+		t,
+		database.URL,
+		100*time.Millisecond,
+	)
+	fixture := fakegithub.DefaultFixture()
+	_, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t,
+		database.Pool,
+		fixture,
+		5*time.Millisecond,
+		100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	seedCoordinatorPulls(t, seedHandler, 4812, 4815)
+
+	fastFake, fastServer, fastHandler, fastRiver := newDirectHandler(
+		t,
+		waiterPool,
+		fixture,
+		5*time.Millisecond,
+		100,
+	)
+	defer fastServer.Close()
+	fastHandler.SetRiverClient(fastRiver)
+
+	slowGate := make(chan struct{})
+	var releaseSlow sync.Once
+	releaseSlowResponse := func() { releaseSlow.Do(func() { close(slowGate) }) }
+	defer releaseSlowResponse()
+	slowFake, slowServer, slowHandler, slowRiver := newDirectHandler(
+		t,
+		database.Pool,
+		fixture,
+		5*time.Millisecond,
+		100,
+		fakegithub.WithResponseGate(http.MethodPost, "/graphql", slowGate),
+	)
+	defer slowServer.Close()
+	slowHandler.SetRiverClient(slowRiver)
+	slowDone := make(chan error, 1)
+	go func() {
+		slowDone <- slowHandler.RefreshPR(t.Context(), refreshPRRequest(4812))
+	}()
+	waitForFakeRequest(t, slowFake, http.MethodPost, "/graphql")
+	probe, err := database.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Release()
+	assertObservationLockAvailability(
+		t,
+		probe,
+		store.PullRequestEntityKey(1, fixture.Repository.ID, 4812),
+		false,
+	)
+	assertObservationLockAvailability(
+		t,
+		probe,
+		store.RepositoryEntityKey(1, fixture.Repository.ID),
+		true,
+	)
+
+	fixture.PullRequests[2].Title = "fast sibling escaped repository lock"
+	fastFake.SetFixture(fixture)
+	fastDone := make(chan error, 1)
+	go func() {
+		fastDone <- fastHandler.RefreshPR(t.Context(), refreshPRRequest(4815))
+	}()
+	select {
+	case err := <-fastDone:
+		if err != nil {
+			t.Fatalf("fast batch hit repository lock wait: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fast batch did not complete while slow GitHub request was in flight")
+	}
+	select {
+	case err := <-slowDone:
+		t.Fatalf("slow batch completed before the fast batch proved overlap: %v", err)
+	default:
+	}
+	releaseSlowResponse()
+	if err := <-slowDone; err != nil {
+		t.Fatalf("slow batch: %v", err)
+	}
+}
+
+func TestCoordinatorRepositoryMetadataConvergesWhenOlderBatchLandsLast(
+	t *testing.T,
+) {
+	t.Parallel()
+	database := testdb.New(t)
+	newerPool := fetchPoolWithStatementTimeout(t, database.URL, 5*time.Second)
+	baseFixture := fakegithub.DefaultFixture()
+	_, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t,
+		newerPool,
+		baseFixture,
+		5*time.Millisecond,
+		100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	seedCoordinatorPulls(t, seedHandler, 4812, 4815)
+
+	olderFixture := baseFixture
+	olderFixture.Repository.DefaultBranch = "legacy"
+	olderFixture.Repository.UpdatedAt = baseFixture.Repository.UpdatedAt
+	olderFixture.PullRequests[1].Title = "older delayed batch"
+	olderGate := make(chan struct{})
+	var releaseOlder sync.Once
+	releaseOlderResponse := func() { releaseOlder.Do(func() { close(olderGate) }) }
+	defer releaseOlderResponse()
+	olderFake, olderServer, olderHandler, olderRiver := newDirectHandler(
+		t,
+		database.Pool,
+		olderFixture,
+		5*time.Millisecond,
+		100,
+		fakegithub.WithResponseGate(http.MethodPost, "/graphql", olderGate),
+	)
+	defer olderServer.Close()
+	olderHandler.SetRiverClient(olderRiver)
+
+	newerFixture := baseFixture
+	newerFixture.Repository.DefaultBranch = "trunk"
+	newerFixture.Repository.DefaultBranchSHA = "newer-default-head"
+	newerFixture.Repository.UpdatedAt = baseFixture.Repository.UpdatedAt.Add(time.Minute)
+	newerFixture.PullRequests[2].Title = "newer fast batch"
+	newerFake, newerServer, newerHandler, newerRiver := newDirectHandler(
+		t,
+		newerPool,
+		newerFixture,
+		5*time.Millisecond,
+		100,
+	)
+	defer newerServer.Close()
+	newerHandler.SetRiverClient(newerRiver)
+
+	olderDone := make(chan error, 1)
+	go func() {
+		olderDone <- olderHandler.RefreshPR(t.Context(), refreshPRRequest(4812))
+	}()
+	waitForFakeRequest(t, olderFake, http.MethodPost, "/graphql")
+	if err := newerHandler.RefreshPR(t.Context(), refreshPRRequest(4815)); err != nil {
+		t.Fatalf("newer batch: %v", err)
+	}
+	if got := newerFake.RequestCount(http.MethodPost, "/graphql"); got == 0 {
+		t.Fatal("newer batch did not fetch repository metadata")
+	}
+	select {
+	case err := <-olderDone:
+		t.Fatalf("older batch applied before its response gate was released: %v", err)
+	default:
+	}
+	releaseOlderResponse()
+	if err := <-olderDone; err != nil {
+		t.Fatalf("older batch: %v", err)
+	}
+
+	repository, err := store.NewEntityWriter(database.Pool).Repository(
+		t.Context(),
+		"acme/monolith",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.DefaultBranch != "trunk" ||
+		repository.DefaultHeadSHA != "newer-default-head" ||
+		!repository.GitHubUpdatedAt.Equal(newerFixture.Repository.UpdatedAt) {
+		t.Fatalf("repository metadata after older-last batches = %+v", repository)
 	}
 }
 
@@ -3469,6 +3649,107 @@ func toGHPullRequest(
 func fetchTestDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	return testdb.New(t).Pool
+}
+
+func fetchPoolWithStatementTimeout(
+	t *testing.T,
+	databaseURL string,
+	timeout time.Duration,
+) *pgxpool.Pool {
+	t.Helper()
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("statement_timeout", timeout.String())
+	query.Set("application_name", fmt.Sprintf(
+		"fetch-lock-waiter-%d",
+		time.Now().UnixNano(),
+	))
+	parsed.RawQuery = query.Encode()
+	pool, err := store.Connect(t.Context(), parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+func seedCoordinatorPulls(t *testing.T, handler *Handler, numbers ...int) {
+	t.Helper()
+	for _, number := range numbers {
+		if err := handler.ResolveStackMembership(
+			t.Context(),
+			queue.RefreshRequest{
+				Args: queue.NewResolveStackMembershipArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", number),
+				).RefreshArgs,
+				Queue: queue.QueueEvent,
+			},
+		); err != nil {
+			t.Fatalf("seed PR %d: %v", number, err)
+		}
+	}
+}
+
+func refreshPRRequest(number int) queue.RefreshRequest {
+	return queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			fmt.Sprintf("pr:acme/monolith:%d", number),
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+}
+
+func waitForFakeRequest(
+	t *testing.T,
+	fake *fakegithub.Server,
+	method string,
+	path string,
+) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for fake.RequestCount(method, path) == 0 || fake.Concurrent() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("fake request %s %s did not enter delayed response", method, path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertObservationLockAvailability(
+	t *testing.T,
+	connection *pgxpool.Conn,
+	key string,
+	want bool,
+) {
+	t.Helper()
+	var acquired bool
+	if err := connection.QueryRow(
+		t.Context(),
+		`SELECT pg_try_advisory_lock(hashtextextended($1::text, 0))`,
+		key,
+	).Scan(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if acquired != want {
+		t.Fatalf("advisory lock %q available = %t, want %t", key, acquired, want)
+	}
+	if !acquired {
+		return
+	}
+	var unlocked bool
+	if err := connection.QueryRow(
+		t.Context(),
+		`SELECT pg_advisory_unlock(hashtextextended($1::text, 0))`,
+		key,
+	).Scan(&unlocked); err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
+		t.Fatalf("release advisory lock probe %q returned false", key)
+	}
 }
 
 type cachedReviewRequest struct {
