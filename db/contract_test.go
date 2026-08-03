@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ewhauser/ghsync/internal/outbox"
+	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/testdb"
 )
 
@@ -108,6 +109,116 @@ func TestPublicSchemaManifestMatchesMigratedDatabase(t *testing.T) {
 			mapDifference(livePublic, documented),
 			changedColumns(documented, livePublic),
 		)
+	}
+}
+
+func TestDocumentedDiffToOwnerSQLRunsAgainstMigratedDatabase(t *testing.T) {
+	t.Parallel()
+	content, err := os.ReadFile("CONTRACT.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const start = "<!-- diff-to-owner-sql:start -->\n```sql\n"
+	const end = "\n```\n<!-- diff-to-owner-sql:end -->"
+	_, query, ok := bytes.Cut(content, []byte(start))
+	if !ok {
+		t.Fatal("missing documented diff-to-owner SQL start marker")
+	}
+	query, _, ok = bytes.Cut(query, []byte(end))
+	if !ok {
+		t.Fatal("missing documented diff-to-owner SQL end marker")
+	}
+	database := testdb.New(t)
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	repository := store.RepositoryRecord{
+		InstallationID: 1, OrgID: 1, GitHubID: 11001,
+		NodeID: "repo-contract-query", Owner: "acme", Name: "contract-query",
+		FullName: "acme/contract-query", DefaultBranch: "main",
+		DefaultHeadSHA: "base-contract", GitHubUpdatedAt: now,
+	}
+	pull := store.PullRequestRecord{
+		Repository: repository, GitHubID: 11002, NodeID: "pr-contract-query",
+		Number: 7, Title: "contract query", State: "open",
+		HeadRef: "feature", HeadSHA: "head-contract",
+		BaseRef: "main", BaseSHA: "base-contract", MembershipKnown: true,
+		GitHubUpdatedAt: now, SyncedAt: now, Source: store.SyncSourceReconcile,
+		ChangeInputsKnown: true,
+		ChangeSnapshot: &store.PullRequestChangeSnapshotRecord{
+			BaseSHA: "base-contract", HeadSHA: "head-contract",
+			FilesTotalCount: 1, CodeownersRef: "main",
+			CodeownersSHA: "base-contract", CodeownersPath: "CODEOWNERS",
+			CodeownersState: "present", CodeownersSource: "*.go @owner",
+			CodeownersHash: "contract-source-hash",
+			Files: []store.ChangedFileRecord{{
+				Path: "src/main.go", ChangeType: "modified",
+			}},
+			Owners: []store.FileOwnerRecord{{
+				Path: "src/main.go", OwnerToken: "@owner", OwnerType: "user",
+				OwnerName: "owner", ResolutionState: "unresolved",
+				SourcePattern: "*.go", SourceLine: 1,
+			}},
+		},
+	}
+	if _, err := store.NewEntityWriter(database.Pool).ApplyPullRequest(
+		t.Context(), pull,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var repoID int64
+	if err := database.Pool.QueryRow(
+		t.Context(), "SELECT id FROM repos WHERE gh_id = $1", repository.GitHubID,
+	).Scan(&repoID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := database.Pool.Query(
+		t.Context(), string(query), repoID, int32(pull.Number),
+	)
+	if err != nil {
+		t.Fatalf("documented diff-to-owner SQL failed: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("documented diff-to-owner SQL returned no row: %v", rows.Err())
+	}
+	values, err := rows.Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 19 || values[8] != "src/main.go" || values[11] != "@owner" {
+		t.Fatalf("documented diff-to-owner SQL row = %#v", values)
+	}
+	if rows.Next() {
+		t.Fatal("documented diff-to-owner SQL returned duplicate rows")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConsumerGrantIncludesChangeInputTables(t *testing.T) {
+	t.Parallel()
+	content, err := os.ReadFile("CONTRACT.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := bytes.Index(content, []byte("GRANT SELECT ON TABLE\n"))
+	if start < 0 {
+		t.Fatal("missing consumer SELECT grant")
+	}
+	grant := content[start:]
+	if end := bytes.Index(grant, []byte("\nTO ghsync_consumer;")); end >= 0 {
+		grant = grant[:end]
+	} else {
+		t.Fatal("unterminated consumer SELECT grant")
+	}
+	for _, table := range []string{
+		"pull_request_change_snapshots",
+		"pull_request_changed_files",
+		"pull_request_file_owners",
+	} {
+		if !bytes.Contains(grant, []byte(table)) {
+			t.Fatalf("consumer SELECT grant omits %s", table)
+		}
 	}
 }
 

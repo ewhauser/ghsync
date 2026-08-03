@@ -141,6 +141,16 @@ type DerivationDirty struct {
 	MarkedAt pgtype.Timestamptz
 }
 
+type DriftEntitiesWithoutChangeInput struct {
+	InstallationID int64
+	EntityKind     string
+	SourceID       int64
+	EntityKey      string
+	LockKey        string
+	CacheSnapshot  []byte
+	LastCheckedAt  pgtype.Timestamptz
+}
+
 type DriftEntitiesWithoutParticipation struct {
 	InstallationID int64
 	EntityKind     string
@@ -260,6 +270,42 @@ type PullRequest struct {
 	DisplayUntil   pgtype.Timestamptz
 }
 
+type PullRequestChangeSnapshot struct {
+	RepoID            int64
+	PrNumber          int32
+	BaseSha           string
+	HeadSha           string
+	FilesTotalCount   int32
+	FilesTruncated    bool
+	CodeownersRef     string
+	CodeownersSha     string
+	CodeownersPath    pgtype.Text
+	CodeownersState   string
+	CodeownersSource  pgtype.Text
+	CodeownersHash    string
+	ParentGhUpdatedAt pgtype.Timestamptz
+	SyncedAt          pgtype.Timestamptz
+	Etag              string
+	SyncSource        string
+	TombstonedAt      pgtype.Timestamptz
+	LastCheckedAt     pgtype.Timestamptz
+}
+
+type PullRequestChangedFile struct {
+	RepoID        int64
+	PrNumber      int32
+	Path          string
+	PreviousPath  pgtype.Text
+	ChangeType    string
+	BaseSha       string
+	HeadSha       string
+	SyncedAt      pgtype.Timestamptz
+	Etag          string
+	SyncSource    string
+	TombstonedAt  pgtype.Timestamptz
+	LastCheckedAt pgtype.Timestamptz
+}
+
 type PullRequestComment struct {
 	NodeID        string
 	GhID          pgtype.Int8
@@ -276,6 +322,28 @@ type PullRequestComment struct {
 	SyncSource    string
 	TombstonedAt  pgtype.Timestamptz
 	LastCheckedAt pgtype.Timestamptz
+}
+
+type PullRequestFileOwner struct {
+	RepoID          int64
+	PrNumber        int32
+	Path            string
+	OwnerToken      string
+	OwnerType       string
+	OwnerName       string
+	ResolutionState string
+	OwnerGhID       pgtype.Int8
+	OwnerNodeID     pgtype.Text
+	OwnerLogin      pgtype.Text
+	SourcePattern   string
+	SourceLine      int32
+	BaseSha         string
+	HeadSha         string
+	SyncedAt        pgtype.Timestamptz
+	Etag            string
+	SyncSource      string
+	TombstonedAt    pgtype.Timestamptz
+	LastCheckedAt   pgtype.Timestamptz
 }
 
 type PullRequestReview struct {

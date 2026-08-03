@@ -68,6 +68,32 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		data["nodes"] = nodes
 	case strings.Contains(
 		request.Query,
+		"GhsyncPullRequestFilesPage",
+	):
+		id, after := graphQLCursorVariables(request.Variables)
+		for fixtureIndex := range fixtures {
+			fx := &fixtures[fixtureIndex]
+			for pullIndex := range fx.PullRequests {
+				pull := &fx.PullRequests[pullIndex]
+				if pull.NodeID == id {
+					var files any
+					if !pull.ChangedFilesOmitted {
+						files = graphQLChangedFiles(pull, after)
+					}
+					data["node"] = map[string]any{
+						"baseRefOid": nullableSHA(pull.Base.SHA),
+						"headRefOid": pull.Head.SHA,
+						"files":      files,
+					}
+					break
+				}
+			}
+			if data["node"] != nil {
+				break
+			}
+		}
+	case strings.Contains(
+		request.Query,
 		"GhsyncPullRequestReviewRequestsPage",
 	):
 		id, after := graphQLCursorVariables(request.Variables)
@@ -185,6 +211,10 @@ func graphQLPullRequest(
 	repository *Repository,
 	pull *PullRequest,
 ) map[string]any {
+	var files any
+	if !pull.ChangedFilesOmitted {
+		files = graphQLChangedFiles(pull, 0)
+	}
 	return map[string]any{
 		"id":             pull.NodeID,
 		"databaseId":     pull.ID,
@@ -199,6 +229,7 @@ func graphQLPullRequest(
 		"headRefOid":     pull.Head.SHA,
 		"baseRefName":    pull.Base.Ref,
 		"baseRefOid":     nullableSHA(pull.Base.SHA),
+		"changedFiles":   changedFilesTotal(pull),
 		"author":         map[string]any{"login": pull.AuthorLogin},
 		"repository": map[string]any{
 			"id":            repository.NodeID,
@@ -216,10 +247,33 @@ func graphQLPullRequest(
 			},
 		},
 		"reviewRequests": graphQLReviewRequests(pull.ReviewRequests, 0),
+		"files":          files,
 		"reviews":        graphQLReviews(pull.Reviews, 0),
 		"comments":       graphQLIssueComments(pull.Comments, 0),
 		"reviewThreads":  graphQLReviewThreads(pull.ReviewThreads, 0),
 	}
+}
+
+func graphQLChangedFiles(pull *PullRequest, after int) map[string]any {
+	start, end, pageInfo := graphQLPage(len(pull.ChangedFiles), after)
+	nodes := make([]map[string]any, 0, end-start)
+	for _, file := range pull.ChangedFiles[start:end] {
+		nodes = append(nodes, map[string]any{
+			"path":       file.Path,
+			"changeType": strings.ToUpper(file.ChangeType),
+		})
+	}
+	return map[string]any{
+		"nodes": nodes, "pageInfo": pageInfo,
+		"totalCount": changedFilesTotal(pull),
+	}
+}
+
+func changedFilesTotal(pull *PullRequest) int {
+	if pull.ChangedFilesTotal > 0 {
+		return pull.ChangedFilesTotal
+	}
+	return len(pull.ChangedFiles)
 }
 
 const fakeGraphQLConnectionLimit = 100

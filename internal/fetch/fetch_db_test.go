@@ -379,6 +379,21 @@ func TestIdenticalPR200OnlyAdvancesLastCheckedAt(t *testing.T) {
 	baseTime := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	repository := testRepository("acme/recheck", 2400, baseTime)
 	pull := testPull(&repository, baseTime, "same-head")
+	pull.ChangeInputsKnown = true
+	pull.ChangeSnapshot = &store.PullRequestChangeSnapshotRecord{
+		BaseSHA: "base", HeadSHA: "same-head", FilesTotalCount: 1,
+		CodeownersRef: "main", CodeownersSHA: "base",
+		CodeownersPath: "CODEOWNERS", CodeownersState: "present",
+		CodeownersSource: "* @unknown", CodeownersHash: "hash-one",
+		Files: []store.ChangedFileRecord{{
+			Path: "src/main.go", ChangeType: "modified",
+		}},
+		Owners: []store.FileOwnerRecord{{
+			Path: "src/main.go", OwnerToken: "@unknown", OwnerType: "user",
+			OwnerName: "unknown", ResolutionState: "unresolved",
+			SourcePattern: "*", SourceLine: 1,
+		}},
+	}
 	if _, err := writer.ApplyPullRequest(context.Background(), pull); err != nil {
 		t.Fatal(err)
 	}
@@ -432,6 +447,137 @@ func TestIdenticalPR200OnlyAdvancesLastCheckedAt(t *testing.T) {
 	}
 	if events != 1 {
 		t.Fatalf("identical PR change events = %d, want 1 initial event", events)
+	}
+	var snapshotSynced, snapshotChecked time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT synced_at, last_checked_at
+		FROM pull_request_change_snapshots
+		WHERE repo_id = (SELECT id FROM repos WHERE gh_id = 2400)
+		  AND pr_number = 42
+	`).Scan(&snapshotSynced, &snapshotChecked); err != nil {
+		t.Fatal(err)
+	}
+	if !snapshotSynced.Equal(initialSynced) ||
+		!snapshotChecked.After(initialChecked) {
+		t.Fatalf(
+			"identical change inputs synced=%s checked=%s",
+			snapshotSynced, snapshotChecked,
+		)
+	}
+
+	ownershipChanged := pull
+	ownershipChanged.SyncedAt = pull.SyncedAt.Add(time.Minute)
+	changedSnapshot := *pull.ChangeSnapshot
+	changedSnapshot.CodeownersSource = "* @new-owner"
+	changedSnapshot.CodeownersHash = "hash-two"
+	changedSnapshot.Owners = []store.FileOwnerRecord{{
+		Path: "src/main.go", OwnerToken: "@new-owner", OwnerType: "user",
+		OwnerName: "new-owner", ResolutionState: "unresolved",
+		SourcePattern: "*", SourceLine: 1,
+	}}
+	ownershipChanged.ChangeSnapshot = &changedSnapshot
+	result, err = writer.ApplyPullRequest(
+		context.Background(), ownershipChanged,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ChangeInputsChanged || !result.Applied || result.DomainChanged {
+		t.Fatalf("equal-parent ownership change result = %+v", result)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM change_events
+		WHERE kind = 'pull_request.changed'
+		  AND entity_key = 'pr:1:2400:42'
+	`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 2 {
+		t.Fatalf("ownership change events = %d, want exactly 2 total", events)
+	}
+
+	stale := ownershipChanged
+	stale.GitHubUpdatedAt = baseTime.Add(-time.Minute)
+	stale.SyncedAt = ownershipChanged.SyncedAt.Add(time.Minute)
+	staleSnapshot := changedSnapshot
+	staleSnapshot.Files = []store.ChangedFileRecord{{
+		Path: "stale.go", ChangeType: "added",
+	}}
+	staleSnapshot.CodeownersSource = "* @stale-owner"
+	staleSnapshot.CodeownersHash = "stale-hash"
+	staleSnapshot.Owners = nil
+	stale.ChangeSnapshot = &staleSnapshot
+	result, err = writer.ApplyPullRequest(context.Background(), stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied || result.ChangeInputsChanged {
+		t.Fatalf("stale parent changed ownership children: %+v", result)
+	}
+	var livePath string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT path FROM pull_request_changed_files
+		WHERE repo_id = (SELECT id FROM repos WHERE gh_id = 2400)
+		  AND pr_number = 42 AND tombstoned_at IS NULL
+	`).Scan(&livePath); err != nil {
+		t.Fatal(err)
+	}
+	if livePath != "src/main.go" {
+		t.Fatalf("stale parent replaced changed files with %q", livePath)
+	}
+	var liveHash, liveOwner string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT snapshot.codeowners_hash, owner.owner_token
+		FROM pull_request_change_snapshots AS snapshot
+		JOIN pull_request_file_owners AS owner
+		  ON owner.repo_id = snapshot.repo_id
+		 AND owner.pr_number = snapshot.pr_number
+		 AND owner.tombstoned_at IS NULL
+		WHERE snapshot.repo_id = (SELECT id FROM repos WHERE gh_id = 2400)
+		  AND snapshot.pr_number = 42
+		  AND snapshot.tombstoned_at IS NULL
+	`).Scan(&liveHash, &liveOwner); err != nil {
+		t.Fatal(err)
+	}
+	if liveHash != "hash-two" || liveOwner != "@new-owner" {
+		t.Fatalf(
+			"stale parent replaced snapshot/owner with %q/%q",
+			liveHash, liveOwner,
+		)
+	}
+	var beforeParentAdvance time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT synced_at
+		FROM pull_request_change_snapshots
+		WHERE repo_id = (SELECT id FROM repos WHERE gh_id = 2400)
+		  AND pr_number = 42
+	`).Scan(&beforeParentAdvance); err != nil {
+		t.Fatal(err)
+	}
+	newerParent := ownershipChanged
+	newerParent.GitHubUpdatedAt = baseTime.Add(time.Minute)
+	newerParent.SyncedAt = stale.SyncedAt.Add(time.Minute)
+	result, err = writer.ApplyPullRequest(context.Background(), newerParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DomainChanged || result.ChangeInputsChanged {
+		t.Fatalf("parent-only freshness advance result = %+v", result)
+	}
+	var afterParentAdvance time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT synced_at
+		FROM pull_request_change_snapshots
+		WHERE repo_id = (SELECT id FROM repos WHERE gh_id = 2400)
+		  AND pr_number = 42
+	`).Scan(&afterParentAdvance); err != nil {
+		t.Fatal(err)
+	}
+	if !afterParentAdvance.Equal(beforeParentAdvance) {
+		t.Fatalf(
+			"parent-only freshness changed snapshot synced_at %s -> %s",
+			beforeParentAdvance, afterParentAdvance,
+		)
 	}
 }
 
@@ -1154,6 +1300,216 @@ func TestRepositoryRulesLockedCASDirtyEventAndConditionalRecheck(t *testing.T) {
 		"/repos/acme/monolith/rulesets",
 	); got != 2 {
 		t.Fatalf("repository rules fetches = %d, want 2", got)
+	}
+}
+
+func TestPullRequestRefreshMirrorsFencedFilesAndCodeowners(t *testing.T) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	_, server, handler, riverClient := newDirectHandler(
+		t, pool, fixture, 5*time.Millisecond, 100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	request := queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.RefreshPR(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var baseSHA, headSHA, sourcePath, sourceState string
+	var total int
+	var truncated bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT base_sha, head_sha, files_total_count, files_truncated,
+		       codeowners_path, codeowners_state
+		FROM pull_request_change_snapshots
+		WHERE pr_number = 4812 AND tombstoned_at IS NULL
+	`).Scan(
+		&baseSHA, &headSHA, &total, &truncated, &sourcePath, &sourceState,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if baseSHA != "bbbb001" || headSHA != "8f31c2d" || total != 2 ||
+		truncated || sourcePath != ".github/CODEOWNERS" ||
+		sourceState != "present" {
+		t.Fatalf(
+			"change snapshot = %q/%q total=%d truncated=%v source=%q/%q",
+			baseSHA, headSHA, total, truncated, sourcePath, sourceState,
+		)
+	}
+	var previous string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT previous_path
+		FROM pull_request_changed_files
+		WHERE pr_number = 4812 AND path = 'docs/ranking.md'
+		  AND tombstoned_at IS NULL
+	`).Scan(&previous); err != nil {
+		t.Fatal(err)
+	}
+	if previous != "docs/search.md" {
+		t.Fatalf("rename previous path = %q", previous)
+	}
+	type ownerState struct {
+		token string
+		kind  string
+		state string
+		id    string
+	}
+	rows, err := pool.Query(context.Background(), `
+		SELECT owner_token, owner_type, resolution_state,
+		       COALESCE(owner_node_id, '')
+		FROM pull_request_file_owners
+		WHERE pr_number = 4812 AND tombstoned_at IS NULL
+		ORDER BY path, owner_token
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var owners []ownerState
+	for rows.Next() {
+		var owner ownerState
+		if err := rows.Scan(
+			&owner.token, &owner.kind, &owner.state, &owner.id,
+		); err != nil {
+			t.Fatal(err)
+		}
+		owners = append(owners, owner)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []ownerState{
+		{token: "docs@example.com", kind: "email", state: "unresolved"},
+		{token: "malformed-owner", kind: "malformed", state: "unresolved"},
+		{
+			token: "@acme/search-platform", kind: "team", state: "resolved",
+			id: "T_kwDOABCDEF6001",
+		},
+		{token: "@unknown-user", kind: "user", state: "unresolved"},
+	}
+	if !reflect.DeepEqual(owners, want) {
+		t.Fatalf("file owners = %#v, want %#v", owners, want)
+	}
+}
+
+func TestPullRequestRefreshResolvesRenameByNewPathAndOwnerCase(t *testing.T) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	contents, ok := fixture.Contents["bbbb001"]
+	if !ok {
+		t.Fatal("fixture has no CODEOWNERS content at rename base")
+	}
+	contents[".github/CODEOWNERS"] =
+		"* @Reviewer\n" +
+			"internal/ranker.go\n" +
+			"docs/search.md @old-owner\n" +
+			"docs/ranking.md @Reviewer\n"
+	_, server, handler, riverClient := newDirectHandler(
+		t, pool, fixture, 5*time.Millisecond, 100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	request := queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.RefreshPR(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var token, state, login, pattern string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT owner_token, resolution_state, owner_login, source_pattern
+		FROM pull_request_file_owners
+		WHERE pr_number = 4812
+		  AND path = 'docs/ranking.md'
+		  AND tombstoned_at IS NULL
+	`).Scan(&token, &state, &login, &pattern); err != nil {
+		t.Fatal(err)
+	}
+	if token != "@Reviewer" || state != "resolved" || login != "reviewer" ||
+		pattern != "docs/ranking.md" {
+		t.Fatalf(
+			"renamed-path owner = %q/%q/%q via %q",
+			token, state, login, pattern,
+		)
+	}
+	var oldPathOwners int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM pull_request_file_owners
+		WHERE pr_number = 4812
+		  AND owner_token = '@old-owner'
+		  AND tombstoned_at IS NULL
+	`).Scan(&oldPathOwners); err != nil {
+		t.Fatal(err)
+	}
+	if oldPathOwners != 0 {
+		t.Fatalf("rename resolved %d owners from previous_path", oldPathOwners)
+	}
+	var clearedOwners int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM pull_request_file_owners
+		WHERE pr_number = 4812
+		  AND path = 'internal/ranker.go'
+		  AND tombstoned_at IS NULL
+	`).Scan(&clearedOwners); err != nil {
+		t.Fatal(err)
+	}
+	if clearedOwners != 0 {
+		t.Fatalf("ownerless later rule retained %d owners", clearedOwners)
+	}
+}
+
+func TestPullRequestRefreshRejectsSynchronizeDuringHydration(t *testing.T) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	path := "/repos/acme/monolith/pulls/4812"
+	_, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		5*time.Millisecond,
+		100,
+		fakegithub.WithRequestHook(func(method, requestPath string, count int, fx *fakegithub.Fixture) {
+			if method != "GET" || requestPath != path || count != 2 {
+				return
+			}
+			fx.PullRequests[1].Head.SHA = "synchronized-head"
+			fx.PullRequests[1].ChangedFiles = []fakegithub.ChangedFile{{
+				Path: "new/from-synchronize.go", ChangeType: "added",
+			}}
+		}),
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	err := handler.RefreshPR(context.Background(), queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	})
+	if err == nil || !strings.Contains(err.Error(), "base/head changed") {
+		t.Fatalf("synchronize race error = %v", err)
+	}
+	var snapshots int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM pull_request_change_snapshots
+	`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 {
+		t.Fatalf("synchronize race persisted %d snapshots", snapshots)
 	}
 }
 
@@ -2398,10 +2754,10 @@ func TestResolveStackMembershipCompletesWithNullHistoricalBaseSHA(
 	); err != nil {
 		t.Fatal(err)
 	}
-	if stackJobs < 1 || stackJobs > 3 || completedStackJobs != stackJobs ||
+	if stackJobs < 1 || stackJobs > 4 || completedStackJobs != stackJobs ||
 		maxStackAttempts != 1 {
 		t.Fatalf(
-			"open unknown-SHA stack refreshes/completed/max-attempt = %d/%d/%d, want 1..3/all/1",
+			"open unknown-SHA stack refreshes/completed/max-attempt = %d/%d/%d, want 1..4/all/1",
 			stackJobs,
 			completedStackJobs,
 			maxStackAttempts,
@@ -2470,22 +2826,25 @@ func TestRefreshPRWorkerPersistsNullGraphQLBaseRefOID(t *testing.T) {
 		t.Fatalf("GraphQL null baseRefOid cached as %q, want unknown", cachedBaseSHA)
 	}
 	var jobs, completed, maxAttempts int
+	var jobErrors string
 	if err := harness.pool.QueryRow(t.Context(), `
 		SELECT count(*),
 		       count(*) FILTER (WHERE state = 'completed'),
-		       COALESCE(max(attempt), 0)
+		       COALESCE(max(attempt), 0),
+		       COALESCE(string_agg(errors::text, E'\n'), '')
 		FROM river_job
 		WHERE kind = 'refresh_pr'
 		  AND args->>'key' = $1
-	`, key).Scan(&jobs, &completed, &maxAttempts); err != nil {
+	`, key).Scan(&jobs, &completed, &maxAttempts, &jobErrors); err != nil {
 		t.Fatal(err)
 	}
-	if jobs != 1 || completed != 1 || maxAttempts != 1 {
+	if jobs != 2 || completed != 2 || maxAttempts != 1 {
 		t.Fatalf(
-			"GraphQL refresh_pr jobs/completed/max-attempt = %d/%d/%d, want 1/1/1",
+			"GraphQL refresh_pr jobs/completed/max-attempt = %d/%d/%d, want 2/2/1; errors: %s",
 			jobs,
 			completed,
 			maxAttempts,
+			jobErrors,
 		)
 	}
 }
@@ -2541,6 +2900,16 @@ func TestOrderIndependenceFinalCacheState(t *testing.T) {
 		}
 		harness.dispatchAll()
 		harness.waitIdle()
+		// Reconciliation must converge the source-rich PR observation after any
+		// event-order race with parent-only repository or stack observations.
+		if _, err := harness.river.Insert(
+			t.Context(),
+			queue.NewRefreshPRArgs(fmt.Sprintf("pr:%s:4812", repo)),
+			queue.NewRefreshInsertOptsForQueue(queue.QueueSweep, time.Time{}),
+		); err != nil {
+			t.Fatal(err)
+		}
+		harness.waitIdle()
 		got := snapshotCache(t, harness.pool, repo)
 		harness.close()
 		if !reflect.DeepEqual(got, want) {
@@ -2559,11 +2928,11 @@ func expectedOrderCacheSnapshot() cacheSnapshot {
 	// and snapshotCache. It prevents an identically empty or consistently
 	// malformed implementation from satisfying C-I4 by self-comparison.
 	return cacheSnapshot{
-		Repos:        `[{"gh_id": 2001, "node_id": "R_acme_order", "archived": false, "head_sha": "", "full_name": "acme/order", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T12:00:00Z", "default_branch": "main"}]`,
+		Repos:        `[{"gh_id": 2001, "node_id": "R_acme_order", "archived": false, "head_sha": "aaaa000", "full_name": "acme/order", "tombstoned": false, "sync_source": "reconcile", "gh_updated_at": "2026-07-28T12:00:00Z", "default_branch": "main"}]`,
 		RepoRules:    `[]`,
 		Stacks:       `[{"open": true, "gh_id": 9876543, "number": 142, "entries": [{"draft": false, "state": "closed", "number": 4810, "head_ref": "refactor/tokenizer", "head_sha": "bbbb001", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4812, "head_ref": "refactor/bm25f-ranker", "head_sha": "8f31c2d", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4815, "head_ref": "feat/relevance-debug", "head_sha": "bbbb003", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4816, "head_ref": "feat/results-rewire", "head_sha": "bbbb004", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4820, "head_ref": "feat/relevance-telemetry", "head_sha": "bbbb005", "updated_at": "2026-07-28T12:00:00Z"}], "node_id": "S_kwDOABCDEF4AAAAA", "base_ref": "main", "base_sha": "aaaa000", "head_sha": "bbbb005", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T12:00:00Z"}]`,
 		Pulls:        `[{"gh_id": 804810, "state": "closed", "title": "Tokenizer rewrite for query parser", "number": 4810, "node_id": "PR_kwDOABCDEF4810", "base_ref": "main", "base_sha": "aaaa000", "head_ref": "refactor/tokenizer", "head_sha": "bbbb001", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 1, "review_decision": "APPROVED"}, {"gh_id": 804812, "state": "open", "title": "BM25F ranker integration", "number": 4812, "node_id": "PR_kwDOABCDEF4812", "base_ref": "refactor/tokenizer", "base_sha": "bbbb001", "head_ref": "refactor/bm25f-ranker", "head_sha": "8f31c2d", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 2, "review_decision": "CHANGES_REQUESTED"}, {"gh_id": 804815, "state": "open", "title": "Relevance debug API endpoint", "number": 4815, "node_id": "PR_kwDOABCDEF4815", "base_ref": "refactor/bm25f-ranker", "base_sha": "8f31c2d", "head_ref": "feat/relevance-debug", "head_sha": "bbbb003", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 3, "review_decision": "REVIEW_REQUIRED"}, {"gh_id": 804816, "state": "open", "title": "Results page rewiring", "number": 4816, "node_id": "PR_kwDOABCDEF4816", "base_ref": "feat/relevance-debug", "base_sha": "bbbb003", "head_ref": "feat/results-rewire", "head_sha": "bbbb004", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 4, "review_decision": "REVIEW_REQUIRED"}, {"gh_id": 804820, "state": "open", "title": "Relevance telemetry dashboards", "number": 4820, "node_id": "PR_kwDOABCDEF4820", "base_ref": "feat/results-rewire", "base_sha": "bbbb004", "head_ref": "feat/relevance-telemetry", "head_sha": "bbbb005", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 5, "review_decision": "REVIEW_REQUIRED"}]`,
-		Threads:      `[]`,
+		Threads:      `[{"id": "PRRT_kwDOABCDEF4812_1", "line": null, "path": "internal/ranker.go", "comments": [{"id": "PRRC_kwDOABCDEF4812_1", "body": "Please cover the tie case.", "updated_at": "2026-07-28T12:00:00Z", "author_login": "reviewer"}], "head_sha": "8f31c2d", "pr_number": 4812, "tombstoned": false, "is_outdated": false, "is_resolved": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T12:00:00Z"}]`,
 		Checks:       `[{"name": "unit", "gh_id": 99001, "status": "completed", "head_sha": "8f31c2d", "conclusion": "failure", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z"}, {"name": "lint", "gh_id": 99002, "status": "completed", "head_sha": "8f31c2d", "conclusion": "success", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z"}]`,
 		CheckHistory: `[{"name": "unit", "status": "completed", "head_sha": "8f31c2d", "conclusion": "failure", "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z", "check_run_gh_id": 99001}, {"name": "lint", "status": "completed", "head_sha": "8f31c2d", "conclusion": "success", "sync_source": "webhook", "gh_updated_at": "2026-07-28T11:55:00Z", "check_run_gh_id": 99002}]`,
 		Dirty:        `["pr:1:2001:4810", "pr:1:2001:4812", "pr:1:2001:4815", "pr:1:2001:4816", "pr:1:2001:4820", "stack:1:2001:142"]`,
@@ -2581,6 +2950,17 @@ func TestStormAssertsFetchCount(t *testing.T) {
 			"stack": map[string]any{"number": 142},
 		},
 	}
+	if _, err := harness.river.Insert(
+		t.Context(),
+		queue.NewRefreshStackArgs("stack:acme/storm:142"),
+		queue.NewRefreshInsertOptsForQueue(queue.QueueEvent, time.Time{}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	// A real branch push fans out from previously mirrored branch membership.
+	// Seed that membership directly so this test measures storm coalescing,
+	// not cold-start behavior.
+	harness.waitIdle()
 	harness.emit("storm-warm", warm)
 	harness.dispatchAll()
 	harness.waitIdle()

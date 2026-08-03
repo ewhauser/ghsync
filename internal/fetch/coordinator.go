@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/changeinputs"
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/store"
 )
@@ -69,6 +70,7 @@ type prCoordinator struct {
 	window         time.Duration
 	max            int
 	graphQL        *gh.GraphQLClient
+	rest           *gh.RESTClient
 	writer         *store.EntityWriter
 	installationID int64
 	orgID          int64
@@ -76,6 +78,7 @@ type prCoordinator struct {
 
 func newPRCoordinator(
 	graphQL *gh.GraphQLClient,
+	rest *gh.RESTClient,
 	writer *store.EntityWriter,
 	installationID int64,
 	orgID int64,
@@ -89,6 +92,7 @@ func newPRCoordinator(
 		window:         window,
 		max:            defaultBatchSize,
 		graphQL:        graphQL,
+		rest:           rest,
 		writer:         writer,
 		installationID: installationID,
 		orgID:          orgID,
@@ -262,6 +266,25 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			c.installationID,
 			c.orgID,
 		)
+		snapshot, err := changeinputs.Hydrate(
+			callCtx,
+			c.rest,
+			c.writer,
+			item.class,
+			record.Repository.GitHubID,
+			record.Repository.Owner,
+			record.Repository.Name,
+			record.Number,
+			node,
+		)
+		if err != nil {
+			results[item] = pullBatchResult{
+				err: fmt.Errorf("hydrate PR change inputs: %w", err),
+			}
+			continue
+		}
+		record.ChangeSnapshot = snapshot
+		record.ChangeInputsKnown = true
 		repoID := record.Repository.GitHubID
 		if repoErr := repositoryFailures[repoID]; repoErr != nil {
 			results[item] = pullBatchResult{err: repoErr}

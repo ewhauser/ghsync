@@ -1698,14 +1698,18 @@ func (h *sweepHarness) seedCheckHistory(
 
 func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		if condition() {
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-ticker.C:
+		case <-t.Context().Done():
+			t.Fatal("condition did not become true before test cancellation")
+		}
 	}
-	t.Fatal("condition did not become true before timeout")
 }
 
 func sweepTestDatabase(t *testing.T) *pgxpool.Pool {

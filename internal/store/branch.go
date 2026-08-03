@@ -54,7 +54,6 @@ func (w *EntityWriter) BranchTargets(
 					fmt.Sprintf("stack:%s:%d", repoFullName, number),
 				)
 			}
-			continue
 		}
 		targets = append(
 			targets,

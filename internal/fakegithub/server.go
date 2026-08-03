@@ -69,25 +69,36 @@ func nullableSHA(value string) any {
 
 // PullRequest is fixture truth for REST and GraphQL pull responses.
 type PullRequest struct {
-	ID             int64               `json:"id"`
-	NodeID         string              `json:"node_id"`
-	Number         int                 `json:"number"`
-	Title          string              `json:"title"`
-	State          string              `json:"state"`
-	Draft          bool                `json:"draft"`
-	AuthorLogin    string              `json:"-"`
-	ReviewDecision string              `json:"review_decision"`
-	MergeableState string              `json:"mergeable_state"`
-	Head           PullRequestBranch   `json:"head"`
-	Base           Base                `json:"base"`
-	UpdatedAt      time.Time           `json:"updated_at"`
-	CreatedAt      time.Time           `json:"-"`
-	MergedAt       *time.Time          `json:"-"`
-	Stack          *StackRef           `json:"stack"`
-	ReviewThreads  []ReviewThread      `json:"-"`
-	ReviewRequests []ReviewRequest     `json:"-"`
-	Reviews        []PullRequestReview `json:"-"`
-	Comments       []IssueComment      `json:"-"`
+	ID                  int64               `json:"id"`
+	NodeID              string              `json:"node_id"`
+	Number              int                 `json:"number"`
+	Title               string              `json:"title"`
+	State               string              `json:"state"`
+	Draft               bool                `json:"draft"`
+	AuthorLogin         string              `json:"-"`
+	ReviewDecision      string              `json:"review_decision"`
+	MergeableState      string              `json:"mergeable_state"`
+	Head                PullRequestBranch   `json:"head"`
+	Base                Base                `json:"base"`
+	UpdatedAt           time.Time           `json:"updated_at"`
+	CreatedAt           time.Time           `json:"-"`
+	MergedAt            *time.Time          `json:"-"`
+	Stack               *StackRef           `json:"stack"`
+	ReviewThreads       []ReviewThread      `json:"-"`
+	ReviewRequests      []ReviewRequest     `json:"-"`
+	Reviews             []PullRequestReview `json:"-"`
+	Comments            []IssueComment      `json:"-"`
+	ChangedFiles        []ChangedFile       `json:"-"`
+	ChangedFilesTotal   int                 `json:"-"`
+	ChangedFilesOmitted bool                `json:"-"`
+}
+
+// ChangedFile is fixture truth for one pull-request changed-file node. The
+// prior path is served by REST because GitHub's GraphQL type omits it.
+type ChangedFile struct {
+	Path         string `json:"filename"`
+	PreviousPath string `json:"previous_filename,omitempty"`
+	ChangeType   string `json:"status"`
 }
 
 // Stack is fixture truth for the gh-stack preview API.
@@ -265,6 +276,8 @@ type Fixture struct {
 	Stacks       []Stack
 	PullRequests []PullRequest
 	CheckRuns    []CheckRun
+	// Contents is keyed by exact Git ref/SHA and repository-relative path.
+	Contents map[string]map[string]string
 }
 
 // RateLimitStep scripts one response's server-authoritative rate state.
@@ -486,6 +499,10 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server { //n
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", s.listPulls)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", s.getPull)
 	mux.HandleFunc(
+		"GET /repos/{owner}/{repo}/pulls/{number}/files",
+		s.listPullFiles,
+	)
+	mux.HandleFunc(
 		"GET /repos/{owner}/{repo}/pulls/{number}/reviews",
 		s.listPullReviews,
 	)
@@ -496,6 +513,10 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server { //n
 	mux.HandleFunc(
 		"GET /repos/{owner}/{repo}/commits/{sha}/check-runs",
 		s.listCheckRuns,
+	)
+	mux.HandleFunc(
+		"GET /repos/{owner}/{repo}/contents/{path...}",
+		s.getRepositoryContent,
 	)
 	mux.HandleFunc("POST /graphql", s.graphql)
 	mux.HandleFunc("POST /app/installations/{id}/access_tokens", s.installationToken)

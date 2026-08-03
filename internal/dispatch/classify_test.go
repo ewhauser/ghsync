@@ -53,6 +53,10 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 			}`,
 			want: []Intent{
 				{
+					Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:4812",
+					Priority: PriorityEvent,
+				},
+				{
 					Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
 					Priority: PriorityEvent,
 				},
@@ -72,6 +76,11 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 				"pull_request":{"number":4815,"stack":{"number":142}}
 			}`,
 			want: []Intent{
+				{
+					Kind:     queue.KindRefreshPR,
+					Key:      "pr:acme/monolith:4815",
+					Priority: PriorityEvent,
+				},
 				{
 					Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
 					Priority: PriorityEvent,
@@ -218,10 +227,13 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 				"repository":{"full_name":"acme/monolith"},
 				"stack":{"number":142}
 			}`,
-			want: []Intent{{
-				Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:142",
-				Priority: PriorityEvent,
-			}},
+			want: []Intent{
+				{
+					Kind:     queue.KindRefreshBranch,
+					Key:      "branch:acme/monolith:refactor/bm25f-ranker",
+					Priority: PriorityEvent,
+				},
+			},
 		},
 		{
 			name:  "tag push is not a branch hint",
@@ -242,6 +254,51 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("intents = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCodeownersPushRuleTargetsOnlyEffectiveDefaultBranchPaths(
+	t *testing.T,
+) {
+	t.Parallel()
+	classifier := NewClassifier([]Rule{{
+		Event: "push", Action: ActionAny, Target: TargetCodeowners,
+	}})
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "modified effective path",
+			body: `{"ref":"refs/heads/main","repository":{"full_name":"acme/monolith","default_branch":"main"},"commits":[{"modified":[".github/CODEOWNERS"]}]}`,
+			want: true,
+		},
+		{
+			name: "removed fallback path",
+			body: `{"ref":"refs/heads/main","repository":{"full_name":"acme/monolith","default_branch":"main"},"head_commit":{"removed":["docs/CODEOWNERS"]}}`,
+			want: true,
+		},
+		{
+			name: "non default branch",
+			body: `{"ref":"refs/heads/topic","repository":{"full_name":"acme/monolith","default_branch":"main"},"commits":[{"modified":["CODEOWNERS"]}]}`,
+		},
+		{
+			name: "unrelated default branch file",
+			body: `{"ref":"refs/heads/main","repository":{"full_name":"acme/monolith","default_branch":"main"},"commits":[{"modified":["src/CODEOWNERS"]}]}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			intents, err := classifier.Classify("push", []byte(test.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(intents) == 1) != test.want {
+				t.Fatalf("intents = %#v, want emitted=%v", intents, test.want)
 			}
 		})
 	}
@@ -396,6 +453,10 @@ func TestUnknownStackBaseSHARetainsEagerStackFetch(t *testing.T) {
 		t.Fatalf("unknown SHA produced suppression hint: %+v", result.stackHint)
 	}
 	want := []Intent{
+		{
+			Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:72787",
+			Priority: PriorityEvent,
+		},
 		{
 			Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:72787",
 			Priority: PriorityEvent,

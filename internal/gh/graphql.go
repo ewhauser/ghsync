@@ -18,6 +18,11 @@ const defaultGraphQLResponseBytes = 10 << 20
 // MaxPullRequestBatch is GitHub's nodes-per-gang cap used by the coordinator.
 const MaxPullRequestBatch = 25
 
+// MaxPullRequestFiles is GitHub's documented changed-file listing cap. The
+// mirror stops at this boundary and records explicit truncation when the
+// connection reports more files or remains pageable.
+const MaxPullRequestFiles = 3000
+
 // GraphQLClient executes budget-gated installation GraphQL calls.
 type GraphQLClient struct {
 	client           client
@@ -93,10 +98,12 @@ type PullRequestNode struct {
 	HeadRefOID     string    `json:"headRefOid"`
 	BaseRefName    string    `json:"baseRefName"`
 	BaseRefOID     string    `json:"baseRefOid"`
+	ChangedFiles   int       `json:"changedFiles"`
 	Author         struct {
 		Login string `json:"login"`
 	} `json:"author"`
-	Repository     RepositoryNode `json:"repository"`
+	Repository     RepositoryNode              `json:"repository"`
+	Files          *PullRequestFilesConnection `json:"files"`
 	ReviewRequests struct {
 		Nodes    []ReviewRequestNode `json:"nodes"`
 		PageInfo PageInfo            `json:"pageInfo"`
@@ -113,6 +120,25 @@ type PullRequestNode struct {
 		Nodes    []ReviewThreadNode `json:"nodes"`
 		PageInfo PageInfo           `json:"pageInfo"`
 	} `json:"reviewThreads"`
+}
+
+// PullRequestChangedFileNode is one GraphQL changed-file fact. GitHub's
+// GraphQL type does not expose the prior path for a rename; the fetch layer
+// supplements renamed nodes from the bounded REST files endpoint.
+type PullRequestChangedFileNode struct {
+	Path         string `json:"path"`
+	PreviousPath string `json:"-"`
+	ChangeType   string `json:"changeType"`
+}
+
+// PullRequestFilesConnection carries the authoritative page set and its
+// completeness state. Truncated is derived locally from GitHub's 3,000-file
+// cap, an inconsistent total, or an unfinished cursor.
+type PullRequestFilesConnection struct {
+	Nodes      []PullRequestChangedFileNode `json:"nodes"`
+	PageInfo   PageInfo                     `json:"pageInfo"`
+	TotalCount int                          `json:"totalCount"`
+	Truncated  bool                         `json:"-"`
 }
 
 // ActorNode preserves every GraphQL Actor variant instead of projecting only
@@ -249,6 +275,7 @@ const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
       headRefOid
       baseRefName
       baseRefOid
+	  changedFiles
       author { login }
       repository {
         id
@@ -260,6 +287,11 @@ const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
         owner { login }
         defaultBranchRef { name target { oid } }
       }
+	  files(first: 100) {
+		pageInfo { hasNextPage endCursor }
+		totalCount
+		nodes { path changeType }
+	  }
       reviewRequests(first: 100) {
         pageInfo { hasNextPage endCursor }
         nodes {
@@ -305,6 +337,24 @@ const pullRequestNodesQuery = `query GhsyncPullRequestNodes($ids: [ID!]!) {
             nodes { id body updatedAt author { login } }
           }
         }
+      }
+    }
+  }
+  rateLimit { cost limit remaining resetAt }
+}`
+
+const pullRequestFilesPageQuery = `query GhsyncPullRequestFilesPage(
+  $id: ID!,
+  $after: String
+) {
+  node(id: $id) {
+    ... on PullRequest {
+      baseRefOid
+      headRefOid
+      files(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        totalCount
+        nodes { path changeType }
       }
     }
   }
@@ -473,6 +523,65 @@ func (c *GraphQLClient) completePullRequestReviewConnections(
 	class budget.Class,
 	pull *PullRequestNode,
 ) error {
+	if pull.Files != nil {
+		if len(pull.Files.Nodes) > MaxPullRequestFiles {
+			pull.Files.Nodes = pull.Files.Nodes[:MaxPullRequestFiles]
+			pull.Files.Truncated = true
+		}
+		for pull.Files.PageInfo.HasNextPage &&
+			len(pull.Files.Nodes) < MaxPullRequestFiles {
+			if pull.Files.PageInfo.EndCursor == nil {
+				return fmt.Errorf("files hasNextPage without endCursor")
+			}
+			var data struct {
+				Node *struct {
+					BaseRefOID string                      `json:"baseRefOid"`
+					HeadRefOID string                      `json:"headRefOid"`
+					Files      *PullRequestFilesConnection `json:"files"`
+				} `json:"node"`
+			}
+			_, err := c.Call(
+				ctx,
+				class,
+				pullRequestFilesPageQuery,
+				map[string]any{
+					"id":    pull.ID,
+					"after": *pull.Files.PageInfo.EndCursor,
+				},
+				&data,
+			)
+			if err != nil {
+				return fmt.Errorf("paginate files for %s: %w", pull.ID, err)
+			}
+			if data.Node == nil || data.Node.Files == nil {
+				pull.Files.Truncated = true
+				break
+			}
+			if data.Node.BaseRefOID != pull.BaseRefOID ||
+				data.Node.HeadRefOID != pull.HeadRefOID {
+				return fmt.Errorf(
+					"paginate files for %s: pull request SHA fence changed",
+					pull.ID,
+				)
+			}
+			remaining := MaxPullRequestFiles - len(pull.Files.Nodes)
+			pageNodes := data.Node.Files.Nodes
+			if len(pageNodes) > remaining {
+				pageNodes = pageNodes[:remaining]
+				pull.Files.Truncated = true
+			}
+			pull.Files.Nodes = append(pull.Files.Nodes, pageNodes...)
+			pull.Files.PageInfo = data.Node.Files.PageInfo
+			if data.Node.Files.TotalCount != pull.Files.TotalCount {
+				pull.Files.Truncated = true
+			}
+		}
+		if pull.Files.PageInfo.HasNextPage ||
+			pull.Files.TotalCount != len(pull.Files.Nodes) ||
+			pull.Files.TotalCount > MaxPullRequestFiles {
+			pull.Files.Truncated = true
+		}
+	}
 	for pull.ReviewRequests.PageInfo.HasNextPage {
 		if pull.ReviewRequests.PageInfo.EndCursor == nil {
 			return fmt.Errorf("reviewRequests hasNextPage without endCursor")

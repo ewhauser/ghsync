@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,6 +14,35 @@ import (
 	"github.com/google/go-github/v88/github"
 
 	"github.com/ewhauser/ghsync/internal/budget"
+)
+
+const (
+	// MaxCodeownersBytes is GitHub's effective CODEOWNERS size boundary.
+	// Files at or above this size are not loaded by GitHub.
+	MaxCodeownersBytes = 3 << 20
+)
+
+// PullRequestFile is the REST rename supplement for a GraphQL changed file.
+type PullRequestFile struct {
+	Path         string `json:"filename"`
+	PreviousPath string `json:"previous_filename"`
+	Status       string `json:"status"`
+}
+
+// CodeownersSource is the first source found in GitHub's precedence order.
+type CodeownersSource struct {
+	Path    string
+	Content string
+	State   string
+}
+
+const (
+	CodeownersPresent   = "present"
+	CodeownersMissing   = "missing"
+	CodeownersOversized = "oversized"
+	// CodeownersUnavailable means the PR base commit is explicitly unknown,
+	// so no source can be read without silently falling back to another ref.
+	CodeownersUnavailable = "unavailable"
 )
 
 // StackBase identifies a stack's base ref and commit.
@@ -205,6 +235,12 @@ func (c *CheckRun) UnmarshalJSON(data []byte) error {
 
 // ListCheckRunsOptions controls checks pagination.
 type ListCheckRunsOptions struct {
+	PerPage int
+	Page    int
+}
+
+// ListPullRequestFilesOptions controls changed-file REST pagination.
+type ListPullRequestFilesOptions struct {
 	PerPage int
 	Page    int
 }
@@ -436,6 +472,168 @@ func (c *RESTClient) GetPull(
 		return nil, response, err
 	}
 	return &pull, response, nil
+}
+
+// ListPullRequestFiles fetches one REST changed-file page. The GraphQL files
+// connection remains authoritative; this endpoint supplies previous_filename,
+// which the GraphQL PullRequestChangedFile type does not expose.
+func (c *RESTClient) ListPullRequestFiles(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	number int,
+	options ListPullRequestFilesOptions,
+) ([]PullRequestFile, *RESTResponse, error) {
+	query := make(url.Values)
+	setPagination(query, options.PerPage, options.Page)
+	path := fmt.Sprintf(
+		"repos/%s/%s/pulls/%d/files",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		number,
+	)
+	var files []PullRequestFile
+	response, err := c.client.getJSON(ctx, class, path, query, "", &files)
+	return files, response, err
+}
+
+// PullRequestFileRenames follows the REST listing to GitHub's documented
+// 3,000-file cap and returns only rename source paths. Truncated is true if a
+// cursor remains at the cap.
+func (c *RESTClient) PullRequestFileRenames(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	number int,
+) (map[string]string, bool, error) {
+	renames := make(map[string]string)
+	count := 0
+	for page := 1; count < MaxPullRequestFiles; page++ {
+		files, response, err := c.ListPullRequestFiles(
+			ctx,
+			class,
+			owner,
+			repo,
+			number,
+			ListPullRequestFilesOptions{PerPage: 100, Page: page},
+		)
+		if err != nil {
+			return nil, false, fmt.Errorf("list PR files page %d: %w", page, err)
+		}
+		for _, file := range files {
+			if count == MaxPullRequestFiles {
+				break
+			}
+			count++
+			if strings.EqualFold(file.Status, "renamed") &&
+				file.Path != "" && file.PreviousPath != "" {
+				renames[file.Path] = file.PreviousPath
+			}
+		}
+		if response.NextPage == 0 {
+			return renames, false, nil
+		}
+		if count == MaxPullRequestFiles {
+			return renames, true, nil
+		}
+		page = response.NextPage - 1
+	}
+	return renames, true, nil
+}
+
+// FindCodeowners reads the first source present at an exact Git ref using
+// GitHub's .github, repository-root, then docs precedence. A missing source is
+// a successful explicit state; an oversized first source is effective empty
+// ownership and does not fall through to lower-precedence files.
+func (c *RESTClient) FindCodeowners(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	ref string,
+) (CodeownersSource, error) {
+	for _, path := range []string{
+		".github/CODEOWNERS",
+		"CODEOWNERS",
+		"docs/CODEOWNERS",
+	} {
+		body, status, err := c.getRepositoryContent(
+			ctx, class, owner, repo, path, ref,
+		)
+		if status == http.StatusNotFound {
+			continue
+		}
+		if err != nil {
+			return CodeownersSource{}, fmt.Errorf(
+				"fetch CODEOWNERS %s at %s: %w", path, ref, err,
+			)
+		}
+		if len(body) >= MaxCodeownersBytes {
+			return CodeownersSource{
+				Path: path, State: CodeownersOversized,
+			}, nil
+		}
+		return CodeownersSource{
+			Path: path, Content: string(body), State: CodeownersPresent,
+		}, nil
+	}
+	return CodeownersSource{State: CodeownersMissing}, nil
+}
+
+func (c *RESTClient) getRepositoryContent(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	path string,
+	ref string,
+) ([]byte, int, error) {
+	segments := strings.Split(path, "/")
+	for index := range segments {
+		segments[index] = url.PathEscape(segments[index])
+	}
+	query := make(url.Values)
+	query.Set("ref", ref)
+	endpoint := fmt.Sprintf(
+		"repos/%s/%s/contents/%s",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		strings.Join(segments, "/"),
+	)
+	req, err := c.client.request(ctx, http.MethodGet, endpoint, query, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Accept", "application/vnd.github.raw+json")
+	gated, err := c.client.gate.Do(
+		ctx,
+		class,
+		budget.NewRESTRequest(req).BeforeSend(c.client.authorize),
+	)
+	if err != nil {
+		if gated != nil {
+			_ = closeResponseBody(gated.HTTP)
+		}
+		return nil, 0, err
+	}
+	response := gated.HTTP
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		status := response.StatusCode
+		return nil, status, decodeHTTPError(response)
+	}
+	defer func() { _ = response.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(
+		response.Body,
+		MaxCodeownersBytes+1,
+	))
+	if err != nil {
+		return nil, response.StatusCode, fmt.Errorf(
+			"read repository content: %w", err,
+		)
+	}
+	return body, response.StatusCode, nil
 }
 
 // ListCheckRuns fetches one checks page for a head SHA.

@@ -915,6 +915,68 @@ func TestWriteRaceBothOrdersNewerWinsConcurrently(t *testing.T) {
 	}
 }
 
+func TestRepositoryUnknownHeadSHACannotEraseKnownValue(t *testing.T) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/repo-head-sentinel", 2110, updatedAt)
+	if _, err := writer.ApplyRepository(
+		t.Context(), repository, SyncSourceWebhook, "", updatedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	repository.DefaultHeadSHA = ""
+	repository.GitHubUpdatedAt = updatedAt.Add(time.Minute)
+	if _, err := writer.ApplyRepository(
+		t.Context(), repository, SyncSourceWebhook, "", updatedAt.Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	var headSHA string
+	if err := pool.QueryRow(t.Context(), `
+		SELECT head_sha FROM repos WHERE gh_id = $1
+	`, repository.GitHubID).Scan(&headSHA); err != nil {
+		t.Fatal(err)
+	}
+	if headSHA != "base" {
+		t.Fatalf("repository head SHA = %q, want preserved known value", headSHA)
+	}
+}
+
+func TestBranchTargetsRefreshOnlyOpenPullsOnAffectedBranch(t *testing.T) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/codeowners-refresh", 2111, now)
+	pulls := []PullRequestRecord{
+		storeTestPull(&repository, now, "open-main-head"),
+		storeTestPull(&repository, now, "closed-main-head"),
+		storeTestPull(&repository, now, "open-other-head"),
+	}
+	pulls[0].Number, pulls[0].GitHubID, pulls[0].NodeID = 41, 4100, "pr-41"
+	pulls[1].Number, pulls[1].GitHubID, pulls[1].NodeID = 42, 4200, "pr-42"
+	pulls[1].State = "closed"
+	pulls[2].Number, pulls[2].GitHubID, pulls[2].NodeID = 43, 4300, "pr-43"
+	pulls[2].BaseRef = "release"
+	for index := range pulls {
+		if _, err := writer.ApplyPullRequest(t.Context(), pulls[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targets, err := writer.BranchTargets(
+		t.Context(), repository.FullName, repository.DefaultBranch,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pr:acme/codeowners-refresh:41"}
+	if !reflect.DeepEqual(targets, want) {
+		t.Fatalf("default-branch targets = %#v, want %#v", targets, want)
+	}
+}
+
 func TestEqualTimestampDomainChangeAndTombstoneResurrection(t *testing.T) {
 	t.Parallel()
 	pool, _ := storeTestDatabase(t)

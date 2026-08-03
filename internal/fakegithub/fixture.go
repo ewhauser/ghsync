@@ -1,6 +1,9 @@
 package fakegithub
 
-import "time"
+import (
+	"maps"
+	"time"
+)
 
 func cloneFixture(source *Fixture) Fixture {
 	clone := *source
@@ -49,6 +52,10 @@ func cloneFixture(source *Fixture) Fixture {
 			[]IssueComment(nil),
 			pull.Comments...,
 		)
+		clone.PullRequests[index].ChangedFiles = append(
+			[]ChangedFile(nil),
+			pull.ChangedFiles...,
+		)
 		if pull.Stack != nil {
 			stack := *pull.Stack
 			clone.PullRequests[index].Stack = &stack
@@ -69,6 +76,11 @@ func cloneFixture(source *Fixture) Fixture {
 		}
 	}
 	clone.CheckRuns = append([]CheckRun(nil), source.CheckRuns...)
+	clone.Contents = make(map[string]map[string]string, len(source.Contents))
+	for ref, files := range source.Contents {
+		clone.Contents[ref] = make(map[string]string, len(files))
+		maps.Copy(clone.Contents[ref], files)
+	}
 	for index := range clone.CheckRuns {
 		clone.CheckRuns[index].StartedAt = cloneTime(
 			clone.CheckRuns[index].StartedAt,
@@ -242,6 +254,25 @@ func DefaultFixture() Fixture {
 			-time.Duration(len(pulls)-index) * 24 * time.Hour,
 		)
 	}
+	pulls[0].ChangedFiles = []ChangedFile{{
+		Path: "internal/tokenizer.go", ChangeType: "modified",
+	}}
+	pulls[1].ChangedFiles = []ChangedFile{
+		{Path: "internal/ranker.go", ChangeType: "modified"},
+		{
+			Path: "docs/ranking.md", PreviousPath: "docs/search.md",
+			ChangeType: "renamed",
+		},
+	}
+	pulls[2].ChangedFiles = []ChangedFile{{
+		Path: "cmd/relevance-debug/main.go", ChangeType: "added",
+	}}
+	pulls[3].ChangedFiles = []ChangedFile{{
+		Path: "web/results.ts", ChangeType: "modified",
+	}}
+	pulls[4].ChangedFiles = []ChangedFile{{
+		Path: "dashboards/relevance.json", ChangeType: "added",
+	}}
 	stackPulls := make([]StackPullRequest, 0, len(pulls))
 	for index := range pulls {
 		pull := &pulls[index]
@@ -311,5 +342,20 @@ func DefaultFixture() Fixture {
 				AppSlug:    "github-actions", StartedAt: &started, CompletedAt: &completed,
 			},
 		},
+		Contents: defaultCodeownersContents(pulls),
 	}
+}
+
+func defaultCodeownersContents(pulls []PullRequest) map[string]map[string]string {
+	const source = `* @reviewer
+internal/** @acme/search-platform @unknown-user
+docs/ docs@example.com malformed-owner
+`
+	contents := make(map[string]map[string]string)
+	for index := range pulls {
+		contents[pulls[index].Base.SHA] = map[string]string{
+			".github/CODEOWNERS": source,
+		}
+	}
+	return contents
 }

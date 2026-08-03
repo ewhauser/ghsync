@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/ewhauser/ghsync/internal/fakegithub"
+	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/replay"
 	"github.com/ewhauser/ghsync/internal/store"
@@ -70,6 +71,36 @@ func TestValidateConfigRejectsUnboundedAndUnownedChaos(t *testing.T) {
 	cfg.engineCmd = "ghsyncd serve --roles=all"
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("owned restart rejected: %v", err)
+	}
+}
+
+func TestLoadgenOracleUsesSameChangedFileCapAsMirror(t *testing.T) {
+	t.Parallel()
+	files := make([]fakegithub.ChangedFile, gh.MaxPullRequestFiles+1)
+	for index := range files {
+		files[index].Path = fmt.Sprintf("file-%04d", index)
+	}
+	bounded := boundedOracleChangedFiles(files)
+	if len(bounded) != gh.MaxPullRequestFiles ||
+		bounded[len(bounded)-1].Path != "file-2999" {
+		t.Fatalf(
+			"bounded oracle files = %d ending %q",
+			len(bounded), bounded[len(bounded)-1].Path,
+		)
+	}
+}
+
+func TestLoadgenOracleMarksRenameWithoutPreviousPathTruncated(t *testing.T) {
+	t.Parallel()
+	files := []fakegithub.ChangedFile{{
+		Path: "new/name.go", ChangeType: "renamed",
+	}}
+	if !oracleChangedFilesTruncated(files, len(files), false) {
+		t.Fatal("rename without previous path was treated as complete")
+	}
+	files[0].PreviousPath = "old/name.go"
+	if oracleChangedFilesTruncated(files, len(files), false) {
+		t.Fatal("complete rename was treated as truncated")
 	}
 }
 

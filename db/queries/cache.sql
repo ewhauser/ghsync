@@ -43,7 +43,8 @@ SET installation_id = EXCLUDED.installation_id,
     default_branch = EXCLUDED.default_branch,
     archived = EXCLUDED.archived,
     gh_updated_at = EXCLUDED.gh_updated_at,
-    head_sha = EXCLUDED.head_sha,
+    head_sha = CASE WHEN EXCLUDED.head_sha = '' THEN repos.head_sha
+                    ELSE EXCLUDED.head_sha END,
     synced_at = EXCLUDED.synced_at,
     last_checked_at = EXCLUDED.last_checked_at,
     etag = EXCLUDED.etag,
@@ -56,7 +57,9 @@ WHERE repos.gh_updated_at IS NULL
        AND ROW(
            EXCLUDED.installation_id, EXCLUDED.org_id, EXCLUDED.node_id,
            EXCLUDED.owner, EXCLUDED.name, EXCLUDED.full_name,
-           EXCLUDED.default_branch, EXCLUDED.archived, EXCLUDED.head_sha
+           EXCLUDED.default_branch, EXCLUDED.archived,
+           CASE WHEN EXCLUDED.head_sha = '' THEN repos.head_sha
+                ELSE EXCLUDED.head_sha END
        ) IS DISTINCT FROM ROW(
            repos.installation_id, repos.org_id, repos.node_id,
            repos.owner, repos.name, repos.full_name,
@@ -927,6 +930,459 @@ WHERE repo_id = sqlc.arg(repo_id)
   AND tombstoned_at IS NULL
 RETURNING node_id;
 
+-- name: UpsertPullRequestChangeSnapshot :one
+-- C-C2 parent freshness plus explicit base/head identity gates the current
+-- changed-file and ownership snapshot. Equal parent versions remain eligible
+-- so a base-branch CODEOWNERS push or a later complete listing can heal facts
+-- without relying on pull_request.updatedAt changing.
+WITH eligible AS (
+    SELECT pull_requests.repo_id
+    FROM pull_requests
+    WHERE pull_requests.repo_id = sqlc.arg(repo_id)
+      AND pull_requests.number = sqlc.arg(pr_number)
+      AND pull_requests.tombstoned_at IS NULL
+      AND pull_requests.head_sha = sqlc.arg(head_sha)
+      AND pull_requests.base_sha = sqlc.arg(base_sha)
+      AND (
+          pull_requests.gh_updated_at IS NULL
+          OR pull_requests.gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+      )
+),
+prior AS MATERIALIZED (
+    SELECT base_sha, head_sha, files_total_count, files_truncated,
+           codeowners_ref, codeowners_sha, codeowners_path,
+           codeowners_state, codeowners_source, codeowners_hash,
+           tombstoned_at
+    FROM pull_request_change_snapshots
+    WHERE repo_id = sqlc.arg(repo_id)
+      AND pr_number = sqlc.arg(pr_number)
+),
+upserted AS (
+    INSERT INTO pull_request_change_snapshots (
+        repo_id, pr_number, base_sha, head_sha, files_total_count,
+        files_truncated, codeowners_ref, codeowners_sha, codeowners_path,
+        codeowners_state, codeowners_source, codeowners_hash,
+        parent_gh_updated_at, synced_at, etag, sync_source, tombstoned_at,
+        last_checked_at
+    )
+    SELECT sqlc.arg(repo_id), sqlc.arg(pr_number), sqlc.arg(base_sha),
+           sqlc.arg(head_sha), sqlc.arg(files_total_count),
+           sqlc.arg(files_truncated), sqlc.arg(codeowners_ref),
+           sqlc.arg(codeowners_sha), sqlc.narg(codeowners_path),
+           sqlc.arg(codeowners_state), sqlc.narg(codeowners_source),
+           sqlc.arg(codeowners_hash), sqlc.arg(parent_gh_updated_at),
+           sqlc.arg(synced_at), sqlc.arg(etag), sqlc.arg(sync_source), NULL,
+           sqlc.arg(last_checked_at)
+    FROM eligible
+    ON CONFLICT (repo_id, pr_number) DO UPDATE
+    SET base_sha = EXCLUDED.base_sha,
+        head_sha = EXCLUDED.head_sha,
+        files_total_count = EXCLUDED.files_total_count,
+        files_truncated = EXCLUDED.files_truncated,
+        codeowners_ref = EXCLUDED.codeowners_ref,
+        codeowners_sha = EXCLUDED.codeowners_sha,
+        codeowners_path = EXCLUDED.codeowners_path,
+        codeowners_state = EXCLUDED.codeowners_state,
+        codeowners_source = EXCLUDED.codeowners_source,
+        codeowners_hash = EXCLUDED.codeowners_hash,
+        parent_gh_updated_at = EXCLUDED.parent_gh_updated_at,
+        synced_at = CASE
+            WHEN pull_request_change_snapshots.tombstoned_at IS NOT NULL
+              OR ROW(
+                     EXCLUDED.base_sha, EXCLUDED.head_sha,
+                     EXCLUDED.files_total_count, EXCLUDED.files_truncated,
+                     EXCLUDED.codeowners_ref, EXCLUDED.codeowners_sha,
+                     EXCLUDED.codeowners_path, EXCLUDED.codeowners_state,
+                     EXCLUDED.codeowners_source, EXCLUDED.codeowners_hash
+                 ) IS DISTINCT FROM ROW(
+                     pull_request_change_snapshots.base_sha,
+                     pull_request_change_snapshots.head_sha,
+                     pull_request_change_snapshots.files_total_count,
+                     pull_request_change_snapshots.files_truncated,
+                     pull_request_change_snapshots.codeowners_ref,
+                     pull_request_change_snapshots.codeowners_sha,
+                     pull_request_change_snapshots.codeowners_path,
+                     pull_request_change_snapshots.codeowners_state,
+                     pull_request_change_snapshots.codeowners_source,
+                     pull_request_change_snapshots.codeowners_hash
+                 )
+            THEN EXCLUDED.synced_at
+            ELSE pull_request_change_snapshots.synced_at
+        END,
+        etag = EXCLUDED.etag,
+        sync_source = CASE
+            WHEN pull_request_change_snapshots.tombstoned_at IS NOT NULL
+              OR ROW(
+                     EXCLUDED.base_sha, EXCLUDED.head_sha,
+                     EXCLUDED.files_total_count, EXCLUDED.files_truncated,
+                     EXCLUDED.codeowners_ref, EXCLUDED.codeowners_sha,
+                     EXCLUDED.codeowners_path, EXCLUDED.codeowners_state,
+                     EXCLUDED.codeowners_source, EXCLUDED.codeowners_hash
+                 ) IS DISTINCT FROM ROW(
+                     pull_request_change_snapshots.base_sha,
+                     pull_request_change_snapshots.head_sha,
+                     pull_request_change_snapshots.files_total_count,
+                     pull_request_change_snapshots.files_truncated,
+                     pull_request_change_snapshots.codeowners_ref,
+                     pull_request_change_snapshots.codeowners_sha,
+                     pull_request_change_snapshots.codeowners_path,
+                     pull_request_change_snapshots.codeowners_state,
+                     pull_request_change_snapshots.codeowners_source,
+                     pull_request_change_snapshots.codeowners_hash
+                 )
+            THEN EXCLUDED.sync_source
+            ELSE pull_request_change_snapshots.sync_source
+        END,
+        tombstoned_at = NULL,
+        last_checked_at = EXCLUDED.last_checked_at
+    WHERE EXCLUDED.parent_gh_updated_at >
+              pull_request_change_snapshots.parent_gh_updated_at
+       OR (
+           EXCLUDED.parent_gh_updated_at =
+               pull_request_change_snapshots.parent_gh_updated_at
+           AND ROW(
+               EXCLUDED.base_sha, EXCLUDED.head_sha,
+               EXCLUDED.files_total_count, EXCLUDED.files_truncated,
+               EXCLUDED.codeowners_ref, EXCLUDED.codeowners_sha,
+               EXCLUDED.codeowners_path, EXCLUDED.codeowners_state,
+               EXCLUDED.codeowners_source, EXCLUDED.codeowners_hash
+           ) IS DISTINCT FROM ROW(
+               pull_request_change_snapshots.base_sha,
+               pull_request_change_snapshots.head_sha,
+               pull_request_change_snapshots.files_total_count,
+               pull_request_change_snapshots.files_truncated,
+               pull_request_change_snapshots.codeowners_ref,
+               pull_request_change_snapshots.codeowners_sha,
+               pull_request_change_snapshots.codeowners_path,
+               pull_request_change_snapshots.codeowners_state,
+               pull_request_change_snapshots.codeowners_source,
+               pull_request_change_snapshots.codeowners_hash
+           )
+       )
+       OR (
+           pull_request_change_snapshots.tombstoned_at IS NOT NULL
+           AND EXCLUDED.last_checked_at >
+               pull_request_change_snapshots.tombstoned_at
+       )
+    RETURNING repo_id
+)
+SELECT count(*)
+FROM upserted
+WHERE NOT EXISTS (SELECT 1 FROM prior)
+   OR EXISTS (
+       SELECT 1
+       FROM prior
+       WHERE prior.tombstoned_at IS NOT NULL
+          OR ROW(
+                 prior.base_sha, prior.head_sha, prior.files_total_count,
+                 prior.files_truncated, prior.codeowners_ref,
+                 prior.codeowners_sha, prior.codeowners_path,
+                 prior.codeowners_state, prior.codeowners_source,
+                 prior.codeowners_hash
+             ) IS DISTINCT FROM ROW(
+                 sqlc.arg(base_sha)::text, sqlc.arg(head_sha)::text,
+                 sqlc.arg(files_total_count)::integer,
+                 sqlc.arg(files_truncated)::boolean,
+                 sqlc.arg(codeowners_ref)::text,
+                 sqlc.arg(codeowners_sha)::text,
+                 sqlc.narg(codeowners_path)::text,
+                 sqlc.arg(codeowners_state)::text,
+                 sqlc.narg(codeowners_source)::text,
+                 sqlc.arg(codeowners_hash)::text
+             )
+   );
+
+-- name: ReplacePullRequestChangedFiles :many
+WITH input AS (
+    SELECT element->>'path' AS path,
+           NULLIF(element->>'previous_path', '') AS previous_path,
+           element->>'change_type' AS change_type
+    FROM jsonb_array_elements(sqlc.arg(changed_files)::jsonb) AS element
+),
+eligible AS (
+    SELECT snapshot.repo_id
+    FROM pull_request_change_snapshots AS snapshot
+    WHERE snapshot.repo_id = sqlc.arg(repo_id)
+      AND snapshot.pr_number = sqlc.arg(pr_number)
+      AND snapshot.tombstoned_at IS NULL
+      AND snapshot.base_sha = sqlc.arg(base_sha)
+      AND snapshot.head_sha = sqlc.arg(head_sha)
+      AND snapshot.parent_gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+),
+upserted AS (
+    INSERT INTO pull_request_changed_files (
+        repo_id, pr_number, path, previous_path, change_type, base_sha,
+        head_sha, synced_at, etag, sync_source, tombstoned_at,
+        last_checked_at
+    )
+    SELECT sqlc.arg(repo_id), sqlc.arg(pr_number), input.path,
+           input.previous_path, input.change_type, sqlc.arg(base_sha),
+           sqlc.arg(head_sha), sqlc.arg(synced_at), sqlc.arg(etag),
+           sqlc.arg(sync_source), NULL, sqlc.arg(last_checked_at)
+    FROM input
+    CROSS JOIN eligible
+    ON CONFLICT (repo_id, pr_number, path) DO UPDATE
+    SET previous_path = EXCLUDED.previous_path,
+        change_type = EXCLUDED.change_type,
+        base_sha = EXCLUDED.base_sha,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL,
+        last_checked_at = EXCLUDED.last_checked_at
+    WHERE ROW(
+              EXCLUDED.previous_path, EXCLUDED.change_type,
+              EXCLUDED.base_sha, EXCLUDED.head_sha
+          ) IS DISTINCT FROM ROW(
+              pull_request_changed_files.previous_path,
+              pull_request_changed_files.change_type,
+              pull_request_changed_files.base_sha,
+              pull_request_changed_files.head_sha
+          )
+       OR pull_request_changed_files.tombstoned_at IS NOT NULL
+    RETURNING path
+),
+tombstoned AS (
+    UPDATE pull_request_changed_files
+    SET tombstoned_at = sqlc.arg(last_checked_at),
+        synced_at = sqlc.arg(synced_at),
+        last_checked_at = sqlc.arg(last_checked_at),
+        etag = sqlc.arg(etag),
+        sync_source = sqlc.arg(sync_source)
+    WHERE repo_id = sqlc.arg(repo_id)
+      AND pr_number = sqlc.arg(pr_number)
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND NOT EXISTS (
+          SELECT 1 FROM input
+          WHERE input.path = pull_request_changed_files.path
+      )
+    RETURNING path
+)
+SELECT path FROM upserted
+UNION ALL
+SELECT path FROM tombstoned;
+
+-- name: ReplacePullRequestFileOwners :many
+WITH input AS (
+    SELECT element->>'path' AS path,
+           element->>'owner_token' AS owner_token,
+           element->>'owner_type' AS owner_type,
+           element->>'owner_name' AS owner_name,
+           element->>'resolution_state' AS resolution_state,
+           NULLIF((element->>'owner_gh_id')::bigint, 0) AS owner_gh_id,
+           NULLIF(element->>'owner_node_id', '') AS owner_node_id,
+           NULLIF(element->>'owner_login', '') AS owner_login,
+           element->>'source_pattern' AS source_pattern,
+           (element->>'source_line')::integer AS source_line
+    FROM jsonb_array_elements(sqlc.arg(file_owners)::jsonb) AS element
+),
+eligible AS (
+    SELECT snapshot.repo_id
+    FROM pull_request_change_snapshots AS snapshot
+    WHERE snapshot.repo_id = sqlc.arg(repo_id)
+      AND snapshot.pr_number = sqlc.arg(pr_number)
+      AND snapshot.tombstoned_at IS NULL
+      AND snapshot.base_sha = sqlc.arg(base_sha)
+      AND snapshot.head_sha = sqlc.arg(head_sha)
+      AND snapshot.parent_gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+),
+upserted AS (
+    INSERT INTO pull_request_file_owners (
+        repo_id, pr_number, path, owner_token, owner_type, owner_name,
+        resolution_state, owner_gh_id, owner_node_id, owner_login,
+        source_pattern, source_line, base_sha, head_sha, synced_at, etag,
+        sync_source, tombstoned_at, last_checked_at
+    )
+    SELECT sqlc.arg(repo_id), sqlc.arg(pr_number), input.path,
+           input.owner_token, input.owner_type, input.owner_name,
+           input.resolution_state,
+           input.owner_gh_id, input.owner_node_id, input.owner_login,
+           input.source_pattern, input.source_line, sqlc.arg(base_sha),
+           sqlc.arg(head_sha), sqlc.arg(synced_at), sqlc.arg(etag),
+           sqlc.arg(sync_source), NULL, sqlc.arg(last_checked_at)
+    FROM input
+    CROSS JOIN eligible
+    ON CONFLICT (repo_id, pr_number, path, owner_token) DO UPDATE
+    SET owner_type = EXCLUDED.owner_type,
+        owner_name = EXCLUDED.owner_name,
+        resolution_state = EXCLUDED.resolution_state,
+        owner_gh_id = EXCLUDED.owner_gh_id,
+        owner_node_id = EXCLUDED.owner_node_id,
+        owner_login = EXCLUDED.owner_login,
+        source_pattern = EXCLUDED.source_pattern,
+        source_line = EXCLUDED.source_line,
+        base_sha = EXCLUDED.base_sha,
+        head_sha = EXCLUDED.head_sha,
+        synced_at = EXCLUDED.synced_at,
+        etag = EXCLUDED.etag,
+        sync_source = EXCLUDED.sync_source,
+        tombstoned_at = NULL,
+        last_checked_at = EXCLUDED.last_checked_at
+    WHERE ROW(
+              EXCLUDED.owner_type, EXCLUDED.owner_name,
+              EXCLUDED.resolution_state,
+              EXCLUDED.owner_gh_id, EXCLUDED.owner_node_id,
+              EXCLUDED.owner_login, EXCLUDED.source_pattern,
+              EXCLUDED.source_line, EXCLUDED.base_sha, EXCLUDED.head_sha
+          ) IS DISTINCT FROM ROW(
+              pull_request_file_owners.owner_type,
+              pull_request_file_owners.owner_name,
+              pull_request_file_owners.resolution_state,
+              pull_request_file_owners.owner_gh_id,
+              pull_request_file_owners.owner_node_id,
+              pull_request_file_owners.owner_login,
+              pull_request_file_owners.source_pattern,
+              pull_request_file_owners.source_line,
+              pull_request_file_owners.base_sha,
+              pull_request_file_owners.head_sha
+          )
+       OR pull_request_file_owners.tombstoned_at IS NOT NULL
+    RETURNING (path || ':' || owner_token)::text AS owner_key
+),
+tombstoned AS (
+    UPDATE pull_request_file_owners
+    SET tombstoned_at = sqlc.arg(last_checked_at),
+        synced_at = sqlc.arg(synced_at),
+        last_checked_at = sqlc.arg(last_checked_at),
+        etag = sqlc.arg(etag),
+        sync_source = sqlc.arg(sync_source)
+    WHERE repo_id = sqlc.arg(repo_id)
+      AND pr_number = sqlc.arg(pr_number)
+      AND tombstoned_at IS NULL
+      AND EXISTS (SELECT 1 FROM eligible)
+      AND NOT EXISTS (
+          SELECT 1 FROM input
+          WHERE input.path = pull_request_file_owners.path
+            AND input.owner_token = pull_request_file_owners.owner_token
+      )
+    RETURNING (path || ':' || owner_token)::text AS owner_key
+)
+SELECT owner_key FROM upserted
+UNION ALL
+SELECT owner_key FROM tombstoned;
+
+-- name: TouchPullRequestChangeInputsCheckedAt :exec
+WITH eligible AS (
+    SELECT snapshot.repo_id
+    FROM pull_request_change_snapshots AS snapshot
+    WHERE snapshot.repo_id = sqlc.arg(repo_id)
+      AND snapshot.pr_number = sqlc.arg(pr_number)
+      AND snapshot.tombstoned_at IS NULL
+      AND snapshot.parent_gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+)
+UPDATE pull_request_change_snapshots AS snapshot
+SET last_checked_at = GREATEST(snapshot.last_checked_at, sqlc.arg(checked_at)),
+    etag = CASE WHEN sqlc.arg(etag)::text = '' THEN snapshot.etag
+                ELSE sqlc.arg(etag)::text END
+WHERE snapshot.repo_id = sqlc.arg(repo_id)
+  AND snapshot.pr_number = sqlc.arg(pr_number)
+  AND EXISTS (SELECT 1 FROM eligible);
+
+-- name: TouchPullRequestChangedFilesCheckedAt :exec
+UPDATE pull_request_changed_files AS file
+SET last_checked_at = GREATEST(file.last_checked_at, sqlc.arg(checked_at)),
+    etag = CASE WHEN sqlc.arg(etag)::text = '' THEN file.etag
+                ELSE sqlc.arg(etag)::text END
+WHERE file.repo_id = sqlc.arg(repo_id)
+  AND file.pr_number = sqlc.arg(pr_number)
+  AND file.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM pull_request_change_snapshots AS snapshot
+      WHERE snapshot.repo_id = sqlc.arg(repo_id)
+        AND snapshot.pr_number = sqlc.arg(pr_number)
+        AND snapshot.tombstoned_at IS NULL
+        AND snapshot.parent_gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+  );
+
+-- name: TouchPullRequestFileOwnersCheckedAt :exec
+UPDATE pull_request_file_owners AS owner
+SET last_checked_at = GREATEST(owner.last_checked_at, sqlc.arg(checked_at)),
+    etag = CASE WHEN sqlc.arg(etag)::text = '' THEN owner.etag
+                ELSE sqlc.arg(etag)::text END
+WHERE owner.repo_id = sqlc.arg(repo_id)
+  AND owner.pr_number = sqlc.arg(pr_number)
+  AND owner.tombstoned_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM pull_request_change_snapshots AS snapshot
+      WHERE snapshot.repo_id = sqlc.arg(repo_id)
+        AND snapshot.pr_number = sqlc.arg(pr_number)
+        AND snapshot.tombstoned_at IS NULL
+        AND snapshot.parent_gh_updated_at <= sqlc.arg(parent_gh_updated_at)
+  );
+
+-- name: TombstonePullRequestChangeSnapshot :execrows
+UPDATE pull_request_change_snapshots
+SET tombstoned_at = sqlc.arg(tombstoned_at),
+    synced_at = sqlc.arg(tombstoned_at),
+    last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    etag = '',
+    sync_source = sqlc.arg(sync_source)
+WHERE repo_id = sqlc.arg(repo_id)
+  AND pr_number = sqlc.arg(pr_number)
+  AND tombstoned_at IS NULL;
+
+-- name: TombstonePullRequestChangedFiles :execrows
+UPDATE pull_request_changed_files
+SET tombstoned_at = sqlc.arg(tombstoned_at),
+    synced_at = sqlc.arg(tombstoned_at),
+    last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    etag = '',
+    sync_source = sqlc.arg(sync_source)
+WHERE repo_id = sqlc.arg(repo_id)
+  AND pr_number = sqlc.arg(pr_number)
+  AND tombstoned_at IS NULL;
+
+-- name: TombstonePullRequestFileOwners :execrows
+UPDATE pull_request_file_owners
+SET tombstoned_at = sqlc.arg(tombstoned_at),
+    synced_at = sqlc.arg(tombstoned_at),
+    last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
+    etag = '',
+    sync_source = sqlc.arg(sync_source)
+WHERE repo_id = sqlc.arg(repo_id)
+  AND pr_number = sqlc.arg(pr_number)
+  AND tombstoned_at IS NULL;
+
+-- name: ListCodeOwnerIdentities :many
+WITH candidates AS (
+    SELECT request.reviewer_kind AS owner_type,
+           request.reviewer_gh_id AS owner_gh_id,
+           request.reviewer_node_id AS owner_node_id,
+           request.reviewer_login AS owner_login,
+           request.last_checked_at
+    FROM pull_request_review_requests AS request
+    WHERE request.repo_id = sqlc.arg(repo_id)
+
+    UNION ALL
+
+    SELECT 'user'::text, NULL::bigint, review.author_node_id,
+           review.author_login, review.last_checked_at
+    FROM pull_request_reviews AS review
+    WHERE review.repo_id = sqlc.arg(repo_id)
+      AND review.author_kind = 'user'
+      AND review.author_node_id IS NOT NULL
+      AND review.author_login IS NOT NULL
+
+    UNION ALL
+
+    SELECT 'user'::text, NULL::bigint, comment.author_node_id,
+           comment.author_login, comment.last_checked_at
+    FROM pull_request_comments AS comment
+    WHERE comment.repo_id = sqlc.arg(repo_id)
+      AND comment.author_kind = 'user'
+      AND comment.author_node_id IS NOT NULL
+      AND comment.author_login IS NOT NULL
+)
+SELECT DISTINCT ON (owner_type, lower(owner_login))
+       owner_type, COALESCE(owner_gh_id, 0)::bigint AS owner_gh_id,
+       owner_node_id, owner_login
+FROM candidates
+ORDER BY owner_type, lower(owner_login),
+         owner_gh_id IS NOT NULL DESC, last_checked_at DESC,
+         owner_node_id;
+
 -- name: ReplaceCheckRuns :many
 WITH input AS (
     SELECT (element->>'gh_id')::bigint AS gh_id,
@@ -1190,6 +1646,7 @@ JOIN repos ON repos.id = pull_requests.repo_id
 JOIN repo_aliases ON repo_aliases.repo_id = repos.id
 WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
   AND pull_requests.tombstoned_at IS NULL
+  AND pull_requests.state = 'open'
   AND (
       pull_requests.head_ref = sqlc.arg(branch)
       OR pull_requests.base_ref = sqlc.arg(branch)

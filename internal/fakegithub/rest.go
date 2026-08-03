@@ -213,6 +213,34 @@ func (s *Server) getPull(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+func (s *Server) listPullFiles(w http.ResponseWriter, r *http.Request) {
+	pull, ok := s.pullForRequest(w, r)
+	if !ok {
+		return
+	}
+	files := append([]ChangedFile(nil), pull.ChangedFiles...)
+	files = paginate(files, r, w)
+	s.writeConditionalJSON(w, r, files)
+}
+
+func (s *Server) getRepositoryContent(w http.ResponseWriter, r *http.Request) {
+	fx, ok := s.checkRepo(w, r)
+	if !ok {
+		return
+	}
+	ref := r.URL.Query().Get("ref")
+	path := r.PathValue("path")
+	files := fx.Contents[ref]
+	content, ok := files[path]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(content))
+}
+
 func (s *Server) listPullReviews(w http.ResponseWriter, r *http.Request) {
 	pull, ok := s.pullForRequest(w, r)
 	if !ok {

@@ -181,6 +181,113 @@ func (q *Queries) ListLoadgenCachedCheckRuns(ctx context.Context, repoFullName s
 	return items, nil
 }
 
+const listLoadgenCachedPullRequestChangeSnapshots = `-- name: ListLoadgenCachedPullRequestChangeSnapshots :many
+SELECT snapshot.pr_number, snapshot.base_sha, snapshot.head_sha,
+       snapshot.files_total_count, snapshot.files_truncated,
+       snapshot.codeowners_ref, snapshot.codeowners_sha,
+       snapshot.codeowners_path, snapshot.codeowners_state,
+       snapshot.codeowners_source, snapshot.codeowners_hash
+FROM pull_request_change_snapshots AS snapshot
+JOIN repos AS repo ON repo.id = snapshot.repo_id
+WHERE repo.full_name = $1
+  AND repo.tombstoned_at IS NULL
+  AND snapshot.tombstoned_at IS NULL
+ORDER BY snapshot.pr_number
+`
+
+type ListLoadgenCachedPullRequestChangeSnapshotsRow struct {
+	PrNumber         int32
+	BaseSha          string
+	HeadSha          string
+	FilesTotalCount  int32
+	FilesTruncated   bool
+	CodeownersRef    string
+	CodeownersSha    string
+	CodeownersPath   pgtype.Text
+	CodeownersState  string
+	CodeownersSource pgtype.Text
+	CodeownersHash   string
+}
+
+func (q *Queries) ListLoadgenCachedPullRequestChangeSnapshots(ctx context.Context, repoFullName string) ([]ListLoadgenCachedPullRequestChangeSnapshotsRow, error) {
+	rows, err := q.db.Query(ctx, listLoadgenCachedPullRequestChangeSnapshots, repoFullName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLoadgenCachedPullRequestChangeSnapshotsRow
+	for rows.Next() {
+		var i ListLoadgenCachedPullRequestChangeSnapshotsRow
+		if err := rows.Scan(
+			&i.PrNumber,
+			&i.BaseSha,
+			&i.HeadSha,
+			&i.FilesTotalCount,
+			&i.FilesTruncated,
+			&i.CodeownersRef,
+			&i.CodeownersSha,
+			&i.CodeownersPath,
+			&i.CodeownersState,
+			&i.CodeownersSource,
+			&i.CodeownersHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLoadgenCachedPullRequestChangedFiles = `-- name: ListLoadgenCachedPullRequestChangedFiles :many
+SELECT file.pr_number, file.path, file.previous_path, file.change_type,
+       file.base_sha, file.head_sha
+FROM pull_request_changed_files AS file
+JOIN repos AS repo ON repo.id = file.repo_id
+WHERE repo.full_name = $1
+  AND repo.tombstoned_at IS NULL
+  AND file.tombstoned_at IS NULL
+ORDER BY file.pr_number, file.path
+`
+
+type ListLoadgenCachedPullRequestChangedFilesRow struct {
+	PrNumber     int32
+	Path         string
+	PreviousPath pgtype.Text
+	ChangeType   string
+	BaseSha      string
+	HeadSha      string
+}
+
+func (q *Queries) ListLoadgenCachedPullRequestChangedFiles(ctx context.Context, repoFullName string) ([]ListLoadgenCachedPullRequestChangedFilesRow, error) {
+	rows, err := q.db.Query(ctx, listLoadgenCachedPullRequestChangedFiles, repoFullName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLoadgenCachedPullRequestChangedFilesRow
+	for rows.Next() {
+		var i ListLoadgenCachedPullRequestChangedFilesRow
+		if err := rows.Scan(
+			&i.PrNumber,
+			&i.Path,
+			&i.PreviousPath,
+			&i.ChangeType,
+			&i.BaseSha,
+			&i.HeadSha,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLoadgenCachedPullRequestComments = `-- name: ListLoadgenCachedPullRequestComments :many
 SELECT comment.pr_number, comment.gh_id, comment.node_id,
        comment.author_kind, comment.author_node_id, comment.author_login,
@@ -223,6 +330,69 @@ func (q *Queries) ListLoadgenCachedPullRequestComments(ctx context.Context, repo
 			&i.AuthorLogin,
 			&i.CreatedAt,
 			&i.GhUpdatedAt,
+			&i.HeadSha,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLoadgenCachedPullRequestFileOwners = `-- name: ListLoadgenCachedPullRequestFileOwners :many
+SELECT owner.pr_number, owner.path, owner.owner_token, owner.owner_type,
+       owner.owner_name, owner.resolution_state, owner.owner_gh_id,
+       owner.owner_node_id, owner.owner_login, owner.source_pattern,
+       owner.source_line, owner.base_sha, owner.head_sha
+FROM pull_request_file_owners AS owner
+JOIN repos AS repo ON repo.id = owner.repo_id
+WHERE repo.full_name = $1
+  AND repo.tombstoned_at IS NULL
+  AND owner.tombstoned_at IS NULL
+ORDER BY owner.pr_number, owner.path, owner.owner_token
+`
+
+type ListLoadgenCachedPullRequestFileOwnersRow struct {
+	PrNumber        int32
+	Path            string
+	OwnerToken      string
+	OwnerType       string
+	OwnerName       string
+	ResolutionState string
+	OwnerGhID       pgtype.Int8
+	OwnerNodeID     pgtype.Text
+	OwnerLogin      pgtype.Text
+	SourcePattern   string
+	SourceLine      int32
+	BaseSha         string
+	HeadSha         string
+}
+
+func (q *Queries) ListLoadgenCachedPullRequestFileOwners(ctx context.Context, repoFullName string) ([]ListLoadgenCachedPullRequestFileOwnersRow, error) {
+	rows, err := q.db.Query(ctx, listLoadgenCachedPullRequestFileOwners, repoFullName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLoadgenCachedPullRequestFileOwnersRow
+	for rows.Next() {
+		var i ListLoadgenCachedPullRequestFileOwnersRow
+		if err := rows.Scan(
+			&i.PrNumber,
+			&i.Path,
+			&i.OwnerToken,
+			&i.OwnerType,
+			&i.OwnerName,
+			&i.ResolutionState,
+			&i.OwnerGhID,
+			&i.OwnerNodeID,
+			&i.OwnerLogin,
+			&i.SourcePattern,
+			&i.SourceLine,
+			&i.BaseSha,
 			&i.HeadSha,
 		); err != nil {
 			return nil, err
