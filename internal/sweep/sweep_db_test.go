@@ -1277,6 +1277,8 @@ func TestGapHealLeaseSingleFlightAndStaleRecoveryPreserveCursor(
 }
 
 func TestGapWindowIncompleteUsesDebugLogging(t *testing.T) {
+	t.Parallel()
+
 	var output bytes.Buffer
 	prior := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(
