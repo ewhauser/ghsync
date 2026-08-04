@@ -17,8 +17,8 @@ import (
 )
 
 // Hydrate preserves the direct authoritative path used by drift inspection.
-// PR refreshes use HydrateFromMirror so ordinary sweeps avoid redundant
-// CODEOWNERS reads.
+// PR refreshes use HydrateFromMirrorConditional so ordinary sweeps reuse
+// matching mirrored CODEOWNERS provenance.
 func Hydrate(
 	ctx context.Context,
 	rest *gh.RESTClient,
@@ -30,27 +30,16 @@ func Hydrate(
 	number int,
 	node *gh.PullRequestNode,
 ) (*store.PullRequestChangeSnapshotRecord, error) {
-	return HydrateFromMirror(
-		ctx,
-		rest,
-		NewSourceResolver(rest),
-		writer,
-		class,
-		repositoryID,
-		repositoryOwner,
-		repositoryName,
-		number,
-		node,
-		nil,
-		true,
+	snapshot, _, err := hydrateFromMirror(
+		ctx, rest, NewSourceResolver(rest), writer, class, repositoryID,
+		repositoryOwner, repositoryName, number, node, nil, true, "",
 	)
+	return snapshot, err
 }
 
-// HydrateFromMirror reads changed-file rename supplements and resolves the
-// effective CODEOWNERS source from matching mirror provenance before GitHub.
-// GraphQL supplies the authoritative paths and connection completeness; REST
-// is used only for facts GraphQL omits, invalidated ownership provenance, and
-// the final base/head fence check.
+// HydrateFromMirror resolves the effective CODEOWNERS source from matching
+// mirror provenance before GitHub and performs an unconditional final PR
+// base/head fence check.
 func HydrateFromMirror(
 	ctx context.Context,
 	rest *gh.RESTClient,
@@ -65,12 +54,81 @@ func HydrateFromMirror(
 	mirrored *store.CodeownersSourceRecord,
 	forceCodeowners bool,
 ) (*store.PullRequestChangeSnapshotRecord, error) {
+	snapshot, _, err := hydrateFromMirror(
+		ctx, rest, sources, writer, class, repositoryID, repositoryOwner,
+		repositoryName, number, node, mirrored, forceCodeowners, "",
+	)
+	return snapshot, err
+}
+
+// PullRequestFence pairs the validator accepted by the final PR fence with
+// the authoritative REST representation that produced it. Pull is nil only
+// when the fence returned 304 and the caller's stored representation remains
+// the validator-associated source of truth.
+type PullRequestFence struct {
+	ETag string
+	Pull *gh.PullRequest
+}
+
+// HydrateFromMirrorConditional combines mirror-first CODEOWNERS resolution
+// with conditional changed-files and final PR-fence requests. The PR validator
+// is reused only when the caller proved that it belongs to node's base/head
+// representation.
+func HydrateFromMirrorConditional(
+	ctx context.Context,
+	rest *gh.RESTClient,
+	sources *SourceResolver,
+	writer *store.EntityWriter,
+	class budget.Class,
+	repositoryID int64,
+	repositoryOwner string,
+	repositoryName string,
+	number int,
+	node *gh.PullRequestNode,
+	mirrored *store.CodeownersSourceRecord,
+	forceCodeowners bool,
+	pullETag string,
+) (*store.PullRequestChangeSnapshotRecord, PullRequestFence, error) {
+	return hydrateFromMirror(
+		ctx, rest, sources, writer, class, repositoryID, repositoryOwner,
+		repositoryName, number, node, mirrored, forceCodeowners, pullETag,
+	)
+}
+
+func hydrateFromMirror(
+	ctx context.Context,
+	rest *gh.RESTClient,
+	sources *SourceResolver,
+	writer *store.EntityWriter,
+	class budget.Class,
+	repositoryID int64,
+	repositoryOwner string,
+	repositoryName string,
+	number int,
+	node *gh.PullRequestNode,
+	mirrored *store.CodeownersSourceRecord,
+	forceCodeowners bool,
+	pullETag string,
+) (*store.PullRequestChangeSnapshotRecord, PullRequestFence, error) {
 	if rest == nil || sources == nil || writer == nil || node == nil {
-		return nil, fmt.Errorf("change-input hydration requires clients and PR")
+		return nil, PullRequestFence{}, fmt.Errorf(
+			"change-input hydration requires clients and PR",
+		)
+	}
+	changeMetadata, err := writer.PullRequestChangeMetadata(
+		ctx,
+		repositoryOwner+"/"+repositoryName,
+		number,
+	)
+	if err != nil {
+		return nil, PullRequestFence{}, fmt.Errorf(
+			"read PR changed-files validator: %w", err,
+		)
 	}
 	snapshot := &store.PullRequestChangeSnapshotRecord{
 		BaseSHA:         node.BaseRefOID,
 		HeadSHA:         node.HeadRefOID,
+		ETag:            changeMetadata.ETag,
 		FilesTotalCount: node.ChangedFiles,
 		CodeownersRef:   node.BaseRefName,
 		CodeownersSHA:   node.BaseRefOID,
@@ -107,13 +165,20 @@ func HydrateFromMirror(
 		}
 	}
 	if needsRenames {
-		renames, truncated, err := rest.PullRequestFileRenames(
+		renames, response, err := rest.PullRequestFileRenamesConditional(
 			ctx, class, repositoryOwner, repositoryName, number,
+			changeMetadata.ETag,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("fetch PR rename paths: %w", err)
+			return nil, PullRequestFence{}, fmt.Errorf(
+				"fetch PR rename paths: %w", err,
+			)
 		}
-		snapshot.FilesTruncated = snapshot.FilesTruncated || truncated
+		if response.NotModified {
+			renames = changeMetadata.PreviousPaths
+		}
+		snapshot.ETag = response.ETag
+		snapshot.FilesTruncated = snapshot.FilesTruncated || response.Truncated
 		for index := range snapshot.Files {
 			file := &snapshot.Files[index]
 			if file.ChangeType != "renamed" {
@@ -153,7 +218,9 @@ func HydrateFromMirror(
 			)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("fetch effective CODEOWNERS: %w", err)
+			return nil, PullRequestFence{}, fmt.Errorf(
+				"fetch effective CODEOWNERS: %w", err,
+			)
 		}
 	}
 	snapshot.CodeownersPath = source.Path
@@ -190,7 +257,9 @@ func HydrateFromMirror(
 		ctx, repositoryID, repositoryOwner, snapshot.Owners,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("resolve CODEOWNERS identities: %w", err)
+		return nil, PullRequestFence{}, fmt.Errorf(
+			"resolve CODEOWNERS identities: %w", err,
+		)
 	}
 	snapshot.Owners = resolveObservedIdentities(
 		resolvedOwners, repositoryOwner, node,
@@ -209,24 +278,37 @@ func HydrateFromMirror(
 		return snapshot.Owners[i].Path < snapshot.Owners[j].Path
 	})
 
-	latest, _, err := rest.GetPull(
+	latest, response, err := rest.GetPull(
 		ctx,
 		class,
 		repositoryOwner,
 		repositoryName,
 		number,
-		"",
+		pullETag,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("verify PR change-input fence: %w", err)
+		return nil, PullRequestFence{}, fmt.Errorf(
+			"verify PR change-input fence: %w", err,
+		)
+	}
+	if response.NotModified {
+		return snapshot, PullRequestFence{ETag: response.ETag}, nil
 	}
 	if latest.GetBase().GetSHA() != snapshot.BaseSHA ||
 		latest.GetHead().GetSHA() != snapshot.HeadSHA {
-		return nil, fmt.Errorf(
+		return nil, PullRequestFence{}, fmt.Errorf(
 			"verify PR change-input fence: base/head changed during observation",
 		)
 	}
-	return snapshot, nil
+	if !latest.GetUpdatedAt().Time.Equal(node.UpdatedAt) {
+		return nil, PullRequestFence{}, fmt.Errorf(
+			"verify PR change-input fence: parent updated_at changed during observation",
+		)
+	}
+	return snapshot, PullRequestFence{
+		ETag: response.ETag,
+		Pull: latest,
+	}, nil
 }
 
 func resolveObservedIdentities(

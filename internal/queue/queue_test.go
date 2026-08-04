@@ -441,3 +441,127 @@ func TestDirtyGenerationReinsertsFollowUpAfterCompletion(t *testing.T) {
 		t.Fatalf("refresh jobs = %d, want completed job + one follow-up", jobCount)
 	}
 }
+
+func TestUrgentRefreshExpeditesScheduledUniquePointer(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testdb.New(t).Pool
+	client, err := NewClient(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := fmt.Sprintf("pr:acme/staggered:%d", time.Now().UnixNano())
+	future := time.Now().Add(time.Hour)
+	insert := func(queueName string, scheduledAt time.Time) {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+		if err := InsertRefreshesTx(
+			ctx,
+			tx,
+			client,
+			[]RefreshSpec{{
+				Kind:        KindRefreshPR,
+				Key:         key,
+				ScheduledAt: scheduledAt,
+			}},
+			queueName,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(QueueSweep, future)
+	insert(QueueEvent, time.Time{})
+
+	var count, generation int
+	var state string
+	var scheduledAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), min(job.state::text), min(job.scheduled_at),
+		       max(intent.generation)
+		FROM river_job AS job
+		JOIN refresh_intent_generations AS intent
+		  ON intent.kind = job.args->>'kind'
+		 AND intent.refresh_key = job.args->>'key'
+		WHERE job.kind = 'refresh_pr'
+		  AND job.args->>'key' = $1
+	`, key).Scan(&count, &state, &scheduledAt, &generation); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || state != "available" || generation != 2 ||
+		!scheduledAt.Before(future) {
+		t.Fatalf(
+			"coalesced urgent pointer count/state/scheduled/generation = %d/%s/%s/%d",
+			count,
+			state,
+			scheduledAt,
+			generation,
+		)
+	}
+}
+
+func TestRefreshBatchDedupeKeepsUrgentSchedule(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testdb.New(t).Pool
+	client, err := NewClient(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := fmt.Sprintf("pr:acme/batch-staggered:%d", time.Now().UnixNano())
+	future := time.Now().Add(time.Hour)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := InsertRefreshesTx(
+		ctx,
+		tx,
+		client,
+		[]RefreshSpec{
+			{Kind: KindRefreshPR, Key: key, ScheduledAt: future},
+			{Kind: KindRefreshPR, Key: key},
+		},
+		QueueSweep,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var count, generation int
+	var state string
+	var scheduledAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), min(job.state::text), min(job.scheduled_at),
+		       max(intent.generation)
+		FROM river_job AS job
+		JOIN refresh_intent_generations AS intent
+		  ON intent.kind = job.args->>'kind'
+		 AND intent.refresh_key = job.args->>'key'
+		WHERE job.kind = 'refresh_pr'
+		  AND job.args->>'key' = $1
+	`, key).Scan(&count, &state, &scheduledAt, &generation); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || state != "available" || generation != 1 ||
+		!scheduledAt.Before(future) {
+		t.Fatalf(
+			"deduped urgent job = count %d, state %s, scheduled %s, generation %d",
+			count,
+			state,
+			scheduledAt,
+			generation,
+		)
+	}
+}

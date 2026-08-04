@@ -63,6 +63,24 @@ This row alone answers the on-call question. Link each stat to its runbook.
   )
   ```
 
+- GitHub request attribution by auth context, endpoint family, and outcome.
+  Keep `200`, `304`, and `403` visible as separate series so a rate-limit
+  incident identifies its consuming endpoint within minutes:
+
+  ```promql
+  sum by (auth_context, endpoint_family, outcome) (
+    rate(ghsync_c_b1_request_attribution_total[5m])
+  )
+  ```
+
+  `auth_context` is `installation` or `app_jwt`; endpoint families are
+  bounded names such as `pull_request_metadata`, `pull_request_files`,
+  `check_runs`, `repository_contents`, and `app_hook_deliveries`. A request
+  without an HTTP response uses the `transport_error` outcome. Other status
+  codes are grouped into bounded `other_2xx`, `other_3xx`, `other_4xx`,
+  `other_5xx`, or `other` outcomes; raw paths, repository names, IDs, and
+  arbitrary status values are never labels.
+
 - `ghsync_c_b2_gate_closed` by `auth_context` as a boolean with continuous
   closed duration supplied by the alert `for` clause:
 

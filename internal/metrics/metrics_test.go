@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -220,11 +221,20 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtimeMetrics.BudgetRequest(budget.RequestObservation{
-		Class:       budget.Sweep,
-		Resource:    budget.REST,
-		StatusCode:  304,
-		Conditional: true,
-		NotModified: true,
+		Class:          budget.Sweep,
+		Resource:       budget.REST,
+		AuthContext:    budget.InstallationAuth,
+		EndpointFamily: "pull_request_metadata",
+		StatusCode:     304,
+		Conditional:    true,
+		NotModified:    true,
+	})
+	runtimeMetrics.BudgetRequest(budget.RequestObservation{
+		Class:          budget.Sweep,
+		Resource:       budget.REST,
+		AuthContext:    budget.AppJWTAuth,
+		EndpointFamily: "app_hook_deliveries",
+		StatusCode:     403,
 	})
 	runtimeMetrics.BudgetStarvation(budget.Starvation{
 		Class:       budget.Sweep,
@@ -265,6 +275,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	for _, name := range []string{
 		"ghsync_c_b3_budget_remaining",
 		"ghsync_c_b4_conditional_304s_total",
+		"ghsync_c_b1_request_attribution_total",
 		"ghsync_c_c2_cache_cas_reject_ratio",
 		"ghsync_c_i5_parked_deliveries",
 		"ghsync_c_o3_drift_findings",
@@ -334,6 +345,48 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 			"installation_id": "1",
 			"resource":        "rest",
 			"auth_context":    "app_jwt",
+		},
+		1,
+	)
+	assertPrometheusValue(
+		t, body,
+		"ghsync_c_b1_request_attribution_total",
+		map[string]string{
+			"auth_context":    "installation",
+			"endpoint_family": "pull_request_metadata",
+			"outcome":         "304",
+		},
+		1,
+	)
+	assertPrometheusLabelShape(
+		t,
+		body,
+		"ghsync_c_b1_request_attribution_total",
+		"auth_context",
+		"endpoint_family",
+		"outcome",
+	)
+	assertPrometheusValue(
+		t,
+		body,
+		"ghsync_c_b4_conditional_requests_total",
+		map[string]string{"class": "sweep", "resource": "rest"},
+		1,
+	)
+	assertPrometheusValue(
+		t,
+		body,
+		"ghsync_c_b4_conditional_304s_total",
+		map[string]string{"class": "sweep", "resource": "rest"},
+		1,
+	)
+	assertPrometheusValue(
+		t, body,
+		"ghsync_c_b1_request_attribution_total",
+		map[string]string{
+			"auth_context":    "app_jwt",
+			"endpoint_family": "app_hook_deliveries",
+			"outcome":         "403",
 		},
 		1,
 	)
@@ -413,6 +466,26 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		map[string]string{"sweep_kind": "stacks"},
 	); duration < 14 || duration > 16 {
 		t.Fatalf("stacks sweep duration = %v, want about 15s", duration)
+	}
+}
+
+func TestRequestAttributionOutcomeIsBounded(t *testing.T) {
+	t.Parallel()
+	tests := map[int]string{
+		0:   "transport_error",
+		200: "200",
+		201: "other_2xx",
+		304: "304",
+		302: "other_3xx",
+		403: "403",
+		429: "other_4xx",
+		503: "other_5xx",
+		999: "other",
+	}
+	for status, want := range tests {
+		if got := requestAttributionOutcome(status); got != want {
+			t.Errorf("status %d outcome = %q, want %q", status, got, want)
+		}
 	}
 }
 
@@ -526,6 +599,35 @@ func metricLabelsMatch(item *dto.Metric, want map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func assertPrometheusLabelShape(
+	t *testing.T,
+	body []byte,
+	name string,
+	want ...string,
+) {
+	t.Helper()
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	family := families[name]
+	if family == nil || len(family.Metric) == 0 {
+		t.Fatalf("metrics exposition omitted family %q", name)
+	}
+	slices.Sort(want)
+	for _, item := range family.Metric {
+		got := make([]string, 0, len(item.Label))
+		for _, label := range item.Label {
+			got = append(got, label.GetName())
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Fatalf("%s label shape = %v, want %v", name, got, want)
+		}
+	}
 }
 
 // CollectDeliveryMetrics feeds the C-I5 parked gauges and the C-Q2 oldest

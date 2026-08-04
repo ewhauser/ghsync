@@ -83,6 +83,38 @@ func (q *Queries) AppendAcceptedCheckHistory(ctx context.Context, arg AppendAcce
 	return err
 }
 
+const confirmPullRequestMetadataCheckedAt = `-- name: ConfirmPullRequestMetadataCheckedAt :execrows
+UPDATE pull_requests
+SET last_checked_at = GREATEST(last_checked_at, $1)
+WHERE repo_id = $2
+  AND number = $3
+  AND tombstoned_at IS NULL
+  -- A 304 only confirms the representation associated with the validator
+  -- that was sent. If another observation replaced or invalidated it, this
+  -- stale response must not advance the new row's freshness clock (C-C2).
+  AND etag = $4
+`
+
+type ConfirmPullRequestMetadataCheckedAtParams struct {
+	CheckedAt pgtype.Timestamptz
+	RepoID    int64
+	PrNumber  int32
+	Etag      string
+}
+
+func (q *Queries) ConfirmPullRequestMetadataCheckedAt(ctx context.Context, arg ConfirmPullRequestMetadataCheckedAtParams) (int64, error) {
+	result, err := q.db.Exec(ctx, confirmPullRequestMetadataCheckedAt,
+		arg.CheckedAt,
+		arg.RepoID,
+		arg.PrNumber,
+		arg.Etag,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getCheckRunsFetchMetadata = `-- name: GetCheckRunsFetchMetadata :one
 SELECT repos.gh_id AS repo_gh_id, repos.installation_id,
        repos.full_name AS repo_full_name,
@@ -276,8 +308,13 @@ func (q *Queries) GetPullRequestByKey(ctx context.Context, arg GetPullRequestByK
 }
 
 const getPullRequestFetchMetadata = `-- name: GetPullRequestFetchMetadata :one
-SELECT pull_requests.node_id, pull_requests.etag,
+SELECT pull_requests.node_id, pull_requests.etag, pull_requests.title,
+       pull_requests.state, pull_requests.draft,
+       pull_requests.author_login, pull_requests.head_ref,
+       pull_requests.base_ref, pull_requests.review_decision,
+       pull_requests.mergeable_state,
        pull_requests.stack_number, pull_requests.stack_position,
+       pull_requests.gh_updated_at, pull_requests.base_sha,
        pull_requests.head_sha, repos.gh_id AS repo_gh_id,
        repos.installation_id, repos.full_name AS repo_full_name,
        COALESCE(snapshot.codeowners_ref, '')::text AS codeowners_ref,
@@ -316,8 +353,18 @@ type GetPullRequestFetchMetadataParams struct {
 type GetPullRequestFetchMetadataRow struct {
 	NodeID                 string
 	Etag                   string
+	Title                  string
+	State                  string
+	Draft                  bool
+	AuthorLogin            string
+	HeadRef                string
+	BaseRef                string
+	ReviewDecision         string
+	MergeableState         string
 	StackNumber            pgtype.Int4
 	StackPosition          pgtype.Int4
+	GhUpdatedAt            pgtype.Timestamptz
+	BaseSha                string
 	HeadSha                string
 	RepoGhID               int64
 	InstallationID         int64
@@ -338,8 +385,18 @@ func (q *Queries) GetPullRequestFetchMetadata(ctx context.Context, arg GetPullRe
 	err := row.Scan(
 		&i.NodeID,
 		&i.Etag,
+		&i.Title,
+		&i.State,
+		&i.Draft,
+		&i.AuthorLogin,
+		&i.HeadRef,
+		&i.BaseRef,
+		&i.ReviewDecision,
+		&i.MergeableState,
 		&i.StackNumber,
 		&i.StackPosition,
+		&i.GhUpdatedAt,
+		&i.BaseSha,
 		&i.HeadSha,
 		&i.RepoGhID,
 		&i.InstallationID,
@@ -834,6 +891,56 @@ func (q *Queries) ListPRsAffectedByBranch(ctx context.Context, arg ListPRsAffect
 	for rows.Next() {
 		var i ListPRsAffectedByBranchRow
 		if err := rows.Scan(&i.Number, &i.StackNumber); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPullRequestChangeFetchMetadata = `-- name: ListPullRequestChangeFetchMetadata :many
+SELECT snapshot.files_etag AS etag, COALESCE(file.path, '')::text AS path,
+       COALESCE(file.previous_path, '')::text AS previous_path
+FROM pull_request_change_snapshots AS snapshot
+JOIN repos ON repos.id = snapshot.repo_id
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+LEFT JOIN pull_request_changed_files AS file
+  ON file.repo_id = snapshot.repo_id
+ AND file.pr_number = snapshot.pr_number
+ AND file.tombstoned_at IS NULL
+WHERE repo_aliases.full_name = $1
+  AND snapshot.pr_number = $2
+  AND snapshot.tombstoned_at IS NULL
+ORDER BY file.path
+`
+
+type ListPullRequestChangeFetchMetadataParams struct {
+	RepoFullName string
+	PrNumber     int32
+}
+
+type ListPullRequestChangeFetchMetadataRow struct {
+	Etag         string
+	Path         string
+	PreviousPath string
+}
+
+// The snapshot and changed-file rows carry the first-page validator for the
+// REST files collection. Previous paths are retained so a 304 can reuse the
+// last authoritative rename supplement without another response body.
+func (q *Queries) ListPullRequestChangeFetchMetadata(ctx context.Context, arg ListPullRequestChangeFetchMetadataParams) ([]ListPullRequestChangeFetchMetadataRow, error) {
+	rows, err := q.db.Query(ctx, listPullRequestChangeFetchMetadata, arg.RepoFullName, arg.PrNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPullRequestChangeFetchMetadataRow
+	for rows.Next() {
+		var i ListPullRequestChangeFetchMetadataRow
+		if err := rows.Scan(&i.Etag, &i.Path, &i.PreviousPath); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -2135,6 +2242,7 @@ SET tombstoned_at = $1,
     synced_at = $1,
     last_checked_at = GREATEST(last_checked_at, $1),
     etag = '',
+    files_etag = '',
     sync_source = $2
 WHERE repo_id = $3
   AND pr_number = $4
@@ -2500,23 +2608,28 @@ const touchPullRequestChangeInputsCheckedAt = `-- name: TouchPullRequestChangeIn
 WITH eligible AS (
     SELECT snapshot.repo_id
     FROM pull_request_change_snapshots AS snapshot
-    WHERE snapshot.repo_id = $3
-      AND snapshot.pr_number = $4
+    WHERE snapshot.repo_id = $4
+      AND snapshot.pr_number = $5
       AND snapshot.tombstoned_at IS NULL
-      AND snapshot.parent_gh_updated_at <= $5
+      AND snapshot.parent_gh_updated_at <= $6
 )
 UPDATE pull_request_change_snapshots AS snapshot
 SET last_checked_at = GREATEST(snapshot.last_checked_at, $1),
     etag = CASE WHEN $2::text = '' THEN snapshot.etag
-                ELSE $2::text END
-WHERE snapshot.repo_id = $3
-  AND snapshot.pr_number = $4
+                ELSE $2::text END,
+    files_etag = CASE
+        WHEN $3::text = '' THEN snapshot.files_etag
+        ELSE $3::text
+    END
+WHERE snapshot.repo_id = $4
+  AND snapshot.pr_number = $5
   AND EXISTS (SELECT 1 FROM eligible)
 `
 
 type TouchPullRequestChangeInputsCheckedAtParams struct {
 	CheckedAt         pgtype.Timestamptz
-	Etag              string
+	CodeownersEtag    string
+	FilesEtag         string
 	RepoID            int64
 	PrNumber          int32
 	ParentGhUpdatedAt pgtype.Timestamptz
@@ -2525,7 +2638,8 @@ type TouchPullRequestChangeInputsCheckedAtParams struct {
 func (q *Queries) TouchPullRequestChangeInputsCheckedAt(ctx context.Context, arg TouchPullRequestChangeInputsCheckedAtParams) error {
 	_, err := q.db.Exec(ctx, touchPullRequestChangeInputsCheckedAt,
 		arg.CheckedAt,
-		arg.Etag,
+		arg.CodeownersEtag,
+		arg.FilesEtag,
 		arg.RepoID,
 		arg.PrNumber,
 		arg.ParentGhUpdatedAt,
@@ -2866,8 +2980,8 @@ upserted AS (
         repo_id, pr_number, base_sha, head_sha, files_total_count,
         files_truncated, codeowners_ref, codeowners_sha, codeowners_path,
         codeowners_state, codeowners_source, codeowners_hash,
-        parent_gh_updated_at, synced_at, etag, sync_source, tombstoned_at,
-        last_checked_at
+        parent_gh_updated_at, synced_at, etag, files_etag, sync_source,
+        tombstoned_at, last_checked_at
     )
     SELECT $11, $12, $1,
            $2, $3,
@@ -2875,8 +2989,9 @@ upserted AS (
            $6, $7,
            $8, $9,
            $10, $13,
-           $14, $15, $16, NULL,
-           $17
+           $14, $15,
+           $16, $17, NULL,
+           $18
     FROM eligible
     ON CONFLICT (repo_id, pr_number) DO UPDATE
     SET base_sha = EXCLUDED.base_sha,
@@ -2914,6 +3029,7 @@ upserted AS (
             ELSE pull_request_change_snapshots.synced_at
         END,
         etag = EXCLUDED.etag,
+        files_etag = EXCLUDED.files_etag,
         sync_source = CASE
             WHEN pull_request_change_snapshots.tombstoned_at IS NOT NULL
               OR ROW(
@@ -3012,7 +3128,8 @@ type UpsertPullRequestChangeSnapshotParams struct {
 	PrNumber          int32
 	ParentGhUpdatedAt pgtype.Timestamptz
 	SyncedAt          pgtype.Timestamptz
-	Etag              string
+	CodeownersEtag    string
+	FilesEtag         string
 	SyncSource        string
 	LastCheckedAt     pgtype.Timestamptz
 }
@@ -3037,7 +3154,8 @@ func (q *Queries) UpsertPullRequestChangeSnapshot(ctx context.Context, arg Upser
 		arg.PrNumber,
 		arg.ParentGhUpdatedAt,
 		arg.SyncedAt,
-		arg.Etag,
+		arg.CodeownersEtag,
+		arg.FilesEtag,
 		arg.SyncSource,
 		arg.LastCheckedAt,
 	)

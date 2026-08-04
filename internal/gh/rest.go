@@ -247,6 +247,13 @@ type ListPullRequestFilesOptions struct {
 	Page    int
 }
 
+// PullRequestFileRenamesResponse describes the first REST changed-files page.
+type PullRequestFileRenamesResponse struct {
+	ETag        string
+	NotModified bool
+	Truncated   bool
+}
+
 // ListStacksOptions controls stack filtering and pagination.
 type ListStacksOptions struct {
 	PullRequest int
@@ -492,6 +499,18 @@ func (c *RESTClient) ListPullRequestFiles(
 	number int,
 	options ListPullRequestFilesOptions,
 ) ([]PullRequestFile, *RESTResponse, error) {
+	return c.listPullRequestFiles(ctx, class, owner, repo, number, options, "")
+}
+
+func (c *RESTClient) listPullRequestFiles(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	number int,
+	options ListPullRequestFilesOptions,
+	etag string,
+) ([]PullRequestFile, *RESTResponse, error) {
 	query := make(url.Values)
 	setPagination(query, options.PerPage, options.Page)
 	path := fmt.Sprintf(
@@ -501,7 +520,7 @@ func (c *RESTClient) ListPullRequestFiles(
 		number,
 	)
 	var files []PullRequestFile
-	response, err := c.client.getJSON(ctx, class, path, query, "", &files)
+	response, err := c.client.getJSON(ctx, class, path, query, etag, &files)
 	return files, response, err
 }
 
@@ -515,19 +534,54 @@ func (c *RESTClient) PullRequestFileRenames(
 	repo string,
 	number int,
 ) (map[string]string, bool, error) {
+	renames, response, err := c.PullRequestFileRenamesConditional(
+		ctx, class, owner, repo, number, "",
+	)
+	return renames, response.Truncated, err
+}
+
+// PullRequestFileRenamesConditional reuses the persisted first-page validator.
+func (c *RESTClient) PullRequestFileRenamesConditional(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	number int,
+	etag string,
+) (map[string]string, PullRequestFileRenamesResponse, error) {
 	renames := make(map[string]string)
+	var result PullRequestFileRenamesResponse
 	count := 0
 	for page := 1; count < MaxPullRequestFiles; page++ {
-		files, response, err := c.ListPullRequestFiles(
+		conditionalETag := ""
+		if page == 1 {
+			conditionalETag = etag
+		}
+		files, response, err := c.listPullRequestFiles(
 			ctx,
 			class,
 			owner,
 			repo,
 			number,
 			ListPullRequestFilesOptions{PerPage: 100, Page: page},
+			conditionalETag,
 		)
 		if err != nil {
-			return nil, false, fmt.Errorf("list PR files page %d: %w", page, err)
+			return nil, result, fmt.Errorf("list PR files page %d: %w", page, err)
+		}
+		if response.NotModified {
+			if page != 1 {
+				return nil, result, fmt.Errorf(
+					"list PR files page %d: unexpected 304",
+					page,
+				)
+			}
+			result.ETag = response.ETag
+			result.NotModified = true
+			return nil, result, nil
+		}
+		if page == 1 {
+			result.ETag = response.ETag
 		}
 		for _, file := range files {
 			if count == MaxPullRequestFiles {
@@ -540,14 +594,16 @@ func (c *RESTClient) PullRequestFileRenames(
 			}
 		}
 		if response.NextPage == 0 {
-			return renames, false, nil
+			return renames, result, nil
 		}
 		if count == MaxPullRequestFiles {
-			return renames, true, nil
+			result.Truncated = true
+			return renames, result, nil
 		}
 		page = response.NextPage - 1
 	}
-	return renames, true, nil
+	result.Truncated = true
+	return renames, result, nil
 }
 
 // FindCodeowners reads the first source present at an exact Git ref using

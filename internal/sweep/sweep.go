@@ -169,6 +169,35 @@ func (p SchedulePlan) dueBefore(now time.Time) time.Time {
 	return now.Add(p.Cadence + p.CompletionHeadroom - p.Bound)
 }
 
+// spreadRefreshSchedule distributes one sweep fan-out across the cadence
+// window. Every job remains scheduled no later than its hard deadline minus
+// the plan's completion headroom, so smoothing cannot consume C-R1's fetch
+// allowance. The stable stale-query order makes the schedule deterministic.
+func spreadRefreshSchedule(
+	specs []queue.RefreshSpec,
+	now time.Time,
+	plan SchedulePlan,
+) {
+	if len(specs) < 2 || plan.Cadence <= 0 ||
+		plan.CompletionHeadroom <= 0 {
+		return
+	}
+	last := max(len(specs)-1, 1)
+	for index := range specs {
+		latestStart := specs[index].Deadline.Add(-plan.CompletionHeadroom)
+		scheduledAt := now.Add(time.Duration(
+			int64(plan.Cadence) * int64(index) / int64(last),
+		))
+		if scheduledAt.After(latestStart) {
+			scheduledAt = latestStart
+		}
+		if scheduledAt.Before(now) {
+			scheduledAt = now
+		}
+		specs[index].ScheduledAt = scheduledAt
+	}
+}
+
 type Observer interface {
 	SweepOverrun(
 		context.Context,
@@ -555,6 +584,7 @@ func (s *Service) enqueueStalePullRequests(ctx context.Context) error {
 			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
+	spreadRefreshSchedule(specs, s.config.Now(), plan)
 	return s.enqueueRefreshes(ctx, specs)
 }
 

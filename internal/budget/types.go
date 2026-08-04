@@ -186,13 +186,14 @@ type StarvationHook func(Starvation)
 // RequestObservation is emitted after one admitted network call. It contains
 // only cardinality-bounded accounting data and never request URLs or headers.
 type RequestObservation struct {
-	Class       Class
-	Resource    Resource
-	AuthContext AuthContext
-	StatusCode  int
-	Conditional bool
-	NotModified bool
-	Err         error
+	Class          Class
+	Resource       Resource
+	AuthContext    AuthContext
+	EndpointFamily string
+	StatusCode     int
+	Conditional    bool
+	NotModified    bool
+	Err            error
 }
 
 // RequestHook is M6's C-B1/C-B4 request-rate and conditional-hit seam.

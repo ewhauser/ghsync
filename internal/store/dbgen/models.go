@@ -301,6 +301,7 @@ type PullRequestChangeSnapshot struct {
 	SyncSource        string
 	TombstonedAt      pgtype.Timestamptz
 	LastCheckedAt     pgtype.Timestamptz
+	FilesEtag         string
 }
 
 type PullRequestChangedFile struct {

@@ -150,6 +150,7 @@ type FileOwnerRecord struct {
 type PullRequestChangeSnapshotRecord struct {
 	BaseSHA          string
 	HeadSHA          string
+	ETag             string
 	FilesTotalCount  int
 	FilesTruncated   bool
 	CodeownersRef    string
@@ -173,6 +174,13 @@ type CodeownersSourceRecord struct {
 	Content string
 	Hash    string
 	ETag    string
+}
+
+// PullRequestChangeFetchMetadata is the persisted conditional-request state
+// for the REST changed-files supplement.
+type PullRequestChangeFetchMetadata struct {
+	ETag          string
+	PreviousPaths map[string]string
 }
 
 // PullRequestRecord is the authoritative pull-request state accepted by the
@@ -325,8 +333,18 @@ type ApplyStackResult struct {
 type FetchMetadata struct {
 	NodeID                 string
 	ETag                   string
+	Title                  string
+	State                  string
+	Draft                  bool
+	AuthorLogin            string
+	HeadRef                string
+	BaseRef                string
+	ReviewDecision         string
+	MergeableState         string
 	StackNumber            *int
 	StackPosition          *int
+	GitHubUpdatedAt        time.Time
+	BaseSHA                string
 	HeadSHA                string
 	RepoGitHubID           int64
 	InstallationID         int64

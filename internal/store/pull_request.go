@@ -31,11 +31,25 @@ func (w *EntityWriter) PullRequestMetadata(
 	if err != nil {
 		return FetchMetadata{}, fmt.Errorf("get PR fetch metadata: %w", err)
 	}
+	var githubUpdatedAt time.Time
+	if row.GhUpdatedAt.Valid {
+		githubUpdatedAt = row.GhUpdatedAt.Time
+	}
 	metadata := FetchMetadata{
 		NodeID:                 row.NodeID,
 		ETag:                   row.Etag,
+		Title:                  row.Title,
+		State:                  row.State,
+		Draft:                  row.Draft,
+		AuthorLogin:            row.AuthorLogin,
+		HeadRef:                row.HeadRef,
+		BaseRef:                row.BaseRef,
+		ReviewDecision:         row.ReviewDecision,
+		MergeableState:         row.MergeableState,
 		StackNumber:            intPointer(row.StackNumber),
 		StackPosition:          intPointer(row.StackPosition),
+		GitHubUpdatedAt:        githubUpdatedAt,
+		BaseSHA:                row.BaseSha,
 		HeadSHA:                row.HeadSha,
 		RepoGitHubID:           row.RepoGhID,
 		InstallationID:         row.InstallationID,
@@ -56,7 +70,42 @@ func (w *EntityWriter) PullRequestMetadata(
 	return metadata, nil
 }
 
-// TouchPullRequest records a successful unchanged pull-request observation.
+// PullRequestChangeMetadata returns the changed-files validator and cached
+// rename supplements. The query completes before callers perform REST I/O
+// (C-C6).
+func (w *EntityWriter) PullRequestChangeMetadata(
+	ctx context.Context,
+	repo string,
+	number int,
+) (PullRequestChangeFetchMetadata, error) {
+	rows, err := dbgen.New(w.pool).ListPullRequestChangeFetchMetadata(
+		ctx,
+		dbgen.ListPullRequestChangeFetchMetadataParams{
+			RepoFullName: repo,
+			PrNumber:     int32(number),
+		},
+	)
+	if err != nil {
+		return PullRequestChangeFetchMetadata{}, fmt.Errorf(
+			"list PR change fetch metadata: %w",
+			err,
+		)
+	}
+	metadata := PullRequestChangeFetchMetadata{
+		PreviousPaths: make(map[string]string),
+	}
+	for _, row := range rows {
+		metadata.ETag = row.Etag
+		if row.Path != "" && row.PreviousPath != "" {
+			metadata.PreviousPaths[row.Path] = row.PreviousPath
+		}
+	}
+	return metadata, nil
+}
+
+// TouchPullRequest records a successful unchanged pull-request metadata
+// observation. The supplied validator must still belong to the current row;
+// GraphQL participation and changed-file clocks are owned by their own fetches.
 func (w *EntityWriter) TouchPullRequest(
 	ctx context.Context,
 	observation *Observation,
@@ -64,13 +113,14 @@ func (w *EntityWriter) TouchPullRequest(
 	number int,
 	checkedAt time.Time,
 	etag string,
-) error {
+) (bool, error) {
 	key := PullRequestEntityKey(
 		repository.InstallationID, repository.GitHubID, number,
 	)
 	if err := requireObservation(observation, key); err != nil {
-		return err
+		return false, err
 	}
+	confirmed := false
 	err := w.withEntityTx(ctx, observation, key, func(entity entityTx) error {
 		ctx, queries := entity.ctx, entity.queries
 		checkedAt = entity.databaseTime
@@ -81,96 +131,25 @@ func (w *EntityWriter) TouchPullRequest(
 		if err != nil {
 			return fmt.Errorf("find PR repository: %w", err)
 		}
-		if err := queries.TouchPullRequestCheckedAt(
+		rows, err := queries.ConfirmPullRequestMetadataCheckedAt(
 			ctx,
-			dbgen.TouchPullRequestCheckedAtParams{
+			dbgen.ConfirmPullRequestMetadataCheckedAtParams{
 				CheckedAt: timestamp(checkedAt),
 				RepoID:    repo.ID,
 				PrNumber:  int32(number),
 				Etag:      etag,
 			},
-		); err != nil {
-			return fmt.Errorf("touch PR checked_at: %w", err)
-		}
-		current, err := queries.GetPullRequestByIdentity(
-			ctx,
-			dbgen.GetPullRequestByIdentityParams{
-				RepoGhID: repository.GitHubID,
-				PrNumber: int32(number),
-			},
 		)
 		if err != nil {
-			return fmt.Errorf("read touched PR: %w", err)
+			return fmt.Errorf("touch PR checked_at: %w", err)
 		}
-		if current.GhUpdatedAt.Valid {
-			if err := queries.TouchPullRequestReviewRequestsCheckedAt(
-				ctx,
-				dbgen.TouchPullRequestReviewRequestsCheckedAtParams{
-					CheckedAt:   timestamp(checkedAt),
-					Etag:        etag,
-					RepoID:      repo.ID,
-					PrNumber:    int32(number),
-					GhUpdatedAt: current.GhUpdatedAt,
-				},
-			); err != nil {
-				return fmt.Errorf("touch PR review requests: %w", err)
-			}
-			if err := queries.TouchPullRequestReviewsCheckedAt(
-				ctx,
-				dbgen.TouchPullRequestReviewsCheckedAtParams{
-					CheckedAt:         timestamp(checkedAt),
-					Etag:              etag,
-					RepoID:            repo.ID,
-					PrNumber:          int32(number),
-					ParentGhUpdatedAt: current.GhUpdatedAt,
-				},
-			); err != nil {
-				return fmt.Errorf("touch PR reviews: %w", err)
-			}
-			if err := queries.TouchPullRequestCommentsCheckedAt(
-				ctx,
-				dbgen.TouchPullRequestCommentsCheckedAtParams{
-					CheckedAt:         timestamp(checkedAt),
-					Etag:              etag,
-					RepoID:            repo.ID,
-					PrNumber:          int32(number),
-					ParentGhUpdatedAt: current.GhUpdatedAt,
-				},
-			); err != nil {
-				return fmt.Errorf("touch PR comments: %w", err)
-			}
-			changeTouch := dbgen.TouchPullRequestChangeInputsCheckedAtParams{
-				CheckedAt:         timestamp(checkedAt),
-				Etag:              "",
-				RepoID:            repo.ID,
-				PrNumber:          int32(number),
-				ParentGhUpdatedAt: current.GhUpdatedAt,
-			}
-			if err := queries.TouchPullRequestChangeInputsCheckedAt(
-				ctx, changeTouch,
-			); err != nil {
-				return fmt.Errorf("touch PR change snapshot: %w", err)
-			}
-			changeTouch.Etag = etag
-			if err := queries.TouchPullRequestChangedFilesCheckedAt(
-				ctx,
-				dbgen.TouchPullRequestChangedFilesCheckedAtParams(changeTouch),
-			); err != nil {
-				return fmt.Errorf("touch PR changed files: %w", err)
-			}
-			if err := queries.TouchPullRequestFileOwnersCheckedAt(
-				ctx,
-				dbgen.TouchPullRequestFileOwnersCheckedAtParams(changeTouch),
-			); err != nil {
-				return fmt.Errorf("touch PR file owners: %w", err)
-			}
-		}
+		confirmed = rows == 1
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("touch PR: %w", err)
+		return false, fmt.Errorf("touch PR: %w", err)
 	}
-	return nil
+	return confirmed, nil
 }
 
 // ApplyPullRequest conditionally applies a direct pull-request observation.
@@ -497,7 +476,8 @@ func (w *EntityWriter) applyPullRequest(
 					),
 					CodeownersHash: snapshot.CodeownersHash,
 					SyncedAt:       timestamp(pull.SyncedAt),
-					Etag:           snapshot.CodeownersETag,
+					CodeownersEtag: snapshot.CodeownersETag,
+					FilesEtag:      snapshot.ETag,
 					SyncSource:     string(pull.Source),
 					LastCheckedAt:  timestamp(pull.SyncedAt),
 				},
@@ -553,7 +533,8 @@ func (w *EntityWriter) applyPullRequest(
 				len(changedFiles) > 0 || len(changedOwners) > 0
 			changeTouch := dbgen.TouchPullRequestChangeInputsCheckedAtParams{
 				CheckedAt:         timestamp(pull.SyncedAt),
-				Etag:              snapshot.CodeownersETag,
+				CodeownersEtag:    snapshot.CodeownersETag,
+				FilesEtag:         snapshot.ETag,
 				RepoID:            repo.ID,
 				PrNumber:          int32(pull.Number),
 				ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
@@ -563,16 +544,27 @@ func (w *EntityWriter) applyPullRequest(
 			); err != nil {
 				return fmt.Errorf("touch PR change snapshot: %w", err)
 			}
-			changeTouch.Etag = pull.ETag
 			if err := queries.TouchPullRequestChangedFilesCheckedAt(
 				ctx,
-				dbgen.TouchPullRequestChangedFilesCheckedAtParams(changeTouch),
+				dbgen.TouchPullRequestChangedFilesCheckedAtParams{
+					CheckedAt:         timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+				},
 			); err != nil {
 				return fmt.Errorf("touch PR changed files: %w", err)
 			}
 			if err := queries.TouchPullRequestFileOwnersCheckedAt(
 				ctx,
-				dbgen.TouchPullRequestFileOwnersCheckedAtParams(changeTouch),
+				dbgen.TouchPullRequestFileOwnersCheckedAtParams{
+					CheckedAt:         timestamp(pull.SyncedAt),
+					Etag:              pull.ETag,
+					RepoID:            repo.ID,
+					PrNumber:          int32(pull.Number),
+					ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
+				},
 			); err != nil {
 				return fmt.Errorf("touch PR file owners: %w", err)
 			}

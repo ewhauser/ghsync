@@ -390,14 +390,16 @@ func (g *Gate) doAdmitted(
 		statusCode = resp.StatusCode
 	}
 	if g.onRequest != nil {
+		authContext, endpoint := requestAttribution(req, httpReq)
 		g.onRequest(RequestObservation{
-			Class:       class,
-			Resource:    req.resource,
-			AuthContext: req.authContext,
-			StatusCode:  statusCode,
-			Conditional: httpReq.Header.Get("If-None-Match") != "",
-			NotModified: statusCode == http.StatusNotModified,
-			Err:         joinErrors(requestErr, observeErr),
+			Class:          class,
+			Resource:       req.resource,
+			AuthContext:    authContext,
+			EndpointFamily: endpoint,
+			StatusCode:     statusCode,
+			Conditional:    httpReq.Header.Get("If-None-Match") != "",
+			NotModified:    statusCode == http.StatusNotModified,
+			Err:            joinErrors(requestErr, observeErr),
 		})
 	}
 	if requestErr != nil {

@@ -205,7 +205,9 @@ explicit review checklist rather than relying on call-site folklore:
 - **C-B4 — Conditional by default.** Reconciliation and any refetch of a
   possibly-unchanged entity sends `If-None-Match`; 304s are close to free and
   must be the common case for sweeps. A sweep that hits < 80% 304 rate on a
-  quiet org indicates an ETag-handling bug. PR ownership hydration first
+  quiet org indicates an ETag-handling bug. PR metadata, the first changed-file
+  page, and the first check-runs page each reuse their own persisted validator.
+  PR ownership hydration first
   reuses an exact ref/SHA CODEOWNERS source from the mirror. Provenance
   invalidation single-flights the repository/ref probe, reuses its content
   ETag, and remembers absent precedence paths only for the exact immutable
@@ -257,6 +259,10 @@ explicit review checklist rather than relying on call-site folklore:
   / unstack — the sweep is the *only* signal for those transitions), open PRs
   ≤ 10 min, repo rules ≤ 1 h, closed-but-displayed entities ≤ 24 h. The
   sweeper's schedule derives from these numbers; they are config, not code.
+  Large PR fan-outs assign River `scheduled_at` times across the cadence
+  portion of that plan at enqueue time. Their hard completion deadlines remain
+  unchanged, and every scheduled start retains the plan's full completion
+  headroom.
 - **C-R2 — Sweeps are incremental and resumable.** List-based (paginated,
   ETag'd, `sort=updated` where available) with a persisted cursor. A crashed
   sweep resumes, never restarts from zero, and a sweep that can't finish
@@ -478,7 +484,9 @@ transactions: **dozens**, not thousands.
   cache, and emits a divergence metric. Divergence > 0 is a bug report with
   the diff attached, not a shrug.
 - **C-O4 — First-class observables.** Per-installation: budget remaining by
-  class and auth context, request rate, 304 ratio. Pipeline: event→cache
+  class and auth context, request and starvation rate by auth context, request
+  attribution by endpoint family and HTTP outcome, and 304 ratio. Pipeline:
+  event→cache
   latency histogram (C-Q2 SLO), queue depth by priority, oldest-unprocessed
   delivery age, staleness per entity class (C-R1), outbox lag, parked-job
   count. All of these have alert thresholds tied to the constraint they
