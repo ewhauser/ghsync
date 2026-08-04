@@ -123,10 +123,31 @@ WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
 SELECT pull_requests.node_id, pull_requests.etag,
        pull_requests.stack_number, pull_requests.stack_position,
        pull_requests.head_sha, repos.gh_id AS repo_gh_id,
-       repos.installation_id, repos.full_name AS repo_full_name
+       repos.installation_id, repos.full_name AS repo_full_name,
+       COALESCE(snapshot.codeowners_ref, '')::text AS codeowners_ref,
+       COALESCE(snapshot.codeowners_sha, '')::text AS codeowners_sha,
+       COALESCE(snapshot.codeowners_path, '')::text AS codeowners_path,
+       COALESCE(snapshot.codeowners_state, '')::text AS codeowners_state,
+       COALESCE(snapshot.codeowners_source, '')::text AS codeowners_source,
+       COALESCE(snapshot.codeowners_hash, '')::text AS codeowners_hash,
+       COALESCE(snapshot.etag, '')::text AS codeowners_etag,
+       EXISTS (
+           SELECT 1
+           FROM drift_findings
+           WHERE drift_findings.installation_id = repos.installation_id
+             AND drift_findings.entity_kind = 'pull_request'
+             AND drift_findings.entity_key =
+                 'pr:' || sqlc.arg(repo_full_name)::text || ':' ||
+                 pull_requests.number::text
+             AND drift_findings.resolved_at IS NULL
+       ) AS force_codeowners_refresh
 FROM pull_requests
 JOIN repos ON repos.id = pull_requests.repo_id
 JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+LEFT JOIN pull_request_change_snapshots AS snapshot
+  ON snapshot.repo_id = pull_requests.repo_id
+ AND snapshot.pr_number = pull_requests.number
+ AND snapshot.tombstoned_at IS NULL
 WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
   AND pull_requests.number = sqlc.arg(pr_number);
 

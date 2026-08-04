@@ -159,7 +159,7 @@ JSON value may be empty.
 | `pull_request_change_snapshots` | `codeowners_hash` | `text` | no | source-state/path/content identity |
 | `pull_request_change_snapshots` | `parent_gh_updated_at` | `timestamp with time zone` | no | parent-observation freshness fence |
 | `pull_request_change_snapshots` | `synced_at` | `timestamp with time zone` | no | domain-change time |
-| `pull_request_change_snapshots` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_change_snapshots` | `etag` | `text` | no | effective CODEOWNERS content validator |
 | `pull_request_change_snapshots` | `sync_source` | `text` | no | provenance enum |
 | `pull_request_change_snapshots` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means snapshot is not live |
 | `pull_request_change_snapshots` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
@@ -362,6 +362,20 @@ is `oversized` and does not fall through. No file at any location is the
 successful `missing` empty-ownership state. If GitHub reports the base ref but
 not its SHA, `codeowners_sha = ''` and `codeowners_state = 'unavailable'`;
 ghsync does not silently read the moving ref.
+
+PR refreshes reuse this mirrored source when `codeowners_ref`,
+`codeowners_sha`, and the source hash match the observed base. A missing row,
+changed provenance, or invalid source hash performs one coalesced fetch per
+repository/ref. Within an exact immutable commit, known higher-precedence 404
+paths are not probed again; any new base SHA invalidates that absence knowledge
+so an added higher-precedence file is discovered. The effective content
+request sends the stored `pull_request_change_snapshots.etag` as
+`If-None-Match`. A 304 retains the mirrored state, path, source, and hash while
+still flowing through the existing C-B4 conditional-request metrics. Drift
+inspection continues to fetch CODEOWNERS directly, and an open PR drift
+finding forces its healing refresh through the same authoritative path before
+mirror reuse resumes. The changed-file and owner child-row ETags remain the
+parent PR validator.
 
 The pure resolver is case-sensitive and repository-root-relative. It applies
 CODEOWNERS' gitignore-style pattern behavior, including root anchoring,

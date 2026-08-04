@@ -1578,6 +1578,408 @@ func TestPullRequestRefreshMirrorsFencedFilesAndCodeowners(t *testing.T) {
 	}
 }
 
+func TestPullRequestSweepReusesMirroredCodeownersAndInvalidationFetchesOnce(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	numbers := []int{4812, 4815, 4816}
+	const (
+		baseSHA = "codeowners-base-one"
+		newSHA  = "codeowners-base-two"
+		source  = "* @reviewer\ninternal/** @acme/search-platform @unknown-user\n"
+	)
+	for index := range fixture.PullRequests {
+		for _, number := range numbers {
+			if fixture.PullRequests[index].Number == number {
+				fixture.PullRequests[index].Base = fakegithub.Base{
+					Ref: "main", SHA: baseSHA,
+				}
+			}
+		}
+	}
+	fixture.Contents = map[string]map[string]string{
+		baseSHA: {"CODEOWNERS": source},
+		newSHA:  {"CODEOWNERS": source},
+	}
+
+	seedFake, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t, pool, fixture, 50*time.Millisecond, 100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	seedCoordinatorPulls(t, seedHandler, numbers...)
+	refreshCodeownersPulls(t, seedHandler, numbers, queue.QueueEvent)
+	githubPath := "/repos/acme/monolith/contents/.github/CODEOWNERS"
+	rootPath := "/repos/acme/monolith/contents/CODEOWNERS"
+	if got := seedFake.RequestCount(http.MethodGet, githubPath); got != 1 {
+		t.Fatalf("cold .github/CODEOWNERS probes = %d, want 1", got)
+	}
+	if got := seedFake.RequestCount(http.MethodGet, rootPath); got != 1 {
+		t.Fatalf("cold root CODEOWNERS probes = %d, want 1", got)
+	}
+	before := readCodeownersResults(t, pool, numbers)
+	databaseNumbers := codeownersDatabaseNumbers(numbers)
+	var mirroredETags int
+	if err := pool.QueryRow(t.Context(), `
+		SELECT count(*)
+		FROM pull_request_change_snapshots
+		WHERE pr_number = ANY($1::integer[])
+		  AND codeowners_ref = 'main'
+		  AND codeowners_sha = $2
+		  AND codeowners_path = 'CODEOWNERS'
+		  AND etag <> ''
+		  AND tombstoned_at IS NULL
+	`, databaseNumbers, baseSHA).Scan(&mirroredETags); err != nil {
+		t.Fatal(err)
+	}
+	if mirroredETags != len(numbers) {
+		t.Fatalf("durable CODEOWNERS ETags = %d, want %d", mirroredETags, len(numbers))
+	}
+
+	reuseFake, reuseServer, reuseHandler, reuseRiver := newDirectHandler(
+		t, pool, fixture, 50*time.Millisecond, 100,
+	)
+	defer reuseServer.Close()
+	reuseHandler.SetRiverClient(reuseRiver)
+	refreshCodeownersPulls(t, reuseHandler, numbers, queue.QueueSweep)
+	for _, request := range reuseFake.Requests() {
+		if strings.Contains(request.Path, "/contents/") {
+			t.Fatalf("unchanged sweep fetched CODEOWNERS: %+v", request)
+		}
+	}
+
+	const newHeadSHA = "codeowners-head-two"
+	for index := range fixture.PullRequests {
+		for _, number := range numbers {
+			if fixture.PullRequests[index].Number == number {
+				fixture.PullRequests[index].Head.SHA = newHeadSHA
+			}
+		}
+	}
+	reuseFake.SetFixture(fixture)
+	baseline := len(reuseFake.Requests())
+	refreshCodeownersPulls(t, reuseHandler, numbers, queue.QueueEvent)
+	for _, request := range reuseFake.Requests()[baseline:] {
+		if strings.Contains(request.Path, "/contents/") {
+			t.Fatalf("head-only change fetched CODEOWNERS: %+v", request)
+		}
+	}
+
+	for index := range fixture.PullRequests {
+		for _, number := range numbers {
+			if fixture.PullRequests[index].Number == number {
+				fixture.PullRequests[index].Base.Ref = "release"
+			}
+		}
+	}
+	reuseFake.SetFixture(fixture)
+	baseline = len(reuseFake.Requests())
+	refreshCodeownersPulls(t, reuseHandler, numbers, queue.QueueEvent)
+	var refChangeContents int
+	for _, request := range reuseFake.Requests()[baseline:] {
+		if strings.Contains(request.Path, "/contents/") {
+			refChangeContents++
+		}
+	}
+	if refChangeContents != 2 {
+		t.Fatalf("base-ref change CODEOWNERS probes = %d, want 2", refChangeContents)
+	}
+
+	for index := range fixture.PullRequests {
+		for _, number := range numbers {
+			if fixture.PullRequests[index].Number == number {
+				fixture.PullRequests[index].Base.SHA = newSHA
+			}
+		}
+	}
+	reuseFake.SetFixture(fixture)
+	baseline = len(reuseFake.Requests())
+	refreshCodeownersPulls(t, reuseHandler, numbers, queue.QueueEvent)
+	requests := reuseFake.Requests()[baseline:]
+	var githubRequests, rootRequests int
+	for _, request := range requests {
+		switch request.Path {
+		case githubPath:
+			githubRequests++
+		case rootPath:
+			rootRequests++
+			if request.IfNoneMatch == "" {
+				t.Fatalf("invalidated root CODEOWNERS request was not conditional: %+v", request)
+			}
+			if request.RawQuery != "ref="+newSHA {
+				t.Fatalf("invalidated CODEOWNERS ref query = %q", request.RawQuery)
+			}
+		}
+	}
+	if githubRequests != 1 || rootRequests != 1 {
+		t.Fatalf(
+			"invalidated CODEOWNERS probes .github/root = %d/%d, want 1/1",
+			githubRequests,
+			rootRequests,
+		)
+	}
+	if got := reuseFake.NotModifiedCount(http.MethodGet, rootPath); got != 1 {
+		t.Fatalf("conditional CODEOWNERS 304s = %d, want 1", got)
+	}
+	after := readCodeownersResults(t, pool, numbers)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("ownership results changed after provenance refresh:\nbefore=%v\nafter=%v", before, after)
+	}
+
+	if _, err := pool.Exec(t.Context(), `
+		UPDATE pull_request_change_snapshots
+		SET tombstoned_at = clock_timestamp()
+		WHERE pr_number = $1
+	`, numbers[0]); err != nil {
+		t.Fatal(err)
+	}
+	missingFake, missingServer, missingHandler, missingRiver := newDirectHandler(
+		t, pool, fixture, 50*time.Millisecond, 100,
+	)
+	defer missingServer.Close()
+	missingHandler.SetRiverClient(missingRiver)
+	if err := missingHandler.RefreshPR(t.Context(), queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			fmt.Sprintf("pr:acme/monolith:%d", numbers[0]),
+		).RefreshArgs,
+		Queue: queue.QueueSweep,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var missingRowContents int
+	for _, request := range missingFake.Requests() {
+		if strings.Contains(request.Path, "/contents/") {
+			missingRowContents++
+		}
+	}
+	if missingRowContents != 2 {
+		t.Fatalf("missing mirror row CODEOWNERS probes = %d, want 2", missingRowContents)
+	}
+}
+
+func TestPullRequestSweepReusesMissingAndOversizedCodeownersStates(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		contents map[string]string
+		state    string
+	}{
+		{name: "missing", state: gh.CodeownersMissing},
+		{
+			name: "oversized",
+			contents: map[string]string{
+				".github/CODEOWNERS": strings.Repeat("x", gh.MaxCodeownersBytes),
+			},
+			state: gh.CodeownersOversized,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			pool := fetchTestDatabase(t)
+			fixture := fakegithub.DefaultFixture()
+			pull := &fixture.PullRequests[1]
+			fixture.PullRequests = []fakegithub.PullRequest{*pull}
+			fixture.Contents = map[string]map[string]string{
+				pull.Base.SHA: test.contents,
+			}
+			_, seedServer, seedHandler, seedRiver := newDirectHandler(
+				t, pool, fixture, 5*time.Millisecond, 100,
+			)
+			defer seedServer.Close()
+			seedHandler.SetRiverClient(seedRiver)
+			if err := seedHandler.RefreshPR(t.Context(), queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", pull.Number),
+				).RefreshArgs,
+				Queue: queue.QueueEvent,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var state string
+			if err := pool.QueryRow(t.Context(), `
+				SELECT codeowners_state
+				FROM pull_request_change_snapshots
+				WHERE pr_number = $1 AND tombstoned_at IS NULL
+			`, pull.Number).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			if state != test.state {
+				t.Fatalf("mirrored state = %q, want %q", state, test.state)
+			}
+
+			reuseFake, reuseServer, reuseHandler, reuseRiver := newDirectHandler(
+				t, pool, fixture, 5*time.Millisecond, 100,
+			)
+			defer reuseServer.Close()
+			reuseHandler.SetRiverClient(reuseRiver)
+			if err := reuseHandler.RefreshPR(t.Context(), queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", pull.Number),
+				).RefreshArgs,
+				Queue: queue.QueueSweep,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, request := range reuseFake.Requests() {
+				if strings.Contains(request.Path, "/contents/") {
+					t.Fatalf("exact %s mirror state fetched CODEOWNERS: %+v", test.state, request)
+				}
+			}
+		})
+	}
+}
+
+func TestPullRequestCodeownersUsesExactSHAWithoutBaseRefName(t *testing.T) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	pull := &fixture.PullRequests[1]
+	pull.Base.Ref = ""
+	fixture.PullRequests = []fakegithub.PullRequest{*pull}
+	fake, server, handler, riverClient := newDirectHandler(
+		t, pool, fixture, 5*time.Millisecond, 100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	if err := handler.RefreshPR(t.Context(), queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			fmt.Sprintf("pr:acme/monolith:%d", pull.Number),
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var ref, sha, state string
+	if err := pool.QueryRow(t.Context(), `
+		SELECT codeowners_ref, codeowners_sha, codeowners_state
+		FROM pull_request_change_snapshots
+		WHERE pr_number = $1 AND tombstoned_at IS NULL
+	`, pull.Number).Scan(&ref, &sha, &state); err != nil {
+		t.Fatal(err)
+	}
+	if ref != "" || sha != pull.Base.SHA || state != gh.CodeownersPresent {
+		t.Fatalf("CODEOWNERS provenance = %q/%q/%q", ref, sha, state)
+	}
+	for _, request := range fake.Requests() {
+		if strings.Contains(request.Path, "/contents/") &&
+			request.RawQuery != "ref="+pull.Base.SHA {
+			t.Fatalf("CODEOWNERS request did not use exact SHA: %+v", request)
+		}
+	}
+}
+
+func refreshCodeownersPulls(
+	t *testing.T,
+	handler *Handler,
+	numbers []int,
+	queueName string,
+) {
+	t.Helper()
+	start := make(chan struct{})
+	results := make(chan error, len(numbers))
+	for _, number := range numbers {
+		go func() {
+			<-start
+			results <- handler.RefreshPR(t.Context(), queue.RefreshRequest{
+				Args: queue.NewRefreshPRArgs(
+					fmt.Sprintf("pr:acme/monolith:%d", number),
+				).RefreshArgs,
+				Queue: queueName,
+			})
+		}()
+	}
+	close(start)
+	for range numbers {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func readCodeownersResults(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	numbers []int,
+) []string {
+	t.Helper()
+	databaseNumbers := codeownersDatabaseNumbers(numbers)
+	rows, err := pool.Query(t.Context(), `
+		SELECT snapshot.pr_number, snapshot.codeowners_path,
+		       snapshot.codeowners_state, snapshot.codeowners_hash,
+		       file.path, COALESCE(owner.owner_token, ''),
+		       COALESCE(owner.owner_type, ''),
+		       COALESCE(owner.resolution_state, ''),
+		       COALESCE(owner.source_pattern, ''),
+		       COALESCE(owner.source_line, 0)
+		FROM pull_request_change_snapshots AS snapshot
+		JOIN pull_request_changed_files AS file
+		  ON file.repo_id = snapshot.repo_id
+		 AND file.pr_number = snapshot.pr_number
+		 AND file.tombstoned_at IS NULL
+		LEFT JOIN pull_request_file_owners AS owner
+		  ON owner.repo_id = file.repo_id
+		 AND owner.pr_number = file.pr_number
+		 AND owner.path = file.path
+		 AND owner.tombstoned_at IS NULL
+		WHERE snapshot.pr_number = ANY($1::integer[])
+		  AND snapshot.tombstoned_at IS NULL
+		ORDER BY snapshot.pr_number, file.path, owner.owner_token
+	`, databaseNumbers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var results []string
+	for rows.Next() {
+		var (
+			number, line                         int
+			path, state, hash, file, token, kind string
+			resolution, pattern                  string
+		)
+		if err := rows.Scan(
+			&number,
+			&path,
+			&state,
+			&hash,
+			&file,
+			&token,
+			&kind,
+			&resolution,
+			&pattern,
+			&line,
+		); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, fmt.Sprintf(
+			"%d:%s:%s:%s:%s:%s:%s:%s:%s:%d",
+			number,
+			path,
+			state,
+			hash,
+			file,
+			token,
+			kind,
+			resolution,
+			pattern,
+			line,
+		))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return results
+}
+
+func codeownersDatabaseNumbers(numbers []int) []int32 {
+	result := make([]int32, len(numbers))
+	for index, number := range numbers {
+		result[index] = int32(number)
+	}
+	return result
+}
+
 func TestPullRequestRefreshResolvesRenameByNewPathAndOwnerCase(t *testing.T) {
 	t.Parallel()
 	pool := fetchTestDatabase(t)

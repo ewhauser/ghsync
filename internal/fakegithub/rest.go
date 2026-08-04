@@ -236,9 +236,7 @@ func (s *Server) getRepositoryContent(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(content))
+	s.writeConditionalBytes(w, r, []byte(content), "application/octet-stream")
 }
 
 func (s *Server) listPullReviews(w http.ResponseWriter, r *http.Request) {

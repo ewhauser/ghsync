@@ -158,8 +158,21 @@ type PullRequestChangeSnapshotRecord struct {
 	CodeownersState  string
 	CodeownersSource string
 	CodeownersHash   string
+	CodeownersETag   string
 	Files            []ChangedFileRecord
 	Owners           []FileOwnerRecord
+}
+
+// CodeownersSourceRecord is the durable effective source mirrored by a prior
+// PR observation, including the exact ref/SHA provenance required for reuse.
+type CodeownersSourceRecord struct {
+	Ref     string
+	SHA     string
+	Path    string
+	State   string
+	Content string
+	Hash    string
+	ETag    string
 }
 
 // PullRequestRecord is the authoritative pull-request state accepted by the
@@ -310,14 +323,16 @@ type ApplyStackResult struct {
 
 // FetchMetadata is the cache metadata needed for a conditional GitHub fetch.
 type FetchMetadata struct {
-	NodeID         string
-	ETag           string
-	StackNumber    *int
-	StackPosition  *int
-	HeadSHA        string
-	RepoGitHubID   int64
-	InstallationID int64
-	RepoFullName   string
+	NodeID                 string
+	ETag                   string
+	StackNumber            *int
+	StackPosition          *int
+	HeadSHA                string
+	RepoGitHubID           int64
+	InstallationID         int64
+	RepoFullName           string
+	Codeowners             *CodeownersSourceRecord
+	ForceCodeownersRefresh bool
 }
 
 // TransactionHook runs after the accepted cache mutation, dirty marking, and

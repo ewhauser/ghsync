@@ -16,10 +16,9 @@ import (
 	"github.com/ewhauser/ghsync/internal/store"
 )
 
-// Hydrate reads changed-file rename supplements and the effective CODEOWNERS
-// source at the observed base SHA. GraphQL supplies the authoritative file
-// paths and connection completeness; REST is used only for facts GraphQL does
-// not expose and for a final base/head fence check.
+// Hydrate preserves the direct authoritative path used by drift inspection.
+// PR refreshes use HydrateFromMirror so ordinary sweeps avoid redundant
+// CODEOWNERS reads.
 func Hydrate(
 	ctx context.Context,
 	rest *gh.RESTClient,
@@ -31,7 +30,42 @@ func Hydrate(
 	number int,
 	node *gh.PullRequestNode,
 ) (*store.PullRequestChangeSnapshotRecord, error) {
-	if rest == nil || writer == nil || node == nil {
+	return HydrateFromMirror(
+		ctx,
+		rest,
+		NewSourceResolver(rest),
+		writer,
+		class,
+		repositoryID,
+		repositoryOwner,
+		repositoryName,
+		number,
+		node,
+		nil,
+		true,
+	)
+}
+
+// HydrateFromMirror reads changed-file rename supplements and resolves the
+// effective CODEOWNERS source from matching mirror provenance before GitHub.
+// GraphQL supplies the authoritative paths and connection completeness; REST
+// is used only for facts GraphQL omits, invalidated ownership provenance, and
+// the final base/head fence check.
+func HydrateFromMirror(
+	ctx context.Context,
+	rest *gh.RESTClient,
+	sources *SourceResolver,
+	writer *store.EntityWriter,
+	class budget.Class,
+	repositoryID int64,
+	repositoryOwner string,
+	repositoryName string,
+	number int,
+	node *gh.PullRequestNode,
+	mirrored *store.CodeownersSourceRecord,
+	forceCodeowners bool,
+) (*store.PullRequestChangeSnapshotRecord, error) {
+	if rest == nil || sources == nil || writer == nil || node == nil {
 		return nil, fmt.Errorf("change-input hydration requires clients and PR")
 	}
 	snapshot := &store.PullRequestChangeSnapshotRecord{
@@ -97,13 +131,27 @@ func Hydrate(
 	source := gh.CodeownersSource{State: gh.CodeownersUnavailable}
 	if node.BaseRefOID != "" {
 		var err error
-		source, err = rest.FindCodeowners(
-			ctx,
-			class,
-			repositoryOwner,
-			repositoryName,
-			node.BaseRefOID,
-		)
+		if forceCodeowners {
+			source, err = rest.FindCodeowners(
+				ctx,
+				class,
+				repositoryOwner,
+				repositoryName,
+				node.BaseRefOID,
+				nil,
+			)
+		} else {
+			source, err = sources.Resolve(
+				ctx,
+				class,
+				repositoryID,
+				repositoryOwner,
+				repositoryName,
+				node.BaseRefName,
+				node.BaseRefOID,
+				mirrored,
+			)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("fetch effective CODEOWNERS: %w", err)
 		}
@@ -111,7 +159,8 @@ func Hydrate(
 	snapshot.CodeownersPath = source.Path
 	snapshot.CodeownersState = source.State
 	snapshot.CodeownersSource = source.Content
-	snapshot.CodeownersHash = sourceHash(source)
+	snapshot.CodeownersHash = sourceHash(&source)
+	snapshot.CodeownersETag = source.ETag
 	if source.State == gh.CodeownersPresent {
 		rules := codeowners.Parse(source.Content)
 		for _, file := range snapshot.Files {
@@ -260,7 +309,7 @@ func resolveObservedIdentities(
 	return resolved
 }
 
-func sourceHash(source gh.CodeownersSource) string {
+func sourceHash(source *gh.CodeownersSource) string {
 	digest := sha256.Sum256([]byte(
 		source.State + "\x00" + source.Path + "\x00" + source.Content,
 	))

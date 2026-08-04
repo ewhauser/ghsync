@@ -169,6 +169,30 @@ func (s *Server) writeConditionalJSON(
 	_, _ = w.Write(body)
 }
 
+func (s *Server) writeConditionalBytes(
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	contentType string,
+) {
+	sum := sha256.Sum256(body)
+	etag := fmt.Sprintf(`"%x"`, sum[:16])
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		s.mu.Lock()
+		s.notModified[r.Method+" "+r.URL.Path]++
+		s.mu.Unlock()
+		if scripted, _ := r.Context().Value(scriptedRateKey{}).(bool); !scripted {
+			rate := s.refund("core", 1)
+			setRateHeaders(w.Header(), rate)
+		}
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	_, _ = w.Write(body)
+}
+
 func (s *Server) refund(resource string, cost int64) rateState {
 	s.mu.Lock()
 	defer s.mu.Unlock()

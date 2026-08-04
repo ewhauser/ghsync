@@ -282,6 +282,11 @@ func TestCodeownersPushRuleTargetsOnlyEffectiveDefaultBranchPaths(
 			want: true,
 		},
 		{
+			name: "added root path",
+			body: `{"ref":"refs/heads/main","repository":{"full_name":"acme/monolith","default_branch":"main"},"commits":[{"added":["CODEOWNERS"]}]}`,
+			want: true,
+		},
+		{
 			name: "non default branch",
 			body: `{"ref":"refs/heads/topic","repository":{"full_name":"acme/monolith","default_branch":"main"},"commits":[{"modified":["CODEOWNERS"]}]}`,
 		},

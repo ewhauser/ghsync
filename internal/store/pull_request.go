@@ -31,16 +31,29 @@ func (w *EntityWriter) PullRequestMetadata(
 	if err != nil {
 		return FetchMetadata{}, fmt.Errorf("get PR fetch metadata: %w", err)
 	}
-	return FetchMetadata{
-		NodeID:         row.NodeID,
-		ETag:           row.Etag,
-		StackNumber:    intPointer(row.StackNumber),
-		StackPosition:  intPointer(row.StackPosition),
-		HeadSHA:        row.HeadSha,
-		RepoGitHubID:   row.RepoGhID,
-		InstallationID: row.InstallationID,
-		RepoFullName:   row.RepoFullName,
-	}, nil
+	metadata := FetchMetadata{
+		NodeID:                 row.NodeID,
+		ETag:                   row.Etag,
+		StackNumber:            intPointer(row.StackNumber),
+		StackPosition:          intPointer(row.StackPosition),
+		HeadSHA:                row.HeadSha,
+		RepoGitHubID:           row.RepoGhID,
+		InstallationID:         row.InstallationID,
+		RepoFullName:           row.RepoFullName,
+		ForceCodeownersRefresh: row.ForceCodeownersRefresh,
+	}
+	if row.CodeownersState != "" {
+		metadata.Codeowners = &CodeownersSourceRecord{
+			Ref:     row.CodeownersRef,
+			SHA:     row.CodeownersSha,
+			Path:    row.CodeownersPath,
+			State:   row.CodeownersState,
+			Content: row.CodeownersSource,
+			Hash:    row.CodeownersHash,
+			ETag:    row.CodeownersEtag,
+		}
+	}
+	return metadata, nil
 }
 
 // TouchPullRequest records a successful unchanged pull-request observation.
@@ -128,7 +141,7 @@ func (w *EntityWriter) TouchPullRequest(
 			}
 			changeTouch := dbgen.TouchPullRequestChangeInputsCheckedAtParams{
 				CheckedAt:         timestamp(checkedAt),
-				Etag:              etag,
+				Etag:              "",
 				RepoID:            repo.ID,
 				PrNumber:          int32(number),
 				ParentGhUpdatedAt: current.GhUpdatedAt,
@@ -138,6 +151,7 @@ func (w *EntityWriter) TouchPullRequest(
 			); err != nil {
 				return fmt.Errorf("touch PR change snapshot: %w", err)
 			}
+			changeTouch.Etag = etag
 			if err := queries.TouchPullRequestChangedFilesCheckedAt(
 				ctx,
 				dbgen.TouchPullRequestChangedFilesCheckedAtParams(changeTouch),
@@ -483,7 +497,7 @@ func (w *EntityWriter) applyPullRequest(
 					),
 					CodeownersHash: snapshot.CodeownersHash,
 					SyncedAt:       timestamp(pull.SyncedAt),
-					Etag:           pull.ETag,
+					Etag:           snapshot.CodeownersETag,
 					SyncSource:     string(pull.Source),
 					LastCheckedAt:  timestamp(pull.SyncedAt),
 				},
@@ -539,7 +553,7 @@ func (w *EntityWriter) applyPullRequest(
 				len(changedFiles) > 0 || len(changedOwners) > 0
 			changeTouch := dbgen.TouchPullRequestChangeInputsCheckedAtParams{
 				CheckedAt:         timestamp(pull.SyncedAt),
-				Etag:              pull.ETag,
+				Etag:              snapshot.CodeownersETag,
 				RepoID:            repo.ID,
 				PrNumber:          int32(pull.Number),
 				ParentGhUpdatedAt: timestamp(pull.GitHubUpdatedAt),
@@ -549,6 +563,7 @@ func (w *EntityWriter) applyPullRequest(
 			); err != nil {
 				return fmt.Errorf("touch PR change snapshot: %w", err)
 			}
+			changeTouch.Etag = pull.ETag
 			if err := queries.TouchPullRequestChangedFilesCheckedAt(
 				ctx,
 				dbgen.TouchPullRequestChangedFilesCheckedAtParams(changeTouch),

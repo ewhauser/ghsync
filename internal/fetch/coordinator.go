@@ -71,6 +71,7 @@ type prCoordinator struct {
 	max            int
 	graphQL        *gh.GraphQLClient
 	rest           *gh.RESTClient
+	codeowners     *changeinputs.SourceResolver
 	writer         *store.EntityWriter
 	installationID int64
 	orgID          int64
@@ -79,6 +80,7 @@ type prCoordinator struct {
 func newPRCoordinator(
 	graphQL *gh.GraphQLClient,
 	rest *gh.RESTClient,
+	codeowners *changeinputs.SourceResolver,
 	writer *store.EntityWriter,
 	installationID int64,
 	orgID int64,
@@ -93,6 +95,7 @@ func newPRCoordinator(
 		max:            defaultBatchSize,
 		graphQL:        graphQL,
 		rest:           rest,
+		codeowners:     codeowners,
 		writer:         writer,
 		installationID: installationID,
 		orgID:          orgID,
@@ -246,9 +249,10 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			c.installationID,
 			c.orgID,
 		)
-		snapshot, err := changeinputs.Hydrate(
+		snapshot, err := changeinputs.HydrateFromMirror(
 			callCtx,
 			c.rest,
+			c.codeowners,
 			c.writer,
 			item.class,
 			record.Repository.GitHubID,
@@ -256,6 +260,8 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			record.Repository.Name,
 			record.Number,
 			node,
+			item.metadata.Codeowners,
+			item.metadata.ForceCodeownersRefresh,
 		)
 		if err != nil {
 			results[item] = pullBatchResult{
