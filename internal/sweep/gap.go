@@ -2,8 +2,11 @@ package sweep
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
 
@@ -12,6 +15,8 @@ import (
 	"github.com/ewhauser/ghsync/internal/repoutil"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
+
+var errGapHealLeaseLost = errors.New("delivery-gap lease lost")
 
 func (s *Service) HealDeliveryGaps(
 	ctx context.Context,
@@ -23,18 +28,28 @@ func (s *Service) HealDeliveryGaps(
 	if s.deliveries == nil {
 		return fmt.Errorf("deliveries client is not configured")
 	}
-	state, err := s.loadOrStartGapWindow(ctx)
+	if args.LeaseToken == "" {
+		args.LeaseToken = newGapLeaseToken()
+	}
+	state, acquired, err := s.loadOrStartGapWindow(ctx, args)
 	if err != nil {
 		return err
 	}
-	if args.Cursor != "" && args.Cursor != state.Cursor {
+	if !acquired {
 		return nil
 	}
+	workCtx, cancelWork := context.WithCancelCause(ctx)
+	stopLease := make(chan struct{})
+	go s.maintainGapLease(workCtx, cancelWork, stopLease, args.LeaseToken)
+	defer func() {
+		close(stopLease)
+		cancelWork(nil)
+	}()
 	cursor := state.Cursor
 	seen := make(map[string]struct{})
 	for pageNumber := 1; pageNumber <= s.config.GapMaxPages; pageNumber++ {
 		deliveries, response, err := s.deliveries.ListAppHookDeliveries(
-			ctx,
+			workCtx,
 			gh.ListAppHookDeliveriesOptions{
 				PerPage: s.config.GapPageSize,
 				Cursor:  cursor,
@@ -42,6 +57,10 @@ func (s *Service) HealDeliveryGaps(
 			"",
 		)
 		if err != nil {
+			if cause := context.Cause(workCtx); cause != nil &&
+				!errors.Is(cause, context.Canceled) {
+				return cause
+			}
 			return fmt.Errorf("list App webhook deliveries: %w", err)
 		}
 		candidates := make([]gh.AppHookDelivery, 0, len(deliveries))
@@ -60,11 +79,11 @@ func (s *Service) HealDeliveryGaps(
 			seen[delivery.GUID] = struct{}{}
 			candidates = append(candidates, *delivery)
 		}
-		if err := s.redeliverMissing(ctx, candidates); err != nil {
+		if err := s.redeliverMissing(workCtx, candidates); err != nil {
 			return err
 		}
 		if response.NextCursor == "" {
-			return s.completeGapWindow(ctx, cursor)
+			return s.completeGapWindow(ctx, cursor, args.LeaseToken)
 		}
 		next := response.NextCursor
 		capped := pageNumber == s.config.GapMaxPages
@@ -73,6 +92,7 @@ func (s *Service) HealDeliveryGaps(
 			cursor,
 			next,
 			capped,
+			args.LeaseToken,
 		); err != nil {
 			return err
 		}
@@ -91,10 +111,11 @@ func (s *Service) HealDeliveryGaps(
 
 func (s *Service) loadOrStartGapWindow(
 	ctx context.Context,
-) (dbgen.GapHealCursor, error) {
+	args GapHealArgs,
+) (dbgen.GapHealCursor, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return dbgen.GapHealCursor{}, fmt.Errorf(
+		return dbgen.GapHealCursor{}, false, fmt.Errorf(
 			"begin delivery-gap cursor: %w",
 			err,
 		)
@@ -105,7 +126,7 @@ func (s *Service) loadOrStartGapWindow(
 		ctx,
 		s.config.InstallationID,
 	); err != nil {
-		return dbgen.GapHealCursor{}, fmt.Errorf(
+		return dbgen.GapHealCursor{}, false, fmt.Errorf(
 			"ensure delivery-gap cursor: %w",
 			err,
 		)
@@ -115,35 +136,108 @@ func (s *Service) loadOrStartGapWindow(
 		s.config.InstallationID,
 	)
 	if err != nil {
-		return dbgen.GapHealCursor{}, fmt.Errorf(
+		return dbgen.GapHealCursor{}, false, fmt.Errorf(
 			"lock delivery-gap cursor: %w",
 			err,
 		)
 	}
+	now := s.config.Now().UTC()
+	leaseUntil := now.Add(s.config.GapLeaseTTL)
 	if !state.StartedAt.Valid || state.CompletedAt.Valid {
-		now := s.config.Now().UTC()
+		// Only a fresh periodic kickoff may open a new comparison window. A
+		// delayed continuation from an already-completed window must be inert.
+		if args.Cursor != "" {
+			return dbgen.GapHealCursor{}, false, nil
+		}
 		state, err = queries.StartGapHealCursor(
 			ctx,
 			dbgen.StartGapHealCursorParams{
 				Cutoff:         repoutil.Timestamptz(now.Add(-s.config.GapWindow)),
 				StartedAt:      repoutil.Timestamptz(now),
 				InstallationID: s.config.InstallationID,
+				LeaseToken:     pgtype.Text{String: args.LeaseToken, Valid: true},
+				LeaseUntil:     repoutil.Timestamptz(leaseUntil),
 			},
 		)
 		if err != nil {
-			return dbgen.GapHealCursor{}, fmt.Errorf(
+			return dbgen.GapHealCursor{}, false, fmt.Errorf(
 				"start delivery-gap cursor: %w",
+				err,
+			)
+		}
+	} else {
+		if args.Cursor != "" && args.Cursor != state.Cursor {
+			return dbgen.GapHealCursor{}, false, nil
+		}
+		leaseHeld := state.LeaseToken.Valid &&
+			state.LeaseToken.String != args.LeaseToken &&
+			state.LeaseUntil.Valid && now.Before(state.LeaseUntil.Time)
+		if leaseHeld {
+			return dbgen.GapHealCursor{}, false, nil
+		}
+		state, err = queries.ClaimGapHealCursor(
+			ctx,
+			dbgen.ClaimGapHealCursorParams{
+				LeaseToken:     pgtype.Text{String: args.LeaseToken, Valid: true},
+				LeaseUntil:     repoutil.Timestamptz(leaseUntil),
+				ClaimedAt:      repoutil.Timestamptz(now),
+				InstallationID: s.config.InstallationID,
+			},
+		)
+		if err != nil {
+			return dbgen.GapHealCursor{}, false, fmt.Errorf(
+				"claim delivery-gap lease: %w",
 				err,
 			)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return dbgen.GapHealCursor{}, fmt.Errorf(
+		return dbgen.GapHealCursor{}, false, fmt.Errorf(
 			"commit delivery-gap cursor: %w",
 			err,
 		)
 	}
-	return state, nil
+	return state, true, nil
+}
+
+func (s *Service) maintainGapLease(
+	ctx context.Context,
+	cancel context.CancelCauseFunc,
+	stop <-chan struct{},
+	leaseToken string,
+) {
+	ticker := time.NewTicker(s.config.GapLeaseTTL / 3)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-ticker.C:
+			rows, err := dbgen.New(s.pool).RenewGapHealLease(
+				ctx,
+				dbgen.RenewGapHealLeaseParams{
+					LeaseUntil: repoutil.Timestamptz(
+						s.config.Now().UTC().Add(s.config.GapLeaseTTL),
+					),
+					InstallationID: s.config.InstallationID,
+					LeaseToken: pgtype.Text{
+						String: leaseToken,
+						Valid:  true,
+					},
+				},
+			)
+			if err != nil {
+				cancel(fmt.Errorf("renew delivery-gap lease: %w", err))
+				return
+			}
+			if rows == 0 {
+				cancel(errGapHealLeaseLost)
+				return
+			}
+		}
+	}
 }
 
 func (s *Service) advanceGapWindow(
@@ -151,6 +245,7 @@ func (s *Service) advanceGapWindow(
 	expected string,
 	next string,
 	scheduleContinuation bool,
+	leaseToken string,
 ) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -164,6 +259,13 @@ func (s *Service) advanceGapWindow(
 			UpdatedAt:      repoutil.Timestamptz(s.config.Now()),
 			InstallationID: s.config.InstallationID,
 			ExpectedCursor: expected,
+			LeaseToken: pgtype.Text{
+				String: leaseToken,
+				Valid:  true,
+			},
+			LeaseUntil: repoutil.Timestamptz(
+				s.config.Now().UTC().Add(s.config.GapLeaseTTL),
+			),
 		},
 	); err != nil {
 		return fmt.Errorf("advance delivery-gap cursor: %w", err)
@@ -179,6 +281,7 @@ func (s *Service) advanceGapWindow(
 			GapHealArgs{
 				Installation: s.config.InstallationID,
 				Cursor:       next,
+				LeaseToken:   leaseToken,
 			},
 			gapContinuationInsertOpts(),
 		); err != nil {
@@ -197,6 +300,7 @@ func (s *Service) advanceGapWindow(
 func (s *Service) completeGapWindow(
 	ctx context.Context,
 	expected string,
+	leaseToken string,
 ) error {
 	_, err := dbgen.New(s.pool).CompleteGapHealCursor(
 		ctx,
@@ -204,6 +308,10 @@ func (s *Service) completeGapWindow(
 			CompletedAt:    repoutil.Timestamptz(s.config.Now()),
 			InstallationID: s.config.InstallationID,
 			ExpectedCursor: expected,
+			LeaseToken: pgtype.Text{
+				String: leaseToken,
+				Valid:  true,
+			},
 		},
 	)
 	if err != nil {

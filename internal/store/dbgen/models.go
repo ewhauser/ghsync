@@ -210,6 +210,8 @@ type GapHealCursor struct {
 	StartedAt      pgtype.Timestamptz
 	UpdatedAt      pgtype.Timestamptz
 	CompletedAt    pgtype.Timestamptz
+	LeaseToken     pgtype.Text
+	LeaseUntil     pgtype.Timestamptz
 }
 
 type InstallationBackfillCursor struct {

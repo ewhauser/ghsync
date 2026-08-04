@@ -46,6 +46,7 @@ const (
 	defaultGapWindow               = 6 * time.Hour
 	defaultGapPageSize             = 100
 	defaultGapMaxPages             = 10
+	defaultGapLeaseTTL             = 5 * time.Minute
 	defaultDriftPeriod             = time.Hour
 	defaultDriftSampleSize         = 10
 	defaultDriftPageSize           = 100
@@ -162,6 +163,8 @@ type Config struct {
 	// GapPageSize and GapMaxPages bound deliveries API work per run.
 	GapPageSize int
 	GapMaxPages int
+	// GapLeaseTTL bounds stale-owner failover for delivery-gap scans.
+	GapLeaseTTL time.Duration
 
 	// DriftPeriod controls semantic-drift scan scheduling.
 	DriftPeriod time.Duration
@@ -236,6 +239,7 @@ func FromEnv() (Config, error) {
 		GapWindow:                  defaultGapWindow,
 		GapPageSize:                defaultGapPageSize,
 		GapMaxPages:                defaultGapMaxPages,
+		GapLeaseTTL:                defaultGapLeaseTTL,
 		DriftPeriod:                defaultDriftPeriod,
 		DriftSampleSize:            defaultDriftSampleSize,
 		DriftPageSize:              defaultDriftPageSize,
@@ -325,6 +329,7 @@ func FromEnv() (Config, error) {
 		{"SWEEP_REPOSITORY_LIST_PERIOD", &cfg.SweepRepositoryListPeriod},
 		{"GAP_HEAL_PERIOD", &cfg.GapHealPeriod},
 		{"GAP_COMPARISON_WINDOW", &cfg.GapWindow},
+		{"GAP_HEAL_LEASE_TTL", &cfg.GapLeaseTTL},
 		{"DRIFT_PERIOD", &cfg.DriftPeriod},
 		{"DRIFT_RESOLVED_RETENTION", &cfg.DriftResolvedRetention},
 		{"RETENTION_PERIOD", &cfg.RetentionPeriod},

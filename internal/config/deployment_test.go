@@ -247,6 +247,7 @@ func environmentDefaults() map[string]any {
 		"SWEEP_PAGE_SIZE":                     defaultSweepPageSize,
 		"GAP_HEAL_PERIOD":                     defaultGapHealPeriod,
 		"GAP_COMPARISON_WINDOW":               defaultGapWindow,
+		"GAP_HEAL_LEASE_TTL":                  defaultGapLeaseTTL,
 		"GAP_PAGE_SIZE":                       defaultGapPageSize,
 		"GAP_MAX_PAGES":                       defaultGapMaxPages,
 		"DRIFT_PERIOD":                        defaultDriftPeriod,

@@ -999,6 +999,7 @@ func sweepConfig(cfg *config.Config) sweep.Config {
 		GapWindow:             cfg.GapWindow,
 		GapPageSize:           cfg.GapPageSize,
 		GapMaxPages:           cfg.GapMaxPages,
+		GapLeaseTTL:           cfg.GapLeaseTTL,
 		RetentionPeriod:       cfg.RetentionPeriod,
 		RetentionAge:          cfg.RetentionAge,
 		RetentionBatchSize:    cfg.RetentionBatchSize,

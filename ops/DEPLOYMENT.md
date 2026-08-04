@@ -107,6 +107,7 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 | `SWEEP_PAGE_SIZE` | `100` | GitHub page size; max `100`. |
 | `GAP_HEAL_PERIOD` | `5m` | C-R4 cadence. |
 | `GAP_COMPARISON_WINDOW` | `6h` | Fixed delivery window. |
+| `GAP_HEAL_LEASE_TTL` | `5m` | Stale-owner failover bound for gap healing. |
 | `GAP_PAGE_SIZE` | `100` | Delivery page size; max `100`. |
 | `GAP_MAX_PAGES` | `10` | Pages per resumable job. |
 | `DRIFT_PERIOD` | `1h` | C-O3 cadence. |
