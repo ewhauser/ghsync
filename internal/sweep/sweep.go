@@ -17,6 +17,7 @@ import (
 
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/observer"
+	"github.com/ewhauser/ghsync/internal/opsstate"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/repoutil"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
@@ -526,7 +527,7 @@ func (s *Service) enqueueStaleRepoRules(ctx context.Context) error {
 			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
-	return s.enqueueRefreshes(ctx, specs)
+	return s.enqueueRefreshesWithHeartbeat(ctx, KindRepoRules, specs)
 }
 
 func (s *Service) enqueueClosedTracked(ctx context.Context) error {
@@ -571,7 +572,7 @@ func (s *Service) enqueueClosedTracked(ctx context.Context) error {
 			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
-	return s.enqueueRefreshes(ctx, specs)
+	return s.enqueueRefreshesWithHeartbeat(ctx, KindClosed, specs)
 }
 
 func (s *Service) enqueueRefreshes(
@@ -596,6 +597,53 @@ func (s *Service) enqueueRefreshes(
 		client,
 		specs,
 		queue.QueueSweep,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit stale refresh enqueue: %w", err)
+	}
+	return nil
+}
+
+// enqueueRefreshesWithHeartbeat inserts the stale refreshes and the sweep
+// pass's durable C-O4 operation heartbeat in one transaction. The
+// transaction is opened even when nothing is stale: a pass that inspected
+// the cache and found no due work still completed, and the aggregate
+// metrics contract expects its heartbeat (issue #21). The sample count is
+// the number of refreshes the pass enqueued.
+func (s *Service) enqueueRefreshesWithHeartbeat(
+	ctx context.Context,
+	sweepKind string,
+	specs []queue.RefreshSpec,
+) error {
+	client := s.riverClient()
+	if client == nil {
+		return fmt.Errorf("sweep River client is not configured")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin stale refresh enqueue: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	if len(specs) > 0 {
+		if err := queue.InsertRefreshesTx(
+			ctx,
+			tx,
+			client,
+			specs,
+			queue.QueueSweep,
+		); err != nil {
+			return err
+		}
+	}
+	if err := opsstate.RecordSuccessN(
+		ctx,
+		tx,
+		s.config.InstallationID,
+		"sweep",
+		sweepKind,
+		int64(len(specs)),
 	); err != nil {
 		return err
 	}
