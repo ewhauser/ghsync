@@ -140,7 +140,7 @@ JSON value may be empty.
 | `pull_requests` | `stack_position` | `integer` | yes | null exactly when stack_number is null |
 | `pull_requests` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
 | `pull_requests` | `synced_at` | `timestamp with time zone` | no | domain-change time |
-| `pull_requests` | `etag` | `text` | no | HTTP validator |
+| `pull_requests` | `etag` | `text` | no | pull-request metadata HTTP validator |
 | `pull_requests` | `sync_source` | `text` | no | provenance enum |
 | `pull_requests` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
 | `pull_requests` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
@@ -160,6 +160,7 @@ JSON value may be empty.
 | `pull_request_change_snapshots` | `parent_gh_updated_at` | `timestamp with time zone` | no | parent-observation freshness fence |
 | `pull_request_change_snapshots` | `synced_at` | `timestamp with time zone` | no | domain-change time |
 | `pull_request_change_snapshots` | `etag` | `text` | no | effective CODEOWNERS content validator |
+| `pull_request_change_snapshots` | `files_etag` | `text` | no | first-page changed-files HTTP validator |
 | `pull_request_change_snapshots` | `sync_source` | `text` | no | provenance enum |
 | `pull_request_change_snapshots` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means snapshot is not live |
 | `pull_request_change_snapshots` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
@@ -171,7 +172,7 @@ JSON value may be empty.
 | `pull_request_changed_files` | `base_sha` | `text` | no | copied snapshot base fence |
 | `pull_request_changed_files` | `head_sha` | `text` | no | copied snapshot head fence |
 | `pull_request_changed_files` | `synced_at` | `timestamp with time zone` | no | domain-change time |
-| `pull_request_changed_files` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_changed_files` | `etag` | `text` | no | copied parent pull-request metadata validator |
 | `pull_request_changed_files` | `sync_source` | `text` | no | provenance enum |
 | `pull_request_changed_files` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not in the current file set |
 | `pull_request_changed_files` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
@@ -190,7 +191,7 @@ JSON value may be empty.
 | `pull_request_file_owners` | `base_sha` | `text` | no | copied snapshot base fence |
 | `pull_request_file_owners` | `head_sha` | `text` | no | copied snapshot head fence |
 | `pull_request_file_owners` | `synced_at` | `timestamp with time zone` | no | domain-change time |
-| `pull_request_file_owners` | `etag` | `text` | no | HTTP validator provenance |
+| `pull_request_file_owners` | `etag` | `text` | no | copied parent pull-request metadata validator |
 | `pull_request_file_owners` | `sync_source` | `text` | no | provenance enum |
 | `pull_request_file_owners` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means owner is not current for the path |
 | `pull_request_file_owners` | `last_checked_at` | `timestamp with time zone` | no | authoritative validation time |
@@ -269,7 +270,7 @@ JSON value may be empty.
 | `check_runs` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
 | `check_runs` | `head_sha` | `text` | no | PR lookup input |
 | `check_runs` | `synced_at` | `timestamp with time zone` | no | domain-change time |
-| `check_runs` | `etag` | `text` | no | HTTP validator |
+| `check_runs` | `etag` | `text` | no | copied first-page check-runs HTTP validator |
 | `check_runs` | `sync_source` | `text` | no | provenance enum |
 | `check_runs` | `tombstoned_at` | `timestamp with time zone` | yes | non-null means not live |
 | `check_runs` | `semantic_version` | `text` | no | write-if-newer input |
@@ -284,7 +285,7 @@ JSON value may be empty.
 | `check_history` | `gh_updated_at` | `timestamp with time zone` | yes | source version |
 | `check_history` | `head_sha` | `text` | no | — |
 | `check_history` | `synced_at` | `timestamp with time zone` | no | accepted transition time |
-| `check_history` | `etag` | `text` | no | HTTP validator |
+| `check_history` | `etag` | `text` | no | copied first-page check-runs HTTP validator |
 | `check_history` | `sync_source` | `text` | no | provenance enum |
 | `check_history` | `tombstoned_at` | `timestamp with time zone` | yes | retained provenance |
 | `check_history` | `semantic_version` | `text` | no | accepted semantic version |
@@ -374,8 +375,10 @@ request sends the stored `pull_request_change_snapshots.etag` as
 still flowing through the existing C-B4 conditional-request metrics. Drift
 inspection continues to fetch CODEOWNERS directly, and an open PR drift
 finding forces its healing refresh through the same authoritative path before
-mirror reuse resumes. The changed-file and owner child-row ETags remain the
-parent PR validator.
+mirror reuse resumes. The independent first-page changed-files validator is
+stored in `pull_request_change_snapshots.files_etag`, so validating rename
+supplements cannot replace CODEOWNERS provenance (and vice versa). The
+changed-file and owner child-row ETags remain the parent PR validator.
 
 The pure resolver is case-sensitive and repository-root-relative. It applies
 CODEOWNERS' gitignore-style pattern behavior, including root anchoring,

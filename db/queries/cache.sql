@@ -120,8 +120,13 @@ WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
   AND pull_requests.number = sqlc.arg(pr_number);
 
 -- name: GetPullRequestFetchMetadata :one
-SELECT pull_requests.node_id, pull_requests.etag,
+SELECT pull_requests.node_id, pull_requests.etag, pull_requests.title,
+       pull_requests.state, pull_requests.draft,
+       pull_requests.author_login, pull_requests.head_ref,
+       pull_requests.base_ref, pull_requests.review_decision,
+       pull_requests.mergeable_state,
        pull_requests.stack_number, pull_requests.stack_position,
+       pull_requests.gh_updated_at, pull_requests.base_sha,
        pull_requests.head_sha, repos.gh_id AS repo_gh_id,
        repos.installation_id, repos.full_name AS repo_full_name,
        COALESCE(snapshot.codeowners_ref, '')::text AS codeowners_ref,
@@ -150,6 +155,24 @@ LEFT JOIN pull_request_change_snapshots AS snapshot
  AND snapshot.tombstoned_at IS NULL
 WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
   AND pull_requests.number = sqlc.arg(pr_number);
+
+-- name: ListPullRequestChangeFetchMetadata :many
+-- The snapshot and changed-file rows carry the first-page validator for the
+-- REST files collection. Previous paths are retained so a 304 can reuse the
+-- last authoritative rename supplement without another response body.
+SELECT snapshot.files_etag AS etag, COALESCE(file.path, '')::text AS path,
+       COALESCE(file.previous_path, '')::text AS previous_path
+FROM pull_request_change_snapshots AS snapshot
+JOIN repos ON repos.id = snapshot.repo_id
+JOIN repo_aliases ON repo_aliases.repo_id = repos.id
+LEFT JOIN pull_request_changed_files AS file
+  ON file.repo_id = snapshot.repo_id
+ AND file.pr_number = snapshot.pr_number
+ AND file.tombstoned_at IS NULL
+WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
+  AND snapshot.pr_number = sqlc.arg(pr_number)
+  AND snapshot.tombstoned_at IS NULL
+ORDER BY file.path;
 
 -- name: GetCheckRunsFetchMetadata :one
 -- C-B4: the first-page validator is shared by every check row in one
@@ -270,6 +293,17 @@ SET last_checked_at = GREATEST(last_checked_at, sqlc.arg(checked_at)),
                 ELSE sqlc.arg(etag)::text END
 WHERE repo_id = sqlc.arg(repo_id)
   AND number = sqlc.arg(pr_number);
+
+-- name: ConfirmPullRequestMetadataCheckedAt :execrows
+UPDATE pull_requests
+SET last_checked_at = GREATEST(last_checked_at, sqlc.arg(checked_at))
+WHERE repo_id = sqlc.arg(repo_id)
+  AND number = sqlc.arg(pr_number)
+  AND tombstoned_at IS NULL
+  -- A 304 only confirms the representation associated with the validator
+  -- that was sent. If another observation replaced or invalidated it, this
+  -- stale response must not advance the new row's freshness clock (C-C2).
+  AND etag = sqlc.arg(etag);
 
 -- name: TombstonePullRequest :one
 UPDATE pull_requests
@@ -983,8 +1017,8 @@ upserted AS (
         repo_id, pr_number, base_sha, head_sha, files_total_count,
         files_truncated, codeowners_ref, codeowners_sha, codeowners_path,
         codeowners_state, codeowners_source, codeowners_hash,
-        parent_gh_updated_at, synced_at, etag, sync_source, tombstoned_at,
-        last_checked_at
+        parent_gh_updated_at, synced_at, etag, files_etag, sync_source,
+        tombstoned_at, last_checked_at
     )
     SELECT sqlc.arg(repo_id), sqlc.arg(pr_number), sqlc.arg(base_sha),
            sqlc.arg(head_sha), sqlc.arg(files_total_count),
@@ -992,7 +1026,8 @@ upserted AS (
            sqlc.arg(codeowners_sha), sqlc.narg(codeowners_path),
            sqlc.arg(codeowners_state), sqlc.narg(codeowners_source),
            sqlc.arg(codeowners_hash), sqlc.arg(parent_gh_updated_at),
-           sqlc.arg(synced_at), sqlc.arg(etag), sqlc.arg(sync_source), NULL,
+           sqlc.arg(synced_at), sqlc.arg(codeowners_etag),
+           sqlc.arg(files_etag), sqlc.arg(sync_source), NULL,
            sqlc.arg(last_checked_at)
     FROM eligible
     ON CONFLICT (repo_id, pr_number) DO UPDATE
@@ -1031,6 +1066,7 @@ upserted AS (
             ELSE pull_request_change_snapshots.synced_at
         END,
         etag = EXCLUDED.etag,
+        files_etag = EXCLUDED.files_etag,
         sync_source = CASE
             WHEN pull_request_change_snapshots.tombstoned_at IS NOT NULL
               OR ROW(
@@ -1295,8 +1331,12 @@ WITH eligible AS (
 )
 UPDATE pull_request_change_snapshots AS snapshot
 SET last_checked_at = GREATEST(snapshot.last_checked_at, sqlc.arg(checked_at)),
-    etag = CASE WHEN sqlc.arg(etag)::text = '' THEN snapshot.etag
-                ELSE sqlc.arg(etag)::text END
+    etag = CASE WHEN sqlc.arg(codeowners_etag)::text = '' THEN snapshot.etag
+                ELSE sqlc.arg(codeowners_etag)::text END,
+    files_etag = CASE
+        WHEN sqlc.arg(files_etag)::text = '' THEN snapshot.files_etag
+        ELSE sqlc.arg(files_etag)::text
+    END
 WHERE snapshot.repo_id = sqlc.arg(repo_id)
   AND snapshot.pr_number = sqlc.arg(pr_number)
   AND EXISTS (SELECT 1 FROM eligible);
@@ -1339,6 +1379,7 @@ SET tombstoned_at = sqlc.arg(tombstoned_at),
     synced_at = sqlc.arg(tombstoned_at),
     last_checked_at = GREATEST(last_checked_at, sqlc.arg(tombstoned_at)),
     etag = '',
+    files_etag = '',
     sync_source = sqlc.arg(sync_source)
 WHERE repo_id = sqlc.arg(repo_id)
   AND pr_number = sqlc.arg(pr_number)

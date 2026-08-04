@@ -74,8 +74,9 @@ the constraint-named `ghsync_*` metrics continue to be the alerting contract.
 
 ## Data handling
 
-Trace attributes may contain role, queue, job kind, attempt, webhook event,
-request class, resource class, batch size, status, and timing information.
+Trace and metric attributes may contain role, queue, job kind, attempt, webhook
+event, request class, resource class, bounded auth context and endpoint family,
+batch size, status, and timing information.
 
 Do not add webhook bodies, stored request headers, GitHub response bodies,
 authorization tokens, private keys, SQL parameters, or complete River job

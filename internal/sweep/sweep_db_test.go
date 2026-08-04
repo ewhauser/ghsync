@@ -475,6 +475,82 @@ func TestC_R1EndToEndBoundIncludesCadenceQueueAndFetch(
 	}
 }
 
+func TestPullRequestSweepSpreadsDeadlinesWithinC_R1Bound(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 100)
+	h.seedCache(t, []int{4812, 4815, 4816, 4820}, false, false)
+	ctx := context.Background()
+	plan := scheduleForBound(h.service.config.OpenPRMaxStaleness)
+	// Put every PR exactly on the due boundary. Its latest safe start is one
+	// cadence from now because completion headroom remains reserved.
+	lastChecked := plan.dueBefore(h.now)
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE pull_requests
+		SET last_checked_at = $1, synced_at = $1
+		WHERE state = 'open'
+	`, lastChecked); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.enqueueStalePullRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `
+		SELECT job.scheduled_at, intent.deadline_at
+		FROM river_job AS job
+		JOIN refresh_intent_generations AS intent
+		  ON intent.kind = job.args->>'kind'
+		 AND intent.refresh_key = job.args->>'key'
+		WHERE job.kind = 'refresh_pr'
+		ORDER BY job.scheduled_at
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var scheduled, deadlines []time.Time
+	for rows.Next() {
+		var scheduledAt, deadline time.Time
+		if err := rows.Scan(&scheduledAt, &deadline); err != nil {
+			t.Fatal(err)
+		}
+		scheduled = append(scheduled, scheduledAt)
+		deadlines = append(deadlines, deadline)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(deadlines) != 4 || len(scheduled) != 4 {
+		t.Fatalf(
+			"refresh schedule/deadlines = %v/%v, want four each",
+			scheduled,
+			deadlines,
+		)
+		return
+	}
+	for index := 1; index < len(scheduled); index++ {
+		if !scheduled[index].After(scheduled[index-1]) {
+			t.Fatalf("refresh schedule is not spread: %v", scheduled)
+		}
+	}
+	hardBound := lastChecked.Add(plan.Bound)
+	for _, deadline := range deadlines {
+		if !deadline.Equal(hardBound) {
+			t.Fatalf("refresh deadline = %s, want %s", deadline, hardBound)
+		}
+	}
+	latestSafeStart := hardBound.Add(-plan.CompletionHeadroom)
+	if scheduled[len(scheduled)-1].After(latestSafeStart) {
+		t.Fatalf(
+			"latest refresh start %s exceeds headroom boundary %s",
+			scheduled[len(scheduled)-1],
+			latestSafeStart,
+		)
+	}
+	if spread := scheduled[len(scheduled)-1].Sub(scheduled[0]); spread != plan.Cadence {
+		t.Fatalf("refresh schedule spread = %s, want %s", spread, plan.Cadence)
+	}
+}
+
 func TestList304AdvancesOnlyListMembershipFreshness(t *testing.T) {
 	t.Parallel()
 	h := newSweepHarness(t, 100)

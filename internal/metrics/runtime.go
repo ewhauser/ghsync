@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -47,6 +48,7 @@ type Runtime struct {
 	cas map[string]ratioCounts
 
 	githubRequests         metric.Int64Counter
+	requestAttribution     metric.Int64Counter
 	conditionalRequests    metric.Int64Counter
 	conditional304s        metric.Int64Counter
 	starvations            metric.Int64Counter
@@ -144,6 +146,12 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	if r.githubRequests, err = meter.Int64Counter(
 		"ghsync_c_b1_github_requests",
 		metric.WithDescription("Admitted GitHub requests by class and resource (C-B1)."),
+	); err != nil {
+		return err
+	}
+	if r.requestAttribution, err = meter.Int64Counter(
+		"ghsync_c_b1_request_attribution",
+		metric.WithDescription("GitHub requests by credential context, endpoint family, and HTTP outcome (C-B1)."),
 	); err != nil {
 		return err
 	}
@@ -291,6 +299,14 @@ func (r *Runtime) BudgetRequest(observation budget.RequestObservation) { //nolin
 		attribute.String("status", status),
 		attribute.String("outcome", outcome),
 	))
+	r.requestAttribution.Add(context.Background(), 1, metric.WithAttributes(
+		attribute.String("auth_context", string(observation.AuthContext)),
+		attribute.String("endpoint_family", observation.EndpointFamily),
+		attribute.String(
+			"outcome",
+			requestAttributionOutcome(observation.StatusCode),
+		),
+	))
 	if !observation.Conditional {
 		return
 	}
@@ -301,6 +317,28 @@ func (r *Runtime) BudgetRequest(observation budget.RequestObservation) { //nolin
 	r.conditionalRequests.Add(context.Background(), 1, attrs)
 	if observation.NotModified {
 		r.conditional304s.Add(context.Background(), 1, attrs)
+	}
+}
+
+func requestAttributionOutcome(statusCode int) string {
+	if statusCode == 0 {
+		return "transport_error"
+	}
+	switch statusCode {
+	case http.StatusOK, http.StatusNotModified, http.StatusForbidden:
+		return strconv.Itoa(statusCode)
+	}
+	switch statusCode / 100 {
+	case 2:
+		return "other_2xx"
+	case 3:
+		return "other_3xx"
+	case 4:
+		return "other_4xx"
+	case 5:
+		return "other_5xx"
+	default:
+		return "other"
 	}
 }
 

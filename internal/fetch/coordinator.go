@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -243,13 +244,15 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			}
 			continue
 		}
+		fenceETag := matchingPullETag(&item.metadata, node)
+		item.metadata.ETag = fenceETag
 		record := pullRecordFromNode(
 			node,
 			item,
 			c.installationID,
 			c.orgID,
 		)
-		snapshot, err := changeinputs.HydrateFromMirror(
+		snapshot, fence, err := changeinputs.HydrateFromMirrorConditional(
 			callCtx,
 			c.rest,
 			c.codeowners,
@@ -262,6 +265,7 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			node,
 			item.metadata.Codeowners,
 			item.metadata.ForceCodeownersRefresh,
+			fenceETag,
 		)
 		if err != nil {
 			results[item] = pullBatchResult{
@@ -269,6 +273,7 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			}
 			continue
 		}
+		applyPullFence(&record, fence)
 		record.ChangeSnapshot = snapshot
 		record.ChangeInputsKnown = true
 		repoID := record.Repository.GitHubID
@@ -353,6 +358,31 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		}
 	}
 	c.finishAll(batch, results, nil)
+}
+
+// matchingPullETag returns a validator only while it is still paired with the
+// exact REST metadata version stored on the row. A later GraphQL observation
+// with a new parent version invalidates the old association even if its
+// base/head pair happens to be unchanged (C-C2).
+func matchingPullETag(
+	metadata *store.FetchMetadata,
+	node *gh.PullRequestNode,
+) string {
+	if metadata == nil || node == nil || metadata.ETag == "" ||
+		!node.UpdatedAt.Equal(metadata.GitHubUpdatedAt) ||
+		node.Title != metadata.Title ||
+		!strings.EqualFold(node.State, metadata.State) ||
+		node.IsDraft != metadata.Draft ||
+		node.Author.Login != metadata.AuthorLogin ||
+		node.HeadRefName != metadata.HeadRef ||
+		node.BaseRefName != metadata.BaseRef ||
+		node.ReviewDecision != metadata.ReviewDecision ||
+		node.Mergeable != metadata.MergeableState ||
+		node.BaseRefOID != metadata.BaseSHA ||
+		node.HeadRefOID != metadata.HeadSHA {
+		return ""
+	}
+	return metadata.ETag
 }
 
 func (c *prCoordinator) fetchPullRequestNodes(

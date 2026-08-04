@@ -736,6 +736,60 @@ func TestRateObservationsMergeByResetWindow(t *testing.T) {
 	}
 }
 
+func TestConditional304UpdatesBudgetHeadersAndRequestObservation(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(time.Hour)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if got := request.Header.Get("If-None-Match"); got != `"pr-a"` {
+			t.Errorf("If-None-Match = %q, want PR validator", got)
+		}
+		header := make(http.Header)
+		header.Set("X-RateLimit-Limit", "5000")
+		header.Set("X-RateLimit-Remaining", "4321")
+		header.Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
+		return &http.Response{
+			StatusCode: http.StatusNotModified,
+			Header:     header,
+			Body:       http.NoBody,
+		}, nil
+	})}
+	var observed RequestObservation
+	gate := New(client, Options{
+		Clock:     newManualClock(now),
+		OnRequest: func(value RequestObservation) { observed = value },
+	})
+	request, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"https://github.example/repos/acme/widgets/pulls/42",
+		http.NoBody,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("If-None-Match", `"pr-a"`)
+	response, err := gate.Do(t.Context(), Sweep, NewRESTRequest(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response == nil || response.HTTP == nil ||
+		response.HTTP.StatusCode != http.StatusNotModified {
+		t.Fatalf("304 response = %+v", response)
+	}
+	if got := gate.Snapshot().REST; !got.Known || got.Limit != 5000 ||
+		got.Remaining != 4321 || !got.ResetAt.Equal(reset) {
+		t.Fatalf("budget after 304 = %+v", got)
+	}
+	if observed.StatusCode != http.StatusNotModified ||
+		!observed.Conditional || !observed.NotModified ||
+		observed.AuthContext != InstallationAuth ||
+		observed.EndpointFamily != endpointPullRequestMetadata ||
+		observed.Err != nil {
+		t.Fatalf("304 request observation = %+v", observed)
+	}
+}
+
 func TestSlowOlderResponseCannotRaiseRemaining(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)

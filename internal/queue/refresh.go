@@ -245,6 +245,7 @@ type RefreshRequest struct {
 type RefreshSpec struct {
 	Kind            string
 	Key             string
+	ScheduledAt     time.Time
 	Deadline        time.Time
 	EventReceivedAt time.Time
 }
@@ -740,6 +741,14 @@ func InsertRefreshesTxReturning(
 		}
 		key := refreshKey{Kind: spec.Kind, Key: spec.Key}
 		if index, duplicate := seen[key]; duplicate {
+			// A zero schedule means available immediately, so it is earlier
+			// than every explicit schedule. This matters when an event and a
+			// staggered sweep pointer meet in the same insertion batch.
+			if !deduped[index].ScheduledAt.IsZero() &&
+				(spec.ScheduledAt.IsZero() ||
+					spec.ScheduledAt.Before(deduped[index].ScheduledAt)) {
+				deduped[index].ScheduledAt = spec.ScheduledAt
+			}
 			if !spec.Deadline.IsZero() &&
 				(deduped[index].Deadline.IsZero() ||
 					spec.Deadline.Before(deduped[index].Deadline)) {
@@ -802,12 +811,66 @@ func InsertRefreshesTxReturning(
 			return nil, err
 		}
 		params = append(params, river.InsertManyParams{
-			Args:       args,
-			InsertOpts: NewRefreshInsertOptsForQueue(queueName, time.Time{}),
+			Args: args,
+			InsertOpts: NewRefreshInsertOptsForQueue(
+				queueName,
+				deduped[index].ScheduledAt,
+			),
 		})
 	}
-	if _, err := client.InsertManyTx(ctx, tx, params); err != nil {
+	inserted, err := client.InsertManyTx(ctx, tx, params)
+	if err != nil {
 		return nil, fmt.Errorf("insert refresh jobs: %w", err)
+	}
+	if len(inserted) != len(deduped) {
+		return nil, fmt.Errorf(
+			"inserted %d refresh jobs for %d specs",
+			len(inserted),
+			len(deduped),
+		)
+	}
+	// River retains the original scheduled_at when a unique insert coalesces.
+	// If a later signal is more urgent (notably an event racing a staggered
+	// sweep), make the existing pointer available now. Its durable generation
+	// still guarantees one follow-up when the pointer is already running.
+	scheduledByKey := make(map[refreshKey]time.Time, len(deduped))
+	for _, spec := range deduped {
+		scheduledByKey[refreshKey{Kind: spec.Kind, Key: spec.Key}] =
+			spec.ScheduledAt
+	}
+	for _, result := range inserted {
+		if result == nil || result.Job == nil ||
+			!result.UniqueSkippedAsDuplicate {
+			continue
+		}
+		var args RefreshArgs
+		if err := json.Unmarshal(result.Job.EncodedArgs, &args); err != nil {
+			return nil, fmt.Errorf(
+				"decode coalesced refresh job %d: %w",
+				result.Job.ID,
+				err,
+			)
+		}
+		desired, ok := scheduledByKey[refreshKey{
+			Kind: args.PointerKind,
+			Key:  args.Key,
+		}]
+		if !ok {
+			return nil, fmt.Errorf(
+				"coalesced refresh job %d was not in insertion batch",
+				result.Job.ID,
+			)
+		}
+		if !desired.IsZero() && !desired.Before(result.Job.ScheduledAt) {
+			continue
+		}
+		if _, err := client.JobRetryTx(ctx, tx, result.Job.ID); err != nil {
+			return nil, fmt.Errorf(
+				"expedite coalesced refresh job %d: %w",
+				result.Job.ID,
+				err,
+			)
+		}
 	}
 	bySpec := make(map[refreshKey]int64, len(generations))
 	for _, generation := range generations {

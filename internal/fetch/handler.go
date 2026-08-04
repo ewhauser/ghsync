@@ -397,7 +397,7 @@ func (h *Handler) refreshPRREST(
 		return fmt.Errorf("fetch PR %s: %w", requestKey(key), err)
 	}
 	if response.NotModified {
-		return h.writer.TouchPullRequest(
+		confirmed, touchErr := h.writer.TouchPullRequest(
 			ctx,
 			observation,
 			repository,
@@ -405,6 +405,16 @@ func (h *Handler) refreshPRREST(
 			startedAt,
 			etag,
 		)
+		if touchErr != nil {
+			return touchErr
+		}
+		if !confirmed {
+			return fmt.Errorf(
+				"confirm PR %s: validator provenance changed",
+				requestKey(key),
+			)
+		}
+		return nil
 	}
 	record := pullRecordFromREST(
 		&repository,
@@ -436,17 +446,29 @@ func (h *Handler) refreshPRREST(
 		}
 		item := pullBatchItem{
 			metadata: store.FetchMetadata{
-				ETag:           response.ETag,
-				StackNumber:    record.StackNumber,
-				StackPosition:  record.StackPosition,
-				HeadSHA:        record.HeadSHA,
-				RepoGitHubID:   repository.GitHubID,
-				InstallationID: repository.InstallationID,
-				RepoFullName:   repository.FullName,
+				ETag:            response.ETag,
+				Title:           record.Title,
+				State:           record.State,
+				Draft:           record.Draft,
+				AuthorLogin:     record.AuthorLogin,
+				HeadRef:         record.HeadRef,
+				BaseRef:         record.BaseRef,
+				ReviewDecision:  record.ReviewDecision,
+				MergeableState:  record.MergeableState,
+				StackNumber:     record.StackNumber,
+				StackPosition:   record.StackPosition,
+				GitHubUpdatedAt: record.GitHubUpdatedAt,
+				BaseSHA:         record.BaseSHA,
+				HeadSHA:         record.HeadSHA,
+				RepoGitHubID:    repository.GitHubID,
+				InstallationID:  repository.InstallationID,
+				RepoFullName:    repository.FullName,
 			},
 			source:    source,
 			startedAt: startedAt,
 		}
+		fenceETag := matchingPullETag(&item.metadata, nodes[0])
+		item.metadata.ETag = fenceETag
 		graphQLRecord := pullRecordFromNode(
 			nodes[0],
 			&item,
@@ -456,7 +478,7 @@ func (h *Handler) refreshPRREST(
 		graphQLRecord.MembershipKnown = true
 		graphQLRecord.StackSummary = record.StackSummary
 		record = graphQLRecord
-		snapshot, hydrateErr := changeinputs.HydrateFromMirror(
+		snapshot, fence, hydrateErr := changeinputs.HydrateFromMirrorConditional(
 			ctx,
 			h.rest,
 			h.codeowners,
@@ -469,6 +491,7 @@ func (h *Handler) refreshPRREST(
 			nodes[0],
 			metadata.Codeowners,
 			metadata.ForceCodeownersRefresh,
+			fenceETag,
 		)
 		if hydrateErr != nil {
 			return fmt.Errorf(
@@ -477,6 +500,7 @@ func (h *Handler) refreshPRREST(
 				hydrateErr,
 			)
 		}
+		applyPullFence(&record, fence)
 		record.ChangeSnapshot = snapshot
 		record.ChangeInputsKnown = true
 	}
@@ -487,6 +511,27 @@ func (h *Handler) refreshPRREST(
 		hook,
 	)
 	return err
+}
+
+func applyPullFence(
+	record *store.PullRequestRecord,
+	fence changeinputs.PullRequestFence,
+) {
+	record.ETag = fence.ETag
+	if fence.Pull == nil {
+		return
+	}
+	authoritative := pullRecordFromREST(
+		&record.Repository,
+		fence.Pull,
+		fence.ETag,
+		record.Source,
+		record.SyncedAt,
+	)
+	record.StackNumber = authoritative.StackNumber
+	record.StackPosition = authoritative.StackPosition
+	record.StackSummary = authoritative.StackSummary
+	record.MembershipKnown = true
 }
 
 func (h *Handler) RefreshStack(

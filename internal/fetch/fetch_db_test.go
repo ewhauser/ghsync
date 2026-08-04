@@ -2095,7 +2095,7 @@ func TestPullRequestRefreshRejectsSynchronizeDuringHydration(t *testing.T) {
 	}
 }
 
-func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
+func TestRefreshRESTETagsProduceDominant304Share(t *testing.T) {
 	t.Parallel()
 	pool := fetchTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
@@ -2114,6 +2114,10 @@ func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
 		Args:  queue.NewResolveStackMembershipArgs(prKey).RefreshArgs,
 		Queue: queue.QueueEvent,
 	}
+	refreshRequest := queue.RefreshRequest{
+		Args:  queue.NewRefreshPRArgs(prKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
 	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
 		t.Fatal(err)
 	}
@@ -2130,10 +2134,7 @@ func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
 	if beforeGraphQL.Etag == "" {
 		t.Fatal("REST PR refresh stored an empty ETag")
 	}
-	if err := handler.RefreshPR(ctx, queue.RefreshRequest{
-		Args:  queue.NewRefreshPRArgs(prKey).RefreshArgs,
-		Queue: queue.QueueEvent,
-	}); err != nil {
+	if err := handler.RefreshPR(ctx, refreshRequest); err != nil {
 		t.Fatal(err)
 	}
 	afterGraphQL, err := dbgen.New(pool).GetPullRequestByKey(
@@ -2153,12 +2154,103 @@ func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
 			afterGraphQL.Etag,
 		)
 	}
+	confirmedBefore := afterGraphQL.LastCheckedAt.Time.Add(-time.Hour)
+	if _, err := pool.Exec(ctx, `
+		UPDATE pull_requests
+		SET last_checked_at = $1
+		WHERE number = 4812
+	`, confirmedBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE pull_request_change_snapshots
+		SET last_checked_at = $1
+		WHERE pr_number = 4812
+		  AND tombstoned_at IS NULL
+	`, confirmedBefore); err != nil {
+		t.Fatal(err)
+	}
+	var changeCheckedBefore time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT last_checked_at
+		FROM pull_request_change_snapshots
+		WHERE pr_number = 4812
+		  AND tombstoned_at IS NULL
+	`).Scan(&changeCheckedBefore); err != nil {
+		t.Fatal(err)
+	}
 	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
 		t.Fatal(err)
 	}
+	afterMetadata304, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var changeCheckedAfter time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT last_checked_at
+		FROM pull_request_change_snapshots
+		WHERE pr_number = 4812
+		  AND tombstoned_at IS NULL
+	`).Scan(&changeCheckedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !afterMetadata304.LastCheckedAt.Time.After(
+		confirmedBefore,
+	) || !afterMetadata304.SyncedAt.Time.Equal(afterGraphQL.SyncedAt.Time) ||
+		!changeCheckedAfter.Equal(changeCheckedBefore) {
+		t.Fatalf(
+			"metadata 304 provenance parent checked=%s->%s synced=%s->%s change_checked=%s->%s",
+			confirmedBefore,
+			afterMetadata304.LastCheckedAt.Time,
+			afterGraphQL.SyncedAt.Time,
+			afterMetadata304.SyncedAt.Time,
+			changeCheckedBefore,
+			changeCheckedAfter,
+		)
+	}
 	prPath := "/repos/acme/monolith/pulls/4812"
-	if got := fake.NotModifiedCount(http.MethodGet, prPath); got != 1 {
-		t.Fatalf("conditional PR 304s = %d, want 1", got)
+	if got := fake.NotModifiedCount(http.MethodGet, prPath); got != 2 {
+		t.Fatalf("conditional PR 304s = %d, want 2", got)
+	}
+	for range 2 {
+		if err := handler.RefreshPR(ctx, refreshRequest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	filesPath := "/repos/acme/monolith/pulls/4812/files"
+	if got := fake.NotModifiedCount(http.MethodGet, prPath); got != 4 {
+		t.Fatalf("conditional PR metadata 304s = %d, want 4", got)
+	}
+	if got := fake.NotModifiedCount(http.MethodGet, filesPath); got != 2 {
+		t.Fatalf("conditional PR files 304s = %d, want 2", got)
+	}
+	var filesETag, codeownersETag, previousPath string
+	if err := pool.QueryRow(ctx, `
+		SELECT snapshot.files_etag, snapshot.etag, file.previous_path
+		FROM pull_request_change_snapshots AS snapshot
+		JOIN pull_request_changed_files AS file
+		  ON file.repo_id = snapshot.repo_id
+		 AND file.pr_number = snapshot.pr_number
+		WHERE snapshot.pr_number = 4812
+		  AND file.path = 'docs/ranking.md'
+	`).Scan(&filesETag, &codeownersETag, &previousPath); err != nil {
+		t.Fatal(err)
+	}
+	if filesETag == "" || codeownersETag == "" ||
+		filesETag == codeownersETag || previousPath != "docs/search.md" {
+		t.Fatalf(
+			"cached files/CODEOWNERS validators and rename = %q/%q/%q",
+			filesETag,
+			codeownersETag,
+			previousPath,
+		)
 	}
 
 	checksKey := "checks:acme/monolith:8f31c2d"
@@ -2209,8 +2301,11 @@ func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
 		t.Fatal(err)
 	}
 	checksPath := "/repos/acme/monolith/commits/8f31c2d/check-runs"
-	if got := fake.NotModifiedCount(http.MethodGet, checksPath); got != 1 {
-		t.Fatalf("conditional checks 304s = %d, want 1", got)
+	if err := handler.RefreshChecks(ctx, checksRequest); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.NotModifiedCount(http.MethodGet, checksPath); got != 2 {
+		t.Fatalf("conditional checks 304s = %d, want 2", got)
 	}
 	var historyAfter, eventsAfter, tombstoned int
 	var syncedAfter, checkedAfter time.Time
@@ -2252,6 +2347,256 @@ func TestPRETagSurvivesGraphQLAndChecksRecheckUses304(t *testing.T) {
 			eventsAfter,
 			tombstoned,
 		)
+	}
+	refreshRequests := fake.RequestCount(http.MethodGet, prPath) +
+		fake.RequestCount(http.MethodGet, filesPath) +
+		fake.RequestCount(http.MethodGet, checksPath)
+	notModified := fake.NotModifiedCount(http.MethodGet, prPath) +
+		fake.NotModifiedCount(http.MethodGet, filesPath) +
+		fake.NotModifiedCount(http.MethodGet, checksPath)
+	if notModified*2 <= refreshRequests {
+		t.Fatalf(
+			"refresh REST 304 share = %d/%d, want dominant",
+			notModified,
+			refreshRequests,
+		)
+	}
+}
+
+func TestStalePR304CannotConfirmLaterGraphQLVersion(t *testing.T) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	prKey := "pr:acme/monolith:4812"
+	resolveRequest := queue.RefreshRequest{
+		Args:  queue.NewResolveStackMembershipArgs(prKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+	responseA, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseA.Etag == "" {
+		t.Fatal("response A did not persist a PR metadata validator")
+	}
+
+	// GraphQL observation B advances the parent version. It must invalidate
+	// response A's validator association instead of copying that ETag onto B.
+	for index := range fixture.PullRequests {
+		if fixture.PullRequests[index].Number != 4812 {
+			continue
+		}
+		fixture.PullRequests[index].Title = "GraphQL response B"
+	}
+	fake.SetFixture(fixture)
+	if err := handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args:  queue.NewRefreshPRArgs(prKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	responseB, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseB.Title != "GraphQL response B" || responseB.Etag == "" ||
+		responseB.Etag == responseA.Etag {
+		t.Fatalf(
+			"response B title/etag = %q/%q, want changed state with its own validator",
+			responseB.Title,
+			responseB.Etag,
+		)
+	}
+
+	// Model response A's 304 reaching the writer after B. The validator CAS
+	// must reject the confirmation and leave both domain and freshness
+	// provenance on B.
+	observation, err := handler.writer.BeginObservation(
+		ctx,
+		store.PullRequestEntityKey(1, fixture.Repository.ID, 4812),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed, touchErr := handler.writer.TouchPullRequest(
+		ctx,
+		observation,
+		store.RepositoryRecord{
+			InstallationID: 1,
+			GitHubID:       fixture.Repository.ID,
+		},
+		4812,
+		time.Now().Add(time.Hour),
+		responseA.Etag,
+	)
+	if closeErr := observation.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if touchErr != nil {
+		t.Fatal(touchErr)
+	}
+	if confirmed {
+		t.Fatal("response A's 304 confirmed response B")
+	}
+	after, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     4812,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Title != responseB.Title || after.Etag != responseB.Etag ||
+		!after.SyncedAt.Time.Equal(responseB.SyncedAt.Time) ||
+		!after.LastCheckedAt.Time.Equal(responseB.LastCheckedAt.Time) {
+		t.Fatalf(
+			"stale 304 changed response B: before=%+v after=%+v",
+			responseB,
+			after,
+		)
+	}
+}
+
+func TestGraphQLFencePairsNewValidatorWithRESTStackMembership(t *testing.T) {
+	t.Parallel()
+	pool := fetchTestDatabase(t)
+	fixture := fakegithub.DefaultFixture()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		pool,
+		fixture,
+		10*time.Millisecond,
+		100,
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+	ctx := context.Background()
+	const number = 4812
+	prKey := fmt.Sprintf("pr:acme/monolith:%d", number)
+	resolveRequest := queue.RefreshRequest{
+		Args:  queue.NewResolveStackMembershipArgs(prKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	refreshRequest := queue.RefreshRequest{
+		Args:  queue.NewRefreshPRArgs(prKey).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	target := -1
+	var finalStack fakegithub.StackRef
+	for index := range fixture.PullRequests {
+		if fixture.PullRequests[index].Number != number {
+			continue
+		}
+		target = index
+		finalStack = *fixture.PullRequests[index].Stack
+		fixture.PullRequests[index].Title = "intermediate unstacked version"
+		fixture.PullRequests[index].Stack = nil
+		break
+	}
+	if target < 0 {
+		t.Fatalf("fixture has no PR %d", number)
+	}
+	fake.SetFixture(fixture)
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+	intermediate, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     number,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intermediate.StackNumber.Valid || intermediate.StackPosition.Valid {
+		t.Fatalf("intermediate membership = %+v", intermediate)
+	}
+
+	fixture.PullRequests[target].Title = "final restacked version"
+	fixture.PullRequests[target].Stack = &finalStack
+	fake.SetFixture(fixture)
+	if err := handler.RefreshPR(ctx, refreshRequest); err != nil {
+		t.Fatal(err)
+	}
+	final, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     number,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Title != "final restacked version" ||
+		!final.StackNumber.Valid ||
+		int(final.StackNumber.Int32) != finalStack.Number ||
+		!final.StackPosition.Valid ||
+		int(final.StackPosition.Int32) != finalStack.Position ||
+		final.Etag == "" || final.Etag == intermediate.Etag {
+		t.Fatalf(
+			"final title/membership/etag = %q/%v/%v/%q",
+			final.Title,
+			final.StackNumber,
+			final.StackPosition,
+			final.Etag,
+		)
+	}
+
+	if err := handler.ResolveStackMembership(ctx, resolveRequest); err != nil {
+		t.Fatal(err)
+	}
+	prPath := fmt.Sprintf("/repos/acme/monolith/pulls/%d", number)
+	if got := fake.NotModifiedCount(http.MethodGet, prPath); got != 1 {
+		t.Fatalf("final validator 304s = %d, want 1", got)
+	}
+	after304, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: "acme/monolith",
+			PrNumber:     number,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after304.StackNumber != final.StackNumber ||
+		after304.StackPosition != final.StackPosition ||
+		after304.Etag != final.Etag {
+		t.Fatalf("304 changed validator-associated membership: %+v", after304)
 	}
 }
 
