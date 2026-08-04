@@ -108,7 +108,8 @@ func TestFindCodeownersPrecedenceMissingAndOversized(t *testing.T) {
 			fixture.Contents = map[string]map[string]string{
 				"exact-sha": test.content,
 			}
-			server := httptest.NewServer(fakegithub.New(fixture, "secret"))
+			fake := fakegithub.New(fixture, "secret")
+			server := httptest.NewServer(fake)
 			t.Cleanup(server.Close)
 			client, err := gh.NewRESTClient(
 				server.URL,
@@ -121,14 +122,100 @@ func TestFindCodeownersPrecedenceMissingAndOversized(t *testing.T) {
 			source, err := client.FindCodeowners(
 				context.Background(), budget.Interactive,
 				fixture.Owner, fixture.Repo, "exact-sha",
+				nil,
 			)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if source.Path != test.path || source.State != test.state ||
+			if source.Ref != "exact-sha" || source.Path != test.path || source.State != test.state ||
 				source.Content != test.source {
-				t.Fatalf("source = %#v, want %q/%q/%q", source, test.path, test.state, test.source)
+				t.Fatalf("source = %#v, want exact-sha/%q/%q/%q", source, test.path, test.state, test.source)
+			}
+			if source.State != gh.CodeownersMissing && source.ETag == "" {
+				t.Fatal("effective source has no ETag")
+			}
+			before := len(fake.Requests())
+			reused, err := client.FindCodeowners(
+				context.Background(), budget.Interactive,
+				fixture.Owner, fixture.Repo, "exact-sha", &source,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reused != source {
+				t.Fatalf("conditional source = %#v, want %#v", reused, source)
+			}
+			requests := fake.Requests()
+			if source.State == gh.CodeownersMissing {
+				if len(requests) != before {
+					t.Fatalf("cached missing source made %d requests, want 0", len(requests)-before)
+				}
+				return
+			}
+			if len(requests) != before+1 {
+				t.Fatalf("same-ref conditional probe made %d requests, want 1", len(requests)-before)
+			}
+			path := "/repos/" + fixture.Owner + "/" + fixture.Repo +
+				"/contents/" + source.Path
+			if got := fake.NotModifiedCount("GET", path); got != 1 {
+				t.Fatalf("conditional CODEOWNERS 304s = %d, want 1", got)
+			}
+			last := requests[len(requests)-1]
+			if last.Path != path || last.IfNoneMatch != source.ETag {
+				t.Fatalf("conditional request = %+v, want path %q ETag %q", last, path, source.ETag)
 			}
 		})
+	}
+}
+
+func TestFindCodeownersNewCommitInvalidatesPathAbsence(t *testing.T) {
+	t.Parallel()
+	fixture := fakegithub.DefaultFixture()
+	fixture.Contents = map[string]map[string]string{
+		"old-sha": {"CODEOWNERS": "* @root"},
+		"new-sha": {
+			".github/CODEOWNERS": "* @github",
+			"CODEOWNERS":         "* @root",
+		},
+	}
+	fake := fakegithub.New(fixture, "secret")
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	client, err := gh.NewRESTClient(
+		server.URL,
+		budget.New(server.Client(), budget.Options{}),
+		gh.StaticToken("fake-installation-codeowners-invalidation"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSource, err := client.FindCodeowners(
+		t.Context(), budget.Interactive,
+		fixture.Owner, fixture.Repo, "old-sha", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldSource.Path != "CODEOWNERS" {
+		t.Fatalf("old source = %#v", oldSource)
+	}
+	before := len(fake.Requests())
+	newSource, err := client.FindCodeowners(
+		t.Context(), budget.Interactive,
+		fixture.Owner, fixture.Repo, "new-sha", &oldSource,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSource.Ref != "new-sha" || newSource.Path != ".github/CODEOWNERS" ||
+		newSource.Content != "* @github" {
+		t.Fatalf("new source = %#v", newSource)
+	}
+	requests := fake.Requests()[before:]
+	if len(requests) != 1 ||
+		requests[0].Path != "/repos/"+fixture.Owner+"/"+fixture.Repo+
+			"/contents/.github/CODEOWNERS" ||
+		requests[0].RawQuery != "ref=new-sha" {
+		t.Fatalf("new-commit precedence probes = %+v", requests)
 	}
 }

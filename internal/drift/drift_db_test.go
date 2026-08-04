@@ -2,6 +2,7 @@ package drift
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http/httptest"
 	"reflect"
@@ -430,15 +431,23 @@ func TestDriftDetectsAndHealsChangeInputDivergence(t *testing.T) {
 	t.Parallel()
 	harness := newReadyDriftHarness(t)
 	ctx := t.Context()
+	const corruptSource = "* @corrupt-owner\n"
+	corruptHash := fmt.Sprintf("%x", sha256.Sum256([]byte(
+		gh.CodeownersPresent+"\x00.github/CODEOWNERS\x00"+corruptSource,
+	)))
 	if _, err := harness.pool.Exec(ctx, `
 		UPDATE pull_request_change_snapshots AS snapshot
 		SET files_truncated = true,
-		    codeowners_hash = 'corrupt-source-hash'
+		    codeowners_source = $1,
+		    codeowners_hash = $2
 		FROM repos
 		WHERE repos.id = snapshot.repo_id
 		  AND repos.full_name = 'acme/monolith'
 		  AND snapshot.pr_number = 4812;
-
+	`, corruptSource, corruptHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.pool.Exec(ctx, `
 		UPDATE pull_request_changed_files AS file
 		SET change_type = 'added'
 		FROM repos
@@ -458,6 +467,8 @@ func TestDriftDetectsAndHealsChangeInputDivergence(t *testing.T) {
 	`); err != nil {
 		t.Fatal(err)
 	}
+	codeownersPath := "/repos/acme/monolith/contents/.github/CODEOWNERS"
+	beforeRequests := len(harness.fake.Requests())
 	findings, err := harness.service.Detect(ctx, DetectArgs{
 		InstallationID: 1,
 		SampleSize:     100,
@@ -471,11 +482,25 @@ func TestDriftDetectsAndHealsChangeInputDivergence(t *testing.T) {
 		t.Fatalf("change-input drift findings = %+v", findings)
 	}
 	waitForCacheProducers(t, harness.pool)
-	var changeType, resolution, nodeID, codeownersHash string
+	var ownershipFetches int
+	for _, request := range harness.fake.Requests()[beforeRequests:] {
+		if request.Method == "GET" && request.Path == codeownersPath &&
+			request.RawQuery == "ref=bbbb001" {
+			ownershipFetches++
+		}
+	}
+	if ownershipFetches != 2 {
+		t.Fatalf(
+			"drift detection and healing CODEOWNERS fetches = %d, want 2",
+			ownershipFetches,
+		)
+	}
+	var changeType, resolution, nodeID, codeownersHash, codeownersSource string
 	var truncated bool
 	if err := harness.pool.QueryRow(ctx, `
 		SELECT file.change_type, owner.resolution_state, owner.owner_node_id,
-		       snapshot.files_truncated, snapshot.codeowners_hash
+		       snapshot.files_truncated, snapshot.codeowners_hash,
+		       snapshot.codeowners_source
 		FROM pull_request_changed_files AS file
 		JOIN pull_request_file_owners AS owner
 		  ON owner.repo_id = file.repo_id
@@ -491,15 +516,17 @@ func TestDriftDetectsAndHealsChangeInputDivergence(t *testing.T) {
 		  AND owner.tombstoned_at IS NULL
 	`).Scan(
 		&changeType, &resolution, &nodeID, &truncated, &codeownersHash,
+		&codeownersSource,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if changeType != "modified" || resolution != "resolved" ||
 		nodeID != "T_kwDOABCDEF6001" || truncated ||
-		codeownersHash == "corrupt-source-hash" {
+		codeownersHash == corruptHash || codeownersSource == corruptSource {
 		t.Fatalf(
-			"healed change inputs = %q/%q/%q truncated=%v hash=%q",
+			"healed change inputs = %q/%q/%q truncated=%v hash=%q source=%q",
 			changeType, resolution, nodeID, truncated, codeownersHash,
+			codeownersSource,
 		)
 	}
 	if findings, err := harness.service.Detect(ctx, DetectArgs{

@@ -40,6 +40,7 @@ type Handler struct {
 	rest             *gh.RESTClient
 	graphQL          *gh.GraphQLClient
 	writer           *store.EntityWriter
+	codeowners       *changeinputs.SourceResolver
 	installationID   int64
 	orgID            int64
 	backfillPageSize int
@@ -62,11 +63,13 @@ func New(options Options) (*Handler, error) {
 		options.BackfillPageSize = 100
 	}
 	writer := store.NewEntityWriter(options.Pool, options.CacheObserver)
+	codeowners := changeinputs.NewSourceResolver(options.REST)
 	handler := &Handler{
 		pool:             options.Pool,
 		rest:             options.REST,
 		graphQL:          options.GraphQL,
 		writer:           writer,
+		codeowners:       codeowners,
 		installationID:   options.InstallationID,
 		orgID:            options.OrgID,
 		backfillPageSize: options.BackfillPageSize,
@@ -74,6 +77,7 @@ func New(options Options) (*Handler, error) {
 	handler.coordinator = newPRCoordinator(
 		options.GraphQL,
 		options.REST,
+		codeowners,
 		writer,
 		options.InstallationID,
 		options.OrgID,
@@ -452,9 +456,10 @@ func (h *Handler) refreshPRREST(
 		graphQLRecord.MembershipKnown = true
 		graphQLRecord.StackSummary = record.StackSummary
 		record = graphQLRecord
-		snapshot, hydrateErr := changeinputs.Hydrate(
+		snapshot, hydrateErr := changeinputs.HydrateFromMirror(
 			ctx,
 			h.rest,
+			h.codeowners,
 			h.writer,
 			class,
 			repository.GitHubID,
@@ -462,6 +467,8 @@ func (h *Handler) refreshPRREST(
 			repoName,
 			record.Number,
 			nodes[0],
+			metadata.Codeowners,
+			metadata.ForceCodeownersRefresh,
 		)
 		if hydrateErr != nil {
 			return fmt.Errorf(

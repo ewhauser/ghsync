@@ -24,6 +24,13 @@ FROM sweep_cursors WHERE completed_at IS NULL ORDER BY started_at;
 ```
 
 Server headers are authoritative; do not calculate a replacement allowance.
+For PR refresh traffic, repeated `/contents/.../CODEOWNERS` requests without a
+base ref/SHA change indicate mirror-reuse failure. After a provenance change,
+expect one precedence probe per repository/ref, with the effective path using
+`If-None-Match` and contributing any 304 to the C-B4 counters.
+An open pull-request drift finding is the deliberate exception: validation and
+its healing refresh both read ownership upstream so a corrupt mirrored source
+cannot create an unhealable drift loop.
 
 ## Remediation
 

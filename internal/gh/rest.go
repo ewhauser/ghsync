@@ -31,9 +31,11 @@ type PullRequestFile struct {
 
 // CodeownersSource is the first source found in GitHub's precedence order.
 type CodeownersSource struct {
+	Ref     string
 	Path    string
 	Content string
 	State   string
+	ETag    string
 }
 
 const (
@@ -558,16 +560,37 @@ func (c *RESTClient) FindCodeowners(
 	owner string,
 	repo string,
 	ref string,
+	prior *CodeownersSource,
 ) (CodeownersSource, error) {
-	for _, path := range []string{
+	paths := []string{
 		".github/CODEOWNERS",
 		"CODEOWNERS",
 		"docs/CODEOWNERS",
-	} {
-		body, status, err := c.getRepositoryContent(
-			ctx, class, owner, repo, path, ref,
+	}
+	start := 0
+	if prior != nil && prior.Ref == ref {
+		if prior.State == CodeownersMissing {
+			return *prior, nil
+		}
+		for index, path := range paths {
+			if prior.Path == path {
+				// Every higher-precedence path was absent at this immutable
+				// commit. Resume at the effective path instead of repeating
+				// guaranteed 404s.
+				start = index
+				break
+			}
+		}
+	}
+	for _, path := range paths[start:] {
+		etag := ""
+		if prior != nil && prior.Path == path {
+			etag = prior.ETag
+		}
+		body, response, err := c.getRepositoryContent(
+			ctx, class, owner, repo, path, ref, etag,
 		)
-		if status == http.StatusNotFound {
+		if response != nil && response.StatusCode == http.StatusNotFound {
 			continue
 		}
 		if err != nil {
@@ -575,16 +598,33 @@ func (c *RESTClient) FindCodeowners(
 				"fetch CODEOWNERS %s at %s: %w", path, ref, err,
 			)
 		}
+		if response.NotModified {
+			if prior == nil || prior.Path != path ||
+				(prior.State != CodeownersPresent &&
+					prior.State != CodeownersOversized) {
+				return CodeownersSource{}, fmt.Errorf(
+					"fetch CODEOWNERS %s at %s: 304 without prior source",
+					path,
+					ref,
+				)
+			}
+			reused := *prior
+			reused.Ref = ref
+			reused.ETag = response.ETag
+			return reused, nil
+		}
 		if len(body) >= MaxCodeownersBytes {
 			return CodeownersSource{
-				Path: path, State: CodeownersOversized,
+				Ref: ref, Path: path, State: CodeownersOversized,
+				ETag: response.ETag,
 			}, nil
 		}
 		return CodeownersSource{
-			Path: path, Content: string(body), State: CodeownersPresent,
+			Ref: ref, Path: path, Content: string(body), State: CodeownersPresent,
+			ETag: response.ETag,
 		}, nil
 	}
-	return CodeownersSource{State: CodeownersMissing}, nil
+	return CodeownersSource{Ref: ref, State: CodeownersMissing}, nil
 }
 
 func (c *RESTClient) getRepositoryContent(
@@ -594,7 +634,8 @@ func (c *RESTClient) getRepositoryContent(
 	repo string,
 	path string,
 	ref string,
-) ([]byte, int, error) {
+	etag string,
+) ([]byte, *RESTResponse, error) {
 	segments := strings.Split(path, "/")
 	for index := range segments {
 		segments[index] = url.PathEscape(segments[index])
@@ -609,9 +650,12 @@ func (c *RESTClient) getRepositoryContent(
 	)
 	req, err := c.client.request(ctx, http.MethodGet, endpoint, query, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.raw+json")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
 	gated, err := c.client.gate.Do(
 		ctx,
 		class,
@@ -621,12 +665,24 @@ func (c *RESTClient) getRepositoryContent(
 		if gated != nil {
 			_ = closeResponseBody(gated.HTTP)
 		}
-		return nil, 0, err
+		return nil, nil, err
 	}
 	response := gated.HTTP
+	responseETag := response.Header.Get("ETag")
+	if response.StatusCode == http.StatusNotModified && responseETag == "" {
+		responseETag = etag
+	}
+	metadata := &RESTResponse{
+		StatusCode:  response.StatusCode,
+		ETag:        responseETag,
+		NotModified: response.StatusCode == http.StatusNotModified,
+	}
+	if metadata.NotModified {
+		_ = response.Body.Close()
+		return nil, metadata, nil
+	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		status := response.StatusCode
-		return nil, status, decodeHTTPError(response)
+		return nil, metadata, decodeHTTPError(response)
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(
@@ -634,11 +690,11 @@ func (c *RESTClient) getRepositoryContent(
 		MaxCodeownersBytes+1,
 	))
 	if err != nil {
-		return nil, response.StatusCode, fmt.Errorf(
+		return nil, metadata, fmt.Errorf(
 			"read repository content: %w", err,
 		)
 	}
-	return body, response.StatusCode, nil
+	return body, metadata, nil
 }
 
 // ListCheckRuns fetches one checks page for a head SHA.

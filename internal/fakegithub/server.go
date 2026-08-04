@@ -27,6 +27,15 @@ const (
 	maxRecordedAuthorizations = 1024
 )
 
+// APIRequest is one request observed by the fake, retaining the conditional
+// validator and exact query needed by request-pattern assertions.
+type APIRequest struct {
+	Method      string
+	Path        string
+	RawQuery    string
+	IfNoneMatch string
+}
+
 // StackRef is the preview stack reference embedded in a pull request.
 type StackRef struct {
 	ID       int64 `json:"id"`
@@ -450,6 +459,7 @@ type Server struct {
 	mux                *http.ServeMux
 	client             *http.Client
 	requestCounts      map[string]int
+	requests           []APIRequest
 	notModified        map[string]int
 	notFound           map[string]int
 	notFoundAt         map[string]map[int]struct{}
@@ -551,6 +561,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestKey := r.Method + " " + r.URL.Path
 	s.mu.Lock()
 	s.requestCounts[requestKey]++
+	s.requests = append(s.requests, APIRequest{
+		Method:      r.Method,
+		Path:        r.URL.Path,
+		RawQuery:    r.URL.RawQuery,
+		IfNoneMatch: r.Header.Get("If-None-Match"),
+	})
 	requestCount := s.requestCounts[requestKey]
 	if s.requestHook != nil {
 		s.requestHook(r.Method, r.URL.Path, requestCount, &s.fixture)
@@ -960,6 +976,13 @@ func (s *Server) RequestCount(method, path string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.requestCounts[method+" "+path]
+}
+
+// Requests returns the request log in arrival order.
+func (s *Server) Requests() []APIRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]APIRequest(nil), s.requests...)
 }
 
 // NotModifiedCount reports conditional requests satisfied with 304.

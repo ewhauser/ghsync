@@ -205,7 +205,12 @@ explicit review checklist rather than relying on call-site folklore:
 - **C-B4 — Conditional by default.** Reconciliation and any refetch of a
   possibly-unchanged entity sends `If-None-Match`; 304s are close to free and
   must be the common case for sweeps. A sweep that hits < 80% 304 rate on a
-  quiet org indicates an ETag-handling bug.
+  quiet org indicates an ETag-handling bug. PR ownership hydration first
+  reuses an exact ref/SHA CODEOWNERS source from the mirror. Provenance
+  invalidation single-flights the repository/ref probe, reuses its content
+  ETag, and remembers absent precedence paths only for the exact immutable
+  commit. Drift validation remains an authoritative read and forces its
+  healing refresh to bypass a source it has just shown to be divergent.
 - **C-B5 — GraphQL is a separate budget with separate accounting.** Batched
   reads (the per-PR fan-out: reviews, ordinary issue comments, threads, check
   suites) go to GraphQL in
