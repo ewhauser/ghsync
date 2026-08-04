@@ -5,9 +5,13 @@ package sweep
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -34,7 +38,11 @@ const (
 	jobKindPage    = "sweep_list_page"
 	jobKindGapHeal = "sweep_gap_heal"
 	jobKindPrune   = "retention_prune"
+
+	defaultGapLeaseTTL = 5 * time.Minute
 )
+
+var gapLeaseFallbackCounter atomic.Uint64
 
 type Config struct {
 	// InstallationID selects the GitHub installation reconciled by this service.
@@ -62,6 +70,8 @@ type Config struct {
 	GapPageSize int
 	// GapMaxPages bounds pages inspected before scheduling a continuation.
 	GapMaxPages int
+	// GapLeaseTTL bounds failover after a gap-heal worker stops making progress.
+	GapLeaseTTL time.Duration
 
 	// RetentionPeriod controls payload-pruner scheduling.
 	RetentionPeriod time.Duration
@@ -89,6 +99,7 @@ func (c *Config) validate() error {
 		"closed staleness":     c.ClosedMaxStaleness,
 		"repository period":    c.RepositoryListPeriod,
 		"gap-heal period":      c.GapHealPeriod,
+		"gap-heal lease TTL":   c.GapLeaseTTL,
 		"gap window":           c.GapWindow,
 		"retention period":     c.RetentionPeriod,
 		"retention age":        c.RetentionAge,
@@ -186,7 +197,7 @@ func (LogObserver) GapWindowIncomplete(
 	cursor string,
 	pages int,
 ) {
-	slog.Error(
+	slog.Debug(
 		"C-R4 webhook delivery gap window hit its page cap; continuation scheduled",
 		"cursor", cursor,
 		"pages", pages,
@@ -253,6 +264,9 @@ func New(options Options) (*Service, error) { //nolint:gocritic // constructor n
 	if options.Config.Observer == nil {
 		options.Config.Observer = Observers{}
 	}
+	if options.Config.GapLeaseTTL <= 0 {
+		options.Config.GapLeaseTTL = defaultGapLeaseTTL
+	}
 	if err := options.Config.validate(); err != nil {
 		return nil, err
 	}
@@ -295,6 +309,7 @@ func (ListPageArgs) Kind() string { return jobKindPage }
 type GapHealArgs struct {
 	Installation int64  `json:"installation_id"`
 	Cursor       string `json:"cursor,omitempty"`
+	LeaseToken   string `json:"lease_token,omitempty"`
 }
 
 func (GapHealArgs) Kind() string { return jobKindGapHeal }
@@ -376,6 +391,7 @@ func (s *Service) ReconciliationPeriodicJobs() []*river.PeriodicJob {
 			func() (river.JobArgs, *river.InsertOpts) {
 				return GapHealArgs{
 						Installation: s.config.InstallationID,
+						LeaseToken:   newGapLeaseToken(),
 					},
 					periodicInsertOpts(queue.QueueReconcile)
 			},
@@ -385,6 +401,19 @@ func (s *Service) ReconciliationPeriodicJobs() []*river.PeriodicJob {
 			},
 		),
 	}
+}
+
+func newGapLeaseToken() string {
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err == nil {
+		return hex.EncodeToString(token[:])
+	}
+	return fmt.Sprintf(
+		"fallback-%d-%d-%d",
+		os.Getpid(),
+		time.Now().UnixNano(),
+		gapLeaseFallbackCounter.Add(1),
+	)
 }
 
 func ReconciliationPeriodicJobs(config *Config) []*river.PeriodicJob {

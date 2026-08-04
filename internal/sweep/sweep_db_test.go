@@ -1,6 +1,7 @@
 package sweep
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -1153,7 +1155,7 @@ func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
 	for range 3 {
 		if err := h.service.HealDeliveryGaps(
 			context.Background(),
-			GapHealArgs{Installation: 1},
+			GapHealArgs{Installation: 1, LeaseToken: "continuation-owner"},
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -1185,6 +1187,113 @@ func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
 	h.observer.mu.Unlock()
 	if incomplete != 2 {
 		t.Fatalf("incomplete-window signals = %d, want 2", incomplete)
+	}
+}
+
+func TestGapHealLeaseSingleFlightAndStaleRecoveryPreserveCursor(
+	t *testing.T,
+) {
+	t.Parallel()
+	h := newSweepHarness(t, 100)
+	now := h.now
+	h.service.config.Now = func() time.Time { return now }
+	h.service.config.GapLeaseTTL = time.Minute
+
+	type result struct {
+		state    dbgen.GapHealCursor
+		acquired bool
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for _, token := range []string{"worker-a", "worker-b"} {
+		go func() {
+			<-start
+			state, acquired, err := h.service.loadOrStartGapWindow(
+				context.Background(),
+				GapHealArgs{Installation: 1, LeaseToken: token},
+			)
+			results <- result{state: state, acquired: acquired, err: err}
+		}()
+	}
+	close(start)
+	var winner result
+	acquired := 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.acquired {
+			acquired++
+			winner = result
+		}
+	}
+	if acquired != 1 {
+		t.Fatalf("concurrent lease acquisitions = %d, want 1", acquired)
+	}
+	if _, err := h.pool.Exec(context.Background(), `
+		UPDATE gap_heal_cursors SET cursor = 'opaque-resume'
+		WHERE installation_id = 1 AND lease_token = $1
+	`, winner.state.LeaseToken.String); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(h.service.config.GapLeaseTTL + time.Second)
+	state, recovered, err := h.service.loadOrStartGapWindow(
+		context.Background(),
+		GapHealArgs{Installation: 1, LeaseToken: "recovery-worker"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered || state.Cursor != "opaque-resume" {
+		t.Fatalf(
+			"stale recovery acquired=%v cursor=%q, want true opaque-resume",
+			recovered,
+			state.Cursor,
+		)
+	}
+	if _, err := h.pool.Exec(context.Background(), `
+		UPDATE gap_heal_cursors
+		SET cursor = '', completed_at = $1, lease_token = NULL, lease_until = NULL
+		WHERE installation_id = 1
+	`, now); err != nil {
+		t.Fatal(err)
+	}
+	_, staleContinuationRan, err := h.service.loadOrStartGapWindow(
+		context.Background(),
+		GapHealArgs{
+			Installation: 1,
+			Cursor:       "opaque-resume",
+			LeaseToken:   "delayed-continuation",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleContinuationRan {
+		t.Fatal("stale continuation opened a new gap-heal window")
+	}
+}
+
+func TestGapWindowIncompleteUsesDebugLogging(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	prior := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(
+		&output,
+		&slog.HandlerOptions{Level: slog.LevelDebug},
+	)))
+	t.Cleanup(func() { slog.SetDefault(prior) })
+
+	LogObserver{}.GapWindowIncomplete(context.Background(), "next", 10)
+	logged := output.String()
+	if !strings.Contains(logged, `"level":"DEBUG"`) {
+		t.Fatalf("gap cap log = %q, want DEBUG", logged)
+	}
+	if strings.Contains(logged, `"level":"ERROR"`) {
+		t.Fatalf("gap cap log = %q, must not be ERROR", logged)
 	}
 }
 

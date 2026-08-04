@@ -529,6 +529,7 @@ func clearConfigEnv(t *testing.T) {
 		"SWEEP_PAGE_SIZE",
 		"GAP_HEAL_PERIOD",
 		"GAP_COMPARISON_WINDOW",
+		"GAP_HEAL_LEASE_TTL",
 		"GAP_PAGE_SIZE",
 		"GAP_MAX_PAGES",
 		"DRIFT_PERIOD",

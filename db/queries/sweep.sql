@@ -313,16 +313,36 @@ SET cursor = '',
     cutoff = sqlc.arg(cutoff),
     started_at = sqlc.arg(started_at),
     updated_at = sqlc.arg(started_at),
-    completed_at = NULL
+    completed_at = NULL,
+    lease_token = sqlc.arg(lease_token),
+    lease_until = sqlc.arg(lease_until)
 WHERE installation_id = sqlc.arg(installation_id)
 RETURNING *;
+
+-- name: ClaimGapHealCursor :one
+UPDATE gap_heal_cursors
+SET lease_token = sqlc.arg(lease_token),
+    lease_until = sqlc.arg(lease_until),
+    updated_at = sqlc.arg(claimed_at)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND completed_at IS NULL
+RETURNING *;
+
+-- name: RenewGapHealLease :execrows
+UPDATE gap_heal_cursors
+SET lease_until = sqlc.arg(lease_until)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND lease_token = sqlc.arg(lease_token)
+  AND completed_at IS NULL;
 
 -- name: AdvanceGapHealCursor :one
 UPDATE gap_heal_cursors
 SET cursor = sqlc.arg(next_cursor),
-    updated_at = sqlc.arg(updated_at)
+    updated_at = sqlc.arg(updated_at),
+    lease_until = sqlc.arg(lease_until)
 WHERE installation_id = sqlc.arg(installation_id)
   AND cursor = sqlc.arg(expected_cursor)
+  AND lease_token = sqlc.arg(lease_token)
   AND completed_at IS NULL
 RETURNING *;
 
@@ -330,9 +350,12 @@ RETURNING *;
 UPDATE gap_heal_cursors
 SET cursor = '',
     updated_at = sqlc.arg(completed_at),
-    completed_at = sqlc.arg(completed_at)
+    completed_at = sqlc.arg(completed_at),
+    lease_token = NULL,
+    lease_until = NULL
 WHERE installation_id = sqlc.arg(installation_id)
   AND cursor = sqlc.arg(expected_cursor)
+  AND lease_token = sqlc.arg(lease_token)
   AND completed_at IS NULL
 RETURNING *;
 

@@ -14,26 +14,32 @@ import (
 const advanceGapHealCursor = `-- name: AdvanceGapHealCursor :one
 UPDATE gap_heal_cursors
 SET cursor = $1,
-    updated_at = $2
-WHERE installation_id = $3
-  AND cursor = $4
+    updated_at = $2,
+    lease_until = $3
+WHERE installation_id = $4
+  AND cursor = $5
+  AND lease_token = $6
   AND completed_at IS NULL
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
 `
 
 type AdvanceGapHealCursorParams struct {
 	NextCursor     string
 	UpdatedAt      pgtype.Timestamptz
+	LeaseUntil     pgtype.Timestamptz
 	InstallationID int64
 	ExpectedCursor string
+	LeaseToken     pgtype.Text
 }
 
 func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCursorParams) (GapHealCursor, error) {
 	row := q.db.QueryRow(ctx, advanceGapHealCursor,
 		arg.NextCursor,
 		arg.UpdatedAt,
+		arg.LeaseUntil,
 		arg.InstallationID,
 		arg.ExpectedCursor,
+		arg.LeaseToken,
 	)
 	var i GapHealCursor
 	err := row.Scan(
@@ -43,6 +49,8 @@ func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCu
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.LeaseToken,
+		&i.LeaseUntil,
 	)
 	return i, err
 }
@@ -94,25 +102,30 @@ func (q *Queries) AdvanceSweepCursor(ctx context.Context, arg AdvanceSweepCursor
 	return i, err
 }
 
-const completeGapHealCursor = `-- name: CompleteGapHealCursor :one
+const claimGapHealCursor = `-- name: ClaimGapHealCursor :one
 UPDATE gap_heal_cursors
-SET cursor = '',
-    updated_at = $1,
-    completed_at = $1
-WHERE installation_id = $2
-  AND cursor = $3
+SET lease_token = $1,
+    lease_until = $2,
+    updated_at = $3
+WHERE installation_id = $4
   AND completed_at IS NULL
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
 `
 
-type CompleteGapHealCursorParams struct {
-	CompletedAt    pgtype.Timestamptz
+type ClaimGapHealCursorParams struct {
+	LeaseToken     pgtype.Text
+	LeaseUntil     pgtype.Timestamptz
+	ClaimedAt      pgtype.Timestamptz
 	InstallationID int64
-	ExpectedCursor string
 }
 
-func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHealCursorParams) (GapHealCursor, error) {
-	row := q.db.QueryRow(ctx, completeGapHealCursor, arg.CompletedAt, arg.InstallationID, arg.ExpectedCursor)
+func (q *Queries) ClaimGapHealCursor(ctx context.Context, arg ClaimGapHealCursorParams) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, claimGapHealCursor,
+		arg.LeaseToken,
+		arg.LeaseUntil,
+		arg.ClaimedAt,
+		arg.InstallationID,
+	)
 	var i GapHealCursor
 	err := row.Scan(
 		&i.InstallationID,
@@ -121,6 +134,50 @@ func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHeal
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.LeaseToken,
+		&i.LeaseUntil,
+	)
+	return i, err
+}
+
+const completeGapHealCursor = `-- name: CompleteGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = '',
+    updated_at = $1,
+    completed_at = $1,
+    lease_token = NULL,
+    lease_until = NULL
+WHERE installation_id = $2
+  AND cursor = $3
+  AND lease_token = $4
+  AND completed_at IS NULL
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
+`
+
+type CompleteGapHealCursorParams struct {
+	CompletedAt    pgtype.Timestamptz
+	InstallationID int64
+	ExpectedCursor string
+	LeaseToken     pgtype.Text
+}
+
+func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHealCursorParams) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, completeGapHealCursor,
+		arg.CompletedAt,
+		arg.InstallationID,
+		arg.ExpectedCursor,
+		arg.LeaseToken,
+	)
+	var i GapHealCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Cursor,
+		&i.Cutoff,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+		&i.LeaseToken,
+		&i.LeaseUntil,
 	)
 	return i, err
 }
@@ -199,7 +256,7 @@ INSERT INTO gap_heal_cursors (installation_id)
 VALUES ($1)
 ON CONFLICT (installation_id) DO UPDATE
 SET installation_id = EXCLUDED.installation_id
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
 `
 
 func (q *Queries) EnsureGapHealCursor(ctx context.Context, installationID int64) (GapHealCursor, error) {
@@ -212,6 +269,8 @@ func (q *Queries) EnsureGapHealCursor(ctx context.Context, installationID int64)
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.LeaseToken,
+		&i.LeaseUntil,
 	)
 	return i, err
 }
@@ -250,7 +309,7 @@ func (q *Queries) EnsureSweepCursor(ctx context.Context, arg EnsureSweepCursorPa
 }
 
 const getGapHealCursorForUpdate = `-- name: GetGapHealCursorForUpdate :one
-SELECT installation_id, cursor, cutoff, started_at, updated_at, completed_at
+SELECT installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
 FROM gap_heal_cursors
 WHERE installation_id = $1
 FOR UPDATE
@@ -266,6 +325,8 @@ func (q *Queries) GetGapHealCursorForUpdate(ctx context.Context, installationID 
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.LeaseToken,
+		&i.LeaseUntil,
 	)
 	return i, err
 }
@@ -932,6 +993,28 @@ func (q *Queries) ReapOrphanedRepositorySweepCursors(ctx context.Context, instal
 	return result.RowsAffected(), nil
 }
 
+const renewGapHealLease = `-- name: RenewGapHealLease :execrows
+UPDATE gap_heal_cursors
+SET lease_until = $1
+WHERE installation_id = $2
+  AND lease_token = $3
+  AND completed_at IS NULL
+`
+
+type RenewGapHealLeaseParams struct {
+	LeaseUntil     pgtype.Timestamptz
+	InstallationID int64
+	LeaseToken     pgtype.Text
+}
+
+func (q *Queries) RenewGapHealLease(ctx context.Context, arg RenewGapHealLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, renewGapHealLease, arg.LeaseUntil, arg.InstallationID, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const restartSweepCursorPass = `-- name: RestartSweepCursorPass :one
 UPDATE sweep_cursors
 SET cursor = $1,
@@ -983,19 +1066,29 @@ SET cursor = '',
     cutoff = $1,
     started_at = $2,
     updated_at = $2,
-    completed_at = NULL
-WHERE installation_id = $3
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at
+    completed_at = NULL,
+    lease_token = $3,
+    lease_until = $4
+WHERE installation_id = $5
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
 `
 
 type StartGapHealCursorParams struct {
 	Cutoff         pgtype.Timestamptz
 	StartedAt      pgtype.Timestamptz
+	LeaseToken     pgtype.Text
+	LeaseUntil     pgtype.Timestamptz
 	InstallationID int64
 }
 
 func (q *Queries) StartGapHealCursor(ctx context.Context, arg StartGapHealCursorParams) (GapHealCursor, error) {
-	row := q.db.QueryRow(ctx, startGapHealCursor, arg.Cutoff, arg.StartedAt, arg.InstallationID)
+	row := q.db.QueryRow(ctx, startGapHealCursor,
+		arg.Cutoff,
+		arg.StartedAt,
+		arg.LeaseToken,
+		arg.LeaseUntil,
+		arg.InstallationID,
+	)
 	var i GapHealCursor
 	err := row.Scan(
 		&i.InstallationID,
@@ -1004,6 +1097,8 @@ func (q *Queries) StartGapHealCursor(ctx context.Context, arg StartGapHealCursor
 		&i.StartedAt,
 		&i.UpdatedAt,
 		&i.CompletedAt,
+		&i.LeaseToken,
+		&i.LeaseUntil,
 	)
 	return i, err
 }
