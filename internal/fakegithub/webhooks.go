@@ -118,25 +118,29 @@ func (s *Server) listAppHookDeliveries(
 		}
 		perPage = value
 	}
-	var beforeID int64
+	var afterID int64
 	if raw := r.URL.Query().Get("cursor"); raw != "" {
 		value, err := decodeDeliveryCursor(raw)
 		if err != nil {
 			http.Error(w, "bad cursor", http.StatusUnprocessableEntity)
 			return
 		}
-		beforeID = value
+		afterID = value
 	}
 	deliveries := s.Deliveries()
-	if beforeID > 0 {
-		filtered := make([]HookDelivery, 0, len(deliveries))
+	if afterID > 0 {
+		boundary := -1
 		for index := range deliveries {
-			delivery := &deliveries[index]
-			if delivery.ID < beforeID {
-				filtered = append(filtered, *delivery)
+			if deliveries[index].ID == afterID {
+				boundary = index
+				break
 			}
 		}
-		deliveries = filtered
+		if boundary < 0 {
+			http.Error(w, "expired cursor", http.StatusUnprocessableEntity)
+			return
+		}
+		deliveries = deliveries[boundary+1:]
 	}
 	end := min(perPage, len(deliveries))
 	page := deliveries[:end]

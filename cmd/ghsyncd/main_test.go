@@ -172,6 +172,7 @@ func TestEveryLeaderEligibleRoleGetsIdenticalPeriodicTable(t *testing.T) {
 		GapWindow:                  6 * time.Hour,
 		GapPageSize:                100,
 		GapMaxPages:                10,
+		GapDeepScanPeriod:          24 * time.Hour,
 		DriftPeriod:                time.Hour,
 		DriftSampleSize:            10,
 		DriftPageSize:              100,

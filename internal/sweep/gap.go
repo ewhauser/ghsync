@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -17,6 +18,12 @@ import (
 )
 
 var errGapHealLeaseLost = errors.New("delivery-gap lease lost")
+
+const (
+	gapCursorVersion = 1
+	gapScanDeep      = "deep"
+	gapScanIncrement = "incremental"
+)
 
 func (s *Service) HealDeliveryGaps(
 	ctx context.Context,
@@ -46,8 +53,14 @@ func (s *Service) HealDeliveryGaps(
 		cancelWork(nil)
 	}()
 	cursor := state.Cursor
+	highWatermark := state.HighWatermarkAt
+	observedHighWatermark := state.PassHighWatermarkAt
+	boundaryDeliveryID := state.BoundaryDeliveryID
+	observedBoundaryDeliveryID := state.PassBoundaryDeliveryID
 	seen := make(map[string]struct{})
-	for pageNumber := 1; pageNumber <= s.config.GapMaxPages; pageNumber++ {
+	pageNumber := 0
+	restartedCursor := false
+	for pageNumber < s.config.GapMaxPages {
 		deliveries, response, err := s.deliveries.ListAppHookDeliveries(
 			workCtx,
 			gh.ListAppHookDeliveriesOptions{
@@ -57,20 +70,61 @@ func (s *Service) HealDeliveryGaps(
 			"",
 		)
 		if err != nil {
+			if cursor != "" && !restartedCursor &&
+				isInvalidDeliveryCursor(err) {
+				state, err = s.restartGapWindow(
+					ctx,
+					&state,
+					args.LeaseToken,
+				)
+				if err != nil {
+					return err
+				}
+				cursor = state.Cursor
+				highWatermark = state.HighWatermarkAt
+				observedHighWatermark = state.PassHighWatermarkAt
+				boundaryDeliveryID = state.BoundaryDeliveryID
+				observedBoundaryDeliveryID = state.PassBoundaryDeliveryID
+				restartedCursor = true
+				continue
+			}
 			if cause := context.Cause(workCtx); cause != nil &&
 				!errors.Is(cause, context.Canceled) {
 				return cause
 			}
 			return fmt.Errorf("list App webhook deliveries: %w", err)
 		}
+		pageNumber++
 		candidates := make([]gh.AppHookDelivery, 0, len(deliveries))
+		reachedHighWatermark := false
+		pageWithinLookback := false
 		for index := range deliveries {
 			delivery := &deliveries[index]
-			// GitHub does not contractually promise delivery-list ordering.
-			// Scan to the terminal cursor and only filter membership in the
-			// fixed time window; an old row never terminates the scan.
-			if delivery.DeliveredAt.Before(state.Cutoff.Time) ||
-				delivery.GUID == "" || delivery.ID <= 0 {
+			if cursor == "" && observedBoundaryDeliveryID == 0 &&
+				delivery.ID > 0 {
+				observedBoundaryDeliveryID = delivery.ID
+			}
+			if !observedHighWatermark.Valid ||
+				delivery.DeliveredAt.After(observedHighWatermark.Time) {
+				observedHighWatermark = repoutil.Timestamptz(
+					delivery.DeliveredAt,
+				)
+			}
+			// Delivery IDs are not an ordering key across redeliveries. The
+			// cheap pass uses the prior root delivery ID only as an exact
+			// boundary identity and treats the remainder of that page as
+			// overlap. The delivered-at watermark is durable evidence, not an
+			// ID comparison. The scheduled deep pass covers deliveries listed
+			// late behind this boundary.
+			if state.ScanMode == gapScanIncrement && highWatermark.Valid &&
+				boundaryDeliveryID > 0 && delivery.ID == boundaryDeliveryID {
+				reachedHighWatermark = true
+			}
+			if delivery.DeliveredAt.Before(state.Cutoff.Time) {
+				continue
+			}
+			pageWithinLookback = true
+			if delivery.GUID == "" || delivery.ID <= 0 {
 				continue
 			}
 			if _, duplicate := seen[delivery.GUID]; duplicate {
@@ -82,8 +136,16 @@ func (s *Service) HealDeliveryGaps(
 		if err := s.redeliverMissing(workCtx, candidates); err != nil {
 			return err
 		}
-		if response.NextCursor == "" {
-			return s.completeGapWindow(ctx, cursor, args.LeaseToken)
+		reachedLookbackEnd := len(deliveries) > 0 && !pageWithinLookback
+		if response.NextCursor == "" || reachedHighWatermark ||
+			reachedLookbackEnd {
+			return s.completeGapWindow(
+				ctx,
+				cursor,
+				observedHighWatermark,
+				observedBoundaryDeliveryID,
+				args.LeaseToken,
+			)
 		}
 		next := response.NextCursor
 		capped := pageNumber == s.config.GapMaxPages
@@ -91,6 +153,8 @@ func (s *Service) HealDeliveryGaps(
 			ctx,
 			cursor,
 			next,
+			observedHighWatermark,
+			observedBoundaryDeliveryID,
 			capped,
 			args.LeaseToken,
 		); err != nil {
@@ -143,20 +207,49 @@ func (s *Service) loadOrStartGapWindow(
 	}
 	now := s.config.Now().UTC()
 	leaseUntil := now.Add(s.config.GapLeaseTTL)
+	lookback := s.gapLookback()
+	shapeCompatible := s.gapCursorShapeCompatible(&state)
 	if !state.StartedAt.Valid || state.CompletedAt.Valid {
 		// Only a fresh periodic kickoff may open a new comparison window. A
 		// delayed continuation from an already-completed window must be inert.
 		if args.Cursor != "" {
 			return dbgen.GapHealCursor{}, false, nil
 		}
+		scanMode := gapScanIncrement
+		highWatermark := state.HighWatermarkAt
+		boundaryDeliveryID := state.BoundaryDeliveryID
+		deepDue := !shapeCompatible || !state.LastDeepStartedAt.Valid ||
+			!state.LastDeepStartedAt.Time.After(
+				now.Add(-s.config.GapDeepScanPeriod),
+			)
+		if deepDue || !highWatermark.Valid || boundaryDeliveryID == 0 {
+			scanMode = gapScanDeep
+		}
+		if !shapeCompatible {
+			highWatermark = pgtype.Timestamptz{}
+			boundaryDeliveryID = 0
+		}
+		cutoff := now.Add(-lookback)
+		if scanMode == gapScanDeep {
+			cutoff = s.gapDeepCutoff(now, &state)
+		}
 		state, err = queries.StartGapHealCursor(
 			ctx,
 			dbgen.StartGapHealCursorParams{
-				Cutoff:         repoutil.Timestamptz(now.Add(-s.config.GapWindow)),
-				StartedAt:      repoutil.Timestamptz(now),
-				InstallationID: s.config.InstallationID,
-				LeaseToken:     pgtype.Text{String: args.LeaseToken, Valid: true},
-				LeaseUntil:     repoutil.Timestamptz(leaseUntil),
+				Cutoff:             repoutil.Timestamptz(cutoff),
+				StartedAt:          repoutil.Timestamptz(now),
+				HighWatermarkAt:    highWatermark,
+				BoundaryDeliveryID: boundaryDeliveryID,
+				ScanMode:           scanMode,
+				CursorVersion:      gapCursorVersion,
+				LookbackDurationNs: lookback.Nanoseconds(),
+				PageSize:           int32(s.config.GapPageSize),
+				InstallationID:     s.config.InstallationID,
+				LeaseToken: pgtype.Text{
+					String: args.LeaseToken,
+					Valid:  true,
+				},
+				LeaseUntil: repoutil.Timestamptz(leaseUntil),
 			},
 		)
 		if err != nil {
@@ -175,20 +268,59 @@ func (s *Service) loadOrStartGapWindow(
 		if leaseHeld {
 			return dbgen.GapHealCursor{}, false, nil
 		}
-		state, err = queries.ClaimGapHealCursor(
-			ctx,
-			dbgen.ClaimGapHealCursorParams{
-				LeaseToken:     pgtype.Text{String: args.LeaseToken, Valid: true},
-				LeaseUntil:     repoutil.Timestamptz(leaseUntil),
-				ClaimedAt:      repoutil.Timestamptz(now),
-				InstallationID: s.config.InstallationID,
-			},
-		)
-		if err != nil {
-			return dbgen.GapHealCursor{}, false, fmt.Errorf(
-				"claim delivery-gap lease: %w",
-				err,
+		passStale := state.StartedAt.Time.Before(now.Add(-lookback))
+		if !shapeCompatible || passStale {
+			highWatermark := state.HighWatermarkAt
+			boundaryDeliveryID := state.BoundaryDeliveryID
+			if !shapeCompatible {
+				highWatermark = pgtype.Timestamptz{}
+				boundaryDeliveryID = 0
+			}
+			cutoff := s.gapDeepCutoff(now, &state)
+			state, err = queries.StartGapHealCursor(
+				ctx,
+				dbgen.StartGapHealCursorParams{
+					Cutoff:             repoutil.Timestamptz(cutoff),
+					StartedAt:          repoutil.Timestamptz(now),
+					HighWatermarkAt:    highWatermark,
+					BoundaryDeliveryID: boundaryDeliveryID,
+					ScanMode:           gapScanDeep,
+					CursorVersion:      gapCursorVersion,
+					LookbackDurationNs: lookback.Nanoseconds(),
+					PageSize:           int32(s.config.GapPageSize),
+					LeaseToken: pgtype.Text{
+						String: args.LeaseToken,
+						Valid:  true,
+					},
+					LeaseUntil:     repoutil.Timestamptz(leaseUntil),
+					InstallationID: s.config.InstallationID,
+				},
 			)
+			if err != nil {
+				return dbgen.GapHealCursor{}, false, fmt.Errorf(
+					"restart stale delivery-gap cursor: %w",
+					err,
+				)
+			}
+		} else {
+			state, err = queries.ClaimGapHealCursor(
+				ctx,
+				dbgen.ClaimGapHealCursorParams{
+					LeaseToken: pgtype.Text{
+						String: args.LeaseToken,
+						Valid:  true,
+					},
+					LeaseUntil:     repoutil.Timestamptz(leaseUntil),
+					ClaimedAt:      repoutil.Timestamptz(now),
+					InstallationID: s.config.InstallationID,
+				},
+			)
+			if err != nil {
+				return dbgen.GapHealCursor{}, false, fmt.Errorf(
+					"claim delivery-gap lease: %w",
+					err,
+				)
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -198,6 +330,34 @@ func (s *Service) loadOrStartGapWindow(
 		)
 	}
 	return state, true, nil
+}
+
+func (s *Service) gapLookback() time.Duration {
+	return s.config.GapWindow + s.config.GapDeepScanPeriod
+}
+
+func (s *Service) gapDeepCutoff(
+	now time.Time,
+	state *dbgen.GapHealCursor,
+) time.Time {
+	cutoff := now.Add(-s.gapLookback())
+	if state.LastDeepStartedAt.Valid {
+		priorBoundary := state.LastDeepStartedAt.Time.Add(-s.config.GapWindow)
+		if priorBoundary.Before(cutoff) {
+			cutoff = priorBoundary
+		}
+	}
+	oldestRetained := now.Add(-githubDeliveryRetention)
+	if cutoff.Before(oldestRetained) {
+		return oldestRetained
+	}
+	return cutoff
+}
+
+func (s *Service) gapCursorShapeCompatible(state *dbgen.GapHealCursor) bool {
+	return state.CursorVersion == gapCursorVersion &&
+		state.LookbackDurationNs == s.gapLookback().Nanoseconds() &&
+		state.PageSize == int32(s.config.GapPageSize)
 }
 
 func (s *Service) maintainGapLease(
@@ -240,10 +400,48 @@ func (s *Service) maintainGapLease(
 	}
 }
 
+func isInvalidDeliveryCursor(err error) bool {
+	var httpErr *gh.HTTPError
+	if !errors.As(err, &httpErr) || httpErr == nil {
+		return false
+	}
+	return httpErr.StatusCode == http.StatusUnprocessableEntity
+}
+
+func (s *Service) restartGapWindow(
+	ctx context.Context,
+	state *dbgen.GapHealCursor,
+	leaseToken string,
+) (dbgen.GapHealCursor, error) {
+	now := s.config.Now().UTC()
+	restarted, err := dbgen.New(s.pool).RestartGapHealCursor(
+		ctx,
+		dbgen.RestartGapHealCursorParams{
+			RestartedAt:    repoutil.Timestamptz(now),
+			LeaseUntil:     repoutil.Timestamptz(now.Add(s.config.GapLeaseTTL)),
+			InstallationID: s.config.InstallationID,
+			ExpectedCursor: state.Cursor,
+			LeaseToken: pgtype.Text{
+				String: leaseToken,
+				Valid:  true,
+			},
+		},
+	)
+	if err != nil {
+		return dbgen.GapHealCursor{}, fmt.Errorf(
+			"restart invalid delivery-gap cursor: %w",
+			err,
+		)
+	}
+	return restarted, nil
+}
+
 func (s *Service) advanceGapWindow(
 	ctx context.Context,
 	expected string,
 	next string,
+	observedHighWatermark pgtype.Timestamptz,
+	observedBoundaryDeliveryID int64,
 	scheduleContinuation bool,
 	leaseToken string,
 ) error {
@@ -252,19 +450,22 @@ func (s *Service) advanceGapWindow(
 		return fmt.Errorf("begin delivery-gap advance: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	now := s.config.Now().UTC()
 	if _, err := dbgen.New(tx).AdvanceGapHealCursor(
 		ctx,
 		dbgen.AdvanceGapHealCursorParams{
-			NextCursor:     next,
-			UpdatedAt:      repoutil.Timestamptz(s.config.Now()),
-			InstallationID: s.config.InstallationID,
-			ExpectedCursor: expected,
+			NextCursor:                 next,
+			ObservedHighWatermarkAt:    observedHighWatermark,
+			ObservedBoundaryDeliveryID: observedBoundaryDeliveryID,
+			UpdatedAt:                  repoutil.Timestamptz(now),
+			InstallationID:             s.config.InstallationID,
+			ExpectedCursor:             expected,
 			LeaseToken: pgtype.Text{
 				String: leaseToken,
 				Valid:  true,
 			},
 			LeaseUntil: repoutil.Timestamptz(
-				s.config.Now().UTC().Add(s.config.GapLeaseTTL),
+				now.Add(s.config.GapLeaseTTL),
 			),
 		},
 	); err != nil {
@@ -283,7 +484,9 @@ func (s *Service) advanceGapWindow(
 				Cursor:       next,
 				LeaseToken:   leaseToken,
 			},
-			gapContinuationInsertOpts(),
+			gapContinuationInsertOpts(
+				now.Add(s.config.GapContinuationDelay),
+			),
 		); err != nil {
 			return fmt.Errorf(
 				"schedule delivery-gap continuation: %w",
@@ -300,14 +503,18 @@ func (s *Service) advanceGapWindow(
 func (s *Service) completeGapWindow(
 	ctx context.Context,
 	expected string,
+	observedHighWatermark pgtype.Timestamptz,
+	observedBoundaryDeliveryID int64,
 	leaseToken string,
 ) error {
 	_, err := dbgen.New(s.pool).CompleteGapHealCursor(
 		ctx,
 		dbgen.CompleteGapHealCursorParams{
-			CompletedAt:    repoutil.Timestamptz(s.config.Now()),
-			InstallationID: s.config.InstallationID,
-			ExpectedCursor: expected,
+			ObservedHighWatermarkAt:    observedHighWatermark,
+			ObservedBoundaryDeliveryID: observedBoundaryDeliveryID,
+			CompletedAt:                repoutil.Timestamptz(s.config.Now()),
+			InstallationID:             s.config.InstallationID,
+			ExpectedCursor:             expected,
 			LeaseToken: pgtype.Text{
 				String: leaseToken,
 				Valid:  true,
@@ -320,10 +527,11 @@ func (s *Service) completeGapWindow(
 	return nil
 }
 
-func gapContinuationInsertOpts() *river.InsertOpts {
+func gapContinuationInsertOpts(scheduledAt time.Time) *river.InsertOpts {
 	return &river.InsertOpts{
-		Queue:    queue.QueueReconcile,
-		Priority: 1,
+		Queue:       queue.QueueReconcile,
+		Priority:    1,
+		ScheduledAt: scheduledAt,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
 			ByState: []rivertype.JobState{

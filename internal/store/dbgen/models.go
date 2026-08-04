@@ -204,14 +204,24 @@ type DriftSampleCursor struct {
 }
 
 type GapHealCursor struct {
-	InstallationID int64
-	Cursor         string
-	Cutoff         pgtype.Timestamptz
-	StartedAt      pgtype.Timestamptz
-	UpdatedAt      pgtype.Timestamptz
-	CompletedAt    pgtype.Timestamptz
-	LeaseToken     pgtype.Text
-	LeaseUntil     pgtype.Timestamptz
+	InstallationID         int64
+	Cursor                 string
+	Cutoff                 pgtype.Timestamptz
+	StartedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+	CompletedAt            pgtype.Timestamptz
+	LeaseToken             pgtype.Text
+	LeaseUntil             pgtype.Timestamptz
+	HighWatermarkAt        pgtype.Timestamptz
+	PassHighWatermarkAt    pgtype.Timestamptz
+	BoundaryDeliveryID     int64
+	PassBoundaryDeliveryID int64
+	LastDeepStartedAt      pgtype.Timestamptz
+	LastDeepCompletedAt    pgtype.Timestamptz
+	ScanMode               string
+	CursorVersion          int32
+	LookbackDurationNs     int64
+	PageSize               int32
 }
 
 type InstallationBackfillCursor struct {

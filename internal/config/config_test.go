@@ -330,6 +330,8 @@ func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("SWEEP_OPEN_STACK_MAX_STALENESS", "30s")
 	t.Setenv("SWEEP_PAGE_SIZE", "50")
 	t.Setenv("GAP_COMPARISON_WINDOW", "2h")
+	t.Setenv("GAP_CONTINUATION_DELAY", "45s")
+	t.Setenv("GAP_DEEP_SCAN_PERIOD", "12h")
 	t.Setenv("DRIFT_SAMPLE_SIZE", "7")
 	t.Setenv("DRIFT_PAGE_SIZE", "50")
 	t.Setenv("RETENTION_AGE", "2160h")
@@ -341,6 +343,8 @@ func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 	if cfg.SweepOpenStackMaxStaleness != 30*time.Second ||
 		cfg.SweepPageSize != 50 ||
 		cfg.GapWindow != 2*time.Hour ||
+		cfg.GapContinuationDelay != 45*time.Second ||
+		cfg.GapDeepScanPeriod != 12*time.Hour ||
 		cfg.DriftSampleSize != 7 ||
 		cfg.DriftPageSize != 50 ||
 		cfg.RetentionAge != 90*24*time.Hour ||
@@ -355,6 +359,8 @@ func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
 		"SWEEP_PAGE_SIZE":             "101",
 		"GAP_PAGE_SIZE":               "101",
 		"GAP_MAX_PAGES":               "0",
+		"GAP_CONTINUATION_DELAY":      "0s",
+		"GAP_DEEP_SCAN_PERIOD":        "0s",
 		"DRIFT_SAMPLE_SIZE":           "none",
 		"DRIFT_PAGE_SIZE":             "101",
 		"RETENTION_AGE":               "-1h",
@@ -367,6 +373,16 @@ func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
 				t.Fatalf("%s=%q accepted", key, value)
 			}
 		})
+	}
+}
+
+func TestFromEnvRejectsGapLookbackBeyondGitHubRetention(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("GAP_COMPARISON_WINDOW", "49h")
+	t.Setenv("GAP_DEEP_SCAN_PERIOD", "24h")
+	_, err := FromEnv()
+	if err == nil || !strings.Contains(err.Error(), "72h delivery retention") {
+		t.Fatalf("over-retention gap lookback error = %v", err)
 	}
 }
 
@@ -530,6 +546,8 @@ func clearConfigEnv(t *testing.T) {
 		"GAP_HEAL_PERIOD",
 		"GAP_COMPARISON_WINDOW",
 		"GAP_HEAL_LEASE_TTL",
+		"GAP_CONTINUATION_DELAY",
+		"GAP_DEEP_SCAN_PERIOD",
 		"GAP_PAGE_SIZE",
 		"GAP_MAX_PAGES",
 		"DRIFT_PERIOD",

@@ -1000,6 +1000,8 @@ func sweepConfig(cfg *config.Config) sweep.Config {
 		GapPageSize:           cfg.GapPageSize,
 		GapMaxPages:           cfg.GapMaxPages,
 		GapLeaseTTL:           cfg.GapLeaseTTL,
+		GapContinuationDelay:  cfg.GapContinuationDelay,
+		GapDeepScanPeriod:     cfg.GapDeepScanPeriod,
 		RetentionPeriod:       cfg.RetentionPeriod,
 		RetentionAge:          cfg.RetentionAge,
 		RetentionBatchSize:    cfg.RetentionBatchSize,
