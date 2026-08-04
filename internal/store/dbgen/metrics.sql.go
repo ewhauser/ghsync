@@ -314,6 +314,7 @@ WITH expected AS (
     UNION ALL SELECT 'sweep', 'repo_rules'
     UNION ALL SELECT 'sweep', 'closed_tracked'
     UNION ALL SELECT 'watermarker', 'entities'
+    UNION ALL SELECT 'deriver', 'dirty_sets'
 )
 SELECT expected.component,
        expected.operation,

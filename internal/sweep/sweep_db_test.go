@@ -1747,3 +1747,44 @@ func TestDispatcherRulesFileIsLoadable(t *testing.T) {
 		t.Fatalf("file-backed rules produced %+v", intents)
 	}
 }
+
+// Regression for issue #21: repo_rules and closed_tracked kickoffs must
+// record their durable C-O4 heartbeat even when no entity is stale, and
+// every subsequent pass must advance the durable success count.
+func TestRepoRulesAndClosedKickoffsRecordHeartbeats(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 100)
+	ctx := context.Background()
+
+	for _, kind := range []string{KindRepoRules, KindClosed} {
+		for pass := int64(1); pass <= 2; pass++ {
+			if err := h.service.Kickoff(ctx, KickoffArgs{
+				SweepKind:    kind,
+				Installation: 1,
+			}); err != nil {
+				t.Fatalf("%s kickoff pass %d: %v", kind, pass, err)
+			}
+			var successes, samples int64
+			if err := h.pool.QueryRow(ctx, `
+				SELECT success_count, sample_count
+				FROM operation_heartbeats
+				WHERE installation_id = 1
+				  AND component = 'sweep'
+				  AND operation = $1
+			`, kind).Scan(&successes, &samples); err != nil {
+				t.Fatalf("%s heartbeat pass %d: %v", kind, pass, err)
+			}
+			if successes != pass {
+				t.Fatalf(
+					"%s success count after pass %d = %d",
+					kind,
+					pass,
+					successes,
+				)
+			}
+			if samples < 0 {
+				t.Fatalf("%s sample count = %d", kind, samples)
+			}
+		}
+	}
+}

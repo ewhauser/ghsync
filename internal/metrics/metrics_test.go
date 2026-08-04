@@ -180,6 +180,9 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		    (1, 'drift', 'detector', 7,
 		     clock_timestamp() - interval '10 seconds', 11,
 		     clock_timestamp() - interval '5 seconds'),
+		    (1, 'deriver', 'dirty_sets', 21,
+		     clock_timestamp() - interval '30 seconds', 23,
+		     clock_timestamp() - interval '25 seconds'),
 		    (1, 'sweep', 'repositories', 13,
 		     clock_timestamp() - interval '20 seconds', 17,
 		     clock_timestamp() - interval '15 seconds')
@@ -258,6 +261,12 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		"ghsync_c_q2_outstanding_generations",
 		"ghsync_c_o4_operation_samples",
 		"ghsync_c_o4_last_operation_sample_age_seconds",
+		// Issue #22: the expected-operation roster must include the deriver
+		// heartbeat, and unseeded expected operations still export series.
+		`ghsync_c_o4_last_operation_success_age_seconds{component="deriver",operation="dirty_sets"}`,
+		`ghsync_c_o4_last_operation_sample_age_seconds{component="deriver",operation="dirty_sets"}`,
+		`ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"}`,
+		`ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"}`,
 		"ghsync_c_p5_deriver_dirty_backlog",
 		`ghsync_c_r2_sweep_period_seconds{sweep_kind="stacks"} 225`,
 		`ghsync_c_o4_role_enabled{role="fetch"} 1`,
