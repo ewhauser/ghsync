@@ -314,6 +314,18 @@ SET cursor = '',
     started_at = sqlc.arg(started_at),
     updated_at = sqlc.arg(started_at),
     completed_at = NULL,
+    high_watermark_at = sqlc.narg(high_watermark_at),
+    pass_high_watermark_at = NULL,
+    boundary_delivery_id = sqlc.arg(boundary_delivery_id),
+    pass_boundary_delivery_id = 0,
+    scan_mode = sqlc.arg(scan_mode),
+    last_deep_started_at = CASE
+        WHEN sqlc.arg(scan_mode)::text = 'deep' THEN sqlc.arg(started_at)
+        ELSE last_deep_started_at
+    END,
+    cursor_version = sqlc.arg(cursor_version),
+    lookback_duration_ns = sqlc.arg(lookback_duration_ns),
+    page_size = sqlc.arg(page_size),
     lease_token = sqlc.arg(lease_token),
     lease_until = sqlc.arg(lease_until)
 WHERE installation_id = sqlc.arg(installation_id)
@@ -338,7 +350,29 @@ WHERE installation_id = sqlc.arg(installation_id)
 -- name: AdvanceGapHealCursor :one
 UPDATE gap_heal_cursors
 SET cursor = sqlc.arg(next_cursor),
+    pass_high_watermark_at = GREATEST(
+        pass_high_watermark_at,
+        sqlc.narg(observed_high_watermark_at)
+    ),
+    pass_boundary_delivery_id = CASE
+        WHEN pass_boundary_delivery_id = 0
+            THEN sqlc.arg(observed_boundary_delivery_id)
+        ELSE pass_boundary_delivery_id
+    END,
     updated_at = sqlc.arg(updated_at),
+    lease_until = sqlc.arg(lease_until)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND cursor = sqlc.arg(expected_cursor)
+  AND lease_token = sqlc.arg(lease_token)
+  AND completed_at IS NULL
+RETURNING *;
+
+-- name: RestartGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = '',
+    pass_high_watermark_at = NULL,
+    pass_boundary_delivery_id = 0,
+    updated_at = sqlc.arg(restarted_at),
     lease_until = sqlc.arg(lease_until)
 WHERE installation_id = sqlc.arg(installation_id)
   AND cursor = sqlc.arg(expected_cursor)
@@ -349,6 +383,22 @@ RETURNING *;
 -- name: CompleteGapHealCursor :one
 UPDATE gap_heal_cursors
 SET cursor = '',
+    high_watermark_at = GREATEST(
+        high_watermark_at,
+        pass_high_watermark_at,
+        sqlc.narg(observed_high_watermark_at)
+    ),
+    pass_high_watermark_at = NULL,
+    boundary_delivery_id = COALESCE(
+        NULLIF(pass_boundary_delivery_id, 0),
+        NULLIF(sqlc.arg(observed_boundary_delivery_id), 0),
+        boundary_delivery_id
+    ),
+    pass_boundary_delivery_id = 0,
+    last_deep_completed_at = CASE
+        WHEN scan_mode = 'deep' THEN sqlc.arg(completed_at)
+        ELSE last_deep_completed_at
+    END,
     updated_at = sqlc.arg(completed_at),
     completed_at = sqlc.arg(completed_at),
     lease_token = NULL,

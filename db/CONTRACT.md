@@ -761,5 +761,11 @@ migration period.
 
 All unlisted tables are private, including webhook, budget, queue, alias,
 backfill, sweep, delivery-gap, drift, and `derivation_dirty` state, River
-tables, and `schema_migrations`. Private state has no consumer compatibility
-guarantee.
+tables, and `schema_migrations`. `gap_heal_cursors.high_watermark_at` is the
+greatest delivery time observed by a completed C-R4 pass;
+`boundary_delivery_id` is an exact prior-root identity, not an ordered ID
+watermark. The separate pass fields preserve both values across capped jobs
+and restarts. `scan_mode`, `last_deep_started_at`, `last_deep_completed_at`,
+and the versioned window shape make the periodic deep-scan guarantee durable.
+These cursor rows are backup state even though they have no consumer
+compatibility guarantee.

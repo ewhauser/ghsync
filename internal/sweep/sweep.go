@@ -39,7 +39,10 @@ const (
 	jobKindGapHeal = "sweep_gap_heal"
 	jobKindPrune   = "retention_prune"
 
-	defaultGapLeaseTTL = 5 * time.Minute
+	defaultGapLeaseTTL          = 5 * time.Minute
+	defaultGapContinuationDelay = 30 * time.Second
+	defaultGapDeepScanPeriod    = 24 * time.Hour
+	githubDeliveryRetention     = 72 * time.Hour
 )
 
 var gapLeaseFallbackCounter atomic.Uint64
@@ -72,6 +75,10 @@ type Config struct {
 	GapMaxPages int
 	// GapLeaseTTL bounds failover after a gap-heal worker stops making progress.
 	GapLeaseTTL time.Duration
+	// GapContinuationDelay paces page-cap continuations.
+	GapContinuationDelay time.Duration
+	// GapDeepScanPeriod bounds detection of deliveries behind the cheap cursor.
+	GapDeepScanPeriod time.Duration
 
 	// RetentionPeriod controls payload-pruner scheduling.
 	RetentionPeriod time.Duration
@@ -93,16 +100,18 @@ type PruneHook func(context.Context, string, int64)
 
 func (c *Config) validate() error {
 	for name, value := range map[string]time.Duration{
-		"open stack staleness": c.OpenStackMaxStaleness,
-		"open PR staleness":    c.OpenPRMaxStaleness,
-		"repo rules staleness": c.RepoRulesMaxStaleness,
-		"closed staleness":     c.ClosedMaxStaleness,
-		"repository period":    c.RepositoryListPeriod,
-		"gap-heal period":      c.GapHealPeriod,
-		"gap-heal lease TTL":   c.GapLeaseTTL,
-		"gap window":           c.GapWindow,
-		"retention period":     c.RetentionPeriod,
-		"retention age":        c.RetentionAge,
+		"open stack staleness":   c.OpenStackMaxStaleness,
+		"open PR staleness":      c.OpenPRMaxStaleness,
+		"repo rules staleness":   c.RepoRulesMaxStaleness,
+		"closed staleness":       c.ClosedMaxStaleness,
+		"repository period":      c.RepositoryListPeriod,
+		"gap-heal period":        c.GapHealPeriod,
+		"gap-heal lease TTL":     c.GapLeaseTTL,
+		"gap continuation delay": c.GapContinuationDelay,
+		"gap deep-scan period":   c.GapDeepScanPeriod,
+		"gap window":             c.GapWindow,
+		"retention period":       c.RetentionPeriod,
+		"retention age":          c.RetentionAge,
 	} {
 		if value <= 0 {
 			return fmt.Errorf("%s must be positive", name)
@@ -112,6 +121,13 @@ func (c *Config) validate() error {
 		c.GapPageSize <= 0 || c.GapPageSize > 100 ||
 		c.GapMaxPages <= 0 || c.RetentionBatchSize <= 0 {
 		return fmt.Errorf("sweep page sizes/max pages are invalid")
+	}
+	if c.GapWindow > githubDeliveryRetention ||
+		c.GapDeepScanPeriod > githubDeliveryRetention-c.GapWindow {
+		return fmt.Errorf(
+			"gap window plus deep-scan period must not exceed %s",
+			githubDeliveryRetention,
+		)
 	}
 	for _, bound := range []time.Duration{
 		c.OpenStackMaxStaleness,
@@ -198,7 +214,7 @@ func (LogObserver) GapWindowIncomplete(
 	pages int,
 ) {
 	slog.Debug(
-		"C-R4 webhook delivery gap window hit its page cap; continuation scheduled",
+		"C-R4 webhook delivery gap window hit its page cap; paced continuation scheduled",
 		"cursor", cursor,
 		"pages", pages,
 	)
@@ -266,6 +282,12 @@ func New(options Options) (*Service, error) { //nolint:gocritic // constructor n
 	}
 	if options.Config.GapLeaseTTL <= 0 {
 		options.Config.GapLeaseTTL = defaultGapLeaseTTL
+	}
+	if options.Config.GapContinuationDelay <= 0 {
+		options.Config.GapContinuationDelay = defaultGapContinuationDelay
+	}
+	if options.Config.GapDeepScanPeriod <= 0 {
+		options.Config.GapDeepScanPeriod = defaultGapDeepScanPeriod
 	}
 	if err := options.Config.validate(); err != nil {
 		return nil, err

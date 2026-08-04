@@ -257,6 +257,7 @@ func newSweepHarness(
 			GapWindow:             6 * time.Hour,
 			GapPageSize:           pageSize,
 			GapMaxPages:           10,
+			GapDeepScanPeriod:     24 * time.Hour,
 			RetentionPeriod:       24 * time.Hour,
 			RetentionAge:          90 * 24 * time.Hour,
 			RetentionBatchSize:    100,
@@ -1035,6 +1036,8 @@ func TestDisappearanceVerificationTombstonesPRStackAndRepository(
 func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	t.Parallel()
 	h := newSweepHarness(t, 100)
+	now := h.now
+	h.service.config.Now = func() time.Time { return now }
 	h.seedCache(t, []int{4812}, false, false)
 	ingressServer := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
@@ -1045,6 +1048,25 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 		),
 	))
 	defer ingressServer.Close()
+	if _, err := h.fake.EmitWebhook(
+		t.Context(),
+		ingressServer.URL+ingress.WebhookPath,
+		"push",
+		map[string]any{
+			"ref": "refs/heads/baseline",
+			"repository": map[string]any{
+				"full_name": "acme/monolith",
+			},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
 	fixture := h.fixture
 	fixture.PullRequests[1].Title = "truth changed during outage"
 	fixture.PullRequests[1].UpdatedAt = h.now.Add(time.Minute)
@@ -1067,6 +1089,7 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	now = now.Add(h.service.config.GapHealPeriod)
 	dispatcher, err := dispatch.New(
 		h.pool,
 		h.river,
@@ -1123,12 +1146,482 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 	})
 }
 
+func TestGapHealingSteadyStateRequestsScaleWithNewDeliveriesAndRestart(
+	t *testing.T,
+) {
+	t.Parallel()
+	h := newSweepHarness(t, 3)
+	ingressServer := httptest.NewServer(ingress.NewMux(
+		ingress.NewHandler(
+			dbgen.New(h.pool),
+			sweepTestSecret,
+			1<<20,
+			time.Second,
+		),
+	))
+	defer ingressServer.Close()
+	emit := func(count int) {
+		t.Helper()
+		for index := range count {
+			if _, err := h.fake.EmitWebhook(
+				t.Context(),
+				ingressServer.URL+ingress.WebhookPath,
+				"push",
+				map[string]any{
+					"ref": fmt.Sprintf("refs/heads/cursor-%d-%d", count, index),
+					"repository": map[string]any{
+						"full_name": "acme/monolith",
+					},
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	requestDelta := func(run func() error) int {
+		t.Helper()
+		before := h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries")
+		if err := run(); err != nil {
+			t.Fatal(err)
+		}
+		return h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries") - before
+	}
+
+	emit(12)
+	if requests := requestDelta(func() error {
+		return h.service.HealDeliveryGaps(
+			context.Background(),
+			GapHealArgs{Installation: 1},
+		)
+	}); requests != 4 {
+		t.Fatalf("initial delivery-list requests = %d, want 4", requests)
+	}
+	for pass := range 6 {
+		if requests := requestDelta(func() error {
+			return h.service.HealDeliveryGaps(
+				context.Background(),
+				GapHealArgs{Installation: 1},
+			)
+		}); requests != 1 {
+			t.Fatalf(
+				"zero-new pass %d delivery-list requests = %d, want 1",
+				pass+1,
+				requests,
+			)
+		}
+	}
+
+	emit(4)
+	if requests := requestDelta(func() error {
+		return h.service.HealDeliveryGaps(
+			context.Background(),
+			GapHealArgs{Installation: 1},
+		)
+	}); requests != 2 {
+		t.Fatalf("four-new delivery-list requests = %d, want 2", requests)
+	}
+
+	restarted, err := New(Options{
+		Pool:       h.pool,
+		REST:       h.rest,
+		Deliveries: h.service.deliveries,
+		Config:     h.service.config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.SetRiverClient(h.river)
+	emit(1)
+	if requests := requestDelta(func() error {
+		return restarted.HealDeliveryGaps(
+			context.Background(),
+			GapHealArgs{Installation: 1},
+		)
+	}); requests != 1 {
+		t.Fatalf("post-restart one-new requests = %d, want 1", requests)
+	}
+	latest := h.fake.Deliveries()[0]
+	var (
+		highWatermark time.Time
+		boundaryID    int64
+	)
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT high_watermark_at, boundary_delivery_id
+		FROM gap_heal_cursors
+		WHERE installation_id = 1
+	`).Scan(&highWatermark, &boundaryID); err != nil {
+		t.Fatal(err)
+	}
+	if !highWatermark.Equal(latest.DeliveredAt) || boundaryID != latest.ID {
+		t.Fatalf(
+			"durable watermark = %s/%d, want latest delivery %s/%d",
+			highWatermark,
+			boundaryID,
+			latest.DeliveredAt,
+			latest.ID,
+		)
+	}
+}
+
+func TestGapHealingDeepScanCatchesDeliveryBehindIncrementalBoundary(
+	t *testing.T,
+) {
+	t.Parallel()
+	h := newSweepHarness(t, 2)
+	now := h.now
+	h.service.config.Now = func() time.Time { return now }
+	ingressServer := httptest.NewServer(ingress.NewMux(
+		ingress.NewHandler(
+			dbgen.New(h.pool),
+			sweepTestSecret,
+			1<<20,
+			time.Second,
+		),
+	))
+	defer ingressServer.Close()
+	for index := range 6 {
+		if _, err := h.fake.EmitWebhook(
+			t.Context(),
+			ingressServer.URL+ingress.WebhookPath,
+			"push",
+			map[string]any{
+				"ref": fmt.Sprintf("refs/heads/deep-baseline-%d", index),
+				"repository": map[string]any{
+					"full_name": "acme/monolith",
+				},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	boundary := h.fake.Deliveries()[0]
+	if _, err := h.fake.DropWebhook(
+		ingressServer.URL+ingress.WebhookPath,
+		"push",
+		map[string]any{
+			"ref": "refs/heads/listed-late",
+			"repository": map[string]any{
+				"full_name": "acme/monolith",
+			},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	lateID := h.fake.Deliveries()[0].ID
+	if lateID <= boundary.ID {
+		t.Fatalf("late delivery ID = %d, want greater than boundary %d", lateID, boundary.ID)
+	}
+	lateDeliveredAt := boundary.DeliveredAt.Add(-5 * time.Hour)
+	if !h.fake.SetDeliveryTime(lateID, lateDeliveredAt) ||
+		!h.fake.ReorderDelivery(lateID, 4) {
+		t.Fatal("failed to place late delivery behind cursor overlap")
+	}
+
+	now = now.Add(h.service.config.GapHealPeriod)
+	before := h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries")
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if requests := h.fake.RequestCount(
+		http.MethodGet,
+		"/app/hook/deliveries",
+	) - before; requests != 1 {
+		t.Fatalf("incremental list requests = %d, want 1", requests)
+	}
+	if requests := h.fake.RedeliveryRequests(); len(requests) != 0 {
+		t.Fatalf("incremental pass unexpectedly found late delivery: %v", requests)
+	}
+	// Model a deep pass whose completion lagged its durable start by two hours.
+	// The next due decision and cutoff must remain anchored to the start, or the
+	// late delivery ages out of the constructed overlap.
+	if _, err := h.pool.Exec(context.Background(), `
+		UPDATE gap_heal_cursors
+		SET last_deep_completed_at = $1
+		WHERE installation_id = 1
+	`, h.now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	now = h.now.Add(h.service.config.GapDeepScanPeriod)
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if requests := h.fake.RedeliveryRequests(); len(requests) != 1 || requests[0] != lateID {
+		t.Fatalf(
+			"deep-pass redelivery requests = %v, want late delivery %d",
+			requests,
+			lateID,
+		)
+	}
+	var deepCompletedAt time.Time
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT last_deep_completed_at
+		FROM gap_heal_cursors
+		WHERE installation_id = 1
+	`).Scan(&deepCompletedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !deepCompletedAt.Equal(now) {
+		t.Fatalf("last deep completion = %s, want %s", deepCompletedAt, now)
+	}
+}
+
+func TestGapHealingStaleOrLostWatermarkFallsBackToBoundedWindow(
+	t *testing.T,
+) {
+	t.Parallel()
+	for _, mode := range []string{"stale", "lost"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			h := newSweepHarness(t, 2)
+			ingressServer := httptest.NewServer(ingress.NewMux(
+				ingress.NewHandler(
+					dbgen.New(h.pool),
+					sweepTestSecret,
+					1<<20,
+					time.Second,
+				),
+			))
+			defer ingressServer.Close()
+			for index := range 8 {
+				if _, err := h.fake.EmitWebhook(
+					t.Context(),
+					ingressServer.URL+ingress.WebhookPath,
+					"push",
+					map[string]any{
+						"ref": fmt.Sprintf("refs/heads/fallback-%d", index),
+						"repository": map[string]any{
+							"full_name": "acme/monolith",
+						},
+					},
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.service.HealDeliveryGaps(
+				context.Background(),
+				GapHealArgs{Installation: 1},
+			); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "lost" {
+				if _, err := h.pool.Exec(
+					context.Background(),
+					`DELETE FROM gap_heal_cursors WHERE installation_id = 1`,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			now := h.now.Add(h.service.gapLookback() + time.Minute)
+			h.service.config.Now = func() time.Time { return now }
+			before := h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries")
+			if err := h.service.HealDeliveryGaps(
+				context.Background(),
+				GapHealArgs{Installation: 1},
+			); err != nil {
+				t.Fatal(err)
+			}
+			requests := h.fake.RequestCount(
+				http.MethodGet,
+				"/app/hook/deliveries",
+			) - before
+			wantRequests := 1
+			if mode == "stale" {
+				// The prior deep start is retained as the overlap anchor, so a
+				// delayed pass catches up instead of aging unseen rows out.
+				wantRequests = 4
+			}
+			if requests != wantRequests {
+				t.Fatalf(
+					"%s watermark fallback requests = %d, want %d",
+					mode,
+					requests,
+					wantRequests,
+				)
+			}
+		})
+	}
+}
+
+func TestGapHealingInvalidOpaqueCursorRestartsFromBoundedRoot(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 2)
+	ingressServer := httptest.NewServer(ingress.NewMux(
+		ingress.NewHandler(
+			dbgen.New(h.pool),
+			sweepTestSecret,
+			1<<20,
+			time.Second,
+		),
+	))
+	defer ingressServer.Close()
+	for index := range 4 {
+		if _, err := h.fake.EmitWebhook(
+			t.Context(),
+			ingressServer.URL+ingress.WebhookPath,
+			"push",
+			map[string]any{
+				"ref": fmt.Sprintf("refs/heads/invalid-cursor-%d", index),
+				"repository": map[string]any{
+					"full_name": "acme/monolith",
+				},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(context.Background(), `
+		UPDATE gap_heal_cursors
+		SET cursor = 'invalid-opaque-cursor',
+		    started_at = $1,
+		    cutoff = $2,
+		    updated_at = $1,
+		    completed_at = NULL,
+		    pass_high_watermark_at = high_watermark_at,
+		    pass_boundary_delivery_id = boundary_delivery_id
+		WHERE installation_id = 1
+	`, h.now, h.now.Add(-h.service.gapLookback())); err != nil {
+		t.Fatal(err)
+	}
+	before := h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries")
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	requests := h.fake.RequestCount(
+		http.MethodGet,
+		"/app/hook/deliveries",
+	) - before
+	if requests != 3 {
+		t.Fatalf(
+			"invalid cursor recovery requests = %d, want invalid plus two-page deep restart",
+			requests,
+		)
+	}
+	var completed bool
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT completed_at IS NOT NULL
+		FROM gap_heal_cursors
+		WHERE installation_id = 1
+	`).Scan(&completed); err != nil {
+		t.Fatal(err)
+	}
+	if !completed {
+		t.Fatal("invalid cursor recovery did not complete the bounded pass")
+	}
+}
+
+func TestGapHealingIncompatibleWindowShapeRestartsAtBoundedRoot(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 2)
+	h.service.config.GapMaxPages = 1
+	now := h.now
+	h.service.config.Now = func() time.Time { return now }
+	ingressServer := httptest.NewServer(ingress.NewMux(
+		ingress.NewHandler(
+			dbgen.New(h.pool),
+			sweepTestSecret,
+			1<<20,
+			time.Second,
+		),
+	))
+	defer ingressServer.Close()
+	for index := range 4 {
+		if _, err := h.fake.EmitWebhook(
+			t.Context(),
+			ingressServer.URL+ingress.WebhookPath,
+			"push",
+			map[string]any{
+				"ref": fmt.Sprintf("refs/heads/shape-%d", index),
+				"repository": map[string]any{
+					"full_name": "acme/monolith",
+				},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1, LeaseToken: "old-shape"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	var oldCursor string
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT cursor FROM gap_heal_cursors WHERE installation_id = 1
+	`).Scan(&oldCursor); err != nil {
+		t.Fatal(err)
+	}
+	if oldCursor == "" {
+		t.Fatal("first capped page did not persist an opaque cursor")
+	}
+
+	h.service.config.GapWindow = 5 * time.Hour
+	now = now.Add(h.service.config.GapLeaseTTL + time.Second)
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1, LeaseToken: "new-shape"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	var (
+		cursor        string
+		mode          string
+		lookbackNS    int64
+		cursorVersion int32
+		cutoff        time.Time
+	)
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT cursor, scan_mode, lookback_duration_ns, cursor_version, cutoff
+		FROM gap_heal_cursors
+		WHERE installation_id = 1
+	`).Scan(&cursor, &mode, &lookbackNS, &cursorVersion, &cutoff); err != nil {
+		t.Fatal(err)
+	}
+	if cursor == "" || mode != gapScanDeep ||
+		lookbackNS != h.service.gapLookback().Nanoseconds() ||
+		cursorVersion != gapCursorVersion ||
+		!cutoff.Equal(now.Add(-h.service.gapLookback())) {
+		t.Fatalf(
+			"shape recovery cursor=%q old=%q mode=%q lookback=%s version=%d cutoff=%s",
+			cursor,
+			oldCursor,
+			mode,
+			time.Duration(lookbackNS),
+			cursorVersion,
+			cutoff,
+		)
+	}
+}
+
 func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
 	t *testing.T,
 ) {
 	t.Parallel()
 	h := newSweepHarness(t, 1)
 	h.service.config.GapMaxPages = 1
+	h.service.config.GapContinuationDelay = 45 * time.Second
 	ingressServer := httptest.NewServer(ingress.NewMux(
 		ingress.NewHandler(
 			dbgen.New(h.pool),
@@ -1187,6 +1680,22 @@ func TestGapHealingSignalsCapAndResumesOpaqueCursorToCompletion(
 	h.observer.mu.Unlock()
 	if incomplete != 2 {
 		t.Fatalf("incomplete-window signals = %d, want 2", incomplete)
+	}
+	var earliestContinuation time.Time
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT min(scheduled_at)
+		FROM river_job
+		WHERE kind = 'sweep_gap_heal'
+	`).Scan(&earliestContinuation); err != nil {
+		t.Fatal(err)
+	}
+	wantNotBefore := h.now.Add(h.service.config.GapContinuationDelay)
+	if earliestContinuation.Before(wantNotBefore) {
+		t.Fatalf(
+			"earliest continuation = %s, want no earlier than %s",
+			earliestContinuation,
+			wantNotBefore,
+		)
 	}
 }
 
@@ -1273,6 +1782,99 @@ func TestGapHealLeaseSingleFlightAndStaleRecoveryPreserveCursor(
 	}
 	if staleContinuationRan {
 		t.Fatal("stale continuation opened a new gap-heal window")
+	}
+}
+
+func TestGapHealLeaseTakeoverResumesNextPageExactlyOnce(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 2)
+	h.service.config.GapMaxPages = 1
+	h.service.config.GapLeaseTTL = time.Minute
+	now := h.now
+	h.service.config.Now = func() time.Time { return now }
+	ingressServer := httptest.NewServer(ingress.NewMux(
+		ingress.NewHandler(
+			dbgen.New(h.pool),
+			sweepTestSecret,
+			1<<20,
+			time.Second,
+		),
+	))
+	defer ingressServer.Close()
+	for index := range 4 {
+		if _, err := h.fake.DropWebhook(
+			ingressServer.URL+ingress.WebhookPath,
+			"push",
+			map[string]any{
+				"ref": fmt.Sprintf("refs/heads/takeover-%d", index),
+				"repository": map[string]any{
+					"full_name": "acme/monolith",
+				},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.service.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1, LeaseToken: "first-owner"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	var continuationCursor string
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT cursor FROM gap_heal_cursors WHERE installation_id = 1
+	`).Scan(&continuationCursor); err != nil {
+		t.Fatal(err)
+	}
+	if continuationCursor == "" {
+		t.Fatal("first page did not persist its next cursor")
+	}
+
+	restarted, err := New(Options{
+		Pool:       h.pool,
+		REST:       h.rest,
+		Deliveries: h.service.deliveries,
+		Config:     h.service.config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.SetRiverClient(h.river)
+	now = now.Add(h.service.config.GapLeaseTTL + time.Second)
+	if err := restarted.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{Installation: 1, LeaseToken: "takeover-owner"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls := h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries"); calls != 2 {
+		t.Fatalf("delivery-list calls after takeover = %d, want 2", calls)
+	}
+	redeliveries := h.fake.RedeliveryRequests()
+	if len(redeliveries) != 4 {
+		t.Fatalf("redeliveries after takeover = %v, want four", redeliveries)
+	}
+	seen := make(map[int64]int, len(redeliveries))
+	for _, deliveryID := range redeliveries {
+		seen[deliveryID]++
+	}
+	if len(seen) != 4 {
+		t.Fatalf("takeover double-processed a page: %v", redeliveries)
+	}
+
+	if err := restarted.HealDeliveryGaps(
+		context.Background(),
+		GapHealArgs{
+			Installation: 1,
+			Cursor:       continuationCursor,
+			LeaseToken:   "first-owner",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls := h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries"); calls != 2 {
+		t.Fatalf("stale continuation made an extra list call: %d", calls)
 	}
 }
 

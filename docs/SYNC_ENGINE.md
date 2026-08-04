@@ -263,7 +263,34 @@ explicit review checklist rather than relying on call-site folklore:
 - **C-R4 — Gap healing uses the deliveries API.** On startup after downtime
   and on a schedule, compare GitHub's recorded deliveries
   (`/app/hook/deliveries`) against `webhook_deliveries`; request redelivery
-  for gaps rather than falling back to full resync.
+  for gaps rather than falling back to full resync. A completed pass durably
+  records both the root delivery's ID and the greatest `delivered_at` it saw.
+  An incremental pass uses the ID only as an exact boundary identity: IDs are
+  not compared or assumed monotonic across redeliveries. It stops after the
+  page containing that identity, so the rest of that page is bounded overlap
+  and no-new list cost is one request.
+
+  Bounded overlap is not the C-R4 proof for a delivery that GitHub lists late
+  behind the boundary. A durable deep pass is due every
+  `GAP_DEEP_SCAN_PERIOD`; it ignores the incremental boundary and compares the
+  fixed delivery-time lookback. The lookback is
+  `GAP_COMPARISON_WINDOW + GAP_DEEP_SCAN_PERIOD`, so a delivery that first
+  becomes visible no more than `GAP_COMPARISON_WINDOW` after its recorded
+  `delivered_at` remains eligible at the next deep-pass start. Deep cadence and
+  the next cutoff are anchored to the prior deep-pass start, so a long-running
+  scan cannot silently consume this overlap. The comparison bound is one
+  `GAP_DEEP_SCAN_PERIOD`, plus any active-pass overrun, queue/API time, and the
+  target pass's completion. For a delivery on page `p`, capped jobs add at least
+  `floor((p-1)/GAP_MAX_PAGES) * GAP_CONTINUATION_DELAY`. The configured
+  lookback may not exceed GitHub.com's 72-hour recent-delivery retention.
+
+  The deep scan stops only when an entire delivery-list page is older than its
+  fixed cutoff, so a single out-of-order timestamp cannot terminate it. Lost
+  state, an incompatible persisted window/page shape, an over-age pass, or an
+  invalid opaque cursor restarts in deep mode from that bounded root. The
+  cursor, pass watermark, scan mode, shape version, and deep completion are
+  durable; the per-installation lease still fences advance and completion
+  without holding a database lock across delivery-list or redelivery calls.
 
 ### Derivation & change feed (C-D)
 
@@ -538,6 +565,9 @@ consumer_cursors(consumer, stream, seq)                  -- durable cursors for 
 installation_budgets(installation_id, class, remaining, reset_at, lease_owner, lease_until)
 -- class: rest | app_jwt_rest | graphql
 sweep_cursors(sweep_kind, installation_id, cursor, updated_at)
+gap_heal_cursors(installation_id, cursor, high_watermark_at,
+                 boundary_delivery_id, scan_mode,
+                 last_deep_started_at, last_deep_completed_at, updated_at)
 
 -- Retention (decided): webhook_deliveries.payload and check_history rows are
 -- pruned at 90 days by a scheduled River periodic job; tombstoned entities

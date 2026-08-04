@@ -14,27 +14,40 @@ import (
 const advanceGapHealCursor = `-- name: AdvanceGapHealCursor :one
 UPDATE gap_heal_cursors
 SET cursor = $1,
-    updated_at = $2,
-    lease_until = $3
-WHERE installation_id = $4
-  AND cursor = $5
-  AND lease_token = $6
+    pass_high_watermark_at = GREATEST(
+        pass_high_watermark_at,
+        $2
+    ),
+    pass_boundary_delivery_id = CASE
+        WHEN pass_boundary_delivery_id = 0
+            THEN $3
+        ELSE pass_boundary_delivery_id
+    END,
+    updated_at = $4,
+    lease_until = $5
+WHERE installation_id = $6
+  AND cursor = $7
+  AND lease_token = $8
   AND completed_at IS NULL
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until, high_watermark_at, pass_high_watermark_at, boundary_delivery_id, pass_boundary_delivery_id, last_deep_started_at, last_deep_completed_at, scan_mode, cursor_version, lookback_duration_ns, page_size
 `
 
 type AdvanceGapHealCursorParams struct {
-	NextCursor     string
-	UpdatedAt      pgtype.Timestamptz
-	LeaseUntil     pgtype.Timestamptz
-	InstallationID int64
-	ExpectedCursor string
-	LeaseToken     pgtype.Text
+	NextCursor                 string
+	ObservedHighWatermarkAt    pgtype.Timestamptz
+	ObservedBoundaryDeliveryID int64
+	UpdatedAt                  pgtype.Timestamptz
+	LeaseUntil                 pgtype.Timestamptz
+	InstallationID             int64
+	ExpectedCursor             string
+	LeaseToken                 pgtype.Text
 }
 
 func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCursorParams) (GapHealCursor, error) {
 	row := q.db.QueryRow(ctx, advanceGapHealCursor,
 		arg.NextCursor,
+		arg.ObservedHighWatermarkAt,
+		arg.ObservedBoundaryDeliveryID,
 		arg.UpdatedAt,
 		arg.LeaseUntil,
 		arg.InstallationID,
@@ -51,6 +64,16 @@ func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCu
 		&i.CompletedAt,
 		&i.LeaseToken,
 		&i.LeaseUntil,
+		&i.HighWatermarkAt,
+		&i.PassHighWatermarkAt,
+		&i.BoundaryDeliveryID,
+		&i.PassBoundaryDeliveryID,
+		&i.LastDeepStartedAt,
+		&i.LastDeepCompletedAt,
+		&i.ScanMode,
+		&i.CursorVersion,
+		&i.LookbackDurationNs,
+		&i.PageSize,
 	)
 	return i, err
 }
@@ -109,7 +132,7 @@ SET lease_token = $1,
     updated_at = $3
 WHERE installation_id = $4
   AND completed_at IS NULL
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until, high_watermark_at, pass_high_watermark_at, boundary_delivery_id, pass_boundary_delivery_id, last_deep_started_at, last_deep_completed_at, scan_mode, cursor_version, lookback_duration_ns, page_size
 `
 
 type ClaimGapHealCursorParams struct {
@@ -136,6 +159,16 @@ func (q *Queries) ClaimGapHealCursor(ctx context.Context, arg ClaimGapHealCursor
 		&i.CompletedAt,
 		&i.LeaseToken,
 		&i.LeaseUntil,
+		&i.HighWatermarkAt,
+		&i.PassHighWatermarkAt,
+		&i.BoundaryDeliveryID,
+		&i.PassBoundaryDeliveryID,
+		&i.LastDeepStartedAt,
+		&i.LastDeepCompletedAt,
+		&i.ScanMode,
+		&i.CursorVersion,
+		&i.LookbackDurationNs,
+		&i.PageSize,
 	)
 	return i, err
 }
@@ -143,26 +176,46 @@ func (q *Queries) ClaimGapHealCursor(ctx context.Context, arg ClaimGapHealCursor
 const completeGapHealCursor = `-- name: CompleteGapHealCursor :one
 UPDATE gap_heal_cursors
 SET cursor = '',
-    updated_at = $1,
-    completed_at = $1,
+    high_watermark_at = GREATEST(
+        high_watermark_at,
+        pass_high_watermark_at,
+        $1
+    ),
+    pass_high_watermark_at = NULL,
+    boundary_delivery_id = COALESCE(
+        NULLIF(pass_boundary_delivery_id, 0),
+        NULLIF($2, 0),
+        boundary_delivery_id
+    ),
+    pass_boundary_delivery_id = 0,
+    last_deep_completed_at = CASE
+        WHEN scan_mode = 'deep' THEN $3
+        ELSE last_deep_completed_at
+    END,
+    updated_at = $3,
+    completed_at = $3,
     lease_token = NULL,
     lease_until = NULL
-WHERE installation_id = $2
-  AND cursor = $3
-  AND lease_token = $4
+WHERE installation_id = $4
+  AND cursor = $5
+  AND lease_token = $6
   AND completed_at IS NULL
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until, high_watermark_at, pass_high_watermark_at, boundary_delivery_id, pass_boundary_delivery_id, last_deep_started_at, last_deep_completed_at, scan_mode, cursor_version, lookback_duration_ns, page_size
 `
 
 type CompleteGapHealCursorParams struct {
-	CompletedAt    pgtype.Timestamptz
-	InstallationID int64
-	ExpectedCursor string
-	LeaseToken     pgtype.Text
+	ObservedHighWatermarkAt    pgtype.Timestamptz
+	ObservedBoundaryDeliveryID interface{}
+	CompletedAt                pgtype.Timestamptz
+	InstallationID             int64
+	ExpectedCursor             string
+	LeaseToken                 pgtype.Text
 }
 
 func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHealCursorParams) (GapHealCursor, error) {
 	row := q.db.QueryRow(ctx, completeGapHealCursor,
+		arg.ObservedHighWatermarkAt,
+		arg.ObservedBoundaryDeliveryID,
 		arg.CompletedAt,
 		arg.InstallationID,
 		arg.ExpectedCursor,
@@ -178,6 +231,16 @@ func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHeal
 		&i.CompletedAt,
 		&i.LeaseToken,
 		&i.LeaseUntil,
+		&i.HighWatermarkAt,
+		&i.PassHighWatermarkAt,
+		&i.BoundaryDeliveryID,
+		&i.PassBoundaryDeliveryID,
+		&i.LastDeepStartedAt,
+		&i.LastDeepCompletedAt,
+		&i.ScanMode,
+		&i.CursorVersion,
+		&i.LookbackDurationNs,
+		&i.PageSize,
 	)
 	return i, err
 }
@@ -256,7 +319,7 @@ INSERT INTO gap_heal_cursors (installation_id)
 VALUES ($1)
 ON CONFLICT (installation_id) DO UPDATE
 SET installation_id = EXCLUDED.installation_id
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until, high_watermark_at, pass_high_watermark_at, boundary_delivery_id, pass_boundary_delivery_id, last_deep_started_at, last_deep_completed_at, scan_mode, cursor_version, lookback_duration_ns, page_size
 `
 
 func (q *Queries) EnsureGapHealCursor(ctx context.Context, installationID int64) (GapHealCursor, error) {
@@ -271,6 +334,16 @@ func (q *Queries) EnsureGapHealCursor(ctx context.Context, installationID int64)
 		&i.CompletedAt,
 		&i.LeaseToken,
 		&i.LeaseUntil,
+		&i.HighWatermarkAt,
+		&i.PassHighWatermarkAt,
+		&i.BoundaryDeliveryID,
+		&i.PassBoundaryDeliveryID,
+		&i.LastDeepStartedAt,
+		&i.LastDeepCompletedAt,
+		&i.ScanMode,
+		&i.CursorVersion,
+		&i.LookbackDurationNs,
+		&i.PageSize,
 	)
 	return i, err
 }
@@ -309,7 +382,7 @@ func (q *Queries) EnsureSweepCursor(ctx context.Context, arg EnsureSweepCursorPa
 }
 
 const getGapHealCursorForUpdate = `-- name: GetGapHealCursorForUpdate :one
-SELECT installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
+SELECT installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until, high_watermark_at, pass_high_watermark_at, boundary_delivery_id, pass_boundary_delivery_id, last_deep_started_at, last_deep_completed_at, scan_mode, cursor_version, lookback_duration_ns, page_size
 FROM gap_heal_cursors
 WHERE installation_id = $1
 FOR UPDATE
@@ -327,6 +400,16 @@ func (q *Queries) GetGapHealCursorForUpdate(ctx context.Context, installationID 
 		&i.CompletedAt,
 		&i.LeaseToken,
 		&i.LeaseUntil,
+		&i.HighWatermarkAt,
+		&i.PassHighWatermarkAt,
+		&i.BoundaryDeliveryID,
+		&i.PassBoundaryDeliveryID,
+		&i.LastDeepStartedAt,
+		&i.LastDeepCompletedAt,
+		&i.ScanMode,
+		&i.CursorVersion,
+		&i.LookbackDurationNs,
+		&i.PageSize,
 	)
 	return i, err
 }
@@ -1015,6 +1098,60 @@ func (q *Queries) RenewGapHealLease(ctx context.Context, arg RenewGapHealLeasePa
 	return result.RowsAffected(), nil
 }
 
+const restartGapHealCursor = `-- name: RestartGapHealCursor :one
+UPDATE gap_heal_cursors
+SET cursor = '',
+    pass_high_watermark_at = NULL,
+    pass_boundary_delivery_id = 0,
+    updated_at = $1,
+    lease_until = $2
+WHERE installation_id = $3
+  AND cursor = $4
+  AND lease_token = $5
+  AND completed_at IS NULL
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until, high_watermark_at, pass_high_watermark_at, boundary_delivery_id, pass_boundary_delivery_id, last_deep_started_at, last_deep_completed_at, scan_mode, cursor_version, lookback_duration_ns, page_size
+`
+
+type RestartGapHealCursorParams struct {
+	RestartedAt    pgtype.Timestamptz
+	LeaseUntil     pgtype.Timestamptz
+	InstallationID int64
+	ExpectedCursor string
+	LeaseToken     pgtype.Text
+}
+
+func (q *Queries) RestartGapHealCursor(ctx context.Context, arg RestartGapHealCursorParams) (GapHealCursor, error) {
+	row := q.db.QueryRow(ctx, restartGapHealCursor,
+		arg.RestartedAt,
+		arg.LeaseUntil,
+		arg.InstallationID,
+		arg.ExpectedCursor,
+		arg.LeaseToken,
+	)
+	var i GapHealCursor
+	err := row.Scan(
+		&i.InstallationID,
+		&i.Cursor,
+		&i.Cutoff,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.CompletedAt,
+		&i.LeaseToken,
+		&i.LeaseUntil,
+		&i.HighWatermarkAt,
+		&i.PassHighWatermarkAt,
+		&i.BoundaryDeliveryID,
+		&i.PassBoundaryDeliveryID,
+		&i.LastDeepStartedAt,
+		&i.LastDeepCompletedAt,
+		&i.ScanMode,
+		&i.CursorVersion,
+		&i.LookbackDurationNs,
+		&i.PageSize,
+	)
+	return i, err
+}
+
 const restartSweepCursorPass = `-- name: RestartSweepCursorPass :one
 UPDATE sweep_cursors
 SET cursor = $1,
@@ -1067,24 +1204,48 @@ SET cursor = '',
     started_at = $2,
     updated_at = $2,
     completed_at = NULL,
-    lease_token = $3,
-    lease_until = $4
-WHERE installation_id = $5
-RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until
+    high_watermark_at = $3,
+    pass_high_watermark_at = NULL,
+    boundary_delivery_id = $4,
+    pass_boundary_delivery_id = 0,
+    scan_mode = $5,
+    last_deep_started_at = CASE
+        WHEN $5::text = 'deep' THEN $2
+        ELSE last_deep_started_at
+    END,
+    cursor_version = $6,
+    lookback_duration_ns = $7,
+    page_size = $8,
+    lease_token = $9,
+    lease_until = $10
+WHERE installation_id = $11
+RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at, lease_token, lease_until, high_watermark_at, pass_high_watermark_at, boundary_delivery_id, pass_boundary_delivery_id, last_deep_started_at, last_deep_completed_at, scan_mode, cursor_version, lookback_duration_ns, page_size
 `
 
 type StartGapHealCursorParams struct {
-	Cutoff         pgtype.Timestamptz
-	StartedAt      pgtype.Timestamptz
-	LeaseToken     pgtype.Text
-	LeaseUntil     pgtype.Timestamptz
-	InstallationID int64
+	Cutoff             pgtype.Timestamptz
+	StartedAt          pgtype.Timestamptz
+	HighWatermarkAt    pgtype.Timestamptz
+	BoundaryDeliveryID int64
+	ScanMode           string
+	CursorVersion      int32
+	LookbackDurationNs int64
+	PageSize           int32
+	LeaseToken         pgtype.Text
+	LeaseUntil         pgtype.Timestamptz
+	InstallationID     int64
 }
 
 func (q *Queries) StartGapHealCursor(ctx context.Context, arg StartGapHealCursorParams) (GapHealCursor, error) {
 	row := q.db.QueryRow(ctx, startGapHealCursor,
 		arg.Cutoff,
 		arg.StartedAt,
+		arg.HighWatermarkAt,
+		arg.BoundaryDeliveryID,
+		arg.ScanMode,
+		arg.CursorVersion,
+		arg.LookbackDurationNs,
+		arg.PageSize,
 		arg.LeaseToken,
 		arg.LeaseUntil,
 		arg.InstallationID,
@@ -1099,6 +1260,16 @@ func (q *Queries) StartGapHealCursor(ctx context.Context, arg StartGapHealCursor
 		&i.CompletedAt,
 		&i.LeaseToken,
 		&i.LeaseUntil,
+		&i.HighWatermarkAt,
+		&i.PassHighWatermarkAt,
+		&i.BoundaryDeliveryID,
+		&i.PassBoundaryDeliveryID,
+		&i.LastDeepStartedAt,
+		&i.LastDeepCompletedAt,
+		&i.ScanMode,
+		&i.CursorVersion,
+		&i.LookbackDurationNs,
+		&i.PageSize,
 	)
 	return i, err
 }

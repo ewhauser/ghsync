@@ -248,6 +248,8 @@ func environmentDefaults() map[string]any {
 		"GAP_HEAL_PERIOD":                     defaultGapHealPeriod,
 		"GAP_COMPARISON_WINDOW":               defaultGapWindow,
 		"GAP_HEAL_LEASE_TTL":                  defaultGapLeaseTTL,
+		"GAP_CONTINUATION_DELAY":              defaultGapContinuationDelay,
+		"GAP_DEEP_SCAN_PERIOD":                defaultGapDeepScanPeriod,
 		"GAP_PAGE_SIZE":                       defaultGapPageSize,
 		"GAP_MAX_PAGES":                       defaultGapMaxPages,
 		"DRIFT_PERIOD":                        defaultDriftPeriod,

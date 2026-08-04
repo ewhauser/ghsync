@@ -47,6 +47,8 @@ const (
 	defaultGapPageSize             = 100
 	defaultGapMaxPages             = 10
 	defaultGapLeaseTTL             = 5 * time.Minute
+	defaultGapContinuationDelay    = 30 * time.Second
+	defaultGapDeepScanPeriod       = 24 * time.Hour
 	defaultDriftPeriod             = time.Hour
 	defaultDriftSampleSize         = 10
 	defaultDriftPageSize           = 100
@@ -166,6 +168,10 @@ type Config struct {
 	GapMaxPages int
 	// GapLeaseTTL bounds stale-owner failover for delivery-gap scans.
 	GapLeaseTTL time.Duration
+	// GapContinuationDelay paces delivery-gap page-cap continuations.
+	GapContinuationDelay time.Duration
+	// GapDeepScanPeriod bounds detection of deliveries behind the cheap cursor.
+	GapDeepScanPeriod time.Duration
 
 	// DriftPeriod controls semantic-drift scan scheduling.
 	DriftPeriod time.Duration
@@ -241,6 +247,8 @@ func FromEnv() (Config, error) {
 		GapPageSize:                defaultGapPageSize,
 		GapMaxPages:                defaultGapMaxPages,
 		GapLeaseTTL:                defaultGapLeaseTTL,
+		GapContinuationDelay:       defaultGapContinuationDelay,
+		GapDeepScanPeriod:          defaultGapDeepScanPeriod,
 		DriftPeriod:                defaultDriftPeriod,
 		DriftSampleSize:            defaultDriftSampleSize,
 		DriftPageSize:              defaultDriftPageSize,
@@ -331,6 +339,8 @@ func FromEnv() (Config, error) {
 		{"GAP_HEAL_PERIOD", &cfg.GapHealPeriod},
 		{"GAP_COMPARISON_WINDOW", &cfg.GapWindow},
 		{"GAP_HEAL_LEASE_TTL", &cfg.GapLeaseTTL},
+		{"GAP_CONTINUATION_DELAY", &cfg.GapContinuationDelay},
+		{"GAP_DEEP_SCAN_PERIOD", &cfg.GapDeepScanPeriod},
 		{"DRIFT_PERIOD", &cfg.DriftPeriod},
 		{"DRIFT_RESOLVED_RETENTION", &cfg.DriftResolvedRetention},
 		{"RETENTION_PERIOD", &cfg.RetentionPeriod},
@@ -457,6 +467,13 @@ func FromEnv() (Config, error) {
 		cfg.DriftPageSize > 100 {
 		return Config{}, fmt.Errorf(
 			"SWEEP_PAGE_SIZE, GAP_PAGE_SIZE, and DRIFT_PAGE_SIZE must not exceed 100",
+		)
+	}
+	const githubDeliveryRetention = 72 * time.Hour
+	if cfg.GapWindow > githubDeliveryRetention ||
+		cfg.GapDeepScanPeriod > githubDeliveryRetention-cfg.GapWindow {
+		return Config{}, fmt.Errorf(
+			"GAP_COMPARISON_WINDOW plus GAP_DEEP_SCAN_PERIOD must not exceed GitHub's 72h delivery retention",
 		)
 	}
 	databaseAuth, err := ParseDatabaseAuth(string(cfg.DatabaseAuth))

@@ -106,10 +106,12 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 | `SWEEP_REPOSITORY_LIST_PERIOD` | `1h` | Repository list period. |
 | `SWEEP_PAGE_SIZE` | `100` | GitHub page size; max `100`. |
 | `GAP_HEAL_PERIOD` | `5m` | C-R4 cadence. |
-| `GAP_COMPARISON_WINDOW` | `6h` | Fixed delivery window. |
+| `GAP_COMPARISON_WINDOW` | `6h` | Maximum supported delay between `delivered_at` and first list visibility. |
 | `GAP_HEAL_LEASE_TTL` | `5m` | Stale-owner failover bound for gap healing. |
-| `GAP_PAGE_SIZE` | `100` | Delivery page size; max `100`. |
-| `GAP_MAX_PAGES` | `10` | Pages per resumable job. |
+| `GAP_CONTINUATION_DELAY` | `30s` | Minimum delay before a page-cap continuation becomes runnable. |
+| `GAP_DEEP_SCAN_PERIOD` | `24h` | Target cadence between boundary-independent C-R4 pass starts. |
+| `GAP_PAGE_SIZE` | `100` | Delivery page size and incremental overlap bound; max `100`. |
+| `GAP_MAX_PAGES` | `10` | Pages per resumable job before a paced continuation. |
 | `DRIFT_PERIOD` | `1h` | C-O3 cadence. |
 | `DRIFT_SAMPLE_SIZE` | `10` | Must cover six classes. |
 | `DRIFT_PAGE_SIZE` | `100` | Drift GitHub page size; max `100`, independent of sweeps. |
@@ -133,6 +135,29 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 | `OTEL_EXPORTER_OTLP_HEADERS` | empty | Collector authentication headers; manage as a secret. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | Head sampler; use `parentbased_traceidratio` in production. |
 | `OTEL_TRACES_SAMPLER_ARG` | `1` | Ratio for trace-ID ratio samplers. |
+
+C-R4's cheap pass persists an exact prior-root delivery ID; it never orders or
+compares IDs. With no new deliveries, each `GAP_HEAL_PERIOD` pass reads one
+overlap page. At defaults that is **12 delivery-list GETs/hour**. A daily deep
+pass ignores the boundary and adds `P/24` GETs/hour amortized, where `P` is the
+number of pages in that pass. An empty lookback therefore costs about
+**12.04 GETs/hour** total; actual missing GUIDs add one redelivery POST each.
+This replaces the incident's at least 5,870 delivery-list GETs/hour.
+
+The deep-pass lookback is `GAP_COMPARISON_WINDOW + GAP_DEEP_SCAN_PERIOD`
+(30h at defaults). This construction ensures that a delivery first listed up
+to 6h after `delivered_at` is still eligible when the next daily deep pass
+starts. Cadence and the next cutoff use the prior deep-pass start, preserving
+the overlap even when a scan takes a material fraction of a day. The two
+settings must total no more than GitHub.com's documented
+[three-day recent-delivery retention](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/viewing-webhook-deliveries).
+Detection is bounded by the deep period plus any active-pass overrun, queue/API
+time, and target-pass completion. Every full `GAP_MAX_PAGES` group before the
+target page contributes at least one `GAP_CONTINUATION_DELAY`. Lost, stale,
+incompatible, or invalid cursor state restarts at the fixed deep root, never an
+unbounded history root.
+The existing `ghsync_c_r4_gap_windows_incomplete` counter and DEBUG cap log
+make paced continuations observable without producing error-level noise.
 
 Pull-request GraphQL gangs collect for `FETCH_BATCH_WINDOW` and use a fixed
 maximum batch size **K = 25**. K is constrained by the shipped GraphQL query and

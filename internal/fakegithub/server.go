@@ -996,6 +996,45 @@ func (s *Server) Deliveries() []HookDelivery {
 	return result
 }
 
+// ReorderDelivery moves one delivery to an absolute position in the list
+// response. Gap-healing tests use it to model a delivery that becomes visible
+// behind a previously completed cursor boundary.
+func (s *Server) ReorderDelivery(deliveryID int64, listedIndex int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if listedIndex < 0 || listedIndex >= len(s.deliveries) {
+		return false
+	}
+	ordered := slices.Clone(s.deliveries)
+	slices.Reverse(ordered)
+	current := slices.IndexFunc(ordered, func(item storedHookDelivery) bool {
+		return item.ID == deliveryID
+	})
+	if current < 0 {
+		return false
+	}
+	delivery := ordered[current]
+	ordered = slices.Delete(ordered, current, current+1)
+	ordered = slices.Insert(ordered, listedIndex, delivery)
+	slices.Reverse(ordered)
+	s.deliveries = ordered
+	return true
+}
+
+// SetDeliveryTime changes delivered_at for one fake delivery. It allows tests
+// to decouple list visibility from GitHub's recorded delivery time.
+func (s *Server) SetDeliveryTime(deliveryID int64, deliveredAt time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := range s.deliveries {
+		if s.deliveries[index].ID == deliveryID {
+			s.deliveries[index].DeliveredAt = deliveredAt.UTC()
+			return true
+		}
+	}
+	return false
+}
+
 // Remaining reports the simulated REST request budget left.
 func (s *Server) Remaining() int64 {
 	return s.snapshot("core").remaining

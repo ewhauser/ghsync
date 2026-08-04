@@ -12,7 +12,12 @@
 SELECT status, count(*), min(received_at) AS oldest, max(received_at) AS newest
 FROM webhook_deliveries GROUP BY status ORDER BY status;
 
-SELECT installation_id, cursor, cutoff, started_at, updated_at, completed_at
+SELECT installation_id, cursor, scan_mode, high_watermark_at,
+       boundary_delivery_id, pass_high_watermark_at,
+       pass_boundary_delivery_id, last_deep_started_at,
+       last_deep_completed_at,
+       cursor_version, lookback_duration_ns, page_size,
+       cutoff, started_at, updated_at, completed_at
 FROM gap_heal_cursors;
 
 SELECT queue, state, count(*), min(scheduled_at) AS oldest_scheduled
@@ -56,8 +61,10 @@ ghsyncd serve --roles=metrics
 ```
 
 The sweep role resumes `gap_heal_cursors` and requests missing GUID
-redelivery. Do not delete cursor/delivery rows. If initial enrollment was never
-completed:
+redelivery. Missing, stale, or incompatible cursor state deliberately starts a
+deep pass over the fixed comparison-plus-deep-period lookback; capped passes
+resume after `GAP_CONTINUATION_DELAY`. Do not delete cursor/delivery rows. If
+initial enrollment was never completed:
 
 ```sh
 ghsyncd backfill
