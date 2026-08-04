@@ -25,23 +25,34 @@ func (c Class) valid() bool {
 	return c == Interactive || c == Event || c == Sweep
 }
 
-// Resource identifies GitHub's independently-accounted API budgets.
+// AuthContext identifies the credential pool GitHub uses to account a
+// request. Installation tokens and App JWTs have independent REST budgets.
+type AuthContext string
+
+const (
+	// InstallationAuth is an installation access token.
+	InstallationAuth AuthContext = "installation"
+	// AppJWTAuth is a GitHub App JWT.
+	AppJWTAuth AuthContext = "app_jwt"
+)
+
+func (c AuthContext) valid() bool {
+	return c == InstallationAuth || c == AppJWTAuth
+}
+
+// Resource identifies GitHub's independently-accounted API resources. REST
+// accounting is further partitioned by AuthContext.
 type Resource string
 
 const (
-	// REST is GitHub's installation REST request budget.
+	// REST is GitHub's REST request budget.
 	REST Resource = "rest"
 	// GraphQL is GitHub's installation GraphQL point budget.
 	GraphQL Resource = "graphql"
-
-	// Auth is the App-JWT installation-token exchange. It passes through the
-	// C-B1 gate for concurrency and global backoff, but GitHub does not account
-	// it against an installation's REST or GraphQL quota.
-	Auth Resource = "auth"
 )
 
 func (r Resource) valid() bool {
-	return r == REST || r == GraphQL || r == Auth
+	return r == REST || r == GraphQL
 }
 
 // GraphQLRate is extracted from a response's top-level data.rateLimit block.
@@ -63,13 +74,35 @@ type GraphQLRateObserver func(*http.Response) (GraphQLRate, bool, error)
 type Request struct {
 	httpRequest *http.Request
 	resource    Resource
+	authContext AuthContext
 	observeRate GraphQLRateObserver
 	beforeSend  func(context.Context, *http.Request) error
+	tokenMint   bool
 }
 
-// NewRESTRequest wraps one REST request for admission.
+// NewRESTRequest wraps one installation-authenticated REST request for
+// admission. New call sites should use NewInstallationRESTRequest so the
+// credential context remains explicit.
 func NewRESTRequest(req *http.Request) *Request {
-	return &Request{httpRequest: req, resource: REST}
+	return NewInstallationRESTRequest(req)
+}
+
+// NewInstallationRESTRequest wraps one installation-token REST request.
+func NewInstallationRESTRequest(req *http.Request) *Request {
+	return &Request{
+		httpRequest: req,
+		resource:    REST,
+		authContext: InstallationAuth,
+	}
+}
+
+// NewAppRESTRequest wraps one App-JWT REST request.
+func NewAppRESTRequest(req *http.Request) *Request {
+	return &Request{
+		httpRequest: req,
+		resource:    REST,
+		authContext: AppJWTAuth,
+	}
 }
 
 // NewGraphQLRequest wraps one GraphQL request and its rate observer.
@@ -77,13 +110,19 @@ func NewGraphQLRequest(req *http.Request, observer GraphQLRateObserver) *Request
 	return &Request{
 		httpRequest: req,
 		resource:    GraphQL,
+		authContext: InstallationAuth,
 		observeRate: observer,
 	}
 }
 
 // NewAuthRequest wraps one App-JWT installation-token exchange.
 func NewAuthRequest(req *http.Request) *Request {
-	return &Request{httpRequest: req, resource: Auth}
+	return &Request{
+		httpRequest: req,
+		resource:    REST,
+		authContext: AppJWTAuth,
+		tokenMint:   true,
+	}
 }
 
 // BeforeSend installs work that must run after admission and immediately
@@ -122,20 +161,23 @@ type ResourceBudget struct {
 // Snapshot is safe to expose to persistence and observability code. It never
 // contains credentials or request data.
 type Snapshot struct {
-	REST         ResourceBudget
-	GraphQL      ResourceBudget
-	BackoffUntil time.Time
-	InFlight     int
+	REST               ResourceBudget
+	AppREST            ResourceBudget
+	GraphQL            ResourceBudget
+	BackoffUntil       time.Time
+	AppJWTBackoffUntil time.Time
+	InFlight           int
 }
 
 // Starvation is emitted once for each request that queues behind a C-B3
 // reserved floor.
 type Starvation struct {
-	Class     Class
-	Resource  Resource
-	Remaining int64
-	Limit     int64
-	ResetAt   time.Time
+	Class       Class
+	Resource    Resource
+	AuthContext AuthContext
+	Remaining   int64
+	Limit       int64
+	ResetAt     time.Time
 }
 
 // StarvationHook is the M1 observability seam; M6 will attach metrics.
@@ -146,6 +188,7 @@ type StarvationHook func(Starvation)
 type RequestObservation struct {
 	Class       Class
 	Resource    Resource
+	AuthContext AuthContext
 	StatusCode  int
 	Conditional bool
 	NotModified bool

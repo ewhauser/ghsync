@@ -68,11 +68,17 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	database := testdb.New(t)
 	if _, err := database.Pool.Exec(ctx, `
 		INSERT INTO installation_budgets (
-		    installation_id, class, remaining, rate_limit, reset_at
+		    installation_id, class, remaining, rate_limit, reset_at,
+		    backoff_until
 		)
 		VALUES
-		    (1, 'rest', 14000, 15000, clock_timestamp() + interval '1 hour'),
-		    (1, 'graphql', 4900, 5000, clock_timestamp() + interval '1 hour')
+		    (1, 'rest', 14000, 15000,
+		     clock_timestamp() + interval '1 hour', NULL),
+		    (1, 'app_jwt_rest', 4800, 5000,
+		     clock_timestamp() + interval '1 hour',
+		     clock_timestamp() + interval '1 minute'),
+		    (1, 'graphql', 4900, 5000,
+		     clock_timestamp() + interval '1 hour', NULL)
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -220,6 +226,11 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		Conditional: true,
 		NotModified: true,
 	})
+	runtimeMetrics.BudgetStarvation(budget.Starvation{
+		Class:       budget.Sweep,
+		Resource:    budget.REST,
+		AuthContext: budget.AppJWTAuth,
+	})
 	runtimeMetrics.CacheWrite(ctx, "pull_request", true, false)
 	runtimeMetrics.CacheWrite(ctx, "pull_request", true, false)
 	runtimeMetrics.CacheWrite(ctx, "pull_request", false, false)
@@ -277,6 +288,55 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 			t.Errorf("metrics exposition omitted %q", name)
 		}
 	}
+	for _, name := range []string{
+		"ghsync_c_b3_budget_remaining",
+		"ghsync_c_b3_budget_limit",
+		"ghsync_c_b3_starvations_total",
+	} {
+		assertEveryPrometheusMetricHasLabel(t, body, name, "auth_context")
+	}
+	assertPrometheusValue(
+		t, body,
+		"ghsync_c_b3_budget_remaining",
+		map[string]string{
+			"installation_id": "1",
+			"class":           "sweep",
+			"resource":        "rest",
+			"auth_context":    "installation",
+		},
+		14000,
+	)
+	assertPrometheusValue(
+		t, body,
+		"ghsync_c_b3_budget_remaining",
+		map[string]string{
+			"installation_id": "1",
+			"class":           "sweep",
+			"resource":        "rest",
+			"auth_context":    "app_jwt",
+		},
+		4800,
+	)
+	assertPrometheusValue(
+		t, body,
+		"ghsync_c_b3_starvations_total",
+		map[string]string{
+			"class":        "sweep",
+			"resource":     "rest",
+			"auth_context": "app_jwt",
+		},
+		1,
+	)
+	assertPrometheusValue(
+		t, body,
+		"ghsync_c_b2_gate_closed",
+		map[string]string{
+			"installation_id": "1",
+			"resource":        "rest",
+			"auth_context":    "app_jwt",
+		},
+		1,
+	)
 	assertPrometheusValue(
 		t, body,
 		"ghsync_c_c2_cache_cas_reject_ratio",
@@ -390,6 +450,36 @@ func assertPrometheusValue(
 	t.Helper()
 	if got := prometheusValue(t, body, name, labels); got != want {
 		t.Fatalf("%s%v = %v, want %v", name, labels, got, want)
+	}
+}
+
+func assertEveryPrometheusMetricHasLabel(
+	t *testing.T,
+	body []byte,
+	name string,
+	labelName string,
+) {
+	t.Helper()
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	family := families[name]
+	if family == nil || len(family.Metric) == 0 {
+		t.Fatalf("metrics exposition omitted family %q", name)
+	}
+	for _, item := range family.Metric {
+		found := false
+		for _, label := range item.Label {
+			if label.GetName() == labelName && label.GetValue() != "" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s metric omitted %q: %+v", name, labelName, item)
+		}
 	}
 }
 

@@ -22,6 +22,8 @@ const (
 	defaultRenewInterval    = 10 * time.Second
 	defaultSnapshotInterval = 30 * time.Second
 	defaultStoreTimeout     = 5 * time.Second
+	appRESTBudgetClass      = "app_jwt_rest"
+	persistedBudgetRowCount = 3
 )
 
 // LeaseStore coordinates the one active budgeter for an installation and
@@ -47,7 +49,13 @@ type LeaseStore interface {
 		time.Duration,
 	) (time.Time, bool, error)
 	Save(context.Context, int64, string, Snapshot) (bool, error)
-	SaveBackoff(context.Context, int64, string, time.Time) (bool, error)
+	SaveBackoff(
+		context.Context,
+		int64,
+		string,
+		AuthContext,
+		time.Time,
+	) (bool, error)
 	Release(context.Context, int64, string) error
 }
 
@@ -390,6 +398,7 @@ func (g *Gate) unavailableError() error {
 
 func (g *Gate) persistBackoff(
 	ctx context.Context,
+	authContext AuthContext,
 	until time.Time,
 ) (bool, error) {
 	runtime := g.lease
@@ -402,6 +411,7 @@ func (g *Gate) persistBackoff(
 		opCtx,
 		runtime.installationID,
 		runtime.token,
+		authContext,
 		until,
 	)
 	return ok, err
@@ -513,12 +523,16 @@ func (s *PostgresLeaseStore) Acquire(
 	}
 
 	queries := dbgen.New(tx)
-	for _, class := range []Resource{REST, GraphQL} {
+	for _, class := range []string{
+		string(REST),
+		appRESTBudgetClass,
+		string(GraphQL),
+	} {
 		if err := queries.EnsureInstallationBudget(
 			ctx,
 			dbgen.EnsureInstallationBudgetParams{
 				InstallationID: installationID,
-				Class:          string(class),
+				Class:          class,
 			},
 		); err != nil {
 			return Snapshot{}, time.Time{}, false, fmt.Errorf("ensure budget row: %w", err)
@@ -608,46 +622,65 @@ func (s *PostgresLeaseStore) Save(
 	snapshot Snapshot, //nolint:gocritic // LeaseStore intentionally accepts immutable snapshot values
 ) (bool, error) {
 	restRemaining, restLimit, restReset := persistedValues(snapshot.REST)
+	appRESTRemaining, appRESTLimit, appRESTReset := persistedValues(
+		snapshot.AppREST,
+	)
 	graphRemaining, graphLimit, graphReset := persistedValues(snapshot.GraphQL)
 	affected, err := dbgen.New(s.pool).SaveInstallationBudgetSnapshot(
 		ctx,
 		dbgen.SaveInstallationBudgetSnapshotParams{
 			RestRemaining:    restRemaining,
+			AppRestRemaining: appRESTRemaining,
 			GraphqlRemaining: graphRemaining,
 			RestLimit:        restLimit,
+			AppRestLimit:     appRESTLimit,
 			GraphqlLimit:     graphLimit,
 			RestResetAt:      restReset,
+			AppRestResetAt:   appRESTReset,
 			GraphqlResetAt:   graphReset,
 			BackoffUntil:     timestamp(snapshot.BackoffUntil),
-			InstallationID:   installationID,
-			LeaseToken:       token,
+			AppJwtBackoffUntil: timestamp(
+				snapshot.AppJWTBackoffUntil,
+			),
+			InstallationID: installationID,
+			LeaseToken:     token,
 		},
 	)
 	if err != nil {
 		return false, fmt.Errorf("save budget snapshot: %w", err)
 	}
-	return affected == 2, nil
+	return affected == persistedBudgetRowCount, nil
 }
 
-// SaveBackoff immediately persists a secondary-limit deadline.
+// SaveBackoff immediately persists one auth context's secondary-limit
+// deadline.
 func (s *PostgresLeaseStore) SaveBackoff(
 	ctx context.Context,
 	installationID int64,
 	token string,
+	authContext AuthContext,
 	until time.Time,
 ) (bool, error) {
+	if !authContext.valid() {
+		return false, fmt.Errorf("save budget backoff: invalid auth context %q", authContext)
+	}
 	affected, err := dbgen.New(s.pool).SaveInstallationBudgetBackoff(
 		ctx,
 		dbgen.SaveInstallationBudgetBackoffParams{
 			BackoffUntil:   timestamp(until),
 			InstallationID: installationID,
 			LeaseToken:     token,
+			AuthContext:    string(authContext),
 		},
 	)
 	if err != nil {
 		return false, fmt.Errorf("save budget backoff: %w", err)
 	}
-	return affected == 2, nil
+	expected := int64(2)
+	if authContext == AppJWTAuth {
+		expected = 1
+	}
+	return affected == expected, nil
 }
 
 // Release clears an installation lease only for the active owner.
@@ -666,7 +699,7 @@ func (s *PostgresLeaseStore) Release(
 	if err != nil {
 		return fmt.Errorf("release budget lease: %w", err)
 	}
-	if affected != 2 {
+	if affected != persistedBudgetRowCount {
 		return ErrLeaseLost
 	}
 	return nil
@@ -688,10 +721,11 @@ func validateLeaseIdentity(installationID int64, token string, ttl time.Duration
 func scanAcquiredBudgetRows(
 	rows []dbgen.AcquireInstallationBudgetLeaseRow,
 ) (Snapshot, time.Time, error) {
-	if len(rows) != 2 {
+	if len(rows) != persistedBudgetRowCount {
 		return Snapshot{}, time.Time{}, fmt.Errorf(
-			"acquire budget lease: updated %d rows, want 2",
+			"acquire budget lease: updated %d rows, want %d",
 			len(rows),
+			persistedBudgetRowCount,
 		)
 	}
 	var snapshot Snapshot
@@ -699,10 +733,12 @@ func scanAcquiredBudgetRows(
 	for index := range rows {
 		row := &rows[index]
 		state := restoredBudget(row.Remaining, row.RateLimit, row.ResetAt)
-		switch Resource(row.Class) {
-		case REST:
+		switch row.Class {
+		case string(REST):
 			snapshot.REST = state
-		case GraphQL:
+		case appRESTBudgetClass:
+			snapshot.AppREST = state
+		case string(GraphQL):
 			snapshot.GraphQL = state
 		default:
 			return Snapshot{}, time.Time{}, fmt.Errorf(
@@ -710,9 +746,14 @@ func scanAcquiredBudgetRows(
 				row.Class,
 			)
 		}
-		if row.BackoffUntil.Valid &&
-			row.BackoffUntil.Time.After(snapshot.BackoffUntil) {
-			snapshot.BackoffUntil = row.BackoffUntil.Time
+		if row.BackoffUntil.Valid {
+			if row.Class == appRESTBudgetClass {
+				if row.BackoffUntil.Time.After(snapshot.AppJWTBackoffUntil) {
+					snapshot.AppJWTBackoffUntil = row.BackoffUntil.Time
+				}
+			} else if row.BackoffUntil.Time.After(snapshot.BackoffUntil) {
+				snapshot.BackoffUntil = row.BackoffUntil.Time
+			}
 		}
 		expiries = append(expiries, row.LeaseUntil)
 	}
@@ -732,18 +773,27 @@ func authoritativeExpiry(
 	if len(values) == 0 {
 		return time.Time{}, false, nil
 	}
-	if len(values) != 2 || !values[0].Valid || !values[1].Valid {
+	if len(values) != persistedBudgetRowCount {
 		return time.Time{}, false, fmt.Errorf(
-			"lease expiry rows = %d, want two valid rows",
+			"lease expiry rows = %d, want %d valid rows",
 			len(values),
+			persistedBudgetRowCount,
 		)
 	}
-	if !values[0].Time.Equal(values[1].Time) {
-		return time.Time{}, false, fmt.Errorf(
-			"inconsistent lease expiries %v and %v",
-			values[0].Time,
-			values[1].Time,
-		)
+	for index := range values {
+		if !values[index].Valid {
+			return time.Time{}, false, fmt.Errorf(
+				"lease expiry row %d is invalid",
+				index,
+			)
+		}
+		if !values[index].Time.Equal(values[0].Time) {
+			return time.Time{}, false, fmt.Errorf(
+				"inconsistent lease expiries %v and %v",
+				values[0].Time,
+				values[index].Time,
+			)
+		}
 	}
 	return values[0].Time, true, nil
 }

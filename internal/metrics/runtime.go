@@ -255,12 +255,31 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	// Prometheus must see explicit zeroes for "nothing bad happened" counters;
 	// otherwise absent-series alerts cannot distinguish a healthy zero from a
 	// missing process/instrument.
-	r.starvations.Add(context.Background(), 0)
+	for _, identity := range []struct {
+		resource    budget.Resource
+		authContext budget.AuthContext
+	}{
+		{resource: budget.REST, authContext: budget.InstallationAuth},
+		{resource: budget.REST, authContext: budget.AppJWTAuth},
+		{resource: budget.GraphQL, authContext: budget.InstallationAuth},
+	} {
+		for _, class := range []budget.Class{
+			budget.Interactive,
+			budget.Event,
+			budget.Sweep,
+		} {
+			r.starvations.Add(context.Background(), 0, metric.WithAttributes(
+				attribute.String("class", string(class)),
+				attribute.String("resource", string(identity.resource)),
+				attribute.String("auth_context", string(identity.authContext)),
+			))
+		}
+	}
 	r.invalidEventLatency.Add(context.Background(), 0)
 	return nil
 }
 
-func (r *Runtime) BudgetRequest(observation budget.RequestObservation) {
+func (r *Runtime) BudgetRequest(observation budget.RequestObservation) { //nolint:gocritic // hook contract passes an immutable observation value
 	outcome := "success"
 	if observation.Err != nil {
 		outcome = "error"
@@ -285,10 +304,11 @@ func (r *Runtime) BudgetRequest(observation budget.RequestObservation) {
 	}
 }
 
-func (r *Runtime) BudgetStarvation(starvation budget.Starvation) {
+func (r *Runtime) BudgetStarvation(starvation budget.Starvation) { //nolint:gocritic // hook contract passes an immutable observation value
 	r.starvations.Add(context.Background(), 1, metric.WithAttributes(
 		attribute.String("class", string(starvation.Class)),
 		attribute.String("resource", string(starvation.Resource)),
+		attribute.String("auth_context", string(starvation.AuthContext)),
 	))
 }
 

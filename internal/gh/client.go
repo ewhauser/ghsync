@@ -32,12 +32,18 @@ func (t StaticToken) Token(context.Context) (string, error) {
 }
 
 type client struct {
-	baseURL *url.URL
-	gate    budget.Doer
-	tokens  TokenProvider
+	baseURL     *url.URL
+	gate        budget.Doer
+	tokens      TokenProvider
+	authContext budget.AuthContext
 }
 
-func newClient(baseURL string, gate budget.Doer, tokens TokenProvider) (client, error) {
+func newClient(
+	baseURL string,
+	gate budget.Doer,
+	tokens TokenProvider,
+	authContext budget.AuthContext,
+) (client, error) {
 	if gate == nil {
 		return client{}, fmt.Errorf("GitHub budget gate is required")
 	}
@@ -51,7 +57,12 @@ func newClient(baseURL string, gate budget.Doer, tokens TokenProvider) (client, 
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return client{}, fmt.Errorf("GitHub base URL must be absolute")
 	}
-	return client{baseURL: parsed, gate: gate, tokens: tokens}, nil
+	return client{
+		baseURL:     parsed,
+		gate:        gate,
+		tokens:      tokens,
+		authContext: authContext,
+	}, nil
 }
 
 func (c client) request(
@@ -79,6 +90,13 @@ func (c client) authorize(ctx context.Context, req *http.Request) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	return nil
+}
+
+func (c client) restRequest(req *http.Request) *budget.Request {
+	if c.authContext == budget.AppJWTAuth {
+		return budget.NewAppRESTRequest(req)
+	}
+	return budget.NewInstallationRESTRequest(req)
 }
 
 // HTTPError is a non-success response from GitHub. Response bodies are

@@ -52,10 +52,14 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 		REST: ResourceBudget{
 			Known: true, Limit: 15000, Remaining: 12345, ResetAt: reset,
 		},
+		AppREST: ResourceBudget{
+			Known: true, Limit: 5000, Remaining: 3456, ResetAt: reset,
+		},
 		GraphQL: ResourceBudget{
 			Known: true, Limit: 5000, Remaining: 4321, ResetAt: reset,
 		},
-		BackoffUntil: reset.Add(-time.Minute),
+		BackoffUntil:       reset.Add(-time.Minute),
+		AppJWTBackoffUntil: reset.Add(-2 * time.Minute),
 	}
 	if saved, err := leases.Save(
 		ctx,
@@ -84,8 +88,10 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 		t.Fatalf("steal expired lease = %v, %v", acquired, err)
 	}
 	if restored.REST.Remaining != 12345 ||
+		restored.AppREST.Remaining != 3456 ||
 		restored.GraphQL.Remaining != 4321 ||
-		!restored.BackoffUntil.Equal(snapshot.BackoffUntil) {
+		!restored.BackoffUntil.Equal(snapshot.BackoffUntil) ||
+		!restored.AppJWTBackoffUntil.Equal(snapshot.AppJWTBackoffUntil) {
 		t.Fatalf("restored snapshot = %+v", restored)
 	}
 	if saved, err := leases.Save(
@@ -95,6 +101,91 @@ func TestPostgresLeaseAcquireRenewAndStealOnExpiry(t *testing.T) {
 		snapshot,
 	); err != nil || saved {
 		t.Fatalf("stale owner save = %v, %v", saved, err)
+	}
+	if err := leases.Release(ctx, installationID, "owner-b"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresLeaseBackoffIsPersistedPerAuthContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testdb.New(t).Pool
+
+	installationID := time.Now().UnixNano()
+	leases := NewPostgresLeaseStore(pool)
+	if _, _, acquired, err := leases.Acquire(
+		ctx,
+		installationID,
+		"owner-a",
+		time.Minute,
+	); err != nil || !acquired {
+		t.Fatalf("acquire = %v, %v", acquired, err)
+	}
+	appBackoff := time.Now().UTC().Add(time.Minute).Truncate(time.Microsecond)
+	if saved, err := leases.SaveBackoff(
+		ctx,
+		installationID,
+		"owner-a",
+		AppJWTAuth,
+		appBackoff,
+	); err != nil || !saved {
+		t.Fatalf("save App-JWT backoff = %v, %v", saved, err)
+	}
+	var appRows, unaffectedInstallationRows int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (
+		           WHERE class = 'app_jwt_rest' AND backoff_until = $2
+		       ),
+		       count(*) FILTER (
+		           WHERE class IN ('rest', 'graphql') AND backoff_until IS NULL
+		       )
+		FROM installation_budgets
+		WHERE installation_id = $1
+	`, installationID, appBackoff).Scan(
+		&appRows,
+		&unaffectedInstallationRows,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if appRows != 1 || unaffectedInstallationRows != 2 {
+		t.Fatalf(
+			"App-JWT backoff rows = %d, unaffected installation rows = %d",
+			appRows,
+			unaffectedInstallationRows,
+		)
+	}
+
+	installationBackoff := appBackoff.Add(time.Minute)
+	if saved, err := leases.SaveBackoff(
+		ctx,
+		installationID,
+		"owner-a",
+		InstallationAuth,
+		installationBackoff,
+	); err != nil || !saved {
+		t.Fatalf("save installation backoff = %v, %v", saved, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE installation_budgets
+		SET lease_until = clock_timestamp() - interval '1 second'
+		WHERE installation_id = $1
+	`, installationID); err != nil {
+		t.Fatal(err)
+	}
+	restored, _, acquired, err := leases.Acquire(
+		ctx,
+		installationID,
+		"owner-b",
+		time.Minute,
+	)
+	if err != nil || !acquired {
+		t.Fatalf("restore = %v, %v", acquired, err)
+	}
+	if !restored.BackoffUntil.Equal(installationBackoff) ||
+		!restored.AppJWTBackoffUntil.Equal(appBackoff) {
+		t.Fatalf("restored per-context backoffs = %+v", restored)
 	}
 	if err := leases.Release(ctx, installationID, "owner-b"); err != nil {
 		t.Fatal(err)
@@ -314,6 +405,7 @@ func (*saveBackoffOwnershipLossStore) SaveBackoff(
 	context.Context,
 	int64,
 	string,
+	AuthContext,
 	time.Time,
 ) (bool, error) {
 	return false, nil

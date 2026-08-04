@@ -135,8 +135,9 @@ type Config struct {
 	BudgetEventFloor float64
 	// BudgetMaxConcurrent is the installation-wide GitHub request ceiling.
 	BudgetMaxConcurrent int
-	// BudgetRESTLimit and BudgetGraphQLLimit are pessimistic denominators until
-	// GitHub supplies authoritative rate-limit observations.
+	// BudgetRESTLimit and BudgetGraphQLLimit are pessimistic installation-token
+	// denominators until GitHub supplies authoritative observations. The
+	// App-JWT REST context uses GitHub's fixed 5,000-request baseline.
 	BudgetRESTLimit    int64
 	BudgetGraphQLLimit int64
 	// BudgetSecondaryFallback is used when a secondary-limit response supplies

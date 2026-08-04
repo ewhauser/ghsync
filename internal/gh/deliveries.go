@@ -44,7 +44,12 @@ func NewDeliveriesClient(
 	gate budget.Doer,
 	appTokens TokenProvider,
 ) (*DeliveriesClient, error) {
-	common, err := newClient(baseURL, gate, appTokens)
+	common, err := newClient(
+		baseURL,
+		gate,
+		appTokens,
+		budget.AppJWTAuth,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +100,7 @@ func (c *DeliveriesClient) RedeliverAppHookDelivery(
 	gated, err := c.client.gate.Do(
 		ctx,
 		budget.Sweep,
-		budget.NewRESTRequest(req).BeforeSend(c.client.authorize),
+		c.client.restRequest(req).BeforeSend(c.client.authorize),
 	)
 	if err != nil {
 		if gated != nil {

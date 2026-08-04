@@ -468,6 +468,7 @@ func (s *runtimeLeaseStore) SaveBackoff(
 	_ context.Context,
 	_ int64,
 	_ string,
+	authContext AuthContext,
 	until time.Time,
 ) (bool, error) {
 	s.mu.Lock()
@@ -478,7 +479,11 @@ func (s *runtimeLeaseStore) SaveBackoff(
 		s.mu.Unlock()
 		return false, err
 	}
-	if until.After(s.snapshot.BackoffUntil) {
+	if authContext == AppJWTAuth {
+		if until.After(s.snapshot.AppJWTBackoffUntil) {
+			s.snapshot.AppJWTBackoffUntil = until
+		}
+	} else if until.After(s.snapshot.BackoffUntil) {
 		s.snapshot.BackoffUntil = until
 	}
 	s.mu.Unlock()

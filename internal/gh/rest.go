@@ -311,7 +311,12 @@ func NewRESTClient(
 	gate budget.Doer,
 	tokens TokenProvider,
 ) (*RESTClient, error) {
-	common, err := newClient(baseURL, gate, tokens)
+	common, err := newClient(
+		baseURL,
+		gate,
+		tokens,
+		budget.InstallationAuth,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +615,7 @@ func (c *RESTClient) getRepositoryContent(
 	gated, err := c.client.gate.Do(
 		ctx,
 		class,
-		budget.NewRESTRequest(req).BeforeSend(c.client.authorize),
+		c.client.restRequest(req).BeforeSend(c.client.authorize),
 	)
 	if err != nil {
 		if gated != nil {
@@ -679,7 +684,7 @@ func (c client) getJSON(
 	gated, err := c.gate.Do(
 		ctx,
 		class,
-		budget.NewRESTRequest(req).BeforeSend(c.authorize),
+		c.restRequest(req).BeforeSend(c.authorize),
 	)
 	if err != nil {
 		if gated != nil {

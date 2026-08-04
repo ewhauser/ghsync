@@ -71,21 +71,31 @@ observed AS MATERIALIZED (
 UPDATE installation_budgets AS budgets
 SET remaining = CASE budgets.class
         WHEN 'rest' THEN sqlc.narg(rest_remaining)::bigint
+        WHEN 'app_jwt_rest' THEN sqlc.narg(app_rest_remaining)::bigint
         WHEN 'graphql' THEN sqlc.narg(graphql_remaining)::bigint
     END,
     rate_limit = CASE budgets.class
         WHEN 'rest' THEN sqlc.narg(rest_limit)::bigint
+        WHEN 'app_jwt_rest' THEN sqlc.narg(app_rest_limit)::bigint
         WHEN 'graphql' THEN sqlc.narg(graphql_limit)::bigint
     END,
     reset_at = CASE budgets.class
         WHEN 'rest' THEN sqlc.narg(rest_reset_at)::timestamptz
+        WHEN 'app_jwt_rest' THEN sqlc.narg(app_rest_reset_at)::timestamptz
         WHEN 'graphql' THEN sqlc.narg(graphql_reset_at)::timestamptz
     END,
     backoff_until = CASE
         WHEN budgets.backoff_until IS NULL
-          OR budgets.backoff_until <
-             sqlc.narg(backoff_until)::timestamptz
-        THEN sqlc.narg(backoff_until)::timestamptz
+          OR budgets.backoff_until < CASE budgets.class
+                 WHEN 'app_jwt_rest'
+                 THEN sqlc.narg(app_jwt_backoff_until)::timestamptz
+                 ELSE sqlc.narg(backoff_until)::timestamptz
+             END
+        THEN CASE budgets.class
+                 WHEN 'app_jwt_rest'
+                 THEN sqlc.narg(app_jwt_backoff_until)::timestamptz
+                 ELSE sqlc.narg(backoff_until)::timestamptz
+             END
         ELSE budgets.backoff_until
     END,
     updated_at = observed.checked_at
@@ -96,7 +106,7 @@ WHERE budgets.installation_id = sqlc.arg(installation_id)
 
 -- name: SaveInstallationBudgetBackoff :execrows
 WITH locked AS MATERIALIZED (
-    SELECT class
+    SELECT class, lease_owner, lease_until
     FROM installation_budgets
     WHERE installation_id = sqlc.arg(installation_id)
     ORDER BY class
@@ -105,6 +115,13 @@ WITH locked AS MATERIALIZED (
 observed AS MATERIALIZED (
     SELECT clock_timestamp() AS checked_at
     FROM (SELECT count(*) FROM locked) AS after_lock
+),
+owned AS MATERIALIZED (
+    SELECT count(*) = 3
+           AND bool_and(lease_owner = sqlc.arg(lease_token)::text)
+           AND bool_and(lease_until > observed.checked_at) AS active
+    FROM locked
+    CROSS JOIN observed
 )
 UPDATE installation_budgets AS budgets
 SET backoff_until = CASE
@@ -114,10 +131,16 @@ SET backoff_until = CASE
         ELSE budgets.backoff_until
     END,
     updated_at = observed.checked_at
-FROM observed
+FROM observed, owned
 WHERE budgets.installation_id = sqlc.arg(installation_id)
-  AND budgets.lease_owner = sqlc.arg(lease_token)::text
-  AND budgets.lease_until > observed.checked_at;
+  AND owned.active
+  AND (
+      (sqlc.arg(auth_context)::text = 'installation'
+       AND budgets.class IN ('rest', 'graphql'))
+      OR
+      (sqlc.arg(auth_context)::text = 'app_jwt'
+       AND budgets.class = 'app_jwt_rest')
+  );
 
 -- name: ReleaseInstallationBudgetLease :execrows
 UPDATE installation_budgets

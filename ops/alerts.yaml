@@ -22,7 +22,9 @@ groups:
           description: The rolling sweep request counters are absent or quiet-org validation is not returning at least 80 percent 304s.
       - alert: GhsyncBudgetClassStarved
         expr: >-
-          increase(ghsync_c_b3_starvations_total[5m]) > 0
+          sum by (class, resource, auth_context) (
+            increase(ghsync_c_b3_starvations_total[5m])
+          ) > 0
           or absent(ghsync_c_b3_starvations_total)
         labels: {severity: page}
         annotations:
@@ -31,14 +33,16 @@ groups:
           description: Inspect the server-authoritative budget, singleton GitHub role, and queued work.
       - alert: GhsyncSecondaryGateClosed
         expr: >-
-          max(ghsync_c_b2_gate_closed) == 1
+          max by (installation_id, resource, auth_context) (
+            ghsync_c_b2_gate_closed
+          ) == 1
           or absent(ghsync_c_b2_gate_closed)
         for: 5m
         labels: {severity: page}
         annotations:
           constraint: C-B2
-          summary: The installation-wide GitHub gate is closed or unobservable
-          description: A secondary-limit response has blocked all GitHub calls continuously, or the metrics collector is absent.
+          summary: A GitHub auth-context gate is closed or unobservable
+          description: A secondary-limit response has blocked one credential context continuously, or the metrics collector is absent.
       - alert: GhsyncEventCacheP95SLOBreach
         expr: >-
           histogram_quantile(0.95, sum by (le) (rate(ghsync_c_q2_event_to_cache_latency_seconds_bucket[10m]))) > 20
