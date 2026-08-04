@@ -18,19 +18,19 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	var err error
 	if r.budgetRemaining, err = meter.Int64ObservableGauge(
 		"ghsync_c_b3_budget_remaining",
-		metric.WithDescription("Server-authoritative remaining budget by priority and resource (C-B3)."),
+		metric.WithDescription("Server-authoritative remaining budget by priority, resource, and auth context (C-B3)."),
 	); err != nil {
 		return err
 	}
 	if r.budgetLimit, err = meter.Int64ObservableGauge(
 		"ghsync_c_b3_budget_limit",
-		metric.WithDescription("Server-authoritative budget denominator by resource (C-B3)."),
+		metric.WithDescription("Server-authoritative budget denominator by resource and auth context (C-B3)."),
 	); err != nil {
 		return err
 	}
 	if r.gateClosed, err = meter.Int64ObservableGauge(
 		"ghsync_c_b2_gate_closed",
-		metric.WithDescription("Whether the installation-wide secondary-limit gate is closed (C-B2)."),
+		metric.WithDescription("Whether an auth context's secondary-limit gate is closed (C-B2)."),
 	); err != nil {
 		return err
 	}
@@ -316,9 +316,23 @@ func (r *Runtime) observeBudget(
 		limit     int64
 		closed    bool
 	}
-	states := map[string]state{
-		"rest":    {remaining: -1, limit: -1},
-		"graphql": {remaining: -1, limit: -1},
+	type budgetIdentity struct {
+		resource    string
+		authContext string
+	}
+	states := map[budgetIdentity]state{
+		{resource: "rest", authContext: "installation"}: {
+			remaining: -1,
+			limit:     -1,
+		},
+		{resource: "rest", authContext: "app_jwt"}: {
+			remaining: -1,
+			limit:     -1,
+		},
+		{resource: "graphql", authContext: "installation"}: {
+			remaining: -1,
+			limit:     -1,
+		},
 	}
 	rows, err := dbgen.New(r.options.Pool).CollectBudgetMetrics(
 		ctx,
@@ -328,13 +342,23 @@ func (r *Runtime) observeBudget(
 		return fmt.Errorf("collect C-B budget metrics: %w", err)
 	}
 	for _, row := range rows {
-		states[row.Class] = state{
+		identity := budgetIdentity{
+			resource:    row.Class,
+			authContext: "installation",
+		}
+		if row.Class == "app_jwt_rest" {
+			identity = budgetIdentity{
+				resource:    "rest",
+				authContext: "app_jwt",
+			}
+		}
+		states[identity] = state{
 			remaining: row.Remaining,
 			limit:     row.RateLimit,
 			closed:    row.GateClosed,
 		}
 	}
-	for resource, state := range states {
+	for identity, state := range states {
 		closed := int64(0)
 		if state.closed {
 			closed = 1
@@ -346,7 +370,8 @@ func (r *Runtime) observeBudget(
 				attribute.String("installation_id", strconv.FormatInt(
 					r.options.InstallationID, 10,
 				)),
-				attribute.String("resource", resource),
+				attribute.String("resource", identity.resource),
+				attribute.String("auth_context", identity.authContext),
 			),
 		)
 		if state.remaining < 0 || state.limit <= 0 {
@@ -358,7 +383,8 @@ func (r *Runtime) observeBudget(
 					r.options.InstallationID, 10,
 				)),
 				attribute.String("class", class),
-				attribute.String("resource", resource),
+				attribute.String("resource", identity.resource),
+				attribute.String("auth_context", identity.authContext),
 			)
 			observer.ObserveInt64(
 				r.budgetRemaining,

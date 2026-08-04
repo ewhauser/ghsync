@@ -117,13 +117,318 @@ func TestObserveSecondaryLimitAcceptsHTTPDateRetryAfter(t *testing.T) {
 		},
 		Body: http.NoBody,
 	}
-	if err := gate.observeSecondaryLimit(context.Background(), response); err != nil {
+	if err := gate.observeSecondaryLimit(
+		context.Background(),
+		InstallationAuth,
+		response,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if got := gate.Snapshot().BackoffUntil; !got.Equal(
 		now.Add(3 * time.Second),
 	) {
 		t.Fatalf("HTTP-date secondary-limit deadline = %v", got)
+	}
+}
+
+func TestSecondaryBackoffIsScopedToAuthContext(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(now)
+	var calls atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		headers := make(http.Header)
+		headers.Set("X-RateLimit-Limit", "100")
+		headers.Set("X-RateLimit-Remaining", "90")
+		headers.Set(
+			"X-RateLimit-Reset",
+			strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+		)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     headers,
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		}, nil
+	})}
+	gate := New(client, Options{Clock: clock})
+	secondary := func(authContext AuthContext) {
+		t.Helper()
+		response := &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"1"}},
+			Body:       http.NoBody,
+		}
+		if err := gate.observeSecondaryLimit(
+			context.Background(),
+			authContext,
+			response,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	do := func(ctx context.Context, authContext AuthContext) error {
+		t.Helper()
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodGet,
+			"http://github.test/resource",
+			http.NoBody,
+		)
+		if err != nil {
+			return err
+		}
+		wrapped := NewInstallationRESTRequest(req)
+		if authContext == AppJWTAuth {
+			wrapped = NewAppRESTRequest(req)
+		}
+		response, err := gate.Do(ctx, Interactive, wrapped)
+		if response != nil && response.HTTP != nil {
+			_ = response.HTTP.Body.Close()
+		}
+		return err
+	}
+
+	secondary(AppJWTAuth)
+	if got := gate.Snapshot(); !got.AppJWTBackoffUntil.Equal(now.Add(time.Second)) ||
+		!got.BackoffUntil.IsZero() {
+		t.Fatalf("App-JWT backoff snapshot = %+v", got)
+	}
+	if err := do(context.Background(), InstallationAuth); err != nil {
+		t.Fatalf("installation request behind App-JWT backoff: %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := do(canceled, AppJWTAuth); !errors.Is(err, context.Canceled) {
+		t.Fatalf("App-JWT request during its backoff = %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("transport calls during App-JWT backoff = %d, want 1", got)
+	}
+
+	clock.Advance(time.Second)
+	secondary(InstallationAuth)
+	if err := do(context.Background(), AppJWTAuth); err != nil {
+		t.Fatalf("App-JWT request behind installation backoff: %v", err)
+	}
+	canceled, cancel = context.WithCancel(context.Background())
+	cancel()
+	if err := do(canceled, InstallationAuth); !errors.Is(err, context.Canceled) {
+		t.Fatalf("installation request during its backoff = %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("transport calls during installation backoff = %d, want 2", got)
+	}
+}
+
+func TestRESTFloorsAndReservationsAreScopedToAuthContext(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	starved := make(chan Starvation, 1)
+	var calls atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		}, nil
+	})}
+	gate := New(client, Options{
+		Clock: newManualClock(now),
+		OnStarvation: func(value Starvation) {
+			starved <- value
+		},
+	})
+	gate.restore(&Snapshot{
+		REST: ResourceBudget{
+			Known: true, Limit: 100, Remaining: 0, ResetAt: now.Add(time.Hour),
+		},
+		AppREST: ResourceBudget{
+			Known: true, Limit: 100, Remaining: 100, ResetAt: now.Add(time.Hour),
+		},
+	})
+	req, _ := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"http://github.test/app-resource",
+		http.NoBody,
+	)
+	response, err := gate.Do(
+		context.Background(),
+		Sweep,
+		NewAppRESTRequest(req),
+	)
+	if err != nil {
+		t.Fatalf("App-JWT admission behind exhausted installation pool: %v", err)
+	}
+	_ = response.HTTP.Body.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(
+			ctx,
+			http.MethodGet,
+			"http://github.test/installation-resource",
+			http.NoBody,
+		)
+		_, callErr := gate.Do(ctx, Sweep, NewInstallationRESTRequest(req))
+		result <- callErr
+	}()
+	select {
+	case starvation := <-starved:
+		if starvation.AuthContext != InstallationAuth ||
+			starvation.Resource != REST {
+			t.Fatalf("installation starvation = %+v", starvation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exhausted installation request did not queue")
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("floor-blocked installation request = %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("per-context floor transport calls = %d, want 1", got)
+	}
+
+	gate.restore(&Snapshot{
+		REST: ResourceBudget{
+			Known: true, Limit: 100, Remaining: 100, ResetAt: now.Add(time.Hour),
+		},
+		AppREST: ResourceBudget{
+			Known: true, Limit: 100, Remaining: 0, ResetAt: now.Add(time.Hour),
+		},
+	})
+	req, _ = http.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"http://github.test/installation-resource",
+		http.NoBody,
+	)
+	response, err = gate.Do(
+		context.Background(),
+		Sweep,
+		NewInstallationRESTRequest(req),
+	)
+	if err != nil {
+		t.Fatalf("installation admission behind exhausted App-JWT pool: %v", err)
+	}
+	_ = response.HTTP.Body.Close()
+
+	ctx, cancel = context.WithCancel(context.Background())
+	result = make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(
+			ctx,
+			http.MethodGet,
+			"http://github.test/app-resource",
+			http.NoBody,
+		)
+		_, callErr := gate.Do(ctx, Sweep, NewAppRESTRequest(req))
+		result <- callErr
+	}()
+	select {
+	case starvation := <-starved:
+		if starvation.AuthContext != AppJWTAuth ||
+			starvation.Resource != REST {
+			t.Fatalf("App-JWT starvation = %+v", starvation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exhausted App-JWT request did not queue")
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("floor-blocked App-JWT request = %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("symmetric per-context floor transport calls = %d, want 2", got)
+	}
+}
+
+func TestNestedTokenMintDoesNotBypassAppJWTBudget(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	starved := make(chan Starvation, 1)
+	var calls atomic.Int64
+	gate := New(
+		&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       http.NoBody,
+			}, nil
+		})},
+		Options{
+			Clock:         newManualClock(now),
+			MaxConcurrent: 1,
+			OnStarvation: func(value Starvation) {
+				starved <- value
+			},
+		},
+	)
+	gate.restore(&Snapshot{
+		REST: ResourceBudget{
+			Known: true, Limit: 100, Remaining: 100, ResetAt: now.Add(time.Hour),
+		},
+		AppREST: ResourceBudget{
+			Known: true, Limit: 100, Remaining: 0, ResetAt: now.Add(time.Hour),
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		outer, _ := http.NewRequestWithContext(
+			ctx,
+			http.MethodGet,
+			"http://github.test/repository",
+			http.NoBody,
+		)
+		_, callErr := gate.Do(
+			ctx,
+			Interactive,
+			NewInstallationRESTRequest(outer).BeforeSend(
+				func(sendCtx context.Context, _ *http.Request) error {
+					mint, _ := http.NewRequestWithContext(
+						sendCtx,
+						http.MethodPost,
+						"http://github.test/app/installations/1/access_tokens",
+						http.NoBody,
+					)
+					response, mintErr := gate.Do(
+						sendCtx,
+						Interactive,
+						NewAuthRequest(mint),
+					)
+					if response != nil && response.HTTP != nil {
+						_ = response.HTTP.Body.Close()
+					}
+					return mintErr
+				},
+			),
+		)
+		result <- callErr
+	}()
+	select {
+	case starvation := <-starved:
+		if starvation.AuthContext != AppJWTAuth ||
+			starvation.Resource != REST || starvation.Remaining != 0 {
+			t.Fatalf("nested mint starvation = %+v", starvation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("nested token mint bypassed exhausted App-JWT budget")
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("nested token mint cancellation = %v", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("transport calls behind exhausted App-JWT pool = %d", got)
+	}
+	if got := gate.Snapshot().InFlight; got != 0 {
+		t.Fatalf("in-flight requests after nested cancellation = %d", got)
 	}
 }
 
@@ -402,22 +707,28 @@ func TestRateObservationsMergeByResetWindow(t *testing.T) {
 		return value
 	}
 	window := now.Add(time.Hour)
-	if err := gate.observeREST(headers(70, window)); err != nil {
+	if err := gate.observeREST(InstallationAuth, headers(70, window)); err != nil {
 		t.Fatal(err)
 	}
-	if err := gate.observeREST(headers(90, window)); err != nil {
+	if err := gate.observeREST(InstallationAuth, headers(90, window)); err != nil {
 		t.Fatal(err)
 	}
 	if got := gate.Snapshot().REST.Remaining; got != 70 {
 		t.Fatalf("same-window slow observation raised remaining to %d", got)
 	}
-	if err := gate.observeREST(headers(99, window.Add(-time.Hour))); err != nil {
+	if err := gate.observeREST(
+		InstallationAuth,
+		headers(99, window.Add(-time.Hour)),
+	); err != nil {
 		t.Fatal(err)
 	}
 	if got := gate.Snapshot().REST.Remaining; got != 70 {
 		t.Fatalf("older-window observation replaced remaining with %d", got)
 	}
-	if err := gate.observeREST(headers(95, window.Add(time.Hour))); err != nil {
+	if err := gate.observeREST(
+		InstallationAuth,
+		headers(95, window.Add(time.Hour)),
+	); err != nil {
 		t.Fatal(err)
 	}
 	if got := gate.Snapshot().REST.Remaining; got != 95 {
@@ -607,6 +918,7 @@ func (s *countingLeaseStore) SaveBackoff(
 	context.Context,
 	int64,
 	string,
+	AuthContext,
 	time.Time,
 ) (bool, error) {
 	return true, nil

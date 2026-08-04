@@ -41,7 +41,12 @@ func NewGraphQLClient(
 	tokens TokenProvider,
 	options ...GraphQLClientOptions,
 ) (*GraphQLClient, error) {
-	common, err := newClient(baseURL, gate, tokens)
+	common, err := newClient(
+		baseURL,
+		gate,
+		tokens,
+		budget.InstallationAuth,
+	)
 	if err != nil {
 		return nil, err
 	}

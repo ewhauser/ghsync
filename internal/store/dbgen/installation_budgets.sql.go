@@ -168,7 +168,7 @@ func (q *Queries) RenewInstallationBudgetLease(ctx context.Context, arg RenewIns
 
 const saveInstallationBudgetBackoff = `-- name: SaveInstallationBudgetBackoff :execrows
 WITH locked AS MATERIALIZED (
-    SELECT class
+    SELECT class, lease_owner, lease_until
     FROM installation_budgets
     WHERE installation_id = $2
     ORDER BY class
@@ -177,6 +177,13 @@ WITH locked AS MATERIALIZED (
 observed AS MATERIALIZED (
     SELECT clock_timestamp() AS checked_at
     FROM (SELECT count(*) FROM locked) AS after_lock
+),
+owned AS MATERIALIZED (
+    SELECT count(*) = 3
+           AND bool_and(lease_owner = $4::text)
+           AND bool_and(lease_until > observed.checked_at) AS active
+    FROM locked
+    CROSS JOIN observed
 )
 UPDATE installation_budgets AS budgets
 SET backoff_until = CASE
@@ -186,20 +193,32 @@ SET backoff_until = CASE
         ELSE budgets.backoff_until
     END,
     updated_at = observed.checked_at
-FROM observed
+FROM observed, owned
 WHERE budgets.installation_id = $2
-  AND budgets.lease_owner = $3::text
-  AND budgets.lease_until > observed.checked_at
+  AND owned.active
+  AND (
+      ($3::text = 'installation'
+       AND budgets.class IN ('rest', 'graphql'))
+      OR
+      ($3::text = 'app_jwt'
+       AND budgets.class = 'app_jwt_rest')
+  )
 `
 
 type SaveInstallationBudgetBackoffParams struct {
 	BackoffUntil   pgtype.Timestamptz
 	InstallationID int64
+	AuthContext    string
 	LeaseToken     string
 }
 
 func (q *Queries) SaveInstallationBudgetBackoff(ctx context.Context, arg SaveInstallationBudgetBackoffParams) (int64, error) {
-	result, err := q.db.Exec(ctx, saveInstallationBudgetBackoff, arg.BackoffUntil, arg.InstallationID, arg.LeaseToken)
+	result, err := q.db.Exec(ctx, saveInstallationBudgetBackoff,
+		arg.BackoffUntil,
+		arg.InstallationID,
+		arg.AuthContext,
+		arg.LeaseToken,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -210,7 +229,7 @@ const saveInstallationBudgetSnapshot = `-- name: SaveInstallationBudgetSnapshot 
 WITH locked AS MATERIALIZED (
     SELECT class
     FROM installation_budgets
-    WHERE installation_id = $8
+    WHERE installation_id = $12
     ORDER BY class
     FOR UPDATE
 ),
@@ -221,50 +240,68 @@ observed AS MATERIALIZED (
 UPDATE installation_budgets AS budgets
 SET remaining = CASE budgets.class
         WHEN 'rest' THEN $1::bigint
-        WHEN 'graphql' THEN $2::bigint
+        WHEN 'app_jwt_rest' THEN $2::bigint
+        WHEN 'graphql' THEN $3::bigint
     END,
     rate_limit = CASE budgets.class
-        WHEN 'rest' THEN $3::bigint
-        WHEN 'graphql' THEN $4::bigint
+        WHEN 'rest' THEN $4::bigint
+        WHEN 'app_jwt_rest' THEN $5::bigint
+        WHEN 'graphql' THEN $6::bigint
     END,
     reset_at = CASE budgets.class
-        WHEN 'rest' THEN $5::timestamptz
-        WHEN 'graphql' THEN $6::timestamptz
+        WHEN 'rest' THEN $7::timestamptz
+        WHEN 'app_jwt_rest' THEN $8::timestamptz
+        WHEN 'graphql' THEN $9::timestamptz
     END,
     backoff_until = CASE
         WHEN budgets.backoff_until IS NULL
-          OR budgets.backoff_until <
-             $7::timestamptz
-        THEN $7::timestamptz
+          OR budgets.backoff_until < CASE budgets.class
+                 WHEN 'app_jwt_rest'
+                 THEN $10::timestamptz
+                 ELSE $11::timestamptz
+             END
+        THEN CASE budgets.class
+                 WHEN 'app_jwt_rest'
+                 THEN $10::timestamptz
+                 ELSE $11::timestamptz
+             END
         ELSE budgets.backoff_until
     END,
     updated_at = observed.checked_at
 FROM observed
-WHERE budgets.installation_id = $8
-  AND budgets.lease_owner = $9::text
+WHERE budgets.installation_id = $12
+  AND budgets.lease_owner = $13::text
   AND budgets.lease_until > observed.checked_at
 `
 
 type SaveInstallationBudgetSnapshotParams struct {
-	RestRemaining    pgtype.Int8
-	GraphqlRemaining pgtype.Int8
-	RestLimit        pgtype.Int8
-	GraphqlLimit     pgtype.Int8
-	RestResetAt      pgtype.Timestamptz
-	GraphqlResetAt   pgtype.Timestamptz
-	BackoffUntil     pgtype.Timestamptz
-	InstallationID   int64
-	LeaseToken       string
+	RestRemaining      pgtype.Int8
+	AppRestRemaining   pgtype.Int8
+	GraphqlRemaining   pgtype.Int8
+	RestLimit          pgtype.Int8
+	AppRestLimit       pgtype.Int8
+	GraphqlLimit       pgtype.Int8
+	RestResetAt        pgtype.Timestamptz
+	AppRestResetAt     pgtype.Timestamptz
+	GraphqlResetAt     pgtype.Timestamptz
+	AppJwtBackoffUntil pgtype.Timestamptz
+	BackoffUntil       pgtype.Timestamptz
+	InstallationID     int64
+	LeaseToken         string
 }
 
 func (q *Queries) SaveInstallationBudgetSnapshot(ctx context.Context, arg SaveInstallationBudgetSnapshotParams) (int64, error) {
 	result, err := q.db.Exec(ctx, saveInstallationBudgetSnapshot,
 		arg.RestRemaining,
+		arg.AppRestRemaining,
 		arg.GraphqlRemaining,
 		arg.RestLimit,
+		arg.AppRestLimit,
 		arg.GraphqlLimit,
 		arg.RestResetAt,
+		arg.AppRestResetAt,
 		arg.GraphqlResetAt,
+		arg.AppJwtBackoffUntil,
 		arg.BackoffUntil,
 		arg.InstallationID,
 		arg.LeaseToken,

@@ -229,6 +229,107 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 }
 
+func TestAppJWTBudgetMigrationPreservesExistingBudgetRows(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testDatabasePool(t)
+	installationID := -time.Now().UnixNano()
+	resetAt := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+
+	// Simulate an upgraded v0.3.3 database: the two original class rows and
+	// their constraint exist, while migration 0010 has not been recorded.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(
+		ctx,
+		`DELETE FROM schema_migrations
+		 WHERE name = '0010_app_jwt_budget_context.sql'`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		ALTER TABLE installation_budgets
+		    DROP CONSTRAINT installation_budgets_class_check;
+		ALTER TABLE installation_budgets
+		    ADD CONSTRAINT installation_budgets_class_check
+		    CHECK (class = ANY (ARRAY['rest'::text, 'graphql'::text]));
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO installation_budgets (
+		    installation_id, class, remaining, rate_limit, reset_at
+		) VALUES
+		    ($1, 'rest', 4321, 5000, $2),
+		    ($1, 'graphql', 3210, 5000, $2)
+	`, installationID, resetAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("upgrade migration: %v", err)
+	}
+	type state struct {
+		remaining int64
+		limit     int64
+		resetAt   time.Time
+	}
+	want := map[string]state{
+		"rest":    {remaining: 4321, limit: 5000, resetAt: resetAt},
+		"graphql": {remaining: 3210, limit: 5000, resetAt: resetAt},
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT class, remaining, rate_limit, reset_at
+		FROM installation_budgets
+		WHERE installation_id = $1
+	`, installationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := make(map[string]state)
+	for rows.Next() {
+		var class string
+		var value state
+		if err := rows.Scan(
+			&class,
+			&value.remaining,
+			&value.limit,
+			&value.resetAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+		got[class] = value
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("upgraded budget rows = %+v, want %+v", got, want)
+	}
+	for class, expected := range want {
+		actual, ok := got[class]
+		if !ok || actual.remaining != expected.remaining ||
+			actual.limit != expected.limit ||
+			!actual.resetAt.Equal(expected.resetAt) {
+			t.Fatalf("upgraded %s row = %+v, want %+v", class, actual, expected)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO installation_budgets (installation_id, class)
+		VALUES ($1, 'app_jwt_rest')
+	`, installationID); err != nil {
+		t.Fatalf("new App-JWT budget class rejected after upgrade: %v", err)
+	}
+}
+
 func TestVerifyChecksum(t *testing.T) {
 	t.Parallel()
 	checksum := []byte("expected")
@@ -468,6 +569,7 @@ func TestInstallationBudgetSnapshotPreservesLaterBackoff(t *testing.T) {
 		    installation_id, class, lease_owner, lease_until, backoff_until
 		) VALUES
 		    ($1, 'rest', 'snapshot-test', $2, $3),
+		    ($1, 'app_jwt_rest', 'snapshot-test', $2, $3),
 		    ($1, 'graphql', 'snapshot-test', $2, $3)
 	`, installationID, now.Add(time.Hour), wantBackoff); err != nil {
 		t.Fatal(err)
@@ -486,8 +588,8 @@ func TestInstallationBudgetSnapshotPreservesLaterBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if affected != 2 {
-		t.Fatalf("snapshot rows = %d, want 2", affected)
+	if affected != 3 {
+		t.Fatalf("snapshot rows = %d, want 3", affected)
 	}
 	var earlierRows int
 	if err := tx.QueryRow(ctx, `
@@ -498,9 +600,9 @@ func TestInstallationBudgetSnapshotPreservesLaterBackoff(t *testing.T) {
 	`, installationID, wantBackoff).Scan(&earlierRows); err != nil {
 		t.Fatal(err)
 	}
-	if earlierRows != 2 {
+	if earlierRows != 3 {
 		t.Fatalf(
-			"rows preserving later backoff = %d, want 2",
+			"rows preserving later backoff = %d, want 3",
 			earlierRows,
 		)
 	}

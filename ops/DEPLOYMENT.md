@@ -94,7 +94,7 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 | `BUDGET_SWEEP_FLOOR` | `0.20` | Fraction reserved from sweep traffic; strictly between zero and one. |
 | `BUDGET_EVENT_FLOOR` | `0.10` | Fraction reserved from event traffic; must be lower than the sweep floor. |
 | `BUDGET_MAX_CONCURRENT` | `40` | Installation-wide admitted GitHub request ceiling. |
-| `BUDGET_REST_LIMIT` | `5000` | Initial REST denominator until GitHub headers are observed (public-GitHub baseline; GHEC's 15,000 is adopted from headers). |
+| `BUDGET_REST_LIMIT` | `5000` | Initial installation-token REST denominator until GitHub headers are observed (public-GitHub baseline; GHEC's 15,000 is adopted from headers). The independent App-JWT REST context starts at 5,000 and also adopts observed headers. |
 | `BUDGET_GRAPHQL_LIMIT` | `5000` | Initial GraphQL denominator until GitHub rate data is observed. |
 | `BUDGET_SECONDARY_FALLBACK` | `60s` | Backoff for a secondary limit with no valid `Retry-After`. |
 | `BUDGET_LEASE_TTL` | `30s` | Budget singleton lease TTL and ungraceful failover bound. |

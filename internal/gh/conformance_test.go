@@ -60,6 +60,257 @@ func TestResponseHeadersAreAuthoritative(t *testing.T) {
 	}
 }
 
+func TestConflictingAuthContextHeadersCannotMaskInstallationExhaustion(
+	t *testing.T,
+) {
+	t.Parallel()
+	installationReset := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	appReset := installationReset.Add(time.Minute)
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	requestCounts := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requestCounts[r.URL.Path]++
+			mu.Unlock()
+			arrived <- struct{}{}
+			<-release
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/repos/acme/monolith/stacks":
+				w.Header().Set("X-RateLimit-Limit", "15000")
+				w.Header().Set("X-RateLimit-Remaining", "0")
+				w.Header().Set(
+					"X-RateLimit-Reset",
+					fmt.Sprint(installationReset.Unix()),
+				)
+			case "/app/hook/deliveries":
+				w.Header().Set("X-RateLimit-Limit", "5000")
+				w.Header().Set("X-RateLimit-Remaining", "4999")
+				w.Header().Set(
+					"X-RateLimit-Reset",
+					fmt.Sprint(appReset.Unix()),
+				)
+			default:
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte("[]"))
+		},
+	))
+	t.Cleanup(server.Close)
+	starved := make(chan budget.Starvation, 1)
+	gate := budget.New(server.Client(), budget.Options{
+		OnStarvation: func(value budget.Starvation) {
+			starved <- value
+		},
+	})
+	rest := newRESTClient(t, server.URL, gate)
+	deliveries, err := gh.NewDeliveriesClient(
+		server.URL,
+		gate,
+		gh.StaticToken("app-jwt"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errs := make(chan error, 2)
+	go func() {
+		_, _, callErr := rest.ListStacks(
+			context.Background(),
+			budget.Interactive,
+			"acme",
+			"monolith",
+			gh.ListStacksOptions{},
+			"",
+		)
+		errs <- callErr
+	}()
+	go func() {
+		_, _, callErr := deliveries.ListAppHookDeliveries(
+			context.Background(),
+			gh.ListAppHookDeliveriesOptions{},
+			"",
+		)
+		errs <- callErr
+	}()
+	<-arrived
+	<-arrived
+	close(release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snapshot := gate.Snapshot()
+	if snapshot.REST.Limit != 15000 || snapshot.REST.Remaining != 0 ||
+		!snapshot.REST.ResetAt.Equal(installationReset) {
+		t.Fatalf("installation REST snapshot = %+v", snapshot.REST)
+	}
+	if snapshot.AppREST.Limit != 5000 || snapshot.AppREST.Remaining != 4999 ||
+		!snapshot.AppREST.ResetAt.Equal(appReset) {
+		t.Fatalf("App-JWT REST snapshot = %+v", snapshot.AppREST)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	blocked := make(chan error, 1)
+	appAdmitted := make(chan error, 1)
+	go func() {
+		_, _, callErr := rest.ListStacks(
+			ctx,
+			budget.Interactive,
+			"acme",
+			"monolith",
+			gh.ListStacksOptions{},
+			"",
+		)
+		blocked <- callErr
+	}()
+	go func() {
+		_, _, callErr := deliveries.ListAppHookDeliveries(
+			context.Background(),
+			gh.ListAppHookDeliveriesOptions{},
+			"",
+		)
+		appAdmitted <- callErr
+	}()
+	select {
+	case starvation := <-starved:
+		if starvation.AuthContext != budget.InstallationAuth ||
+			starvation.Resource != budget.REST || starvation.Remaining != 0 {
+			t.Fatalf("masked installation starvation = %+v", starvation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exhausted installation pool was masked by App-JWT headers")
+	}
+	select {
+	case err := <-appAdmitted:
+		if err != nil {
+			t.Fatalf("full App-JWT pool was masked by installation headers: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full App-JWT pool did not admit independently")
+	}
+	cancel()
+	if err := <-blocked; !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked installation request = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requestCounts["/repos/acme/monolith/stacks"] != 1 ||
+		requestCounts["/app/hook/deliveries"] != 2 {
+		t.Fatalf("auth-context request counts = %v", requestCounts)
+	}
+}
+
+func TestInstallationTokenMintUsesAppJWTRESTBudget(t *testing.T) {
+	t.Parallel()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	installationReset := now.Add(time.Hour)
+	appReset := installationReset.Add(time.Minute)
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/app/installations/1234/access_tokens":
+				setConformanceRateHeaders(w.Header(), 5000, 4998, appReset)
+				_, _ = fmt.Fprintf(
+					w,
+					`{"token":"installation-token","expires_at":%q}`,
+					now.Add(time.Hour).Format(time.RFC3339),
+				)
+			case "/repos/acme/monolith/stacks":
+				setConformanceRateHeaders(
+					w.Header(),
+					15000,
+					14997,
+					installationReset,
+				)
+				_, _ = w.Write([]byte("[]"))
+			default:
+				http.NotFound(w, r)
+			}
+		},
+	))
+	t.Cleanup(server.Close)
+	observed := make(chan budget.RequestObservation, 2)
+	gate := budget.New(server.Client(), budget.Options{
+		MaxConcurrent: 1,
+		OnRequest: func(value budget.RequestObservation) {
+			observed <- value
+		},
+	})
+	tokens, err := gh.NewInstallationTokens(
+		gate,
+		gh.InstallationTokenOptions{
+			BaseURL:        server.URL,
+			AppID:          99,
+			InstallationID: 1234,
+			PrivateKey:     key,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest, err := gh.NewRESTClient(server.URL, gate, tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rest.ListStacks(
+		context.Background(),
+		budget.Interactive,
+		"acme",
+		"monolith",
+		gh.ListStacksOptions{},
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := gate.Snapshot()
+	if snapshot.AppREST.Limit != 5000 ||
+		snapshot.AppREST.Remaining != 4998 ||
+		!snapshot.AppREST.ResetAt.Equal(appReset) {
+		t.Fatalf("token-mint App-JWT snapshot = %+v", snapshot.AppREST)
+	}
+	if snapshot.REST.Limit != 15000 || snapshot.REST.Remaining != 14997 ||
+		!snapshot.REST.ResetAt.Equal(installationReset) {
+		t.Fatalf("repository installation snapshot = %+v", snapshot.REST)
+	}
+	for _, want := range []budget.AuthContext{
+		budget.AppJWTAuth,
+		budget.InstallationAuth,
+	} {
+		select {
+		case got := <-observed:
+			if got.AuthContext != want || got.Resource != budget.REST {
+				t.Fatalf("request observation = %+v, want REST/%s", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing REST/%s request observation", want)
+		}
+	}
+}
+
+func setConformanceRateHeaders(
+	header http.Header,
+	limit int64,
+	remaining int64,
+	reset time.Time,
+) {
+	header.Set("X-RateLimit-Limit", fmt.Sprint(limit))
+	header.Set("X-RateLimit-Remaining", fmt.Sprint(remaining))
+	header.Set("X-RateLimit-Reset", fmt.Sprint(reset.Unix()))
+}
+
 func TestSecondaryLimitClosesGateGloballyForRetryAfter(t *testing.T) {
 	clock := newManualClock(time.Now())
 	reset := clock.Now().Add(time.Hour)

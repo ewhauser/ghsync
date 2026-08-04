@@ -55,8 +55,8 @@ type Options struct {
 }
 
 // Gate is the C-B1 per-installation choke point. It owns admission,
-// server-authoritative REST and GraphQL observations, global secondary-limit
-// backoff, and the C-B6 concurrency ceiling.
+// server-authoritative REST and GraphQL observations, per-auth-context
+// secondary-limit backoff, and the C-B6 concurrency ceiling.
 type Gate struct {
 	client *http.Client
 	clock  Clock
@@ -66,14 +66,17 @@ type Gate struct {
 	inFlight               int
 	maxConcurrent          int
 	rest                   ResourceBudget
+	appREST                ResourceBudget
 	graphql                ResourceBudget
 	restReserved           int64
+	appRESTReserved        int64
 	graphqlReserved        int64
 	restEstimate           int64
 	graphqlEstimate        int64
 	sweepFloor             float64
 	eventFloor             float64
 	backoffUntil           time.Time
+	appJWTBackoffUntil     time.Time
 	secondaryLimitFallback time.Duration
 	unavailable            error
 	leaseUntil             time.Time
@@ -87,12 +90,14 @@ type Gate struct {
 }
 
 type admission struct {
-	gate     *Gate
-	id       uint64
-	resource Resource
-	cost     int64
-	cancel   context.CancelFunc
-	once     sync.Once
+	gate        *Gate
+	id          uint64
+	resource    Resource
+	authContext AuthContext
+	cost        int64
+	holdsSlot   bool
+	cancel      context.CancelFunc
+	once        sync.Once
 
 	mu      sync.Mutex
 	body    io.Closer
@@ -163,6 +168,7 @@ func New(client *http.Client, options Options) *Gate { //nolint:gocritic // valu
 		changed:                make(chan struct{}),
 		maxConcurrent:          options.MaxConcurrent,
 		rest:                   ResourceBudget{Limit: options.RESTLimit},
+		appREST:                ResourceBudget{Limit: defaultRESTLimit},
 		graphql:                ResourceBudget{Limit: options.GraphQLLimit},
 		restEstimate:           options.RESTRequestEstimate,
 		graphqlEstimate:        options.GraphQLPointEstimate,
@@ -187,11 +193,10 @@ func New(client *http.Client, options Options) *Gate { //nolint:gocritic // valu
 // Redirect following is disabled because a redirect would otherwise hide an
 // unadmitted request inside http.Client.Do.
 //
-// An Auth request issued from a BeforeSend hook reuses its outer request's
-// admission. It is exempt from an additional concurrency slot and rate-floor
-// reservation so installation-token renewal cannot deadlock behind its own
-// admitted request; it inherits the outer availability/backoff decision rather
-// than performing a second admission check.
+// An installation-token mint issued from a BeforeSend hook reuses its outer
+// request's concurrency slot so renewal cannot deadlock at MaxConcurrent=1.
+// The mint still performs independent App-JWT REST admission, reservation,
+// header observation, and backoff accounting.
 func (g *Gate) Do(
 	ctx context.Context,
 	class Class,
@@ -206,6 +211,7 @@ func (g *Gate) Do(
 		trace.WithAttributes(
 			attribute.String("ghsync.github.class", string(class)),
 			attribute.String("ghsync.github.resource", string(req.resource)),
+			attribute.String("ghsync.github.auth_context", string(req.authContext)),
 		),
 	)
 	defer func() {
@@ -227,10 +233,11 @@ func (g *Gate) Do(
 	// inside this gate's admitted slot. It executes sequentially in that slot,
 	// avoiding a MaxConcurrent=1 nested-admission deadlock while remaining
 	// covered by the outer C-B6 accounting.
+	var parentAdmission *admission
 	if parent, ok := ctx.Value(admissionContextKey{}).(*admission); ok &&
-		parent.gate == g && req.resource == Auth {
+		parent.gate == g && req.tokenMint {
+		parentAdmission = parent
 		span.SetAttributes(attribute.Bool("ghsync.github.nested_auth", true))
-		return g.doAdmitted(ctx, class, req, nil)
 	}
 
 	reportedStarvation := false
@@ -241,6 +248,8 @@ func (g *Gate) Do(
 			ctx,
 			class,
 			req.resource,
+			req.authContext,
+			parentAdmission,
 		)
 		if decision.err != nil {
 			return nil, decision.err
@@ -289,6 +298,16 @@ func validateDo(ctx context.Context, class Class, req *Request) error {
 	if !req.resource.valid() {
 		return fmt.Errorf("budget gate: invalid resource %q", req.resource)
 	}
+	if !req.authContext.valid() {
+		return fmt.Errorf("budget gate: invalid auth context %q", req.authContext)
+	}
+	if req.resource == GraphQL && req.authContext != InstallationAuth {
+		return fmt.Errorf("budget gate: GraphQL requires installation auth")
+	}
+	if req.tokenMint &&
+		(req.resource != REST || req.authContext != AppJWTAuth) {
+		return fmt.Errorf("budget gate: token exchange requires App-JWT auth")
+	}
 	if req.resource == GraphQL && req.observeRate == nil {
 		return fmt.Errorf("budget gate: GraphQL request has no rate observer")
 	}
@@ -326,10 +345,14 @@ func (g *Gate) doAdmitted(
 	var graphQLRate *GraphQLRate
 	var observeErr error
 	if resp != nil {
-		secondaryErr := g.observeSecondaryLimit(sendCtx, resp)
+		secondaryErr := g.observeSecondaryLimit(
+			sendCtx,
+			req.authContext,
+			resp,
+		)
 		switch req.resource {
 		case REST:
-			observeErr = g.observeREST(resp.Header)
+			observeErr = g.observeREST(req.authContext, resp.Header)
 		case GraphQL:
 			var rate GraphQLRate
 			var ok bool
@@ -370,6 +393,7 @@ func (g *Gate) doAdmitted(
 		g.onRequest(RequestObservation{
 			Class:       class,
 			Resource:    req.resource,
+			AuthContext: req.authContext,
 			StatusCode:  statusCode,
 			Conditional: httpReq.Header.Get("If-None-Match") != "",
 			NotModified: statusCode == http.StatusNotModified,
@@ -402,9 +426,13 @@ func (g *Gate) tryAdmit(
 	ctx context.Context,
 	class Class,
 	resource Resource,
+	authContext AuthContext,
+	parent *admission,
 ) (admissionDecision, context.Context) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	reuseSlot := parent != nil && parent.holdsSlot &&
+		g.admissions[parent.id] == parent
 
 	now := g.clock.Now()
 	if g.unavailable == nil && !g.leaseUntil.IsZero() &&
@@ -418,54 +446,59 @@ func (g *Gate) tryAdmit(
 	if g.unavailable != nil {
 		return admissionDecision{err: g.unavailable}, nil
 	}
-	if now.Before(g.backoffUntil) {
+	backoffUntil := g.backoffLocked(authContext)
+	if now.Before(backoffUntil) {
 		return admissionDecision{
 			wait:      true,
-			waitUntil: g.backoffUntil,
+			waitUntil: backoffUntil,
 			changed:   g.changed,
 		}, nil
 	}
-	if g.inFlight >= g.maxConcurrent {
+	if !reuseSlot && g.inFlight >= g.maxConcurrent {
 		// A zero deadline means "wait for a state-change notification".
 		return admissionDecision{wait: true, changed: g.changed}, nil
 	}
 
 	cost := g.estimateLocked(resource)
-	if resource != Auth {
-		state := g.resourceLocked(resource)
-		if state.Known && now.Before(state.ResetAt) {
-			afterReservation := state.Remaining - g.reservedLocked(resource) - cost
-			floor := g.floorFor(class)
-			floorRemaining := int64(math.Ceil(float64(state.Limit) * floor))
-			if afterReservation < 0 || (floor > 0 && afterReservation < floorRemaining) {
-				return admissionDecision{
-					wait:      true,
-					waitUntil: state.ResetAt,
-					changed:   g.changed,
-					starvation: &Starvation{
-						Class:    class,
-						Resource: resource,
-						Remaining: state.Remaining -
-							g.reservedLocked(resource),
-						Limit:   state.Limit,
-						ResetAt: state.ResetAt,
-					},
-				}, nil
-			}
+	state := g.resourceLocked(resource, authContext)
+	if state.Known && now.Before(state.ResetAt) {
+		afterReservation := state.Remaining -
+			g.reservedLocked(resource, authContext) - cost
+		floor := g.floorFor(class)
+		floorRemaining := int64(math.Ceil(float64(state.Limit) * floor))
+		if afterReservation < 0 || (floor > 0 && afterReservation < floorRemaining) {
+			return admissionDecision{
+				wait:      true,
+				waitUntil: state.ResetAt,
+				changed:   g.changed,
+				starvation: &Starvation{
+					Class:       class,
+					Resource:    resource,
+					AuthContext: authContext,
+					Remaining: state.Remaining -
+						g.reservedLocked(resource, authContext),
+					Limit:   state.Limit,
+					ResetAt: state.ResetAt,
+				},
+			}, nil
 		}
 	}
 
 	admittedCtx, cancel := context.WithCancel(ctx)
 	g.nextAdmissionID++
 	entry := &admission{
-		gate:     g,
-		id:       g.nextAdmissionID,
-		resource: resource,
-		cost:     cost,
-		cancel:   cancel,
+		gate:        g,
+		id:          g.nextAdmissionID,
+		resource:    resource,
+		authContext: authContext,
+		cost:        cost,
+		holdsSlot:   !reuseSlot,
+		cancel:      cancel,
 	}
-	g.inFlight++
-	g.addReservationLocked(resource, cost)
+	if entry.holdsSlot {
+		g.inFlight++
+	}
+	g.addReservationLocked(resource, authContext, cost)
 	g.admissions[entry.id] = entry
 	return admissionDecision{admitted: entry}, admittedCtx
 }
@@ -530,8 +563,10 @@ func (g *Gate) finishAdmission(a *admission) {
 	g.mu.Lock()
 	if _, ok := g.admissions[a.id]; ok {
 		delete(g.admissions, a.id)
-		g.inFlight--
-		g.addReservationLocked(a.resource, -a.cost)
+		if a.holdsSlot {
+			g.inFlight--
+		}
+		g.addReservationLocked(a.resource, a.authContext, -a.cost)
 		g.signalLocked()
 	}
 	g.mu.Unlock()
@@ -586,7 +621,10 @@ func (b *networkBody) Done() bool {
 	return b.done
 }
 
-func (g *Gate) observeREST(header http.Header) error {
+func (g *Gate) observeREST(
+	authContext AuthContext,
+	header http.Header,
+) error {
 	rawLimit := header.Get("X-RateLimit-Limit")
 	rawRemaining := header.Get("X-RateLimit-Remaining")
 	rawReset := header.Get("X-RateLimit-Reset")
@@ -610,7 +648,8 @@ func (g *Gate) observeREST(header http.Header) error {
 	}
 
 	g.mu.Lock()
-	g.rest = mergeObservation(g.rest, ResourceBudget{
+	state := g.resourceLocked(REST, authContext)
+	*state = mergeObservation(*state, ResourceBudget{
 		Known:     true,
 		Limit:     limit,
 		Remaining: remaining,
@@ -657,6 +696,7 @@ func mergeObservation(current, observed ResourceBudget) ResourceBudget {
 
 func (g *Gate) observeSecondaryLimit(
 	ctx context.Context,
+	authContext AuthContext,
 	resp *http.Response,
 ) error {
 	if resp.StatusCode != http.StatusForbidden &&
@@ -685,9 +725,10 @@ func (g *Gate) observeSecondaryLimit(
 	}
 
 	g.mu.Lock()
-	changed := until.After(g.backoffUntil)
+	backoffUntil := g.backoffLocked(authContext)
+	changed := until.After(backoffUntil)
 	if changed {
-		g.backoffUntil = until
+		g.setBackoffLocked(authContext, until)
 		g.signalLocked()
 	}
 	g.mu.Unlock()
@@ -696,9 +737,9 @@ func (g *Gate) observeSecondaryLimit(
 	}
 
 	// Secondary-limit coordination is the deliberate exception to C-P6's
-	// periodic snapshots: losing this installation-wide closure on handoff is
+	// periodic snapshots: losing this credential-context closure on handoff is
 	// unsafe, so persist it synchronously under the lease token.
-	ok, err := g.persistBackoff(ctx, until)
+	ok, err := g.persistBackoff(ctx, authContext, until)
 	if err != nil {
 		// The in-memory closure remains authoritative and the periodic snapshot
 		// loop will retry persistence. A transport error does not prove that
@@ -783,27 +824,65 @@ func (g *Gate) estimateLocked(resource Resource) int64 {
 	}
 }
 
-func (g *Gate) reservedLocked(resource Resource) int64 {
+func (g *Gate) reservedLocked(
+	resource Resource,
+	authContext AuthContext,
+) int64 {
 	if resource == GraphQL {
 		return g.graphqlReserved
+	}
+	if resource == REST && authContext == AppJWTAuth {
+		return g.appRESTReserved
 	}
 	return g.restReserved
 }
 
-func (g *Gate) addReservationLocked(resource Resource, delta int64) {
+func (g *Gate) addReservationLocked(
+	resource Resource,
+	authContext AuthContext,
+	delta int64,
+) {
 	switch resource {
 	case REST:
-		g.restReserved += delta
+		if authContext == AppJWTAuth {
+			g.appRESTReserved += delta
+		} else {
+			g.restReserved += delta
+		}
 	case GraphQL:
 		g.graphqlReserved += delta
 	}
 }
 
-func (g *Gate) resourceLocked(resource Resource) *ResourceBudget {
+func (g *Gate) resourceLocked(
+	resource Resource,
+	authContext AuthContext,
+) *ResourceBudget {
 	if resource == GraphQL {
 		return &g.graphql
 	}
+	if resource == REST && authContext == AppJWTAuth {
+		return &g.appREST
+	}
 	return &g.rest
+}
+
+func (g *Gate) backoffLocked(authContext AuthContext) time.Time {
+	if authContext == AppJWTAuth {
+		return g.appJWTBackoffUntil
+	}
+	return g.backoffUntil
+}
+
+func (g *Gate) setBackoffLocked(
+	authContext AuthContext,
+	until time.Time,
+) {
+	if authContext == AppJWTAuth {
+		g.appJWTBackoffUntil = until
+		return
+	}
+	g.backoffUntil = until
 }
 
 func (g *Gate) signalLocked() {
@@ -817,10 +896,12 @@ func (g *Gate) Snapshot() Snapshot {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return Snapshot{
-		REST:         g.rest,
-		GraphQL:      g.graphql,
-		BackoffUntil: g.backoffUntil,
-		InFlight:     g.inFlight,
+		REST:               g.rest,
+		AppREST:            g.appREST,
+		GraphQL:            g.graphql,
+		BackoffUntil:       g.backoffUntil,
+		AppJWTBackoffUntil: g.appJWTBackoffUntil,
+		InFlight:           g.inFlight,
 	}
 }
 
@@ -829,11 +910,17 @@ func (g *Gate) restore(snapshot *Snapshot) {
 	if snapshot.REST.Known {
 		g.rest = snapshot.REST
 	}
+	if snapshot.AppREST.Known {
+		g.appREST = snapshot.AppREST
+	}
 	if snapshot.GraphQL.Known {
 		g.graphql = snapshot.GraphQL
 	}
 	if snapshot.BackoffUntil.After(g.backoffUntil) {
 		g.backoffUntil = snapshot.BackoffUntil
+	}
+	if snapshot.AppJWTBackoffUntil.After(g.appJWTBackoffUntil) {
+		g.appJWTBackoffUntil = snapshot.AppJWTBackoffUntil
 	}
 	g.signalLocked()
 	g.mu.Unlock()

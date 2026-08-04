@@ -186,21 +186,22 @@ explicit review checklist rather than relying on call-site folklore:
 
 - **C-B1 — One choke point.** Every GitHub call in the system goes through a
   single per-installation gate (one goroutine-owned budgeter per installation
-  token, coordinated across processes via Postgres lease). No component holds
-  its own HTTP client to GitHub. This is the constraint that makes every
-  other budget rule enforceable.
+  across its installation-token and App-JWT traffic, coordinated across
+  processes via Postgres lease). No component holds its own HTTP client to
+  GitHub. This is the constraint that makes every other budget rule
+  enforceable.
 - **C-B2 — Server headers are authoritative.** Remaining budget is tracked
   from `x-ratelimit-remaining` / `x-ratelimit-reset` response headers, never
   from local counting. On 403/429 secondary-limit responses, `Retry-After` is
-  honored exactly, and the gate closes for the whole installation, not just
-  the offending caller.
+  honored exactly, and the gate closes for the offending credential context,
+  not the independent installation-token or App-JWT pool.
 - **C-B3 — Priority classes with reserved headroom.** Three classes:
   `interactive` (a user is waiting: cold-start backfill of a just-opened
   view), `event` (webhook-driven refresh), `sweep` (reconciliation).
-  Background classes may not spend below a floor (default: 20% of the hourly
-  budget remains untouched by `sweep`, 10% by `event`), so interactive work
-  and mutations always have room. Class starvation is a paging alert, not a
-  silent behavior.
+  Within each credential/resource budget, background classes may not spend
+  below a floor (default: 20% of the hourly budget remains untouched by
+  `sweep`, 10% by `event`), so interactive work and mutations always have
+  room. Class starvation is a paging alert, not a silent behavior.
 - **C-B4 — Conditional by default.** Reconciliation and any refetch of a
   possibly-unchanged entity sends `If-None-Match`; 304s are close to free and
   must be the common case for sweeps. A sweep that hits < 80% 304 rate on a
@@ -445,10 +446,11 @@ transactions: **dozens**, not thousands.
   cache, and emits a divergence metric. Divergence > 0 is a bug report with
   the diff attached, not a shrug.
 - **C-O4 — First-class observables.** Per-installation: budget remaining by
-  class, request rate, 304 ratio. Pipeline: event→cache latency histogram
-  (C-Q2 SLO), queue depth by priority, oldest-unprocessed delivery age,
-  staleness per entity class (C-R1), outbox lag, parked-job count. All of
-  these have alert thresholds tied to the constraint they verify.
+  class and auth context, request rate, 304 ratio. Pipeline: event→cache
+  latency histogram (C-Q2 SLO), queue depth by priority, oldest-unprocessed
+  delivery age, staleness per entity class (C-R1), outbox lag, parked-job
+  count. All of these have alert thresholds tied to the constraint they
+  verify.
 - **C-O5 — Backfill is resumable and budget-polite.** Installation
   onboarding (enumerate repos → open PRs → stacks → per-PR detail) runs as
   ordinary keyed jobs in the `interactive` class while a user waits on the
@@ -534,6 +536,7 @@ consumer_cursors(consumer, stream, seq)                  -- durable cursors for 
 -- Budget & coordination (single org ⇒ one installation row; kept keyed by
 -- installation_id anyway so multi-org later is a data change, not a schema one)
 installation_budgets(installation_id, class, remaining, reset_at, lease_owner, lease_until)
+-- class: rest | app_jwt_rest | graphql
 sweep_cursors(sweep_kind, installation_id, cursor, updated_at)
 
 -- Retention (decided): webhook_deliveries.payload and check_history rows are
@@ -592,9 +595,10 @@ type Deriver interface { // pure (C-D1)
 ## 7. Budget math (sanity check against C-B)
 
 Assume public GitHub's App-installation baseline (5,000 REST/hr + 5,000
-GraphQL points/hr; GHEC reports 15,000 REST/hr, which the budgeter adopts
-from rate headers), one org, 60 engineers, ~40 active PRs, peak ~300
-PR-affecting events/hr.
+GraphQL points/hr; GHEC reports 15,000 installation-token REST/hr, which the
+budgeter adopts from rate headers), plus the App JWT's independent 5,000
+REST/hr pool for delivery APIs and installation-token mint requests, one org,
+60 engineers, ~40 active PRs, peak ~300 PR-affecting events/hr.
 
 - Event path: 300 events/hr → coalescing (C-Q1) → ~120 fetch batches/hr ×
   (1 GraphQL batch + ~1 REST call) ≈ **~150 REST/hr + ~600 GraphQL points/hr**.
@@ -642,7 +646,9 @@ payload (this also preserves C-I4: the fetch re-reads truth at run time).
 - **Coalescing test (C-Q1/Q2):** synthetic rebase storm (20 events / 3
   branches / 10s) → assert fetch count ≤ entities affected and freshness SLO.
 - **Budget conformance (C-B):** fake GitHub returns declining rate headers +
-  secondary-limit 403s; assert class floors, global backoff, Retry-After.
+  secondary-limit 403s; assert per-context class floors and backoff,
+  Retry-After, and concurrent installation-token/App-JWT responses with
+  conflicting headers.
 - **Sweep/tombstone (C-R3):** entity vanishes from listing → tombstoned;
   never hard-deleted.
 - **Watch resume (C-D4):** kill and reconnect a watcher mid-stream at every

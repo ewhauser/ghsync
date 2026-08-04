@@ -77,8 +77,17 @@ func TestAlertRulesReferenceConstraintsAndLockedThresholds(t *testing.T) {
 		!strings.Contains(
 			expressions["GhsyncSecondaryGateClosed"],
 			"ghsync_c_b2_gate_closed",
-		) {
+		) || !strings.Contains(
+		expressions["GhsyncSecondaryGateClosed"],
+		"max by (installation_id, resource, auth_context)",
+	) {
 		t.Fatal("secondary gate alert is not a five-minute boolean condition")
+	}
+	if !strings.Contains(
+		expressions["GhsyncBudgetClassStarved"],
+		"sum by (class, resource, auth_context)",
+	) {
+		t.Fatal("budget starvation alert drops auth-context series identity")
 	}
 	for _, role := range []string{
 		"metrics", "ingress", "dispatch", "fetch", "sweep", "drift",

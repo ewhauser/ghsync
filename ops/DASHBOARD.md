@@ -45,11 +45,33 @@ This row alone answers the on-call question. Link each stat to its runbook.
 
 ## Row 3: reconciliation and budget
 
-- Server-authoritative budget remaining by class/resource; request and
-  starvation rates. Starvation, not a post-request floor comparison, is the
-  admission-safety signal.
-- `ghsync_c_b2_gate_closed` as a boolean with continuous closed duration
-  supplied by the alert `for` clause.
+- Server-authoritative budget remaining by class/resource/auth context;
+  request and starvation rates. Split installation-token (`installation`)
+  from App-JWT (`app_jwt`) panels so one pool cannot mask the other.
+  Starvation, not a post-request floor comparison, is the admission-safety
+  signal. Preserve `auth_context` explicitly in the queries:
+
+  ```promql
+  min by (installation_id, class, resource, auth_context) (
+    ghsync_c_b3_budget_remaining
+  )
+  ```
+
+  ```promql
+  sum by (class, resource, auth_context) (
+    increase(ghsync_c_b3_starvations_total[5m])
+  )
+  ```
+
+- `ghsync_c_b2_gate_closed` by `auth_context` as a boolean with continuous
+  closed duration supplied by the alert `for` clause:
+
+  ```promql
+  max by (installation_id, resource, auth_context) (
+    ghsync_c_b2_gate_closed
+  )
+  ```
+
 - Sweep duration and period by kind, gap-heal requests, drift state, and
   pruner deletes. Include durable sweep/drift success count, drift sample
   count, and age; `-1` or absent is red.
