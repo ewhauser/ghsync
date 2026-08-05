@@ -85,6 +85,17 @@ func TestWebhookValidatorChecksPrivateStackPreview(t *testing.T) {
 	}
 	pull := payload["pull_request"].(map[string]any)
 	stack := pull["stack"].(map[string]any)
+	stack["size"] = 2
+	stack["position"] = 5
+	if err := validate(); err != nil {
+		t.Fatalf("valid historical stack position rejected: %v", err)
+	}
+	stack["position"] = 0
+	if err := validate(); err == nil ||
+		!strings.Contains(err.Error(), "stack.position") {
+		t.Fatalf("non-positive stack position error = %v", err)
+	}
+	stack["position"] = 5
 	base := stack["base"].(map[string]any)
 	base["sha"] = ""
 	if err := validate(); err == nil ||

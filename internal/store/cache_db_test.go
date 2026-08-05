@@ -90,6 +90,196 @@ func TestUnknownStackBaseSHAFailsOpenWithoutPoisoningPullWrite(t *testing.T) {
 	}
 }
 
+func TestHistoricalStackPositionFailsOpenWithoutPoisoningPullWrite(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/historical-stack-position", 9051, now)
+	stackNumber := 142
+	stackPosition := 3
+	if _, err := writer.ApplyStack(ctx, StackRecord{
+		Repository: repository,
+		GitHubID:   7001,
+		NodeID:     "stack-node-historical-position",
+		Number:     stackNumber,
+		BaseRef:    "main",
+		BaseSHA:    "base-one",
+		Open:       true,
+		Entries: []StackEntry{
+			{
+				Number: 43, State: "open", UpdatedAt: now,
+				HeadRef: "feature/current-one", HeadSHA: "head-current-one",
+			},
+			{
+				Number: 44, State: "open", UpdatedAt: now,
+				HeadRef: "feature/current-two", HeadSHA: "head-current-two",
+			},
+		},
+		GitHubUpdatedAt: now,
+		SyncedAt:        now,
+		Source:          SyncSourceWebhook,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pull := storeTestPull(&repository, now, "head-historical")
+	pull.StackNumber = &stackNumber
+	pull.StackPosition = &stackPosition
+	pull.StackSummary = &StackSummaryRecord{
+		GitHubID: 7001,
+		Number:   stackNumber,
+		Size:     2,
+		Position: stackPosition,
+		BaseRef:  "main",
+		BaseSHA:  "base-one",
+	}
+	pull.MembershipKnown = true
+	result, err := writer.ApplyPullRequest(ctx, pull)
+	if err != nil {
+		t.Fatalf("apply PR with historical stack position: %v", err)
+	}
+	if !result.DomainChanged || !result.StackStateChanged {
+		t.Fatalf("historical-position PR result = %+v", result)
+	}
+	row, err := dbgen.New(pool).GetPullRequestByKey(
+		ctx,
+		dbgen.GetPullRequestByKeyParams{
+			RepoFullName: repository.FullName,
+			PrNumber:     int32(pull.Number),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.StackNumber.Valid || row.StackNumber.Int32 != int32(stackNumber) ||
+		!row.StackPosition.Valid || row.StackPosition.Int32 != int32(stackPosition) {
+		t.Fatalf("persisted historical membership = %+v", row)
+	}
+}
+
+func TestHistoricalStackPositionObeysWriteIfNewerOrderingBothDirections(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	ctx := t.Context()
+	now := time.Date(2026, 8, 4, 13, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/historical-position-order", 9052, now)
+	const stackNumber = 142
+	stackedPull := func(updatedAt time.Time, size, position int) PullRequestRecord {
+		pull := storeTestPull(&repository, updatedAt, "head")
+		number := stackNumber
+		currentPosition := position
+		pull.StackNumber = &number
+		pull.StackPosition = &currentPosition
+		pull.StackSummary = &StackSummaryRecord{
+			GitHubID: 7002,
+			Number:   stackNumber,
+			Size:     size,
+			Position: position,
+			BaseRef:  "main",
+			BaseSHA:  "base-one",
+		}
+		pull.MembershipKnown = true
+		return pull
+	}
+	assertPosition := func(want int, updatedAt time.Time) {
+		t.Helper()
+		row, err := dbgen.New(pool).GetPullRequestByKey(
+			ctx,
+			dbgen.GetPullRequestByKeyParams{
+				RepoFullName: repository.FullName,
+				PrNumber:     42,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !row.StackPosition.Valid || int(row.StackPosition.Int32) != want ||
+			!row.GhUpdatedAt.Valid || !row.GhUpdatedAt.Time.Equal(updatedAt) {
+			t.Fatalf(
+				"cached stack position/version = %v/%v, want %d/%v",
+				row.StackPosition,
+				row.GhUpdatedAt,
+				want,
+				updatedAt,
+			)
+		}
+	}
+
+	valid := stackedPull(now, 5, 2)
+	if _, err := writer.ApplyPullRequest(ctx, valid); err != nil {
+		t.Fatal(err)
+	}
+	historical := stackedPull(now.Add(2*time.Minute), 2, 5)
+	result, err := writer.ApplyPullRequest(ctx, historical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DomainChanged {
+		t.Fatalf("newer historical summary result = %+v", result)
+	}
+
+	staleValid := valid
+	staleValid.SyncedAt = now.Add(3 * time.Minute)
+	result, err = writer.ApplyPullRequest(ctx, staleValid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DomainChanged {
+		t.Fatalf("older valid summary resurrected past historical truth: %+v", result)
+	}
+	assertPosition(5, historical.GitHubUpdatedAt)
+
+	newerValid := stackedPull(now.Add(4*time.Minute), 5, 2)
+	result, err = writer.ApplyPullRequest(ctx, newerValid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DomainChanged {
+		t.Fatalf("newer valid summary result = %+v", result)
+	}
+
+	staleHistorical := historical
+	staleHistorical.SyncedAt = now.Add(5 * time.Minute)
+	result, err = writer.ApplyPullRequest(ctx, staleHistorical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DomainChanged {
+		t.Fatalf("older historical summary resurrected past valid truth: %+v", result)
+	}
+	assertPosition(2, newerValid.GitHubUpdatedAt)
+}
+
+func TestPullRequestStackSummaryRequiresPositivePosition(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 4, 14, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/invalid-stack-position", 9053, now)
+	stackNumber := 142
+	stackPosition := 0
+	pull := storeTestPull(&repository, now, "head")
+	pull.StackNumber = &stackNumber
+	pull.StackPosition = &stackPosition
+	pull.StackSummary = &StackSummaryRecord{
+		GitHubID: 7003,
+		Number:   stackNumber,
+		Size:     2,
+		Position: stackPosition,
+		BaseRef:  "main",
+		BaseSHA:  "base-one",
+	}
+	pull.MembershipKnown = true
+	if err := validatePullRequest(&pull); err == nil ||
+		!strings.Contains(err.Error(), "invalid PR stack summary") {
+		t.Fatalf("zero stack position validation error = %v", err)
+	}
+}
+
 func TestStackUnknownBaseSHAObeysWriteIfNewerOrderingBothDirections(
 	t *testing.T,
 ) {

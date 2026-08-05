@@ -137,7 +137,7 @@ JSON value may be empty.
 | `pull_requests` | `review_decision` | `text` | no | — |
 | `pull_requests` | `mergeable_state` | `text` | no | — |
 | `pull_requests` | `stack_number` | `integer` | yes | null means loose PR |
-| `pull_requests` | `stack_position` | `integer` | yes | null exactly when stack_number is null |
+| `pull_requests` | `stack_position` | `integer` | yes | null exactly when stack_number is null; GitHub's positive historical ordinal may exceed the current stack's `entries` length after membership shrinks, for open or closed PRs |
 | `pull_requests` | `gh_updated_at` | `timestamp with time zone` | yes | write-if-newer input |
 | `pull_requests` | `synced_at` | `timestamp with time zone` | no | domain-change time |
 | `pull_requests` | `etag` | `text` | no | pull-request metadata HTTP validator |

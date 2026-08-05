@@ -476,6 +476,8 @@ func (h *Handler) refreshPRREST(
 			h.orgID,
 		)
 		graphQLRecord.MembershipKnown = true
+		// GraphQL has no stack-preview tuple. Preserve the authoritative REST
+		// summary across hydration, including a historical Position > Size.
 		graphQLRecord.StackSummary = record.StackSummary
 		record = graphQLRecord
 		snapshot, fence, hydrateErr := changeinputs.HydrateFromMirrorConditional(

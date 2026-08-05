@@ -476,6 +476,61 @@ func TestUnknownStackBaseSHARetainsEagerStackFetch(t *testing.T) {
 	}
 }
 
+func TestHistoricalStackPositionRetainsEagerStackFetch(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"action":"synchronize",
+		"number":72787,
+		"repository":{"full_name":"acme/monolith"},
+		"pull_request":{
+			"number":72787,
+			"stack":{
+				"id":46101,
+				"number":72787,
+				"base":{"ref":"main","sha":"base-one"},
+				"size":2,
+				"position":5
+			}
+		}
+	}`)
+	result, err := DefaultClassifier().classify("pull_request", body)
+	if err != nil {
+		t.Fatalf("classify historical stack position: %v", err)
+	}
+	if result.stackHint != nil {
+		t.Fatalf("historical position produced suppression hint: %+v", result.stackHint)
+	}
+	want := []Intent{
+		{
+			Kind: queue.KindRefreshPR, Key: "pr:acme/monolith:72787",
+			Priority: PriorityEvent,
+		},
+		{
+			Kind: queue.KindRefreshStack, Key: "stack:acme/monolith:72787",
+			Priority: PriorityEvent,
+		},
+		{
+			Kind: queue.KindResolveStackMembership,
+			Key:  "pr:acme/monolith:72787", Priority: PriorityEvent,
+		},
+	}
+	if !reflect.DeepEqual(result.intents, want) {
+		t.Fatalf("historical-position intents = %#v, want %#v", result.intents, want)
+	}
+}
+
+func TestHistoricalStackPositionCannotIndexCurrentEntries(t *testing.T) {
+	t.Parallel()
+	matched, err := stackSummaryMatchesCache(
+		t.Context(),
+		nil,
+		&stackSummaryHint{Size: 2, Position: 5},
+	)
+	if err != nil || matched {
+		t.Fatalf("historical-position comparison = %v, %v, want false, nil", matched, err)
+	}
+}
+
 func TestClassifierUsesStoredFormContentType(t *testing.T) {
 	t.Parallel()
 	jsonBody := []byte(`{

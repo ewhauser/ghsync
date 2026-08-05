@@ -281,6 +281,38 @@ func TestDriftTreatsUnknownBaseSHAAsConvergedTruth(t *testing.T) {
 	}
 }
 
+func TestDriftTreatsHistoricalStackPositionAsConvergedTruth(t *testing.T) {
+	t.Parallel()
+	harness := newReadyDriftHarness(t)
+	ctx := t.Context()
+	pull := &harness.fixture.PullRequests[0]
+	if pull.Stack == nil {
+		t.Fatal("drift fixture PR has no stack summary")
+	}
+	pull.Stack.Size = 2
+	pull.Stack.Position = 5
+	harness.fake.SetFixture(harness.fixture)
+	if err := harness.handler.ResolveStackMembership(ctx, queue.RefreshRequest{
+		Args: queue.NewResolveStackMembershipArgs(
+			"pr:acme/monolith:4810",
+		).RefreshArgs,
+		Queue: queue.QueueSweep,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("historical stack position produced drift: %+v", findings)
+	}
+}
+
 func TestDriftDetectsAndHealsReviewRequestSetDivergence(t *testing.T) {
 	t.Parallel()
 	harness := newReadyDriftHarness(t)

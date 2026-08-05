@@ -81,7 +81,11 @@ Consequences baked into the design:
    draft change still enqueues the stack transactionally. A JSON-null base SHA
    is valid upstream truth for historical and open stacks, but it can never
    prove a tuple match: unknown fails open to the eager stack fetch even when
-   both the payload and cache use the empty-string unknown sentinel.
+   both the payload and cache use the empty-string unknown sentinel. Likewise,
+   `position > size` is valid historical membership after the current stack
+   shrinks, including when it arrives on an open PR. PR state cannot prove the
+   embedded summary is current; the historical ordinal cannot address current
+   ordered entries and therefore always fails open to the eager stack fetch.
 2. **Stacked-PR events escalate scope when needed.** For a PR in a stack,
    `closed`, `synchronize`, and base-edit events always retain an authoritative
    PR refresh. A tuple mismatch or a fetched membership, position, head, state,

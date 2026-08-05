@@ -587,6 +587,8 @@ func completeStackSummaryHint(
 		stack.Number <= 0 ||
 		stack.Size <= 0 ||
 		stack.Position <= 0 ||
+		// A historical ordinal beyond the current size is valid payload truth,
+		// but cannot suppress the eager fetch of current ordered membership.
 		stack.Position > stack.Size ||
 		stack.Base.Ref == "" ||
 		// An unknown SHA is valid payload truth, but it is not a complete

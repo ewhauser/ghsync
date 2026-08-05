@@ -36,7 +36,9 @@ type APIRequest struct {
 	IfNoneMatch string
 }
 
-// StackRef is the preview stack reference embedded in a pull request.
+// StackRef is the preview stack reference embedded in a pull request. Position
+// may exceed Size when GitHub retains historical membership after a stack
+// shrinks; the fake preserves both values exactly.
 type StackRef struct {
 	ID       int64 `json:"id"`
 	Number   int   `json:"number"`
