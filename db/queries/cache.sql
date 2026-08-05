@@ -1416,6 +1416,7 @@ WITH candidates AS (
            request.last_checked_at
     FROM pull_request_review_requests AS request
     WHERE request.repo_id = sqlc.arg(repo_id)
+      AND request.tombstoned_at IS NULL
 
     UNION ALL
 
@@ -1423,6 +1424,7 @@ WITH candidates AS (
            review.author_login, review.last_checked_at
     FROM pull_request_reviews AS review
     WHERE review.repo_id = sqlc.arg(repo_id)
+      AND review.tombstoned_at IS NULL
       AND review.author_kind = 'user'
       AND review.author_node_id IS NOT NULL
       AND review.author_login IS NOT NULL
@@ -1433,6 +1435,7 @@ WITH candidates AS (
            comment.author_login, comment.last_checked_at
     FROM pull_request_comments AS comment
     WHERE comment.repo_id = sqlc.arg(repo_id)
+      AND comment.tombstoned_at IS NULL
       AND comment.author_kind = 'user'
       AND comment.author_node_id IS NOT NULL
       AND comment.author_login IS NOT NULL
