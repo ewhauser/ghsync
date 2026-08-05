@@ -285,6 +285,27 @@ func TestDriftDetectsAndHealsReviewRequestSetDivergence(t *testing.T) {
 	t.Parallel()
 	harness := newReadyDriftHarness(t)
 	ctx := t.Context()
+	// Use an identity that exists only in the review-request set and is not a
+	// CODEOWNER. Tombstoning the fixture's original user request deliberately
+	// changes its repository-wide ownership identity (reviews preserve the
+	// node ID and login, but not the request's numeric GitHub ID), which would
+	// turn this focused review-request test into a change-input drift test too.
+	harness.fixture.PullRequests[1].ReviewRequests = append(
+		harness.fixture.PullRequests[1].ReviewRequests,
+		fakegithub.ReviewRequest{
+			Kind: "user", ID: 5002, NodeID: "U_kwDOABCDEF5002",
+			Login: "review-request-only",
+		},
+	)
+	harness.fake.SetFixture(harness.fixture)
+	if err := harness.handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4812",
+		).RefreshArgs,
+		Queue: queue.QueueSweep,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := harness.pool.Exec(ctx, `
 		UPDATE pull_request_review_requests AS request
 		SET tombstoned_at = clock_timestamp()
@@ -292,7 +313,7 @@ func TestDriftDetectsAndHealsReviewRequestSetDivergence(t *testing.T) {
 		WHERE repos.id = request.repo_id
 		  AND repos.full_name = 'acme/monolith'
 		  AND request.pr_number = 4812
-		  AND request.reviewer_kind = 'user'
+		  AND request.reviewer_gh_id = 5002
 		  AND request.tombstoned_at IS NULL
 	`); err != nil {
 		t.Fatal(err)
@@ -322,8 +343,8 @@ func TestDriftDetectsAndHealsReviewRequestSetDivergence(t *testing.T) {
 	`).Scan(&live); err != nil {
 		t.Fatal(err)
 	}
-	if live != 2 {
-		t.Fatalf("healed live review requests = %d, want 2", live)
+	if live != 3 {
+		t.Fatalf("healed live review requests = %d, want 3", live)
 	}
 	if findings, err := harness.service.Detect(ctx, DetectArgs{
 		InstallationID: 1,
