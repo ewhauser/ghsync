@@ -151,6 +151,9 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 }
 
 func retryableDispatchError(err error) bool {
+	if errors.Is(err, queue.ErrRefreshGenerationContention) {
+		return true
+	}
 	var sqlState interface{ SQLState() string }
 	if errors.As(err, &sqlState) {
 		code := sqlState.SQLState()
@@ -197,10 +200,31 @@ func waitForDispatch(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-// DispatchBatch claims, classifies, enqueues, and finishes one batch in one
-// pgx transaction shared by sqlc and River.
+// DispatchBatch claims, classifies, enqueues, and finishes one batch. Each
+// attempt uses one pgx transaction shared by sqlc and River; a contended
+// generation lock rolls that attempt back before retrying the complete batch.
 func (d *Dispatcher) DispatchBatch(
 	ctx context.Context,
+) (count int, resultErr error) {
+	afterClaim := d.afterClaim
+	for {
+		count, err := d.dispatchBatchAttempt(ctx, afterClaim)
+		afterClaim = nil
+		if !errors.Is(err, queue.ErrRefreshGenerationContention) {
+			return count, err
+		}
+		if !waitForDispatch(ctx, d.retryDelay(d.config.PollInterval)) {
+			return 0, fmt.Errorf(
+				"retry contended refresh generation batch: %w",
+				ctx.Err(),
+			)
+		}
+	}
+}
+
+func (d *Dispatcher) dispatchBatchAttempt(
+	ctx context.Context,
+	afterClaim func(),
 ) (count int, resultErr error) {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
@@ -238,8 +262,8 @@ func (d *Dispatcher) DispatchBatch(
 		span.End()
 	}()
 	addDeliveryTraceLinks(ctx, span, deliveries)
-	if d.afterClaim != nil {
-		d.afterClaim()
+	if afterClaim != nil {
+		afterClaim()
 	}
 
 	type deliveryResult struct {
@@ -318,6 +342,20 @@ func (d *Dispatcher) DispatchBatch(
 
 	if len(intents) > 0 {
 		intents = dedupeIntents(intents)
+		generationKeys := make([]queue.RefreshGenerationKey, 0, len(intents))
+		for _, intent := range intents {
+			generationKeys = append(generationKeys, queue.RefreshGenerationKey{
+				Kind: intent.Kind,
+				Key:  intent.Key,
+			})
+		}
+		if err := queue.TryLockRefreshIntentGenerationsTx(
+			ctx,
+			tx,
+			generationKeys,
+		); err != nil {
+			return 0, fmt.Errorf("lock refresh intent generations: %w", err)
+		}
 		encodedIntents, err := json.Marshal(
 			intentGenerationPointers(intents, intentReceivedAt),
 		)
