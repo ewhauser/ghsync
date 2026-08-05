@@ -148,15 +148,6 @@ func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO operation_heartbeats (
-		    installation_id, component, operation, success_count,
-		    sample_count, last_success_at
-		)
-		VALUES (1, 'watermarker', 'entities', 0, 0, clock_timestamp())
-	`); err != nil {
-		t.Fatal(err)
-	}
 	target := insertStreamEvent(
 		t,
 		ctx,
@@ -167,21 +158,6 @@ func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 	if err := pool.QueryRow(ctx, `
 		SELECT safe_seq FROM stream_watermark WHERE singleton
 	`).Scan(&priorSafe); err != nil {
-		t.Fatal(err)
-	}
-
-	heartbeatLock, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer heartbeatLock.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
-	if _, err := heartbeatLock.Exec(ctx, `
-		UPDATE operation_heartbeats
-		SET success_count = success_count
-		WHERE installation_id = 1
-		  AND component = 'watermarker'
-		  AND operation = 'entities'
-	`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -198,12 +174,30 @@ func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeCommit := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseCommit:
+		default:
+			close(releaseCommit)
+		}
+	}()
+	watermarker.testBeforeCommit = func() {
+		close(beforeCommit)
+		<-releaseCommit
+	}
 	stepErr := make(chan error, 1)
 	go func() {
 		_, err := watermarker.Step(ctx)
 		stepErr <- err
 	}()
 
+	select {
+	case <-beforeCommit:
+	case <-ctx.Done():
+		t.Fatalf("watermarker did not reach commit gate: %v", ctx.Err())
+	}
 	watermarkerPID := waitForExclusiveFenceHolder(t, ctx, pool)
 	type writerResult struct {
 		seq int64
@@ -232,6 +226,7 @@ func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 	if !terminated {
 		t.Fatalf("watermarker backend %d was not terminated", watermarkerPID)
 	}
+	close(releaseCommit)
 	if err := <-stepErr; err == nil {
 		t.Fatal("terminated watermarker step unexpectedly succeeded")
 	}
@@ -253,9 +248,7 @@ func TestTerminatingWatermarkerFenceBackendUnblocksWriterWithoutRegression(
 			afterTermination,
 		)
 	}
-	if err := heartbeatLock.Rollback(ctx); err != nil {
-		t.Fatal(err)
-	}
+	watermarker.testBeforeCommit = nil
 	progress, err := watermarker.Step(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -324,6 +317,435 @@ func TestWatermarkWaitsForRegisteredWriterTransaction(t *testing.T) {
 	}
 	if got := <-progress; got.SafeSeq < seq {
 		t.Fatalf("safe seq = %d, want at least %d", got.SafeSeq, seq)
+	}
+}
+
+func TestWatermarkerHeartbeatDoesNotExtendWriterConvoyOrPublishLateGap(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO operation_heartbeats (
+		    installation_id, component, operation, success_count,
+		    sample_count, last_success_at
+		)
+		VALUES (1, 'watermarker', 'entities', 0, 0, clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+	heartbeatLock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer heartbeatLock.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	if _, err := heartbeatLock.Exec(ctx, `
+		UPDATE operation_heartbeats
+		SET success_count = success_count
+		WHERE installation_id = 1
+		  AND component = 'watermarker'
+		  AND operation = 'entities'
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var heartbeatLockPID int32
+	if err := heartbeatLock.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(
+		&heartbeatLockPID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	leadingWriter, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leadingWriter.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	if err := outbox.AcquireWriterFence(ctx, leadingWriter); err != nil {
+		t.Fatal(err)
+	}
+	leadingSeq, err := insertStreamEventTx(
+		ctx,
+		leadingWriter,
+		"watermark-convoy",
+		"leading",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	watermarkObserver := &convoyWatermarkObserver{
+		fences: make(chan outbox.FenceObservation, 1),
+	}
+	watermarker, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval: 10 * time.Millisecond,
+		LeaseTTL:        time.Second,
+		Owner: fmt.Sprintf(
+			"watermark-convoy-%d",
+			time.Now().UnixNano(),
+		),
+		Observer:       watermarkObserver,
+		InstallationID: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	beforeFence := make(chan struct{})
+	watermarker.testBeforeFence = func() { close(beforeFence) }
+	type stepResult struct {
+		progress WatermarkProgress
+		err      error
+	}
+	stepDone := make(chan stepResult, 1)
+	go func() {
+		progress, err := watermarker.Step(ctx)
+		stepDone <- stepResult{progress: progress, err: err}
+	}()
+	select {
+	case <-beforeFence:
+	case <-ctx.Done():
+		t.Fatalf("watermarker did not reach fence: %v", ctx.Err())
+	}
+	waitForFenceLocks(t, ctx, pool, "ExclusiveLock", false, 1)
+
+	lateWriter, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lateWriter.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	writerObserver := &fenceObservationRecorder{
+		observations: make(chan outbox.FenceObservation, 1),
+	}
+	type writerResult struct {
+		seq int64
+		err error
+	}
+	lateAllocated := make(chan int64, 1)
+	releaseLateWriter := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseLateWriter:
+		default:
+			close(releaseLateWriter)
+		}
+	}()
+	lateWriterDone := make(chan writerResult, 1)
+	go func() {
+		observedTx, err := outbox.AcquireObservedWriterFence(
+			ctx,
+			lateWriter,
+			writerObserver,
+		)
+		if err != nil {
+			lateWriterDone <- writerResult{err: err}
+			return
+		}
+		seq, err := insertStreamEventTx(
+			ctx,
+			observedTx,
+			"watermark-convoy",
+			"late-low",
+			time.Now(),
+		)
+		if err == nil {
+			lateAllocated <- seq
+			<-releaseLateWriter
+			err = observedTx.Commit(ctx)
+		}
+		lateWriterDone <- writerResult{seq: seq, err: err}
+	}()
+	waitForFenceLocks(t, ctx, pool, "ShareLock", false, 1)
+
+	if err := leadingWriter.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForBackendBlockedBy(t, ctx, pool, heartbeatLockPID)
+	var lateSeq int64
+	select {
+	case lateSeq = <-lateAllocated:
+	case <-ctx.Done():
+		t.Fatalf("late writer did not allocate during heartbeat: %v", ctx.Err())
+	}
+	highSeq, err := insertStreamEventWithKey(
+		ctx,
+		pool,
+		"watermark-convoy",
+		"late-high",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if highSeq <= lateSeq {
+		t.Fatalf(
+			"late sequences low=%d high=%d, want low < high",
+			lateSeq,
+			highSeq,
+		)
+	}
+	if held := fenceLockCount(
+		t,
+		ctx,
+		pool,
+		"ExclusiveLock",
+		true,
+	); held != 0 {
+		t.Fatalf(
+			"watermarker retained %d exclusive fences while heartbeat waited",
+			held,
+		)
+	}
+	select {
+	case result := <-stepDone:
+		t.Fatalf(
+			"watermark step finished before blocked heartbeat was released: %+v",
+			result,
+		)
+	default:
+	}
+	var published int64
+	if err := pool.QueryRow(ctx, `
+		SELECT safe_seq FROM stream_watermark WHERE singleton
+	`).Scan(&published); err != nil {
+		t.Fatal(err)
+	}
+	if published < leadingSeq {
+		t.Fatalf(
+			"safe seq = %d, want at least committed leading writer %d",
+			published,
+			leadingSeq,
+		)
+	}
+	if published >= lateSeq {
+		t.Fatalf(
+			"safe seq = %d crossed uncommitted late writer %d below committed %d",
+			published,
+			lateSeq,
+			highSeq,
+		)
+	}
+	assertFenceObservation(
+		t,
+		ctx,
+		watermarkObserver.fences,
+		outbox.ExclusiveWatermarkFence,
+	)
+
+	if err := heartbeatLock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var step stepResult
+	select {
+	case step = <-stepDone:
+	case <-ctx.Done():
+		t.Fatalf("watermark step did not finish: %v", ctx.Err())
+	}
+	if step.err != nil {
+		t.Fatal(step.err)
+	}
+	if step.progress.SafeSeq < leadingSeq {
+		t.Fatalf(
+			"safe seq = %d, want at least committed leading writer %d",
+			step.progress.SafeSeq,
+			leadingSeq,
+		)
+	}
+	if step.progress.SafeSeq >= lateSeq {
+		t.Fatalf(
+			"safe seq = %d crossed uncommitted late writer %d below committed %d",
+			step.progress.SafeSeq,
+			lateSeq,
+			highSeq,
+		)
+	}
+	close(releaseLateWriter)
+	var late writerResult
+	select {
+	case late = <-lateWriterDone:
+	case <-ctx.Done():
+		t.Fatalf("late writer did not commit: %v", ctx.Err())
+	}
+	if late.err != nil {
+		t.Fatalf("late writer: %v", late.err)
+	}
+	if late.seq != lateSeq {
+		t.Fatalf("late writer seq = %d, want %d", late.seq, lateSeq)
+	}
+	assertFenceObservation(
+		t,
+		ctx,
+		writerObserver.observations,
+		outbox.SharedWriterFence,
+	)
+	watermarker.testBeforeFence = nil
+	followup, err := watermarker.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if followup.SafeSeq < highSeq {
+		t.Fatalf(
+			"follow-up safe seq = %d, want late writers through %d",
+			followup.SafeSeq,
+			highSeq,
+		)
+	}
+}
+
+func TestWatermarkerHeartbeatFailurePreservesCommittedProgressAndFenceRelease(
+	t *testing.T,
+) {
+	t.Parallel()
+	pool := streamDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO operation_heartbeats (
+		    installation_id, component, operation, success_count,
+		    sample_count, last_success_at
+		)
+		VALUES (1, 'watermarker', 'entities', 0, 0, clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
+	target := insertStreamEvent(
+		t,
+		ctx,
+		pool,
+		fmt.Sprintf("watermark-heartbeat-failure-%d", time.Now().UnixNano()),
+	)
+	heartbeatLock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer heartbeatLock.Rollback(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	if _, err := heartbeatLock.Exec(ctx, `
+		UPDATE operation_heartbeats
+		SET success_count = success_count
+		WHERE installation_id = 1
+		  AND component = 'watermarker'
+		  AND operation = 'entities'
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var heartbeatLockPID int32
+	if err := heartbeatLock.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(
+		&heartbeatLockPID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	observer := &watermarkProgressRecorder{
+		steps: make(chan WatermarkProgress, 1),
+	}
+	watermarker, err := NewWatermarker(pool, WatermarkOptions{
+		RefreshInterval: 10 * time.Millisecond,
+		LeaseTTL:        time.Second,
+		Owner: fmt.Sprintf(
+			"watermark-heartbeat-failure-%d",
+			time.Now().UnixNano(),
+		),
+		Observer:       observer,
+		InstallationID: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	stepCtx, cancelStep := context.WithCancel(ctx)
+	defer cancelStep()
+	type stepResult struct {
+		progress WatermarkProgress
+		err      error
+	}
+	stepDone := make(chan stepResult, 1)
+	go func() {
+		progress, err := watermarker.Step(stepCtx)
+		stepDone <- stepResult{progress: progress, err: err}
+	}()
+	waitForBackendBlockedBy(t, ctx, pool, heartbeatLockPID)
+
+	var observed WatermarkProgress
+	select {
+	case observed = <-observer.steps:
+	case <-ctx.Done():
+		t.Fatalf("committed watermark was not observed: %v", ctx.Err())
+	}
+	if observed.SafeSeq < target || !observed.Advanced {
+		t.Fatalf(
+			"observed committed progress = %+v, want advance through %d",
+			observed,
+			target,
+		)
+	}
+	var published int64
+	if err := pool.QueryRow(ctx, `
+		SELECT safe_seq FROM stream_watermark WHERE singleton
+	`).Scan(&published); err != nil {
+		t.Fatal(err)
+	}
+	if published != observed.SafeSeq {
+		t.Fatalf(
+			"published safe seq = %d, observed %d",
+			published,
+			observed.SafeSeq,
+		)
+	}
+	if held := fenceLockCount(
+		t,
+		ctx,
+		pool,
+		"ExclusiveLock",
+		true,
+	); held != 0 {
+		t.Fatalf(
+			"watermarker retained %d exclusive fences after publication",
+			held,
+		)
+	}
+	writerSeq, err := insertStreamEventWithKey(
+		ctx,
+		pool,
+		"watermark-heartbeat-failure",
+		"writer-after-publish",
+	)
+	if err != nil {
+		t.Fatalf("writer blocked behind failed heartbeat: %v", err)
+	}
+
+	cancelStep()
+	var result stepResult
+	select {
+	case result = <-stepDone:
+	case <-ctx.Done():
+		t.Fatalf("canceled heartbeat did not return: %v", ctx.Err())
+	}
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("heartbeat failure = %v, want context cancellation", result.err)
+	}
+	if result.progress != observed {
+		t.Fatalf(
+			"returned progress = %+v, observed committed progress %+v",
+			result.progress,
+			observed,
+		)
+	}
+	if err := heartbeatLock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	followup, err := watermarker.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if followup.SafeSeq < writerSeq {
+		t.Fatalf(
+			"follow-up safe seq = %d, want writer %d",
+			followup.SafeSeq,
+			writerSeq,
+		)
 	}
 }
 
@@ -1088,31 +1510,12 @@ func waitForFenceLocks(
 	want int,
 ) {
 	t.Helper()
-	fenceKey := uint64(outbox.FenceKey)
-	classID := int64(fenceKey >> 32)
-	objectID := int64(uint32(fenceKey))
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		var count int
-		if err := pool.QueryRow(ctx, `
-			SELECT count(*)
-			FROM pg_locks
-			WHERE locktype = 'advisory'
-			  AND database = (
-			      SELECT oid FROM pg_database
-			      WHERE datname = current_database()
-			  )
-			  AND classid = $1
-			  AND objid = $2
-			  AND objsubid = 1
-			  AND mode = $3
-			  AND granted = $4
-		`, classID, objectID, mode, granted).Scan(&count); err != nil {
-			t.Fatal(err)
-		}
+		count := fenceLockCount(t, ctx, pool, mode, granted)
 		if count >= want {
 			return
 		}
@@ -1128,6 +1531,107 @@ func waitForFenceLocks(
 			)
 		case <-ticker.C:
 		}
+	}
+}
+
+func fenceLockCount(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	mode string,
+	granted bool,
+) int {
+	t.Helper()
+	fenceKey := uint64(outbox.FenceKey)
+	classID := int64(fenceKey >> 32)
+	objectID := int64(uint32(fenceKey))
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND database = (
+		      SELECT oid FROM pg_database
+		      WHERE datname = current_database()
+		  )
+		  AND classid = $1
+		  AND objid = $2
+		  AND objsubid = 1
+		  AND mode = $3
+		  AND granted = $4
+	`, classID, objectID, mode, granted).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func waitForBackendBlockedBy(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	blockerPID int32,
+) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var blocked bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+			    SELECT 1
+			    FROM pg_stat_activity
+			    WHERE $1 = ANY(pg_blocking_pids(pid))
+			)
+		`, blockerPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf(
+				"no backend blocked behind heartbeat holder %d: %v",
+				blockerPID,
+				ctx.Err(),
+			)
+		case <-deadline.C:
+			t.Fatalf(
+				"timed out waiting for backend blocked behind heartbeat holder %d",
+				blockerPID,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func assertFenceObservation(
+	t *testing.T,
+	ctx context.Context,
+	observations <-chan outbox.FenceObservation,
+	wantRole outbox.FenceRole,
+) {
+	t.Helper()
+	var observation outbox.FenceObservation
+	select {
+	case observation = <-observations:
+	case <-ctx.Done():
+		t.Fatalf("fence observation was not emitted: %v", ctx.Err())
+	}
+	if !observation.Acquired || observation.Role != wantRole {
+		t.Fatalf(
+			"fence observation = %+v, want acquired role %q",
+			observation,
+			wantRole,
+		)
+	}
+	if observation.WaitDuration <= 0 || observation.HoldDuration <= 0 {
+		t.Fatalf(
+			"fence observation did not separate positive wait and hold: %+v",
+			observation,
+		)
 	}
 }
 
@@ -1221,6 +1725,34 @@ func waitSafeSequence(
 
 type watermarkProgressRecorder struct {
 	steps chan WatermarkProgress
+}
+
+type fenceObservationRecorder struct {
+	observations chan outbox.FenceObservation
+}
+
+func (r *fenceObservationRecorder) OutboxFence(
+	_ context.Context,
+	observation outbox.FenceObservation,
+) {
+	r.observations <- observation
+}
+
+type convoyWatermarkObserver struct {
+	fences chan outbox.FenceObservation
+}
+
+func (r *convoyWatermarkObserver) OutboxFence(
+	_ context.Context,
+	observation outbox.FenceObservation,
+) {
+	r.fences <- observation
+}
+
+func (r *convoyWatermarkObserver) WatermarkStep(
+	_ context.Context,
+	_ WatermarkProgress,
+) {
 }
 
 func (r *watermarkProgressRecorder) WatermarkStep(

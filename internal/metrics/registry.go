@@ -87,6 +87,34 @@ func New() (*Registry, error) {
 				},
 			},
 		)),
+		sdkmetric.WithView(sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name: "ghsync_c_s2_outbox_fence_wait_seconds",
+			},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: []float64{
+						0.001, 0.005, 0.01, 0.025, 0.05,
+						0.1, 0.25, 0.5, 1, 2, 5,
+					},
+					NoMinMax: true,
+				},
+			},
+		)),
+		sdkmetric.WithView(sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name: "ghsync_c_s2_outbox_fence_hold_seconds",
+			},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: []float64{
+						0.001, 0.005, 0.01, 0.025, 0.05,
+						0.1, 0.25, 0.5, 1, 2, 5,
+					},
+					NoMinMax: true,
+				},
+			},
+		)),
 	)
 	return &Registry{
 		provider: provider,

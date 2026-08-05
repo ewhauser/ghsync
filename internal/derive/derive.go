@@ -210,14 +210,23 @@ func (s *Service) runOnce(
 	if err != nil {
 		return 0, fmt.Errorf("begin derivation pass: %w", err)
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+	}()
 
 	// Q1: the writer fence is deliberately the outermost lock in this
 	// outbox-writing transaction. Taking dirty-row locks first lets a pending
 	// watermarker and a fenced entity writer form a soft-deadlock cycle.
-	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+	fenceObserver, _ := s.observer.(outbox.FenceObserver)
+	observedTx, err := outbox.AcquireObservedWriterFence(
+		ctx,
+		tx,
+		fenceObserver,
+	)
+	if err != nil {
 		return 0, err
 	}
+	tx = observedTx
 	queries := dbgen.New(tx)
 
 	scopeKeys, err := queries.ClaimDerivationDirtyScopes(

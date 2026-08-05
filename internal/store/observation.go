@@ -211,10 +211,17 @@ func (w *EntityWriter) beginEntityTx(
 	if tx == nil {
 		return nil, fmt.Errorf("begin transaction returned nil transaction")
 	}
-	if err := outbox.AcquireWriterFence(ctx, tx); err != nil {
+	fenceObserver, _ := w.observer.(outbox.FenceObserver)
+	observedTx, err := outbox.AcquireObservedWriterFence(
+		ctx,
+		tx,
+		fenceObserver,
+	)
+	if err != nil {
 		_ = tx.Rollback(ctx)
 		return nil, err
 	}
+	tx = observedTx
 	return tx, nil
 }
 

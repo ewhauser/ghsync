@@ -38,6 +38,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/ingress"
 	ghsyncmetrics "github.com/ewhauser/ghsync/internal/metrics"
+	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
@@ -696,10 +697,11 @@ func serve(args []string) error {
 				runtimeMetrics,
 			}
 			driftService, err = drift.New(drift.Options{
-				Pool:    pool,
-				REST:    rest,
-				GraphQL: graphQL,
-				Config:  driftCfg,
+				Pool:          pool,
+				REST:          rest,
+				GraphQL:       graphQL,
+				Config:        driftCfg,
+				CacheObserver: runtimeMetrics,
 			})
 			if err != nil {
 				return err
@@ -1107,4 +1109,11 @@ func (a watermarkMetricsAdapter) WatermarkStep(
 	progress streammaint.WatermarkProgress,
 ) {
 	a.runtime.WatermarkStep(ctx, progress.Advanced)
+}
+
+func (a watermarkMetricsAdapter) OutboxFence(
+	ctx context.Context,
+	observation outbox.FenceObservation,
+) {
+	a.runtime.OutboxFence(ctx, observation)
 }
