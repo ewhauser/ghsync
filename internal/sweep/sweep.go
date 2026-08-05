@@ -170,6 +170,24 @@ func (p SchedulePlan) dueBefore(now time.Time) time.Time {
 	return now.Add(p.Cadence + p.CompletionHeadroom - p.Bound)
 }
 
+// schedulePlanForSweepKind returns the cadence and completion headroom for a
+// list-based sweep. Page fan-out and disappearance verification use the same
+// plan as the stale-row kickoff so their refreshes share one C-R1 budget.
+func (s *Service) schedulePlanForSweepKind(kind string) (SchedulePlan, error) {
+	var bound time.Duration
+	switch kind {
+	case KindRepositories:
+		bound = s.config.RepositoryListPeriod
+	case KindStacks:
+		bound = s.config.OpenStackMaxStaleness
+	case KindPullRequests:
+		bound = s.config.OpenPRMaxStaleness
+	default:
+		return SchedulePlan{}, fmt.Errorf("unsupported sweep kind %q", kind)
+	}
+	return scheduleForBound(bound), nil
+}
+
 // spreadRefreshSchedule distributes one sweep fan-out across the cadence
 // window. Every job remains scheduled no later than its hard deadline minus
 // the plan's completion headroom, so smoothing cannot consume C-R1's fetch
@@ -571,6 +589,7 @@ func (s *Service) enqueueStaleStacks(ctx context.Context) error {
 			Deadline: row.LastCheckedAt.Time.Add(plan.Bound),
 		})
 	}
+	spreadRefreshSchedule(specs, s.config.Now(), plan)
 	return s.enqueueRefreshes(ctx, specs)
 }
 

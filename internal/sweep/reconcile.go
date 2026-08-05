@@ -243,6 +243,11 @@ func (s *Service) fetchPage(
 	args ListPageArgs,
 	etag string,
 ) (fetchedPage, error) {
+	plan, err := s.schedulePlanForSweepKind(args.SweepKind)
+	if err != nil {
+		return fetchedPage{}, err
+	}
+	now := s.config.Now().UTC()
 	switch args.SweepKind {
 	case KindRepositories:
 		page, err := decimalCursor(args.Cursor)
@@ -277,13 +282,9 @@ func (s *Service) fetchPage(
 			result.refreshSpecs = append(
 				result.refreshSpecs,
 				queue.RefreshSpec{
-					Kind: queue.KindRefreshRepository,
-					Key:  key,
-					Deadline: s.config.Now().Add(
-						scheduleForBound(
-							s.config.RepositoryListPeriod,
-						).CompletionHeadroom,
-					),
+					Kind:     queue.KindRefreshRepository,
+					Key:      key,
+					Deadline: now.Add(plan.Bound),
 				},
 			)
 		}
@@ -332,13 +333,9 @@ func (s *Service) fetchPage(
 			result.refreshSpecs = append(
 				result.refreshSpecs,
 				queue.RefreshSpec{
-					Kind: queue.KindRefreshStack,
-					Key:  key,
-					Deadline: s.config.Now().Add(
-						scheduleForBound(
-							s.config.OpenStackMaxStaleness,
-						).CompletionHeadroom,
-					),
+					Kind:     queue.KindRefreshStack,
+					Key:      key,
+					Deadline: now.Add(plan.Bound),
 				},
 			)
 		}
@@ -389,13 +386,9 @@ func (s *Service) fetchPage(
 			result.refreshSpecs = append(
 				result.refreshSpecs,
 				queue.RefreshSpec{
-					Kind: queue.KindRefreshPR,
-					Key:  key,
-					Deadline: s.config.Now().Add(
-						scheduleForBound(
-							s.config.OpenPRMaxStaleness,
-						).CompletionHeadroom,
-					),
+					Kind:     queue.KindRefreshPR,
+					Key:      key,
+					Deadline: now.Add(plan.Bound),
 				},
 			)
 		}
@@ -559,6 +552,16 @@ func (s *Service) persistPage(
 			return fmt.Errorf("insert next sweep page: %w", err)
 		}
 	}
+	if len(specs) > 0 {
+		plan, err := s.schedulePlanForSweepKind(args.SweepKind)
+		if err != nil {
+			return err
+		}
+		// Listing pages can contain hundreds of entities. Spread the complete
+		// page fan-out, including disappearance verification, across the
+		// cadence while retaining the completion headroom before its deadline.
+		spreadRefreshSchedule(specs, now, plan)
+	}
 	if err := queue.InsertRefreshesTx(
 		ctx,
 		tx,
@@ -592,17 +595,13 @@ func (s *Service) missingVerificationSpecs(
 	args ListPageArgs,
 ) ([]queue.RefreshSpec, error) {
 	var kind string
-	var bound time.Duration
 	switch args.SweepKind {
 	case KindRepositories:
 		kind = queue.KindRefreshRepository
-		bound = s.config.RepositoryListPeriod
 	case KindStacks:
 		kind = queue.KindRefreshStack
-		bound = s.config.OpenStackMaxStaleness
 	case KindPullRequests:
 		kind = queue.KindRefreshPR
-		bound = s.config.OpenPRMaxStaleness
 	default:
 		return nil, fmt.Errorf(
 			"unsupported disappearance sweep %q",
@@ -621,9 +620,11 @@ func (s *Service) missingVerificationSpecs(
 		return nil, fmt.Errorf("list missing sweep entities: %w", err)
 	}
 	specs := make([]queue.RefreshSpec, 0, len(missing))
-	deadline := s.config.Now().Add(
-		scheduleForBound(bound).CompletionHeadroom,
-	)
+	plan, err := s.schedulePlanForSweepKind(args.SweepKind)
+	if err != nil {
+		return nil, err
+	}
+	deadline := s.config.Now().UTC().Add(plan.Bound)
 	for _, key := range missing {
 		// C-R3: listing absence is only a hint. The ordinary entity worker
 		// performs the verification fetch, and only a 404 writes a tombstone.
