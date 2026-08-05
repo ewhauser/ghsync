@@ -162,6 +162,68 @@ func TestNullBaseSHARoundTripsAcrossRESTGraphQLAndWebhooks(t *testing.T) {
 	}
 }
 
+func TestHistoricalStackPositionRoundTripsAcrossRESTAndWebhook(t *testing.T) {
+	t.Parallel()
+	fixture := DefaultFixture()
+	pull := &fixture.PullRequests[4]
+	if pull.State != "open" || pull.Stack == nil {
+		t.Fatalf("historical fixture PR = %+v, want open stacked PR", pull)
+	}
+	pull.Stack.Size = 2
+	pull.Stack.Position = 5
+	pull.Stack.Base.SHA = ""
+	fake := New(fixture, "secret")
+
+	response := serve(
+		fake,
+		http.MethodGet,
+		"http://fake.test/repos/acme/monolith/pulls/4820",
+		nil,
+	)
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("REST pull status = %d", response.StatusCode)
+	}
+	var wirePull map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&wirePull); err != nil {
+		t.Fatal(err)
+	}
+	wireStack, ok := wirePull["stack"].(map[string]any)
+	if !ok || wirePull["state"] != "open" ||
+		wireStack["size"] != float64(2) ||
+		wireStack["position"] != float64(5) {
+		t.Fatalf("REST historical stack = %#v", wirePull["stack"])
+	}
+	wireBase, ok := wireStack["base"].(map[string]any)
+	if !ok || wireBase["ref"] != "main" || wireBase["sha"] != nil {
+		t.Fatalf("REST historical stack base = %#v", wireStack["base"])
+	}
+
+	payload, err := fake.PullRequestWebhookPayload("synchronize", pull.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookPull, err := payloadObject(payload, "pull_request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookStack, ok := webhookPull["stack"].(map[string]any)
+	if !ok || webhookPull["state"] != "open" ||
+		webhookStack["size"] != 2 || webhookStack["position"] != 5 {
+		t.Fatalf("webhook historical stack = %#v", webhookPull["stack"])
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conformance.NewWebhookSchemaValidator().Validate(
+		"pull_request",
+		body,
+	); err != nil {
+		t.Fatalf("historical stack webhook schema: %v", err)
+	}
+}
+
 func TestControlEmitRecordsAndSignsLoopbackWebhook(t *testing.T) {
 	received := make(chan *http.Request, 1)
 	target := httptest.NewServer(http.HandlerFunc(

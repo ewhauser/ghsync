@@ -83,7 +83,8 @@ type Stack struct {
 }
 
 // StackRef is the private-preview extension carried by ordinary pull request
-// responses.
+// responses. Size is the current stack size, while Position is GitHub's
+// positive membership ordinal and may exceed Size for historical membership.
 type StackRef struct {
 	ID       int64     `json:"id"`
 	Number   int       `json:"number"`

@@ -3698,6 +3698,168 @@ func TestResolveStackMembershipCompletesWithNullHistoricalBaseSHA(
 	}
 }
 
+func TestStackWorkersCompleteWithOpenHistoricalPositionBeyondSize(
+	t *testing.T,
+) {
+	t.Parallel()
+	const repo = "acme/historical-stack-position"
+	harness := newPipelineHarness(t, repo)
+	defer harness.close()
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	historical := &fixture.PullRequests[4]
+	if historical.Stack == nil {
+		t.Fatal("historical fixture PR has no stack summary")
+	}
+	if historical.State != "open" {
+		t.Fatalf("historical fixture PR state = %q, want open", historical.State)
+	}
+	historical.Stack.Size = 2
+	historical.Stack.Position = 5
+	historical.Stack.Base.SHA = ""
+	fixture.Stacks[0].Base.SHA = ""
+	fixture.Stacks[0].PullRequests = append(
+		[]fakegithub.StackPullRequest(nil),
+		fixture.Stacks[0].PullRequests[1:3]...,
+	)
+	for offset, pullIndex := range []int{1, 2} {
+		current := &fixture.PullRequests[pullIndex]
+		if current.Stack == nil {
+			t.Fatalf("current fixture PR %d has no stack summary", current.Number)
+		}
+		current.Stack.Size = 2
+		current.Stack.Position = offset + 1
+		current.Stack.Base.SHA = ""
+	}
+	harness.fake.SetFixture(fixture)
+
+	payload, err := harness.fake.PullRequestWebhookPayload(
+		"synchronize",
+		historical.Number,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wirePull, ok := payload["pull_request"].(map[string]any)
+	if !ok {
+		t.Fatalf("webhook pull_request = %#v", payload["pull_request"])
+	}
+	wireStack, ok := wirePull["stack"].(map[string]any)
+	if !ok || wirePull["state"] != "open" ||
+		wireStack["size"] != 2 || wireStack["position"] != 5 {
+		t.Fatalf("webhook historical stack tuple = %#v", wirePull["stack"])
+	}
+	wireBase, ok := wireStack["base"].(map[string]any)
+	if !ok || wireBase["ref"] != "main" || wireBase["sha"] != nil {
+		t.Fatalf("webhook historical stack base = %#v", wireStack["base"])
+	}
+
+	harness.emit("historical-position-beyond-size", pipelineEvent{
+		event:   "pull_request",
+		payload: payload,
+	})
+	harness.dispatchAll()
+	harness.waitIdle()
+
+	ctx := t.Context()
+	var stackNumber, stackPosition int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT stack_number, stack_position
+		FROM pull_requests
+		JOIN repos ON repos.id = pull_requests.repo_id
+		WHERE repos.full_name = $1
+		  AND pull_requests.number = $2
+	`, repo, historical.Number).Scan(&stackNumber, &stackPosition); err != nil {
+		t.Fatal(err)
+	}
+	if stackNumber != historical.Stack.Number ||
+		stackPosition != historical.Stack.Position {
+		t.Fatalf(
+			"persisted historical membership = stack %d position %d, want %d/%d",
+			stackNumber,
+			stackPosition,
+			historical.Stack.Number,
+			historical.Stack.Position,
+		)
+	}
+	var currentSize int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT jsonb_array_length(stacks.entries)
+		FROM stacks
+		JOIN repos ON repos.id = stacks.repo_id
+		WHERE repos.full_name = $1
+		  AND stacks.number = $2
+	`, repo, historical.Stack.Number).Scan(&currentSize); err != nil {
+		t.Fatal(err)
+	}
+	if currentSize != historical.Stack.Size {
+		t.Fatalf(
+			"cached current stack size = %d, want %d",
+			currentSize,
+			historical.Stack.Size,
+		)
+	}
+
+	key := fmt.Sprintf("pr:%s:%d", repo, historical.Number)
+	assertCompletedAtAttemptOne := func(kind string) {
+		t.Helper()
+		var jobs, completed, maxAttempts int
+		if err := harness.pool.QueryRow(ctx, `
+			SELECT count(*),
+			       count(*) FILTER (WHERE state = 'completed'),
+			       COALESCE(max(attempt), 0)
+			FROM river_job
+			WHERE kind = $1
+			  AND args->>'key' = $2
+		`, kind, key).Scan(&jobs, &completed, &maxAttempts); err != nil {
+			t.Fatal(err)
+		}
+		if jobs == 0 || completed != jobs || maxAttempts != 1 {
+			t.Fatalf(
+				"%s jobs/completed/max-attempt = %d/%d/%d, want nonzero/all/1",
+				kind,
+				jobs,
+				completed,
+				maxAttempts,
+			)
+		}
+	}
+	assertCompletedAtAttemptOne("resolve_stack_membership")
+	assertCompletedAtAttemptOne("refresh_pr")
+	var stackJobs, completedStackJobs, maxStackAttempts int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE state = 'completed'),
+		       COALESCE(max(attempt), 0)
+		FROM river_job
+		WHERE kind = 'refresh_stack'
+		  AND args->>'key' = $1
+	`, fmt.Sprintf("stack:%s:%d", repo, historical.Stack.Number)).Scan(
+		&stackJobs,
+		&completedStackJobs,
+		&maxStackAttempts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if stackJobs < 1 || stackJobs > 4 || completedStackJobs != stackJobs ||
+		maxStackAttempts != 1 {
+		t.Fatalf(
+			"historical-position stack refreshes/completed/max-attempt = %d/%d/%d, want 1..4/all/1",
+			stackJobs,
+			completedStackJobs,
+			maxStackAttempts,
+		)
+	}
+	if got := harness.fake.RequestCount(
+		http.MethodGet,
+		fmt.Sprintf("/repos/%s/pulls/%d", repo, historical.Number),
+	); got < 1 {
+		t.Fatalf("historical PR fetches = %d, want at least one", got)
+	}
+	if got := harness.fake.RequestCount(http.MethodPost, "/graphql"); got < 1 {
+		t.Fatalf("historical PR GraphQL hydrations = %d, want at least one", got)
+	}
+}
+
 func TestRefreshPRWorkerPersistsNullGraphQLBaseRefOID(t *testing.T) {
 	t.Parallel()
 	const repo = "acme/graphql-null-base"

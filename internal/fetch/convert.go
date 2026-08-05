@@ -68,6 +68,8 @@ func pullRecordFromREST(
 		position := pull.Stack.Position
 		stackNumber = &number
 		stackPosition = &position
+		// Preserve both independently reported values. GitHub may retain a
+		// historical position beyond the current stack size.
 		stackSummary = &store.StackSummaryRecord{
 			GitHubID: pull.Stack.ID,
 			Number:   pull.Stack.Number,

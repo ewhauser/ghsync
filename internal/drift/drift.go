@@ -860,6 +860,8 @@ func (s *Service) fullFetch(
 		var stackPosition any
 		if pull.Stack != nil {
 			stackNumber = pull.Stack.Number
+			// Preserve GitHub's historical ordinal even when it exceeds the
+			// current stack size; clamping would manufacture cache drift.
 			stackPosition = pull.Stack.Position
 		}
 		// JSON null decodes through go-github as "", the public cache

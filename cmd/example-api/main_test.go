@@ -222,7 +222,8 @@ func TestRESTEndpointsReadSeededMirrorEntities(t *testing.T) {
 	}
 	var pull map[string]any
 	getJSON(t, api.server.URL+"/v1/pull-requests/7", &pull)
-	if pull["head_sha"] != fixture.headSHA {
+	if pull["head_sha"] != fixture.headSHA ||
+		pull["stack_position"] != float64(5) {
 		t.Fatalf("pull request = %#v", pull)
 	}
 	var stackList struct {
@@ -866,14 +867,14 @@ func seedMirror(
 		`INSERT INTO pull_requests (
 		    id, repo_id, gh_id, node_id, number, title, state, draft,
 		    author_login, head_ref, head_sha, base_ref, base_sha,
-		    review_decision, mergeable_state, gh_updated_at, synced_at,
-		    etag, sync_source, last_checked_at
+		    review_decision, mergeable_state, stack_number, stack_position,
+		    gh_updated_at, synced_at, etag, sync_source, last_checked_at
 		)
 		VALUES (
 		    201, 101, 2001, 'PR_2001', 7, 'initial title', 'open', false,
 		    'octocat', 'feature', $1, 'main', 'base-sha', 'approved',
-		    'clean', clock_timestamp(), clock_timestamp(), '', 'manual',
-		    clock_timestamp()
+		    'clean', 3, 5, clock_timestamp(), clock_timestamp(), '',
+		    'manual', clock_timestamp()
 		)`,
 		`INSERT INTO stacks (
 		    id, repo_id, gh_id, node_id, number, base_ref, base_sha, open,

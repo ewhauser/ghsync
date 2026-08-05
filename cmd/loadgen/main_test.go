@@ -1107,7 +1107,7 @@ func TestFullFixtureOracleComparesEveryCacheFamily(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	line := 17
 	stackNumber := 9
-	stackPosition := 1
+	stackPosition := 5 // Historical ordinal; current stack below has one entry.
 	repository := fakegithub.Repository{
 		ID:               7001,
 		NodeID:           "R_oracle",
@@ -1172,7 +1172,7 @@ func TestFullFixtureOracleComparesEveryCacheFamily(t *testing.T) {
 		VALUES (
 		    $1, 8001, 'PR_oracle', 42, 'Oracle PR', 'open', false,
 		    'author', 'feature', 'head', 'main', '',
-		    'APPROVED', 'MERGEABLE', 9, 1, $2, $2, $2, 'webhook'
+		    'APPROVED', 'MERGEABLE', 9, 5, $2, $2, $2, 'webhook'
 		)
 	`, repoID, now); err != nil {
 		t.Fatal(err)

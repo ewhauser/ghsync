@@ -21,7 +21,7 @@ func TestNullBaseSHAConvertersPreserveUnknown(t *testing.T) {
 		"node_id":"PR_historical",
 		"number":4810,
 		"title":"Historical stack member",
-		"state":"closed",
+		"state":"open",
 		"user":{"login":"author"},
 		"head":{"ref":"feature/historical","sha":"head-sha"},
 		"base":{"ref":"deleted/pr-base","sha":null},
@@ -29,8 +29,8 @@ func TestNullBaseSHAConvertersPreserveUnknown(t *testing.T) {
 		"stack":{
 			"id":9876543,
 			"number":142,
-			"size":1,
-			"position":1,
+			"size":2,
+			"position":5,
 			"base":{"ref":"deleted/stack-base","sha":null}
 		}
 	}`), &restPull); err != nil {
@@ -46,7 +46,9 @@ func TestNullBaseSHAConvertersPreserveUnknown(t *testing.T) {
 	if restRecord.BaseRef != "deleted/pr-base" || restRecord.BaseSHA != "" ||
 		restRecord.StackSummary == nil ||
 		restRecord.StackSummary.BaseRef != "deleted/stack-base" ||
-		restRecord.StackSummary.BaseSHA != "" {
+		restRecord.StackSummary.BaseSHA != "" ||
+		restRecord.StackSummary.Size != 2 ||
+		restRecord.StackSummary.Position != 5 {
 		t.Fatalf("REST null-SHA record = %+v", restRecord)
 	}
 

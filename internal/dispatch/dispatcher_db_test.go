@@ -454,6 +454,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 	tests := []struct {
 		name         string
 		size         int
+		position     int
 		cachedSHA    string
 		payloadSHA   any
 		wantStackJob bool
@@ -461,12 +462,22 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 		{
 			name:       "matching known tuple",
 			size:       6,
+			position:   1,
 			cachedSHA:  "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
 			payloadSHA: "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
 		},
 		{
 			name:         "size mismatch",
 			size:         7,
+			position:     1,
+			cachedSHA:    "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+			payloadSHA:   "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
+			wantStackJob: true,
+		},
+		{
+			name:         "historical position beyond current size",
+			size:         6,
+			position:     7,
 			cachedSHA:    "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
 			payloadSHA:   "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
 			wantStackJob: true,
@@ -474,6 +485,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 		{
 			name:         "payload SHA unknown",
 			size:         6,
+			position:     1,
 			cachedSHA:    "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
 			payloadSHA:   nil,
 			wantStackJob: true,
@@ -481,6 +493,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 		{
 			name:         "cached SHA unknown",
 			size:         6,
+			position:     1,
 			cachedSHA:    "",
 			payloadSHA:   "89850dd46b0e9edb77b61bf2ea8c376e58fc5aca",
 			wantStackJob: true,
@@ -488,6 +501,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 		{
 			name:         "both SHAs unknown",
 			size:         6,
+			position:     1,
 			cachedSHA:    "",
 			payloadSHA:   nil,
 			wantStackJob: true,
@@ -551,7 +565,7 @@ func TestMatchingStackSummarySkipsEagerStackRefresh(t *testing.T) {
 						"id":       46101,
 						"number":   72787,
 						"size":     test.size,
-						"position": 1,
+						"position": test.position,
 						"base": map[string]any{
 							"ref": "main",
 							"sha": test.payloadSHA,

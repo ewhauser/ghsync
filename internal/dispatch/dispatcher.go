@@ -428,6 +428,11 @@ func stackSummaryMatchesCache(
 	queries *dbgen.Queries,
 	hint *stackSummaryHint,
 ) (bool, error) {
+	// A historical ordinal beyond the current size cannot identify a member in
+	// the cached current entries, so it never suppresses the eager stack fetch.
+	if hint.Position > hint.Size {
+		return false, nil
+	}
 	// Suppression requires positive knowledge of the base commit. Treat an
 	// unknown payload SHA as a mismatch even if the cache is also unknown.
 	if hint.BaseSHA == "" {

@@ -221,9 +221,13 @@ type PullRequestRecord struct {
 }
 
 // StackSummaryRecord is the stack tuple embedded in an authoritative
-// pull-request response. BaseSHA is empty when GitHub reports the stack base
-// ref but can no longer resolve its commit, including historical stacks whose
-// base branch was deleted.
+// pull-request response. Position and Size are independently reported positive
+// integers: Position greater than Size records historical membership after the
+// current stack shrank. This is accepted for open and closed PRs because PR
+// state cannot prove that the embedded summary still describes current ordered
+// membership. BaseSHA is empty when GitHub reports the stack base ref but can
+// no longer resolve its commit, including historical stacks whose base branch
+// was deleted.
 type StackSummaryRecord struct {
 	GitHubID int64
 	Number   int
@@ -409,8 +413,8 @@ func validatePullRequest(pull *PullRequestRecord) error {
 			pull.StackSummary.GitHubID <= 0 ||
 			pull.StackSummary.Number != *pull.StackNumber ||
 			pull.StackSummary.Size <= 0 ||
+			pull.StackSummary.Position <= 0 ||
 			pull.StackSummary.Position != *pull.StackPosition ||
-			pull.StackSummary.Position > pull.StackSummary.Size ||
 			pull.StackSummary.BaseRef == "") {
 		return fmt.Errorf("invalid PR stack summary")
 	}

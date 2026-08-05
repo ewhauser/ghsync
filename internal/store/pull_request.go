@@ -654,6 +654,12 @@ func pullStackSummaryMatches(
 	prNumber int,
 	summary *StackSummaryRecord,
 ) (bool, error) {
+	// GitHub can retain a PR's historical ordinal after the current stack
+	// shrinks. That is valid membership truth, but it cannot identify a member
+	// in the current ordered entries, so retain the authoritative stack fetch.
+	if summary.Position > summary.Size {
+		return false, nil
+	}
 	// An unknown SHA cannot prove that the summary and cached stack describe
 	// the same base commit. Fail open so the authoritative stack fetch runs.
 	if summary.BaseSHA == "" {

@@ -1035,6 +1035,8 @@ func assertFixtureConverged(
 		}
 		if pull.Stack != nil {
 			number := pull.Stack.Number
+			// The oracle compares GitHub's historical ordinal exactly, including
+			// positions beyond the current stack size.
 			position := pull.Stack.Position
 			expected.StackNumber = &number
 			expected.StackPosition = &position

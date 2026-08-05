@@ -138,11 +138,9 @@ func validateAndStripStackPreview(value any) error {
 			return fmt.Errorf("stack.%s must be a positive integer", field)
 		}
 	}
-	size, _ := jsonInteger(stack["size"])
-	position, _ := jsonInteger(stack["position"])
-	if position > size {
-		return fmt.Errorf("stack.position must not exceed stack.size")
-	}
+	// GitHub may retain a historical position after the current stack shrinks,
+	// including on an open PR, so position and size are independently
+	// constrained positive integers.
 	base, ok := stack["base"].(map[string]any)
 	if !ok {
 		return fmt.Errorf("stack.base must be an object")
