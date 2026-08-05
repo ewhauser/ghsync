@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -34,7 +36,56 @@ const (
 
 	EntityWriterOrigin = "entity_writer"
 	DeriverOrigin      = "deriver"
+
+	SharedWriterFence       FenceRole = "shared_writer"
+	ExclusiveWatermarkFence FenceRole = "exclusive_watermarker"
 )
+
+// FenceRole identifies one side of the C-S2 advisory fence.
+type FenceRole string
+
+// FenceObservation separates time queued for the advisory lock from time the
+// acquired transaction retained it. Acquired is false when lock acquisition
+// failed, in which case HoldDuration is zero.
+type FenceObservation struct {
+	Role         FenceRole
+	WaitDuration time.Duration
+	HoldDuration time.Duration
+	Acquired     bool
+}
+
+// FenceObserver receives completed C-S2 fence attempts. Implementations must
+// not block: successful observations run immediately after Commit or Rollback.
+type FenceObserver interface {
+	OutboxFence(context.Context, FenceObservation)
+}
+
+type observedFenceTx struct {
+	pgx.Tx
+	observer    FenceObserver
+	observation FenceObservation
+	acquiredAt  time.Time
+	once        sync.Once
+}
+
+func (tx *observedFenceTx) Commit(ctx context.Context) error {
+	err := tx.Tx.Commit(ctx)
+	tx.observe(ctx)
+	return err
+}
+
+func (tx *observedFenceTx) Rollback(ctx context.Context) error {
+	err := tx.Tx.Rollback(ctx)
+	tx.observe(ctx)
+	return err
+}
+
+func (tx *observedFenceTx) observe(ctx context.Context) {
+	tx.once.Do(func() {
+		tx.observation.HoldDuration = time.Since(tx.acquiredAt)
+		tx.observer.OutboxFence(ctx, tx.observation)
+	})
+}
 
 type sequenceAllocationHookKey struct{}
 
@@ -97,6 +148,23 @@ func AcquireWriterFence(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
+// AcquireObservedWriterFence is AcquireWriterFence with wait/hold
+// observation. Callers must use the returned transaction for all subsequent
+// work so Commit or Rollback records the hold interval.
+func AcquireObservedWriterFence(
+	ctx context.Context,
+	tx pgx.Tx,
+	observer FenceObserver,
+) (pgx.Tx, error) {
+	return acquireObservedFence(
+		ctx,
+		tx,
+		SharedWriterFence,
+		observer,
+		func() error { return AcquireWriterFence(ctx, tx) },
+	)
+}
+
 // AcquireWatermarkFence waits for every registered writer transaction to end
 // and prevents a new writer from allocating a sequence until tx commits.
 func AcquireWatermarkFence(ctx context.Context, tx pgx.Tx) error {
@@ -104,6 +172,55 @@ func AcquireWatermarkFence(ctx context.Context, tx pgx.Tx) error {
 		return fmt.Errorf("acquire outbox watermark fence: %w", err)
 	}
 	return nil
+}
+
+// AcquireObservedWatermarkFence is AcquireWatermarkFence with wait/hold
+// observation. Callers must use the returned transaction for the fenced read,
+// publication, and Commit or Rollback.
+func AcquireObservedWatermarkFence(
+	ctx context.Context,
+	tx pgx.Tx,
+	observer FenceObserver,
+) (pgx.Tx, error) {
+	return acquireObservedFence(
+		ctx,
+		tx,
+		ExclusiveWatermarkFence,
+		observer,
+		func() error { return AcquireWatermarkFence(ctx, tx) },
+	)
+}
+
+func acquireObservedFence(
+	ctx context.Context,
+	tx pgx.Tx,
+	role FenceRole,
+	observer FenceObserver,
+	acquire func() error,
+) (pgx.Tx, error) {
+	if observer == nil {
+		if err := acquire(); err != nil {
+			return nil, err
+		}
+		return tx, nil
+	}
+	waitStartedAt := time.Now()
+	err := acquire()
+	observation := FenceObservation{
+		Role:         role,
+		WaitDuration: time.Since(waitStartedAt),
+		Acquired:     err == nil,
+	}
+	if err != nil {
+		observer.OutboxFence(ctx, observation)
+		return nil, err
+	}
+	return &observedFenceTx{
+		Tx:          tx,
+		observer:    observer,
+		observation: observation,
+		acquiredAt:  time.Now(),
+	}, nil
 }
 
 func RepositoryKey(installationID, repositoryGitHubID int64) string {

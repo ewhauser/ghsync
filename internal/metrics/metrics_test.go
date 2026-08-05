@@ -244,6 +244,12 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	runtimeMetrics.CacheWrite(ctx, "pull_request", true, false)
 	runtimeMetrics.CacheWrite(ctx, "pull_request", true, false)
 	runtimeMetrics.CacheWrite(ctx, "pull_request", false, false)
+	runtimeMetrics.OutboxFence(ctx, outbox.FenceObservation{
+		Role:         outbox.SharedWriterFence,
+		WaitDuration: 2 * time.Millisecond,
+		HoldDuration: 3 * time.Millisecond,
+		Acquired:     true,
+	})
 	receivedAt := time.Now().UTC()
 	runtimeMetrics.RefreshFinished(ctx, &queue.RefreshObservation{
 		Kind:            queue.KindRefreshBranch,
@@ -280,6 +286,8 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		"ghsync_c_i5_parked_deliveries",
 		"ghsync_c_o3_drift_findings",
 		"ghsync_c_s2_watermark_lag_sequences",
+		`ghsync_c_s2_outbox_fence_wait_seconds_count{outcome="acquired",role="shared_writer"} 1`,
+		`ghsync_c_s2_outbox_fence_hold_seconds_count{outcome="acquired",role="shared_writer"} 1`,
 		"ghsync_c_q2_outstanding_generations",
 		"ghsync_c_o4_operation_samples",
 		"ghsync_c_o4_last_operation_sample_age_seconds",

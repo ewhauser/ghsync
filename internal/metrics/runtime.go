@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/ewhauser/ghsync/internal/budget"
+	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
@@ -63,6 +64,8 @@ type Runtime struct {
 	driftTransitions       metric.Int64Counter
 	prunerDeletes          metric.Int64Counter
 	watermarkAdvances      metric.Int64Counter
+	outboxFenceWait        metric.Float64Histogram
+	outboxFenceHold        metric.Float64Histogram
 	deriverPassDuration    metric.Float64Histogram
 	deriverPasses          metric.Int64Counter
 	stalenessMisses        metric.Int64Counter
@@ -236,6 +239,18 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	if r.watermarkAdvances, err = meter.Int64Counter(
 		"ghsync_c_s2_watermark_advances",
 		metric.WithDescription("Visibility watermark advances (C-S2)."),
+	); err != nil {
+		return err
+	}
+	if r.outboxFenceWait, err = meter.Float64Histogram(
+		"ghsync_c_s2_outbox_fence_wait_seconds",
+		metric.WithDescription("Time queued to acquire the C-S2 outbox fence."),
+	); err != nil {
+		return err
+	}
+	if r.outboxFenceHold, err = meter.Float64Histogram(
+		"ghsync_c_s2_outbox_fence_hold_seconds",
+		metric.WithDescription("Time an acquired transaction retained the C-S2 outbox fence."),
 	); err != nil {
 		return err
 	}
@@ -491,6 +506,35 @@ func (r *Runtime) WatermarkStep(
 ) {
 	if advanced {
 		r.watermarkAdvances.Add(ctx, 1)
+	}
+}
+
+// OutboxFence records the C-S2 shared-writer and exclusive-watermarker phases
+// independently so queueing cannot be mistaken for an oversized critical
+// section.
+func (r *Runtime) OutboxFence(
+	ctx context.Context,
+	observation outbox.FenceObservation,
+) {
+	outcome := "failed"
+	if observation.Acquired {
+		outcome = "acquired"
+	}
+	attributes := metric.WithAttributes(
+		attribute.String("role", string(observation.Role)),
+		attribute.String("outcome", outcome),
+	)
+	r.outboxFenceWait.Record(
+		ctx,
+		observation.WaitDuration.Seconds(),
+		attributes,
+	)
+	if observation.Acquired {
+		r.outboxFenceHold.Record(
+			ctx,
+			observation.HoldDuration.Seconds(),
+			attributes,
+		)
 	}
 }
 

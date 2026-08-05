@@ -118,10 +118,11 @@ func (observers Observers) PersistentDivergence(
 }
 
 type Options struct {
-	Pool    *pgxpool.Pool
-	REST    *gh.RESTClient
-	GraphQL *gh.GraphQLClient
-	Config  Config
+	Pool          *pgxpool.Pool
+	REST          *gh.RESTClient
+	GraphQL       *gh.GraphQLClient
+	Config        Config
+	CacheObserver store.CacheObserver
 }
 
 type Service struct {
@@ -160,7 +161,7 @@ func New(options Options) (*Service, error) { //nolint:gocritic // constructor c
 		pool:    options.Pool,
 		rest:    options.REST,
 		graphQL: options.GraphQL,
-		writer:  store.NewEntityWriter(options.Pool),
+		writer:  store.NewEntityWriter(options.Pool, options.CacheObserver),
 		config:  options.Config,
 	}, nil
 }

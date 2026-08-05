@@ -77,6 +77,7 @@ type Watermarker struct {
 	stepMu           sync.Mutex
 	lastHeartbeatAt  time.Time
 	testBeforeFence  func()
+	testBeforeCommit func()
 }
 
 // NewWatermarker constructs a leader-coordinated C-S2 watermarker.
@@ -142,7 +143,9 @@ func (w *Watermarker) Step(
 	if err != nil {
 		return WatermarkProgress{}, fmt.Errorf("begin stream watermark step: %w", err)
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+	}()
 	if w.testBeforeFence != nil {
 		w.testBeforeFence()
 	}
@@ -155,7 +158,13 @@ func (w *Watermarker) Step(
 			"set outbox watermark fence timeout: %w", err,
 		)
 	}
-	if err := outbox.AcquireWatermarkFence(ctx, tx); err != nil {
+	fenceObserver, _ := w.observer.(outbox.FenceObserver)
+	observedTx, err := outbox.AcquireObservedWatermarkFence(
+		ctx,
+		tx,
+		fenceObserver,
+	)
+	if err != nil {
 		if isLockTimeout(err) {
 			progress := WatermarkProgress{FenceTimedOut: true}
 			w.observer.WatermarkStep(ctx, progress)
@@ -163,6 +172,8 @@ func (w *Watermarker) Step(
 		}
 		return WatermarkProgress{}, err
 	}
+	tx = observedTx
+	queries = dbgen.New(tx)
 
 	targetState, err := queries.ReadStreamWatermarkTarget(ctx, w.token)
 	if err != nil {
@@ -195,7 +206,27 @@ func (w *Watermarker) Step(
 			)
 		}
 	}
+	if w.testBeforeCommit != nil {
+		w.testBeforeCommit()
+	}
 
+	if err := tx.Commit(ctx); err != nil {
+		return WatermarkProgress{}, fmt.Errorf(
+			"commit stream watermark: %w", err,
+		)
+	}
+	progress := WatermarkProgress{
+		SafeSeq:  safe,
+		MaxSeq:   target,
+		Advanced: safe > prior,
+	}
+	// The watermark transaction is complete. Report that durable result even
+	// when the independent operation heartbeat below fails.
+	w.observer.WatermarkStep(ctx, progress)
+
+	// C-S2 only needs the exclusive fence through the committed target
+	// read/publication. The heartbeat neither allocates a sequence nor affects
+	// safe_seq, so record it afterward to avoid extending the writer convoy.
 	heartbeatAt := time.Now()
 	recordHeartbeat := w.installationID > 0 &&
 		(w.lastHeartbeatAt.IsZero() ||
@@ -203,29 +234,19 @@ func (w *Watermarker) Step(
 	if recordHeartbeat {
 		if err := opsstate.RecordSuccessN(
 			ctx,
-			tx,
+			w.pool,
 			w.installationID,
 			"watermarker",
 			outbox.EntitiesStream,
 			1,
 		); err != nil {
-			return WatermarkProgress{}, err
+			return progress, fmt.Errorf(
+				"record heartbeat after committed stream watermark: %w",
+				err,
+			)
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return WatermarkProgress{}, fmt.Errorf(
-			"commit stream watermark: %w", err,
-		)
-	}
-	if recordHeartbeat {
 		w.lastHeartbeatAt = heartbeatAt
 	}
-	progress := WatermarkProgress{
-		SafeSeq:  safe,
-		MaxSeq:   target,
-		Advanced: safe > prior,
-	}
-	w.observer.WatermarkStep(ctx, progress)
 	return progress, nil
 }
 
