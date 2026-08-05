@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const advanceGapHealCursor = `-- name: AdvanceGapHealCursor :one
+const advanceGapHealCursor = `-- name: AdvanceGapHealCursor :execrows
 UPDATE gap_heal_cursors
 SET cursor = $1,
     pass_high_watermark_at = GREATEST(
@@ -43,8 +43,8 @@ type AdvanceGapHealCursorParams struct {
 	LeaseToken                 pgtype.Text
 }
 
-func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCursorParams) (GapHealCursor, error) {
-	row := q.db.QueryRow(ctx, advanceGapHealCursor,
+func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCursorParams) (int64, error) {
+	result, err := q.db.Exec(ctx, advanceGapHealCursor,
 		arg.NextCursor,
 		arg.ObservedHighWatermarkAt,
 		arg.ObservedBoundaryDeliveryID,
@@ -54,28 +54,10 @@ func (q *Queries) AdvanceGapHealCursor(ctx context.Context, arg AdvanceGapHealCu
 		arg.ExpectedCursor,
 		arg.LeaseToken,
 	)
-	var i GapHealCursor
-	err := row.Scan(
-		&i.InstallationID,
-		&i.Cursor,
-		&i.Cutoff,
-		&i.StartedAt,
-		&i.UpdatedAt,
-		&i.CompletedAt,
-		&i.LeaseToken,
-		&i.LeaseUntil,
-		&i.HighWatermarkAt,
-		&i.PassHighWatermarkAt,
-		&i.BoundaryDeliveryID,
-		&i.PassBoundaryDeliveryID,
-		&i.LastDeepStartedAt,
-		&i.LastDeepCompletedAt,
-		&i.ScanMode,
-		&i.CursorVersion,
-		&i.LookbackDurationNs,
-		&i.PageSize,
-	)
-	return i, err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const advanceSweepCursor = `-- name: AdvanceSweepCursor :one
@@ -173,7 +155,7 @@ func (q *Queries) ClaimGapHealCursor(ctx context.Context, arg ClaimGapHealCursor
 	return i, err
 }
 
-const completeGapHealCursor = `-- name: CompleteGapHealCursor :one
+const completeGapHealCursor = `-- name: CompleteGapHealCursor :execrows
 UPDATE gap_heal_cursors
 SET cursor = '',
     high_watermark_at = GREATEST(
@@ -212,8 +194,8 @@ type CompleteGapHealCursorParams struct {
 	LeaseToken                 pgtype.Text
 }
 
-func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHealCursorParams) (GapHealCursor, error) {
-	row := q.db.QueryRow(ctx, completeGapHealCursor,
+func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHealCursorParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeGapHealCursor,
 		arg.ObservedHighWatermarkAt,
 		arg.ObservedBoundaryDeliveryID,
 		arg.CompletedAt,
@@ -221,28 +203,10 @@ func (q *Queries) CompleteGapHealCursor(ctx context.Context, arg CompleteGapHeal
 		arg.ExpectedCursor,
 		arg.LeaseToken,
 	)
-	var i GapHealCursor
-	err := row.Scan(
-		&i.InstallationID,
-		&i.Cursor,
-		&i.Cutoff,
-		&i.StartedAt,
-		&i.UpdatedAt,
-		&i.CompletedAt,
-		&i.LeaseToken,
-		&i.LeaseUntil,
-		&i.HighWatermarkAt,
-		&i.PassHighWatermarkAt,
-		&i.BoundaryDeliveryID,
-		&i.PassBoundaryDeliveryID,
-		&i.LastDeepStartedAt,
-		&i.LastDeepCompletedAt,
-		&i.ScanMode,
-		&i.CursorVersion,
-		&i.LookbackDurationNs,
-		&i.PageSize,
-	)
-	return i, err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const completeSweepCursor = `-- name: CompleteSweepCursor :one

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
@@ -134,6 +135,10 @@ func (s *Service) HealDeliveryGaps(
 			candidates = append(candidates, *delivery)
 		}
 		if err := s.redeliverMissing(workCtx, candidates); err != nil {
+			if cause := context.Cause(workCtx); cause != nil &&
+				!errors.Is(cause, context.Canceled) {
+				return cause
+			}
 			return err
 		}
 		reachedLookbackEnd := len(deliveries) > 0 && !pageWithinLookback
@@ -428,6 +433,12 @@ func (s *Service) restartGapWindow(
 		},
 	)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return dbgen.GapHealCursor{}, fmt.Errorf(
+				"restart invalid delivery-gap cursor: %w",
+				errGapHealLeaseLost,
+			)
+		}
 		return dbgen.GapHealCursor{}, fmt.Errorf(
 			"restart invalid delivery-gap cursor: %w",
 			err,
@@ -451,7 +462,7 @@ func (s *Service) advanceGapWindow(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	now := s.config.Now().UTC()
-	if _, err := dbgen.New(tx).AdvanceGapHealCursor(
+	rows, err := dbgen.New(tx).AdvanceGapHealCursor(
 		ctx,
 		dbgen.AdvanceGapHealCursorParams{
 			NextCursor:                 next,
@@ -468,8 +479,15 @@ func (s *Service) advanceGapWindow(
 				now.Add(s.config.GapLeaseTTL),
 			),
 		},
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("advance delivery-gap cursor: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf(
+			"advance delivery-gap cursor: %w",
+			errGapHealLeaseLost,
+		)
 	}
 	if scheduleContinuation {
 		client := s.riverClient()
@@ -507,7 +525,7 @@ func (s *Service) completeGapWindow(
 	observedBoundaryDeliveryID int64,
 	leaseToken string,
 ) error {
-	_, err := dbgen.New(s.pool).CompleteGapHealCursor(
+	rows, err := dbgen.New(s.pool).CompleteGapHealCursor(
 		ctx,
 		dbgen.CompleteGapHealCursorParams{
 			ObservedHighWatermarkAt:    observedHighWatermark,
@@ -523,6 +541,12 @@ func (s *Service) completeGapWindow(
 	)
 	if err != nil {
 		return fmt.Errorf("complete delivery-gap cursor: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf(
+			"complete delivery-gap cursor: %w",
+			errGapHealLeaseLost,
+		)
 	}
 	return nil
 }
