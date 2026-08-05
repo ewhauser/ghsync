@@ -59,6 +59,7 @@ The principal application spans are:
 |---|---|
 | `github.webhook` | Verified inbound webhook request and durable acknowledgement. |
 | `ghsync.dispatch.batch` | Claimed delivery batch, classification, and transactional River inserts. |
+| `ghsync.refresh_generation.lock` | Refresh-generation lock acquisition, with try/wait mode, key count, acquired count, and contention status but no raw refresh key. |
 | `river.insert_many` | River job insert or insert batch, including unique-job skips. |
 | `river.work/<job-kind>` | River worker execution, attempts, snoozes, failures, and queue. |
 | `ghsync.github.admission` | Time waiting for the installation-wide budget gate. |

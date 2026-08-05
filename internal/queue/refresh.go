@@ -13,10 +13,193 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivertype"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ewhauser/ghsync/internal/pipeline"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
+
+// ErrRefreshGenerationContention reports that a nonblocking generation-lock
+// attempt must be rolled back before it can be retried.
+var ErrRefreshGenerationContention = errors.New("refresh generation contention")
+
+func refreshGenerationTracer(ctx context.Context) trace.Tracer {
+	return trace.SpanFromContext(ctx).TracerProvider().Tracer(
+		"github.com/ewhauser/ghsync/internal/queue/refresh-generation-lock",
+	)
+}
+
+// RefreshGenerationKey identifies one durable generation row.
+type RefreshGenerationKey struct {
+	Kind string `json:"kind"`
+	Key  string `json:"refresh_key"`
+}
+
+// TryLockRefreshIntentGenerationsTx gates a batch before the generation
+// upsert. Advisory and existing-row locks are tried in deterministic order. On
+// contention, callers must roll back the transaction or containing savepoint
+// so every lock acquired by the attempt is released before retrying.
+func TryLockRefreshIntentGenerationsTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	keys []RefreshGenerationKey,
+) error {
+	ordered := append([]RefreshGenerationKey(nil), keys...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Kind != ordered[j].Kind {
+			return ordered[i].Kind < ordered[j].Kind
+		}
+		return ordered[i].Key < ordered[j].Key
+	})
+	ctx, span := refreshGenerationTracer(ctx).Start(
+		ctx,
+		"ghsync.refresh_generation.lock",
+		trace.WithAttributes(
+			attribute.String("ghsync.refresh_generation.lock_mode", "try"),
+			attribute.Int("ghsync.refresh_generation.key_count", len(ordered)),
+		),
+	)
+	defer span.End()
+
+	encoded, err := json.Marshal(ordered)
+	if err != nil {
+		wrapped := fmt.Errorf("encode refresh generation locks: %w", err)
+		span.RecordError(wrapped)
+		span.SetStatus(codes.Error, wrapped.Error())
+		return wrapped
+	}
+	result, err := dbgen.New(tx).TryAcquireRefreshIntentGenerationLocks(
+		ctx,
+		encoded,
+	)
+	if err != nil {
+		wrapped := fmt.Errorf("try refresh generation locks: %w", err)
+		span.RecordError(wrapped)
+		span.SetStatus(codes.Error, wrapped.Error())
+		return wrapped
+	}
+	acquired := result.Acquired
+	acquiredCount := result.AcquiredCount
+	keyCount := result.KeyCount
+	if acquired {
+		rowResult, rowErr := dbgen.New(tx).
+			TryAcquireRefreshIntentGenerationRowLocks(ctx, encoded)
+		if rowErr != nil {
+			wrapped := fmt.Errorf("try refresh generation row locks: %w", rowErr)
+			span.RecordError(wrapped)
+			span.SetStatus(codes.Error, wrapped.Error())
+			return wrapped
+		}
+		acquired = rowResult.Acquired
+		acquiredCount = rowResult.AcquiredCount
+		keyCount = rowResult.KeyCount
+	}
+	if !acquired {
+		span.SetAttributes(
+			attribute.Bool("ghsync.refresh_generation.contended", true),
+			attribute.Int64(
+				"ghsync.refresh_generation.acquired_count",
+				acquiredCount,
+			),
+		)
+		span.SetStatus(codes.Error, ErrRefreshGenerationContention.Error())
+		return fmt.Errorf(
+			"acquire refresh generation locks: acquired %d of %d: %w",
+			acquiredCount,
+			keyCount,
+			ErrRefreshGenerationContention,
+		)
+	}
+	span.SetAttributes(
+		attribute.Bool("ghsync.refresh_generation.contended", false),
+		attribute.Int64(
+			"ghsync.refresh_generation.acquired_count",
+			acquiredCount,
+		),
+	)
+	return nil
+}
+
+// LockRefreshIntentGenerationsTx waits for a batch without retaining locks
+// from a failed attempt. Each try runs inside a savepoint, whose rollback
+// releases any advisory and generation-row locks acquired before contention.
+// Successful locks remain owned by the caller's transaction after the
+// savepoint is released.
+func LockRefreshIntentGenerationsTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	keys []RefreshGenerationKey,
+) error {
+	for {
+		attempt, err := tx.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin refresh generation lock attempt: %w", err)
+		}
+		err = TryLockRefreshIntentGenerationsTx(ctx, attempt, keys)
+		if err == nil {
+			if commitErr := attempt.Commit(ctx); commitErr != nil {
+				return fmt.Errorf(
+					"commit refresh generation lock attempt: %w",
+					commitErr,
+				)
+			}
+			return nil
+		}
+		if rollbackErr := attempt.Rollback(ctx); rollbackErr != nil {
+			return errors.Join(
+				err,
+				fmt.Errorf(
+					"rollback refresh generation lock attempt: %w",
+					rollbackErr,
+				),
+			)
+		}
+		if !errors.Is(err, ErrRefreshGenerationContention) {
+			return err
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf(
+				"wait for refresh generation locks: %w",
+				ctx.Err(),
+			)
+		case <-timer.C:
+		}
+	}
+}
+
+func lockRefreshIntentGenerationTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	key RefreshGenerationKey,
+) error {
+	ctx, span := refreshGenerationTracer(ctx).Start(
+		ctx,
+		"ghsync.refresh_generation.lock",
+		trace.WithAttributes(
+			attribute.String("ghsync.refresh_generation.lock_mode", "wait"),
+			attribute.Int("ghsync.refresh_generation.key_count", 1),
+		),
+	)
+	defer span.End()
+	if err := dbgen.New(tx).AcquireRefreshIntentGenerationLock(
+		ctx,
+		dbgen.AcquireRefreshIntentGenerationLockParams{
+			Kind:       key.Kind,
+			RefreshKey: key.Key,
+		},
+	); err != nil {
+		wrapped := fmt.Errorf("acquire refresh generation lock: %w", err)
+		span.RecordError(wrapped)
+		span.SetStatus(codes.Error, wrapped.Error())
+		return wrapped
+	}
+	return nil
+}
 
 const (
 	// KindRefreshPR refreshes one pull request.
@@ -773,6 +956,16 @@ func InsertRefreshesTxReturning(
 		}
 		return deduped[i].Key < deduped[j].Key
 	})
+	generationKeys := make([]RefreshGenerationKey, 0, len(deduped))
+	for _, spec := range deduped {
+		generationKeys = append(generationKeys, RefreshGenerationKey{
+			Kind: spec.Kind,
+			Key:  spec.Key,
+		})
+	}
+	if err := LockRefreshIntentGenerationsTx(ctx, tx, generationKeys); err != nil {
+		return nil, fmt.Errorf("lock refresh generations: %w", err)
+	}
 	pointers := make([]generationPointer, 0, len(deduped))
 	for _, spec := range deduped {
 		pointer := generationPointer{
@@ -926,6 +1119,13 @@ func completeRefresh[T river.JobArgs](
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
+	if err := lockRefreshIntentGenerationTx(
+		ctx,
+		tx,
+		RefreshGenerationKey{Kind: args.PointerKind, Key: args.Key},
+	); err != nil {
+		return err
+	}
 	generation, err := dbgen.New(tx).GetRefreshIntentGenerationForUpdate(
 		ctx,
 		dbgen.GetRefreshIntentGenerationForUpdateParams{

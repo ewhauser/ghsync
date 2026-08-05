@@ -1,6 +1,114 @@
+-- name: TryAcquireRefreshIntentGenerationLocks :one
+-- Producers acquire these transaction locks one key at a time in sorted order.
+-- A failed try-lock is rolled back with its transaction or containing
+-- savepoint before it takes any refresh-generation row locks. Include the
+-- database in the hash because advisory locks are cluster-wide and tests use
+-- parallel per-test databases.
+WITH RECURSIVE generation_keys AS MATERIALIZED (
+    SELECT
+        row_number() OVER (ORDER BY kind, refresh_key) AS lock_index,
+        kind,
+        refresh_key
+    FROM (
+        SELECT DISTINCT
+            element->>'kind' AS kind,
+            element->>'refresh_key' AS refresh_key
+        FROM jsonb_array_elements(sqlc.arg(keys)::jsonb) AS element
+    ) AS parsed
+), generation_locks AS (
+    SELECT
+        lock_index,
+        pg_try_advisory_xact_lock(hashtextextended(
+            current_database() || chr(31) || kind || chr(31) || refresh_key,
+            0
+        )) AS acquired
+    FROM generation_keys
+    WHERE lock_index = 1
+
+    UNION ALL
+
+    SELECT
+        next_key.lock_index,
+        pg_try_advisory_xact_lock(hashtextextended(
+            current_database() || chr(31) || next_key.kind || chr(31) ||
+                next_key.refresh_key,
+            0
+        )) AS acquired
+    FROM generation_locks AS prior_lock
+    JOIN generation_keys AS next_key
+      ON next_key.lock_index = prior_lock.lock_index + 1
+    WHERE prior_lock.acquired
+), lock_summary AS (
+    SELECT count(*) AS key_count
+    FROM generation_keys
+)
+SELECT
+    CASE
+        WHEN COALESCE((
+            SELECT bool_and(acquired)
+            FROM generation_locks
+        ), true)
+          AND (SELECT count(*) FROM generation_locks) = lock_summary.key_count
+        THEN true
+        ELSE false
+    END AS acquired,
+    COALESCE((
+        SELECT count(*) FILTER (WHERE acquired)
+        FROM generation_locks
+    ), 0::bigint)::bigint AS acquired_count,
+    lock_summary.key_count
+FROM lock_summary;
+
+-- name: TryAcquireRefreshIntentGenerationRowLocks :one
+-- Advisory locks serialize participating producers, but an already-open
+-- transaction may hold only the generation row. Probe every existing row
+-- without waiting so a hot row cannot make this transaction retain unrelated
+-- generation locks.
+WITH generation_keys AS MATERIALIZED (
+    SELECT DISTINCT
+        element->>'kind' AS kind,
+        element->>'refresh_key' AS refresh_key
+    FROM jsonb_array_elements(sqlc.arg(keys)::jsonb) AS element
+), locked_generation_rows AS MATERIALIZED (
+    SELECT generation.kind, generation.refresh_key
+    FROM refresh_intent_generations AS generation
+    JOIN generation_keys AS requested
+      ON requested.kind = generation.kind
+     AND requested.refresh_key = generation.refresh_key
+    ORDER BY generation.kind, generation.refresh_key
+    FOR UPDATE OF generation SKIP LOCKED
+), lock_summary AS (
+    SELECT
+        (SELECT count(*) FROM generation_keys) AS key_count,
+        (
+            SELECT count(*)
+            FROM refresh_intent_generations AS generation
+            JOIN generation_keys AS requested
+              ON requested.kind = generation.kind
+             AND requested.refresh_key = generation.refresh_key
+        ) AS existing_count,
+        (SELECT count(*) FROM locked_generation_rows) AS locked_count
+)
+SELECT
+    locked_count = existing_count AS acquired,
+    (key_count - existing_count + locked_count)::bigint AS acquired_count,
+    key_count
+FROM lock_summary;
+
+-- name: AcquireRefreshIntentGenerationLock :exec
+-- Completion has only one generation key, so it may wait without convoying
+-- unrelated keys. It takes this lock before the corresponding row lock.
+SELECT pg_advisory_xact_lock(hashtextextended(
+    current_database() || chr(31) || sqlc.arg(kind)::text || chr(31) ||
+        sqlc.arg(refresh_key)::text,
+    0
+));
+
 -- name: BumpRefreshIntentGenerations :many
 -- Bump each coalesced key once in the same transaction that inserts its River
--- job. Workers snapshot it when they begin authoritative refresh work.
+-- job. Production callers first acquire the transaction advisory lock for
+-- every key; this ordered upsert remains a second deadlock-avoidance layer.
+-- Workers snapshot it when they begin authoritative refresh work.
 WITH intents AS (
     SELECT DISTINCT
         element->>'kind' AS kind,

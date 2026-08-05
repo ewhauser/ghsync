@@ -246,7 +246,14 @@ explicit review checklist rather than relying on call-site folklore:
   ran, the worker completes the current job and reinserts a follow-up pointer
   before committing. Thus a queued burst still collapses to one job, while an
   in-flight signal cannot be lost. The guarantee is unchanged; the durable
-  generation protocol supplies it through River 0.41's supported mask.)
+  generation protocol supplies it through River 0.41's supported mask.
+  Producers try transaction advisory locks and existing generation-row locks
+  for their sorted keys without waiting before the batch upsert. A contended
+  dispatcher rolls back and retries its complete batch; transactional
+  follow-up producers roll back a lock-attempt savepoint and retry before the
+  generation + River boundary. Completion takes the same one-key advisory lock
+  before its row lock. This preserves batch atomicity and ordering without
+  letting a hot row convoy disjoint generation transactions.)
 - **C-Q2 — Debounce is bounded.** The first intent fixes `ScheduledAt`;
   because coalesced duplicates never reschedule it, the delay is exactly one
   debounce window (default 5s) — the 15s hard cap holds by construction.
