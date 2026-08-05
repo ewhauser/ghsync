@@ -653,13 +653,18 @@ func TestPullRequestListingAndMissingFanoutSpreadsWithinC_R1Bound(
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.service.ReconcilePage(ctx, ListPageArgs{
-		SweepKind:    KindPullRequests,
-		Installation: 1,
-		ScopeKey:     "acme/monolith",
-		Cursor:       "1",
-	}); err != nil {
-		t.Fatal(err)
+	// The first pass discovers the current listing and schedules an overlap
+	// pass. The second pass completes the membership comparison and enqueues
+	// disappearance verification for cached PRs absent from the listing.
+	for range 2 {
+		if err := h.service.ReconcilePage(ctx, ListPageArgs{
+			SweepKind:    KindPullRequests,
+			Installation: 1,
+			ScopeKey:     "acme/monolith",
+			Cursor:       "1",
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	rows, err := h.pool.Query(ctx, `
 		SELECT job.scheduled_at, intent.deadline_at
@@ -696,10 +701,19 @@ func TestPullRequestListingAndMissingFanoutSpreadsWithinC_R1Bound(
 			t.Fatalf("missing verification deadline = %s, want %s", deadline, wantDeadline)
 		}
 	}
+	// The overlap pass re-inserts existing intents, and River preserves their
+	// original schedule when coalescing duplicates. Assert monotonic buckets
+	// with a full-cadence spread instead of strict ordering per row.
+	spreadAcrossBuckets := false
 	for index := 1; index < len(scheduled); index++ {
-		if !scheduled[index].After(scheduled[index-1]) {
-			t.Fatalf("pull listing/missing fan-out is not spread: %v", scheduled)
+		if scheduled[index].Before(scheduled[index-1]) {
+			t.Fatalf("pull listing/missing fan-out is not monotonic: %v", scheduled)
 		}
+		spreadAcrossBuckets = spreadAcrossBuckets ||
+			scheduled[index].After(scheduled[index-1])
+	}
+	if !spreadAcrossBuckets {
+		t.Fatalf("pull listing/missing fan-out has no spread: %v", scheduled)
 	}
 	if spread := scheduled[len(scheduled)-1].Sub(scheduled[0]); spread != plan.Cadence {
 		t.Fatalf("pull listing/missing spread = %s, want %s", spread, plan.Cadence)
