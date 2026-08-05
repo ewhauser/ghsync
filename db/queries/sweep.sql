@@ -347,7 +347,7 @@ WHERE installation_id = sqlc.arg(installation_id)
   AND lease_token = sqlc.arg(lease_token)
   AND completed_at IS NULL;
 
--- name: AdvanceGapHealCursor :one
+-- name: AdvanceGapHealCursor :execrows
 UPDATE gap_heal_cursors
 SET cursor = sqlc.arg(next_cursor),
     pass_high_watermark_at = GREATEST(
@@ -380,7 +380,7 @@ WHERE installation_id = sqlc.arg(installation_id)
   AND completed_at IS NULL
 RETURNING *;
 
--- name: CompleteGapHealCursor :one
+-- name: CompleteGapHealCursor :execrows
 UPDATE gap_heal_cursors
 SET cursor = '',
     high_watermark_at = GREATEST(

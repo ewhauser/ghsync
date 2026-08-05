@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 
@@ -180,6 +182,7 @@ type sweepHarness struct {
 func newSweepHarness(
 	t *testing.T,
 	pageSize int,
+	fakeOptions ...fakegithub.Option,
 ) *sweepHarness {
 	t.Helper()
 	pool := sweepTestDatabase(t)
@@ -189,12 +192,14 @@ func newSweepHarness(
 	if err != nil {
 		t.Fatal(err)
 	}
-	fake := fakegithub.New(
-		fixture,
-		sweepTestSecret,
-		fakegithub.WithNow(func() time.Time { return now }),
-		fakegithub.WithAppAuthentication(99, &appKey.PublicKey),
+	fakeOptions = append(
+		[]fakegithub.Option{
+			fakegithub.WithNow(func() time.Time { return now }),
+			fakegithub.WithAppAuthentication(99, &appKey.PublicKey),
+		},
+		fakeOptions...,
 	)
+	fake := fakegithub.New(fixture, sweepTestSecret, fakeOptions...)
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 	gate := budget.New(server.Client(), budget.Options{})
@@ -1951,6 +1956,283 @@ func TestGapHealLeaseTakeoverResumesNextPageExactlyOnce(t *testing.T) {
 	}
 	if calls := h.fake.RequestCount(http.MethodGet, "/app/hook/deliveries"); calls != 2 {
 		t.Fatalf("stale continuation made an extra list call: %d", calls)
+	}
+}
+
+func TestGapHealLeaseLossCompletesRiverJobWithoutDeliveryGap(
+	t *testing.T,
+) {
+	t.Parallel()
+	redeliveryGate := make(chan struct{})
+	h := newSweepHarness(
+		t,
+		4,
+		fakegithub.WithResponseGate(
+			http.MethodPost,
+			"/app/hook/deliveries/3/attempts",
+			redeliveryGate,
+		),
+	)
+	h.service.config.GapLeaseTTL = 300 * time.Millisecond
+	clock := &simulatedClock{now: h.now}
+	h.service.config.Now = clock.Now
+	ingressServer := httptest.NewServer(ingress.NewMux(
+		ingress.NewHandler(
+			dbgen.New(h.pool),
+			sweepTestSecret,
+			1<<20,
+			time.Second,
+		),
+	))
+	defer ingressServer.Close()
+	missingGUIDs := make([]string, 0, 4)
+	for index := range 4 {
+		guid, err := h.fake.DropWebhook(
+			ingressServer.URL+ingress.WebhookPath,
+			"push",
+			map[string]any{
+				"ref": fmt.Sprintf("refs/heads/lease-loss-%d", index),
+				"repository": map[string]any{
+					"full_name": "acme/monolith",
+				},
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		missingGUIDs = append(missingGUIDs, guid)
+	}
+
+	inserted, err := h.river.Insert(
+		t.Context(),
+		GapHealArgs{Installation: 1, LeaseToken: "expired-owner"},
+		&river.InsertOpts{Queue: queue.QueueReconcile},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.start(t)
+	waitFor(t, func() bool {
+		return h.fake.RequestCount(
+			http.MethodGet,
+			"/app/hook/deliveries",
+		) == 1 && h.fake.RequestCount(
+			http.MethodPost,
+			"/app/hook/deliveries/3/attempts",
+		) == 1
+	})
+
+	clock.Advance(h.service.config.GapLeaseTTL + time.Second)
+	winnerResult := make(chan error, 1)
+	go func() {
+		winnerResult <- h.service.HealDeliveryGaps(
+			t.Context(),
+			GapHealArgs{
+				Installation: 1,
+				LeaseToken:   "successor-owner",
+			},
+		)
+	}()
+	waitFor(t, func() bool {
+		var leaseToken string
+		err := h.pool.QueryRow(t.Context(), `
+			SELECT lease_token
+			FROM gap_heal_cursors
+			WHERE installation_id = 1
+		`).Scan(&leaseToken)
+		return err == nil && leaseToken == "successor-owner" &&
+			h.fake.RequestCount(
+				http.MethodGet,
+				"/app/hook/deliveries",
+			) == 2
+	})
+
+	var (
+		jobState  string
+		attempts  int
+		jobErrors int
+	)
+	waitFor(t, func() bool {
+		err := h.pool.QueryRow(t.Context(), `
+			SELECT state::text, attempt, COALESCE(cardinality(errors), 0)
+			FROM river_job
+			WHERE id = $1
+		`, inserted.Job.ID).Scan(&jobState, &attempts, &jobErrors)
+		return err == nil && jobState == "completed"
+	})
+	if attempts != 1 || jobErrors != 0 {
+		t.Fatalf(
+			"stale River job state/attempts/errors = %s/%d/%d, want completed/1/0",
+			jobState,
+			attempts,
+			jobErrors,
+		)
+	}
+
+	close(redeliveryGate)
+	select {
+	case err := <-winnerResult:
+		if err != nil {
+			t.Fatalf("successor gap-heal worker: %v", err)
+		}
+	case <-t.Context().Done():
+		t.Fatal("successor gap-heal worker did not finish the interrupted page")
+	}
+
+	waitFor(t, func() bool {
+		var delivered int
+		err := h.pool.QueryRow(t.Context(), `
+			SELECT count(*)
+			FROM webhook_deliveries
+			WHERE delivery_guid = ANY($1::text[])
+		`, missingGUIDs).Scan(&delivered)
+		return err == nil && delivered == len(missingGUIDs)
+	})
+	redeliveries := h.fake.RedeliveryRequests()
+	if len(redeliveries) != len(missingGUIDs) {
+		t.Fatalf(
+			"redeliveries after mid-page lease loss = %v, want four",
+			redeliveries,
+		)
+	}
+	seen := make(map[int64]struct{}, len(redeliveries))
+	for _, deliveryID := range redeliveries {
+		seen[deliveryID] = struct{}{}
+	}
+	if len(seen) != len(missingGUIDs) {
+		t.Fatalf("duplicate redeliveries after lease loss: %v", redeliveries)
+	}
+	var cursor string
+	var completed bool
+	if err := h.pool.QueryRow(t.Context(), `
+		SELECT cursor, completed_at IS NOT NULL
+		FROM gap_heal_cursors
+		WHERE installation_id = 1
+	`).Scan(&cursor, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != "" || !completed {
+		t.Fatalf(
+			"successor cursor state = %q/completed=%v, want terminal",
+			cursor,
+			completed,
+		)
+	}
+}
+
+func TestGapWindowFencesReportOnlyNoMatchAsLeaseLoss(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 2)
+	h.service.config.GapLeaseTTL = time.Hour
+	clock := &simulatedClock{now: h.now}
+	h.service.config.Now = clock.Now
+	_, acquired, err := h.service.loadOrStartGapWindow(
+		t.Context(),
+		GapHealArgs{Installation: 1, LeaseToken: "expired-owner"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("initial gap-heal lease was not acquired")
+	}
+	clock.Advance(h.service.config.GapLeaseTTL + time.Second)
+	successor, acquired, err := h.service.loadOrStartGapWindow(
+		t.Context(),
+		GapHealArgs{Installation: 1, LeaseToken: "successor-owner"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("successor gap-heal lease was not acquired")
+	}
+	operations := map[string]func(context.Context, string) error{
+		"advance": func(ctx context.Context, token string) error {
+			return h.service.advanceGapWindow(
+				ctx,
+				successor.Cursor,
+				"stale-next",
+				successor.PassHighWatermarkAt,
+				successor.PassBoundaryDeliveryID,
+				false,
+				token,
+			)
+		},
+		"complete": func(ctx context.Context, token string) error {
+			return h.service.completeGapWindow(
+				ctx,
+				successor.Cursor,
+				successor.PassHighWatermarkAt,
+				successor.PassBoundaryDeliveryID,
+				token,
+			)
+		},
+		"restart": func(ctx context.Context, token string) error {
+			_, err := h.service.restartGapWindow(ctx, &successor, token)
+			return err
+		},
+	}
+	for name, operation := range operations {
+		err := operation(t.Context(), "expired-owner")
+		if !errors.Is(err, errGapHealLeaseLost) {
+			t.Fatalf("fenced %s error = %v, want lease loss", name, err)
+		}
+	}
+
+	canceledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	for name, operation := range operations {
+		err := operation(canceledCtx, "successor-owner")
+		if !errors.Is(err, context.Canceled) ||
+			errors.Is(err, errGapHealLeaseLost) {
+			t.Fatalf(
+				"canceled fenced %s error = %v, want retryable cancellation",
+				name,
+				err,
+			)
+		}
+	}
+
+	if _, err := h.pool.Exec(t.Context(), `
+		CREATE FUNCTION fail_gap_heal_cursor_update()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $function$
+		BEGIN
+			RAISE EXCEPTION 'forced gap-heal cursor update failure';
+		END
+		$function$;
+
+		CREATE TRIGGER fail_gap_heal_cursor_update
+		BEFORE UPDATE ON gap_heal_cursors
+		FOR EACH ROW EXECUTE FUNCTION fail_gap_heal_cursor_update()
+	`); err != nil {
+		t.Fatal(err)
+	}
+	for name, operation := range operations {
+		err := operation(t.Context(), "successor-owner")
+		var postgresError *pgconn.PgError
+		if !errors.As(err, &postgresError) ||
+			errors.Is(err, errGapHealLeaseLost) {
+			t.Fatalf(
+				"SQL fenced %s error = %v, want retryable PostgreSQL error",
+				name,
+				err,
+			)
+		}
+	}
+
+	h.pool.Close()
+	for name, operation := range operations {
+		err := operation(t.Context(), "successor-owner")
+		if err == nil || errors.Is(err, errGapHealLeaseLost) {
+			t.Fatalf(
+				"closed-pool fenced %s error = %v, want retryable connection error",
+				name,
+				err,
+			)
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -402,7 +403,17 @@ func (w *gapHealWorker) Work(
 	ctx context.Context,
 	job *river.Job[GapHealArgs],
 ) error {
-	return w.service.HealDeliveryGaps(ctx, job.Args)
+	err := w.service.HealDeliveryGaps(ctx, job.Args)
+	if !errors.Is(err, errGapHealLeaseLost) {
+		return err
+	}
+	slog.DebugContext(
+		ctx,
+		"C-R4 delivery-gap lease lost; stale job completed without retry",
+		"installation_id", job.Args.Installation,
+		"cursor", job.Args.Cursor,
+	)
+	return nil
 }
 
 type pruneWorker struct {
