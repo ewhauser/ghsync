@@ -77,6 +77,10 @@ func TestRunReturnsNilOnContextCancellation(t *testing.T) {
 func TestRunRetriesTransientError(t *testing.T) {
 	t.Parallel()
 	dispatcher := newRunTestDispatcher(t)
+	// Keep the post-retry poll timer from racing with cancellation. With a
+	// millisecond interval, both timer.C and ctx.Done can be ready after the
+	// second probe, allowing a nondeterministic third dispatch call.
+	dispatcher.config.PollInterval = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
 	dispatcher.dispatchBatch = func(context.Context) (int, error) {
