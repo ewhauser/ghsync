@@ -556,6 +556,163 @@ func TestPullRequestSweepSpreadsDeadlinesWithinC_R1Bound(t *testing.T) {
 	}
 }
 
+func TestStackListingFanoutSpreadsRefreshesWithinC_R1Bound(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 100)
+	h.seedCache(t, nil, true, false)
+	fixture := h.fixture
+	second := fixture.Stacks[0]
+	second.ID++
+	second.Number++
+	second.NodeID += "-second"
+	fixture.Stacks = append(fixture.Stacks, second)
+	h.fake.SetFixture(fixture)
+	ctx := context.Background()
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindStacks,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcilePage(ctx, ListPageArgs{
+		SweepKind:    KindStacks,
+		Installation: 1,
+		ScopeKey:     "acme/monolith",
+		Cursor:       "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `
+		SELECT job.scheduled_at, intent.deadline_at
+		FROM river_job AS job
+		JOIN refresh_intent_generations AS intent
+		  ON intent.kind = job.args->>'kind'
+		 AND intent.refresh_key = job.args->>'key'
+		WHERE job.kind = 'refresh_stack'
+		ORDER BY job.scheduled_at
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var scheduled, deadlines []time.Time
+	for rows.Next() {
+		var scheduledAt, deadline time.Time
+		if err := rows.Scan(&scheduledAt, &deadline); err != nil {
+			t.Fatal(err)
+		}
+		scheduled = append(scheduled, scheduledAt)
+		deadlines = append(deadlines, deadline)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(scheduled) != 2 || len(deadlines) != 2 {
+		t.Fatalf("stack page fan-out = %v/%v, want two jobs", scheduled, deadlines)
+	}
+	plan := scheduleForBound(h.service.config.OpenStackMaxStaleness)
+	wantDeadline := h.now.Add(plan.Bound)
+	for _, deadline := range deadlines {
+		if !deadline.Equal(wantDeadline) {
+			t.Fatalf("stack page deadline = %s, want %s", deadline, wantDeadline)
+		}
+	}
+	if !scheduled[1].After(scheduled[0]) {
+		t.Fatalf("stack page fan-out is not spread: %v", scheduled)
+	}
+	if spread := scheduled[1].Sub(scheduled[0]); spread != plan.Cadence {
+		t.Fatalf("stack page spread = %s, want %s", spread, plan.Cadence)
+	}
+	if scheduled[1].After(wantDeadline.Add(-plan.CompletionHeadroom)) {
+		t.Fatalf(
+			"latest stack start %s exceeds headroom boundary %s",
+			scheduled[1],
+			wantDeadline.Add(-plan.CompletionHeadroom),
+		)
+	}
+}
+
+func TestPullRequestListingAndMissingFanoutSpreadsWithinC_R1Bound(
+	t *testing.T,
+) {
+	t.Parallel()
+	h := newSweepHarness(t, 100)
+	h.seedCache(t, []int{4812, 4815}, false, false)
+	fixture := h.fixture
+	for index := range fixture.PullRequests {
+		if fixture.PullRequests[index].Number == 4812 ||
+			fixture.PullRequests[index].Number == 4815 {
+			fixture.PullRequests[index].State = "closed"
+		}
+	}
+	h.fake.SetFixture(fixture)
+	ctx := context.Background()
+	if err := h.service.Kickoff(ctx, KickoffArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcilePage(ctx, ListPageArgs{
+		SweepKind:    KindPullRequests,
+		Installation: 1,
+		ScopeKey:     "acme/monolith",
+		Cursor:       "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `
+		SELECT job.scheduled_at, intent.deadline_at
+		FROM river_job AS job
+		JOIN refresh_intent_generations AS intent
+		  ON intent.kind = job.args->>'kind'
+		 AND intent.refresh_key = job.args->>'key'
+		WHERE job.kind = 'refresh_pr'
+		ORDER BY job.scheduled_at
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var scheduled, deadlines []time.Time
+	for rows.Next() {
+		var scheduledAt, deadline time.Time
+		if err := rows.Scan(&scheduledAt, &deadline); err != nil {
+			t.Fatal(err)
+		}
+		scheduled = append(scheduled, scheduledAt)
+		deadlines = append(deadlines, deadline)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(scheduled) != 4 || len(deadlines) != 4 {
+		t.Fatalf("pull listing/missing fan-out = %v/%v, want four jobs", scheduled, deadlines)
+	}
+	plan := scheduleForBound(h.service.config.OpenPRMaxStaleness)
+	wantDeadline := h.now.Add(plan.Bound)
+	for _, deadline := range deadlines {
+		if !deadline.Equal(wantDeadline) {
+			t.Fatalf("missing verification deadline = %s, want %s", deadline, wantDeadline)
+		}
+	}
+	for index := 1; index < len(scheduled); index++ {
+		if !scheduled[index].After(scheduled[index-1]) {
+			t.Fatalf("pull listing/missing fan-out is not spread: %v", scheduled)
+		}
+	}
+	if spread := scheduled[len(scheduled)-1].Sub(scheduled[0]); spread != plan.Cadence {
+		t.Fatalf("pull listing/missing spread = %s, want %s", spread, plan.Cadence)
+	}
+	if scheduled[len(scheduled)-1].After(wantDeadline.Add(-plan.CompletionHeadroom)) {
+		t.Fatalf(
+			"latest pull listing/missing start %s exceeds headroom boundary %s",
+			scheduled[len(scheduled)-1],
+			wantDeadline.Add(-plan.CompletionHeadroom),
+		)
+	}
+}
+
 func TestList304AdvancesOnlyListMembershipFreshness(t *testing.T) {
 	t.Parallel()
 	h := newSweepHarness(t, 100)
