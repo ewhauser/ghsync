@@ -84,87 +84,130 @@ WITH requested AS (
            (element->>'number')::int AS number
     FROM jsonb_array_elements(sqlc.arg(scopes)::jsonb) AS element
 ),
-selected_prs AS (
-    SELECT requested.scope_key, pull_requests.*
+requested_repos AS (
+    SELECT requested.*,
+           repos.id AS local_repo_id,
+           COALESCE(repos.org_id, 0)::bigint AS org_id,
+           to_jsonb(repos) AS repository
     FROM requested
-    JOIN repos
+    LEFT JOIN repos
       ON repos.installation_id = requested.installation_id
      AND repos.gh_id = requested.repo_id
      AND repos.tombstoned_at IS NULL
-    JOIN pull_requests ON pull_requests.repo_id = repos.id
+),
+selected_prs AS (
+    SELECT requested_repos.scope_key, pull_requests.*
+    FROM requested_repos
+    JOIN pull_requests
+      ON pull_requests.repo_id = requested_repos.local_repo_id
     WHERE pull_requests.tombstoned_at IS NULL
       AND (
           (
-              requested.kind = 'stack'
-              AND pull_requests.stack_number = requested.number
+              requested_repos.kind = 'stack'
+              AND pull_requests.stack_number = requested_repos.number
           ) OR (
-              requested.kind = 'pr'
-              AND pull_requests.number = requested.number
+              requested_repos.kind = 'pr'
+              AND pull_requests.number = requested_repos.number
               AND pull_requests.stack_number IS NULL
           )
       )
+),
+pull_requests_by_scope AS (
+    SELECT selected_prs.scope_key,
+           jsonb_agg(
+               to_jsonb(selected_prs) - 'scope_key'
+               ORDER BY selected_prs.number
+           ) AS rows
+    FROM selected_prs
+    GROUP BY selected_prs.scope_key
+),
+selected_pr_keys AS (
+    SELECT DISTINCT scope_key, repo_id, number, head_sha
+    FROM selected_prs
+),
+review_threads_by_scope AS (
+    SELECT selected_pr_keys.scope_key,
+           jsonb_agg(
+               to_jsonb(review_threads)
+               ORDER BY review_threads.id
+           ) AS rows
+    FROM selected_pr_keys
+    JOIN review_threads
+      ON review_threads.repo_id = selected_pr_keys.repo_id
+     AND review_threads.pr_number = selected_pr_keys.number
+     AND review_threads.tombstoned_at IS NULL
+    GROUP BY selected_pr_keys.scope_key
+),
+selected_heads AS (
+    SELECT DISTINCT scope_key, repo_id, head_sha
+    FROM selected_pr_keys
+),
+check_runs_by_scope AS (
+    SELECT selected_heads.scope_key,
+           jsonb_agg(
+               to_jsonb(check_runs)
+               ORDER BY check_runs.gh_id
+           ) AS rows
+    FROM selected_heads
+    JOIN check_runs
+      ON check_runs.repo_id = selected_heads.repo_id
+     AND check_runs.head_sha = selected_heads.head_sha
+     AND check_runs.tombstoned_at IS NULL
+    GROUP BY selected_heads.scope_key
+),
+requested_repo_ids AS (
+    SELECT DISTINCT local_repo_id
+    FROM requested_repos
+    WHERE local_repo_id IS NOT NULL
+),
+repo_rules_by_repo AS (
+    SELECT repo_rules.repo_id,
+           jsonb_agg(
+               to_jsonb(repo_rules)
+               ORDER BY repo_rules.rule_key
+           ) AS rows
+    FROM requested_repo_ids
+    JOIN repo_rules ON repo_rules.repo_id = requested_repo_ids.local_repo_id
+    WHERE repo_rules.tombstoned_at IS NULL
+    GROUP BY repo_rules.repo_id
 )
-SELECT requested.scope_key::text AS scope_key,
-       COALESCE(repos.org_id, 0)::bigint AS org_id,
-       requested.repo_id,
+SELECT requested_repos.scope_key::text AS scope_key,
+       requested_repos.org_id,
+       requested_repos.repo_id,
        jsonb_build_object(
            'version', 1,
            'scope', jsonb_build_object(
-               'kind', requested.kind,
-               'number', requested.number
+               'kind', requested_repos.kind,
+               'number', requested_repos.number
            ),
-           'repository', to_jsonb(repos),
-           'repo_rules', COALESCE((
-               SELECT jsonb_agg(to_jsonb(repo_rules)
-                                ORDER BY repo_rules.rule_key)
-               FROM repo_rules
-               WHERE repo_rules.repo_id = repos.id
-                 AND repo_rules.tombstoned_at IS NULL
-           ), '[]'::jsonb),
-           'stack', (
-               SELECT to_jsonb(stacks)
-               FROM stacks
-               WHERE requested.kind = 'stack'
-                 AND stacks.repo_id = repos.id
-                 AND stacks.number = requested.number
-                 AND stacks.tombstoned_at IS NULL
+           'repository', requested_repos.repository,
+           'repo_rules', COALESCE(repo_rules_by_repo.rows, '[]'::jsonb),
+           'stack', to_jsonb(stacks),
+           'pull_requests', COALESCE(
+               pull_requests_by_scope.rows,
+               '[]'::jsonb
            ),
-           'pull_requests', COALESCE((
-               SELECT jsonb_agg(to_jsonb(selected_prs) - 'scope_key'
-                                ORDER BY selected_prs.number)
-               FROM selected_prs
-               WHERE selected_prs.scope_key = requested.scope_key
-           ), '[]'::jsonb),
-           'review_threads', COALESCE((
-               SELECT jsonb_agg(to_jsonb(review_threads)
-                                ORDER BY review_threads.id)
-               FROM review_threads
-               WHERE review_threads.repo_id = repos.id
-                 AND review_threads.tombstoned_at IS NULL
-                 AND EXISTS (
-                     SELECT 1
-                     FROM selected_prs
-                     WHERE selected_prs.scope_key = requested.scope_key
-                       AND selected_prs.number = review_threads.pr_number
-                 )
-           ), '[]'::jsonb),
-           'check_runs', COALESCE((
-               SELECT jsonb_agg(to_jsonb(check_runs)
-                                ORDER BY check_runs.gh_id)
-               FROM check_runs
-               WHERE check_runs.repo_id = repos.id
-                 AND check_runs.tombstoned_at IS NULL
-                 AND EXISTS (
-                     SELECT 1
-                     FROM selected_prs
-                     WHERE selected_prs.scope_key = requested.scope_key
-                       AND selected_prs.head_sha = check_runs.head_sha
-                 )
-           ), '[]'::jsonb)
+           'review_threads', COALESCE(
+               review_threads_by_scope.rows,
+               '[]'::jsonb
+           ),
+           'check_runs', COALESCE(
+               check_runs_by_scope.rows,
+               '[]'::jsonb
+           )
        ) AS data
-FROM requested
-LEFT JOIN repos
-  ON repos.installation_id = requested.installation_id
- AND repos.gh_id = requested.repo_id
- AND repos.tombstoned_at IS NULL
-ORDER BY requested.scope_key;
+FROM requested_repos
+LEFT JOIN stacks
+  ON requested_repos.kind = 'stack'
+ AND stacks.repo_id = requested_repos.local_repo_id
+ AND stacks.number = requested_repos.number
+ AND stacks.tombstoned_at IS NULL
+LEFT JOIN repo_rules_by_repo
+  ON repo_rules_by_repo.repo_id = requested_repos.local_repo_id
+LEFT JOIN pull_requests_by_scope
+  ON pull_requests_by_scope.scope_key = requested_repos.scope_key
+LEFT JOIN review_threads_by_scope
+  ON review_threads_by_scope.scope_key = requested_repos.scope_key
+LEFT JOIN check_runs_by_scope
+  ON check_runs_by_scope.scope_key = requested_repos.scope_key
+ORDER BY requested_repos.scope_key;
