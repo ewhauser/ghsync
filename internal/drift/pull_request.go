@@ -1,6 +1,9 @@
 package drift
 
-import "strings"
+import (
+	"maps"
+	"strings"
+)
 
 // pullRequestMergeabilityClasses maps both REST mergeable_state values and
 // GraphQL PullRequest.mergeable values onto the cache's GraphQL enum contract.
@@ -56,9 +59,7 @@ func canonicalizePullRequestComparison(
 
 func canonicalPullRequestSnapshot(snapshot map[string]any) map[string]any {
 	canonical := make(map[string]any, len(snapshot))
-	for key, value := range snapshot {
-		canonical[key] = value
-	}
+	maps.Copy(canonical, snapshot)
 
 	// REST's merged bit disambiguates state=closed. Missing and false both
 	// leave the state unchanged, so closed+merged=false remains real drift
