@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ewhauser/ghsync/internal/pipeline"
+	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
@@ -214,6 +215,9 @@ const (
 	KindRefreshChecks = "refresh_checks"
 	// KindRefreshBranch refreshes branch-dependent entities.
 	KindRefreshBranch = "refresh_branch"
+	// KindReconcileBranchPage authoritatively refreshes one bounded subset of
+	// branch-dependent entities on the background lane.
+	KindReconcileBranchPage = "reconcile_branch_page"
 	// KindResolveStackMembership resolves a pull request's stack ownership.
 	KindResolveStackMembership = "resolve_stack_membership"
 	// KindBackfillRepoPage continues one repository backfill.
@@ -225,8 +229,9 @@ const (
 // RefreshArgs is the complete durable job pointer. It intentionally contains
 // no webhook or entity payload (SYNC_ENGINE §8 and C-I4).
 type RefreshArgs struct {
-	PointerKind string `json:"kind"`
-	Key         string `json:"key"`
+	PointerKind              string `json:"kind"`
+	Key                      string `json:"key"`
+	ObserveDefaultBranchHead bool   `json:"observe_default_branch_head,omitempty"`
 }
 
 // RefreshPRArgs points at one pull request.
@@ -246,6 +251,26 @@ type RefreshChecksArgs struct{ RefreshArgs }
 
 // RefreshBranchArgs points at one repository branch.
 type RefreshBranchArgs struct{ RefreshArgs }
+
+// BranchReconcileTarget is an entity pointer plus the direct-refresh
+// generation observed by the atomic branch bulk transaction.
+type BranchReconcileTarget struct {
+	Kind       string `json:"kind"`
+	Key        string `json:"key"`
+	EntityKey  string `json:"entity_key"`
+	Generation int64  `json:"generation"`
+}
+
+// BranchReconcilePageArgs identifies one bounded failure/retry unit. Targets
+// contain pointers and generation fences only, never entity data.
+type BranchReconcilePageArgs struct {
+	RepoID       int64                   `json:"repo_id"`
+	RepoFullName string                  `json:"repo"`
+	Branch       string                  `json:"branch"`
+	Generation   int64                   `json:"generation"`
+	Page         int                     `json:"page"`
+	Targets      []BranchReconcileTarget `json:"targets"`
+}
 
 // ResolveStackMembershipArgs points at a pull request requiring resolution.
 type ResolveStackMembershipArgs struct{ RefreshArgs }
@@ -277,6 +302,18 @@ func NewRefreshRepositoryArgs(key string) RefreshRepositoryArgs {
 	}
 }
 
+// NewRefreshRepositoryHeadArgs constructs the constant-size repository
+// observation used to close a default-branch push's partial-order gap.
+func NewRefreshRepositoryHeadArgs(key string) RefreshRepositoryArgs {
+	return RefreshRepositoryArgs{
+		RefreshArgs{
+			PointerKind:              KindRefreshRepository,
+			Key:                      key,
+			ObserveDefaultBranchHead: true,
+		},
+	}
+}
+
 // NewRefreshRepoRulesArgs constructs a repository-rules refresh pointer.
 func NewRefreshRepoRulesArgs(key string) RefreshRepoRulesArgs {
 	return RefreshRepoRulesArgs{
@@ -297,6 +334,25 @@ func NewRefreshChecksArgs(key string) RefreshChecksArgs {
 // NewRefreshBranchArgs constructs a branch refresh pointer.
 func NewRefreshBranchArgs(key string) RefreshBranchArgs {
 	return RefreshBranchArgs{RefreshArgs{PointerKind: KindRefreshBranch, Key: key}}
+}
+
+// NewBranchReconcilePageArgs constructs one bounded branch page pointer.
+func NewBranchReconcilePageArgs(
+	repoID int64,
+	repoFullName string,
+	branch string,
+	generation int64,
+	page int,
+	targets []BranchReconcileTarget,
+) BranchReconcilePageArgs {
+	return BranchReconcilePageArgs{
+		RepoID:       repoID,
+		RepoFullName: repoFullName,
+		Branch:       branch,
+		Generation:   generation,
+		Page:         page,
+		Targets:      append([]BranchReconcileTarget(nil), targets...),
+	}
 }
 
 // NewResolveStackMembershipArgs constructs a membership-resolution pointer.
@@ -323,6 +379,9 @@ func (RefreshChecksArgs) Kind() string { return KindRefreshChecks }
 
 // Kind returns the River job kind.
 func (RefreshBranchArgs) Kind() string { return KindRefreshBranch }
+
+// Kind returns the River job kind.
+func (BranchReconcilePageArgs) Kind() string { return KindReconcileBranchPage }
 
 // Kind returns the River job kind.
 func (ResolveStackMembershipArgs) Kind() string {
@@ -442,6 +501,7 @@ type RefreshHandler interface {
 	RefreshStack(context.Context, RefreshRequest) error
 	RefreshChecks(context.Context, RefreshRequest) error
 	RefreshBranch(context.Context, RefreshRequest) error
+	ReconcileBranchPage(context.Context, *BranchReconcilePageArgs) error
 	ResolveStackMembership(context.Context, RefreshRequest) error
 	BackfillRepoPage(context.Context, BackfillRepoPageArgs) error
 	BackfillInstallationPage(
@@ -498,6 +558,11 @@ type refreshBranchWorker struct {
 	work    refreshWork
 	handler RefreshHandler
 	monitor refreshDeadlineMonitor
+}
+
+type branchReconcilePageWorker struct {
+	river.WorkerDefaults[BranchReconcilePageArgs]
+	handler RefreshHandler
 }
 
 type resolveStackMembershipWorker struct {
@@ -636,6 +701,16 @@ func (w *refreshBranchWorker) Work(
 	)
 }
 
+func (w *branchReconcilePageWorker) Work(
+	ctx context.Context,
+	job *river.Job[BranchReconcilePageArgs],
+) error {
+	if w.handler == nil {
+		return fmt.Errorf("branch reconciliation page worker is not configured")
+	}
+	return w.handler.ReconcileBranchPage(ctx, &job.Args)
+}
+
 func (w *resolveStackMembershipWorker) Work(
 	ctx context.Context,
 	job *river.Job[ResolveStackMembershipArgs],
@@ -674,6 +749,7 @@ func (w *backfillRepoPageWorker) Work(
 		time.Time{},
 		startedAt,
 		w.monitor.now(),
+		false,
 		err,
 	)
 	return err
@@ -696,6 +772,7 @@ func (w *backfillInstallationPageWorker) Work(
 		time.Time{},
 		startedAt,
 		w.monitor.now(),
+		false,
 		err,
 	)
 	return err
@@ -741,6 +818,7 @@ func registerRefreshWorkers(
 	river.AddWorker(workers, &refreshBranchWorker{
 		pool: pool, handler: handler, monitor: monitor,
 	})
+	river.AddWorker(workers, &branchReconcilePageWorker{handler: handler})
 	river.AddWorker(
 		workers,
 		&resolveStackMembershipWorker{
@@ -789,7 +867,19 @@ func runRefresh[T river.JobArgs](
 		)
 	}
 	workCtx := pipeline.WithEvent(ctx, started.EventReceivedAt.Time)
-	if workErr := work(workCtx, args); workErr != nil {
+	if started.Generation > 0 {
+		workCtx = store.WithRefreshGenerationFence(
+			workCtx,
+			store.RefreshGenerationFence{
+				Kind:       args.PointerKind,
+				RefreshKey: args.Key,
+				Generation: started.Generation,
+			},
+		)
+	}
+	workErr := work(workCtx, args)
+	superseded := errors.Is(workErr, store.ErrRefreshGenerationSuperseded)
+	if workErr != nil && !superseded {
 		monitor.observeRefresh(
 			ctx,
 			args.PointerKind,
@@ -798,6 +888,7 @@ func runRefresh[T river.JobArgs](
 			pipeline.CacheCommittedAt(workCtx),
 			startedAt,
 			now(),
+			false,
 			workErr,
 		)
 		return workErr
@@ -814,6 +905,7 @@ func runRefresh[T river.JobArgs](
 			pipeline.CacheCommittedAt(workCtx),
 			startedAt,
 			completedAt,
+			superseded,
 			completeErr,
 		)
 		return completeErr
@@ -826,6 +918,7 @@ func runRefresh[T river.JobArgs](
 		pipeline.CacheCommittedAt(workCtx),
 		startedAt,
 		completedAt,
+		superseded,
 		nil,
 	)
 	if monitor.deadlineObserver != nil && started.DeadlineAt.Valid &&
@@ -849,6 +942,7 @@ func (m refreshDeadlineMonitor) observeRefresh(
 	cacheCommittedAt time.Time,
 	startedAt time.Time,
 	completedAt time.Time,
+	superseded bool,
 	err error,
 ) {
 	if m.refreshObserver == nil {
@@ -861,6 +955,7 @@ func (m refreshDeadlineMonitor) observeRefresh(
 		CacheCommittedAt: cacheCommittedAt,
 		StartedAt:        startedAt,
 		CompletedAt:      completedAt,
+		Superseded:       superseded,
 		Err:              err,
 	})
 }
@@ -1136,6 +1231,20 @@ func completeRefresh[T river.JobArgs](
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("lock refresh generation: %w", err)
 	}
+	completedGeneration := int64(0)
+	if err == nil {
+		state, stateErr := dbgen.New(tx).GetRefreshIntentState(
+			ctx,
+			dbgen.GetRefreshIntentStateParams{
+				Kind:       args.PointerKind,
+				RefreshKey: args.Key,
+			},
+		)
+		if stateErr != nil {
+			return fmt.Errorf("read refresh completion state: %w", stateErr)
+		}
+		completedGeneration = state.CompletedGeneration
+	}
 
 	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
 		return fmt.Errorf("complete refresh job: %w", err)
@@ -1153,7 +1262,7 @@ func completeRefresh[T river.JobArgs](
 		}
 	}
 
-	if generation > startedGeneration {
+	if generation > startedGeneration && completedGeneration < generation {
 		client := river.ClientFromContext[pgx.Tx](ctx)
 		if client == nil {
 			return fmt.Errorf("river client missing from refresh worker context")

@@ -58,6 +58,11 @@ func TestLoadDerivationSnapshotMatchesCorrelatedQuery(t *testing.T) {
 		WHERE repo_id = $1 AND id = 'thread-3-2'
 	`, localRepoID)
 	batch.Queue(`
+		UPDATE review_threads
+		SET head_sha = 'stale-thread-head'
+		WHERE repo_id = $1 AND id = 'thread-3-1'
+	`, localRepoID)
+	batch.Queue(`
 		UPDATE check_runs
 		SET tombstoned_at = clock_timestamp()
 		WHERE repo_id = $1 AND head_sha = 'head-3' AND name = 'check-4'
@@ -95,6 +100,19 @@ func TestLoadDerivationSnapshotMatchesCorrelatedQuery(t *testing.T) {
 	}
 	defer tx.Rollback(context.Background()) //nolint:errcheck // test cleanup
 	assertSnapshotMatchesLegacy(t, ctx, tx, requested)
+	fenced, err := (SnapshotLoader{}).Load(ctx, tx, []string{scopes[2]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fenced.Scopes) != 1 {
+		t.Fatalf("fenced derivation snapshot rows = %d, want 1", len(fenced.Scopes))
+	}
+	if bytes.Contains(fenced.Scopes[0].Data, []byte("stale-thread-head")) {
+		t.Fatalf(
+			"derivation snapshot exposed mismatched review-thread fence: %s",
+			fenced.Scopes[0].Data,
+		)
+	}
 	assertSnapshotMatchesLegacy(t, ctx, tx, []string{})
 }
 
@@ -582,6 +600,7 @@ SELECT requested.scope_key::text AS scope_key,
                      FROM selected_prs
                      WHERE selected_prs.scope_key = requested.scope_key
                        AND selected_prs.number = review_threads.pr_number
+                       AND selected_prs.head_sha = review_threads.head_sha
                  )
            ), '[]'::jsonb),
            'check_runs', COALESCE((

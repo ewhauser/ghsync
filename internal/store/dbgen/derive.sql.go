@@ -208,6 +208,7 @@ review_threads_by_scope AS (
     JOIN review_threads
       ON review_threads.repo_id = selected_pr_keys.repo_id
      AND review_threads.pr_number = selected_pr_keys.number
+     AND review_threads.head_sha = selected_pr_keys.head_sha
      AND review_threads.tombstoned_at IS NULL
     GROUP BY selected_pr_keys.scope_key
 ),

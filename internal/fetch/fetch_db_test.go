@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 
@@ -28,6 +30,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/fakegithub"
 	"github.com/ewhauser/ghsync/internal/gh"
 	"github.com/ewhauser/ghsync/internal/ingress"
+	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/pipeline"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store"
@@ -961,6 +964,99 @@ func TestCoordinatorRepositoryMetadataConvergesWhenOlderBatchLandsLast(
 		repository.DefaultHeadSHA != "newer-default-head" ||
 		!repository.GitHubUpdatedAt.Equal(newerFixture.Repository.UpdatedAt) {
 		t.Fatalf("repository metadata after older-last batches = %+v", repository)
+	}
+}
+
+func TestCoordinatorDropsSupersededParentButCommitsUnrelatedDirectPR(
+	t *testing.T,
+) {
+	t.Parallel()
+	database := testdb.New(t)
+	fixture := fakegithub.DefaultFixture()
+	_, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t, database.Pool, fixture, 5*time.Millisecond, 100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	if err := seedHandler.RefreshRepository(t.Context(), queue.RefreshRequest{
+		Args: queue.NewRefreshRepositoryHeadArgs(
+			"repo:acme/monolith:metadata",
+		).RefreshArgs,
+		Queue: queue.QueueEvent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedCoordinatorPulls(t, seedHandler, 4812)
+
+	fixture.PullRequests[1].Title = "unrelated direct event survives branch bulk"
+	gate := make(chan struct{})
+	var release sync.Once
+	releaseResponse := func() { release.Do(func() { close(gate) }) }
+	defer releaseResponse()
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		database.Pool,
+		fixture,
+		5*time.Millisecond,
+		100,
+		fakegithub.WithResponseGate(http.MethodPost, "/graphql", gate),
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.RefreshPR(t.Context(), refreshPRRequest(4812))
+	}()
+	waitForFakeRequest(t, fake, http.MethodPost, "/graphql")
+
+	tx, err := database.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(t.Context()) //nolint:errcheck // rollback after commit
+	if err := outbox.AcquireWriterFence(t.Context(), tx); err != nil {
+		t.Fatal(err)
+	}
+	bulk, err := store.NewEntityWriter(database.Pool).ApplyBranchPushTx(
+		t.Context(),
+		tx,
+		&store.BranchPushHint{
+			RepoFullName: "acme/monolith", Branch: "main",
+			BeforeSHA: "aaaa000", AfterSHA: "new-default-head",
+			TransitionKnown: true, DeliveryGUID: "parent-fence-direct-pr",
+			ReceivedAt: time.Date(2026, 8, 5, 19, 30, 0, 0, time.UTC),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bulk.Targets) != 0 || bulk.RepositoryRefreshKey == "" {
+		t.Fatalf("unrelated branch bulk result = %+v", bulk)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	releaseResponse()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	var title, repositoryHead string
+	if err := database.Pool.QueryRow(t.Context(), `
+		SELECT pull.title, repos.head_sha
+		FROM pull_requests AS pull
+		JOIN repos ON repos.id = pull.repo_id
+		WHERE repos.full_name = 'acme/monolith' AND pull.number = 4812
+	`).Scan(&title, &repositoryHead); err != nil {
+		t.Fatal(err)
+	}
+	if title != fixture.PullRequests[1].Title ||
+		repositoryHead != "new-default-head" {
+		t.Fatalf(
+			"direct PR/parent after bulk = %q/%q",
+			title, repositoryHead,
+		)
 	}
 }
 
@@ -4070,6 +4166,620 @@ func TestStormAssertsFetchCount(t *testing.T) {
 	}
 }
 
+func TestBranchBulkPagesConvergeWithIndividualRefreshes(t *testing.T) {
+	t.Parallel()
+	const (
+		branch     = "refactor/bm25f-ranker"
+		oldSHA     = "force-pushed-away"
+		currentSHA = "8f31c2d"
+	)
+
+	baseline := newManualBranchHarness(t, "acme/branch-convergence")
+	bulk := newManualBranchHarness(t, "acme/branch-convergence")
+	for _, harness := range []*manualBranchHarness{baseline, bulk} {
+		harness.warmBranchDependents()
+		harness.rewindBranchCache(branch, currentSHA, oldSHA)
+	}
+
+	// The control runs the equivalent independent observations: the interleaved
+	// PR on the direct lane and the remaining reference targets through their
+	// ordinary per-entity reconciliation semantics.
+	baseline.refreshPR(4812, queue.QueueEvent)
+	baseline.refreshPR(4815, queue.QueueSweep)
+	baseline.refreshStack(142, queue.QueueSweep)
+
+	// The new path exposes the exact force-push transition locally, then runs
+	// one bounded page. A newer direct generation interleaved after page
+	// creation supersedes PR 4812's page target; its direct refresh supplies
+	// that entity's authoritative observation instead.
+	page := bulk.applyBranchPage(&store.BranchPushHint{
+		RepoFullName:    bulk.repo,
+		Branch:          branch,
+		BeforeSHA:       oldSHA,
+		AfterSHA:        currentSHA,
+		TransitionKnown: true,
+		Forced:          true,
+		DeliveryGUID:    "branch-convergence-force-push",
+		ReceivedAt: time.Date(
+			2026, 8, 5, 18, 0, 0, 0, time.UTC,
+		),
+	})
+	var direct queue.BranchReconcileTarget
+	for _, target := range page.Targets {
+		if target.Kind == queue.KindRefreshPR &&
+			target.Key == "pr:"+bulk.repo+":4812" {
+			direct = target
+			break
+		}
+	}
+	if direct.Key == "" {
+		t.Fatalf("page has no interleaved direct target: %+v", page.Targets)
+	}
+	gotTargets := make([]string, 0, len(page.Targets))
+	for _, target := range page.Targets {
+		gotTargets = append(gotTargets, target.Kind+"/"+target.Key)
+	}
+	sort.Strings(gotTargets)
+	wantTargets := []string{
+		queue.KindRefreshPR + "/pr:" + bulk.repo + ":4812",
+		queue.KindRefreshPR + "/pr:" + bulk.repo + ":4815",
+		queue.KindRefreshStack + "/stack:" + bulk.repo + ":142",
+	}
+	if !reflect.DeepEqual(gotTargets, wantTargets) {
+		t.Fatalf("mixed branch targets = %v, want %v", gotTargets, wantTargets)
+	}
+	bulk.bumpDirectGeneration(direct)
+	// Event workers are reserved independently of the bulk lane. Complete the
+	// newer direct observation first so this oracle exercises direct -> stale
+	// page superseding under the production lane ordering. Delayed-response
+	// tests separately cover stale page/direct responses completing last.
+	bulk.refreshPR(4812, queue.QueueEvent)
+	if err := bulk.handler.ReconcileBranchPage(t.Context(), &page); err != nil {
+		t.Fatal(err)
+	}
+
+	want := snapshotBranchConvergenceCache(t, baseline.pool, baseline.repo)
+	got := snapshotBranchConvergenceCache(t, bulk.pool, bulk.repo)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("bulk+page cache did not converge\ngot:  %+v\nwant: %+v", got, want)
+	}
+
+	var status string
+	var superseded int
+	if err := bulk.pool.QueryRow(t.Context(), `
+		SELECT status, superseded_targets
+		FROM branch_reconciliation_pages
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+	`, page.RepoID, page.Branch, page.Generation).Scan(
+		&status, &superseded,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if status != "completed" || superseded != 1 {
+		t.Fatalf(
+			"page status/superseded = %q/%d, want completed/1",
+			status, superseded,
+		)
+	}
+}
+
+// snapshotBranchConvergenceCache compares every persisted semantic,
+// authoritative-version, validator, and provenance field in both PR and stack
+// cache scopes. It strips only database-local identities and wall-clock
+// bookkeeping, preserves tombstone state as a boolean, and sorts rows in Go so
+// PostgreSQL collation cannot make the oracle agree accidentally.
+func snapshotBranchConvergenceCache(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	repo string,
+) map[string][]string {
+	t.Helper()
+	type tableSpec struct {
+		name     string
+		localIDs []string
+	}
+	tables := []tableSpec{
+		{name: "repos", localIDs: []string{"id"}},
+		{name: "repo_rules"},
+		{name: "pull_requests", localIDs: []string{"id"}},
+		{name: "stacks", localIDs: []string{"id"}},
+		{name: "review_threads"},
+		{name: "pull_request_review_requests"},
+		{name: "pull_request_reviews"},
+		{name: "pull_request_comments"},
+		{name: "pull_request_change_snapshots"},
+		{name: "pull_request_changed_files"},
+		{name: "pull_request_file_owners"},
+		{name: "check_runs"},
+		{name: "check_history", localIDs: []string{"id"}},
+	}
+	ignored := []string{
+		"repo_id", "synced_at", "last_checked_at", "tombstoned_at",
+		"display_until", "first_seen_at",
+	}
+	snapshot := make(map[string][]string, len(tables)+1)
+	for _, table := range tables {
+		removed := append(append([]string(nil), ignored...), table.localIDs...)
+		filter := "JOIN repos ON repos.id = cache_row.repo_id " +
+			"WHERE repos.full_name = $1"
+		if table.name == "repos" {
+			filter = "WHERE cache_row.full_name = $1"
+		}
+		query := fmt.Sprintf(`
+			SELECT (to_jsonb(cache_row) - $2::text[]) ||
+			       jsonb_build_object(
+			           'tombstoned', cache_row.tombstoned_at IS NOT NULL
+			       )
+			FROM %s AS cache_row
+			%s
+		`, table.name, filter)
+		rows, err := pool.Query(t.Context(), query, repo, removed)
+		if err != nil {
+			t.Fatalf("snapshot %s: %v", table.name, err)
+		}
+		values := make([]string, 0)
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				rows.Close()
+				t.Fatalf("scan snapshot %s: %v", table.name, err)
+			}
+			values = append(values, string(raw))
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatalf("iterate snapshot %s: %v", table.name, err)
+		}
+		rows.Close()
+		sort.Strings(values)
+		snapshot[table.name] = values
+	}
+
+	rows, err := pool.Query(t.Context(), `
+		SELECT scope_key
+		FROM derivation_dirty
+		WHERE scope_key LIKE (
+			SELECT '%:' || installation_id::text || ':' || gh_id::text || ':%'
+			FROM repos WHERE full_name = $1
+		)
+	`, repo)
+	if err != nil {
+		t.Fatalf("snapshot dirty scopes: %v", err)
+	}
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		snapshot["derivation_dirty"] = append(
+			snapshot["derivation_dirty"], key,
+		)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	sort.Strings(snapshot["derivation_dirty"])
+	return snapshot
+}
+
+func TestBranchPageDoesNotOverwriteRepositoryBranchHint(t *testing.T) {
+	t.Parallel()
+	harness := newManualBranchHarness(t, "acme/branch-parent-fence")
+	harness.refreshPR(4812, queue.QueueEvent)
+	harness.rewindBranchCache(
+		"refactor/tokenizer", "bbbb001", "old-tokenizer-head",
+	)
+	if _, err := harness.pool.Exec(t.Context(), `
+		UPDATE repos
+		SET head_sha = 'newer-local-default-head', etag = ''
+		WHERE full_name = $1
+	`, harness.repo); err != nil {
+		t.Fatal(err)
+	}
+	page := harness.applyBranchPage(&store.BranchPushHint{
+		RepoFullName:    harness.repo,
+		Branch:          "refactor/tokenizer",
+		BeforeSHA:       "old-tokenizer-head",
+		AfterSHA:        "bbbb001",
+		TransitionKnown: true,
+		DeliveryGUID:    "branch-parent-fence",
+		ReceivedAt: time.Date(
+			2026, 8, 5, 18, 30, 0, 0, time.UTC,
+		),
+	})
+	if err := harness.handler.ReconcileBranchPage(t.Context(), &page); err != nil {
+		t.Fatal(err)
+	}
+	var repoHead, baseHead string
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT repos.head_sha, pull_requests.base_sha
+		FROM repos
+		JOIN pull_requests ON pull_requests.repo_id = repos.id
+		WHERE repos.full_name = $1 AND pull_requests.number = 4812
+	`, harness.repo).Scan(&repoHead, &baseHead); err != nil {
+		t.Fatal(err)
+	}
+	if repoHead != "newer-local-default-head" || baseHead != "bbbb001" {
+		t.Fatalf(
+			"page repository/PR heads = %q/%q, want newer hint/bbbb001",
+			repoHead, baseHead,
+		)
+	}
+}
+
+func TestReverseOrderedDefaultBranchTransitionsConvergeRepository(t *testing.T) {
+	t.Parallel()
+	harness := newManualBranchHarness(t, "acme/branch-reverse-order")
+	harness.refreshRepository(queue.QueueEvent)
+	if _, err := harness.pool.Exec(t.Context(), `
+		UPDATE repos SET head_sha = 'old-default-head'
+		WHERE full_name = $1
+	`, harness.repo); err != nil {
+		t.Fatal(err)
+	}
+
+	// GitHub emitted old->middle and then middle->aaaa000. Delivering the
+	// second push first cannot be ordered by comparing SHA strings: its exact
+	// CAS is initially a no-op, then the delayed predecessor advances the
+	// local hint only to middle.
+	harness.applyBranchPage(&store.BranchPushHint{
+		RepoFullName: harness.repo, Branch: "main",
+		BeforeSHA: "middle-default-head", AfterSHA: "aaaa000",
+		TransitionKnown: true, DeliveryGUID: "reverse-order-newer",
+		ReceivedAt: time.Date(2026, 8, 5, 19, 0, 0, 0, time.UTC),
+	})
+	harness.applyBranchPage(&store.BranchPushHint{
+		RepoFullName: harness.repo, Branch: "main",
+		BeforeSHA: "old-default-head", AfterSHA: "middle-default-head",
+		TransitionKnown: true, DeliveryGUID: "reverse-order-older",
+		ReceivedAt: time.Date(2026, 8, 5, 19, 0, 1, 0, time.UTC),
+	})
+	var hintedHead string
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT head_sha FROM repos WHERE full_name = $1
+	`, harness.repo).Scan(&hintedHead); err != nil {
+		t.Fatal(err)
+	}
+	if hintedHead != "middle-default-head" {
+		t.Fatalf("reverse-ordered exact CAS head = %q, want middle", hintedHead)
+	}
+
+	// Dispatch schedules this one constant-size repository observation on the
+	// bulk lane for every default-branch bulk generation. The real repository
+	// refresh path closes the partial-order gap with authoritative truth.
+	harness.refreshRepository(queue.QueueBulk)
+	var convergedHead string
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT head_sha FROM repos WHERE full_name = $1
+	`, harness.repo).Scan(&convergedHead); err != nil {
+		t.Fatal(err)
+	}
+	if convergedHead != "aaaa000" {
+		t.Fatalf("authoritative repository head = %q, want aaaa000", convergedHead)
+	}
+}
+
+func TestBranchPageFailureLeavesOnlyBoundedPagePendingForRetry(t *testing.T) {
+	t.Parallel()
+	harness := newManualBranchHarness(t, "acme/branch-page-retry")
+	harness.warmBranchDependents()
+	harness.rewindBranchCache(
+		"refactor/bm25f-ranker", "8f31c2d", "old-retry-head",
+	)
+	page := harness.applyBranchPage(&store.BranchPushHint{
+		RepoFullName:    harness.repo,
+		Branch:          "refactor/bm25f-ranker",
+		BeforeSHA:       "old-retry-head",
+		AfterSHA:        "8f31c2d",
+		TransitionKnown: true,
+		DeliveryGUID:    "branch-page-retry",
+		ReceivedAt: time.Date(
+			2026, 8, 5, 18, 45, 0, 0, time.UTC,
+		),
+	})
+	if len(page.Targets) > dispatch.DefaultBranchReconcilePageSize {
+		t.Fatalf("page has %d unbounded targets", len(page.Targets))
+	}
+	failed := page
+	failed.Targets = append([]queue.BranchReconcileTarget(nil), page.Targets...)
+	failed.Targets[0].Kind = "unsupported_retry_fixture"
+	if err := harness.handler.ReconcileBranchPage(t.Context(), &failed); err == nil {
+		t.Fatal("poisoned page unexpectedly succeeded")
+	}
+	var status string
+	var attempts int64
+	var startedAt, heartbeatAt pgtype.Timestamptz
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT status, attempt_count, last_started_at, heartbeat_at
+		FROM branch_reconciliation_pages
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+	`, page.RepoID, page.Branch, page.Generation).Scan(
+		&status, &attempts, &startedAt, &heartbeatAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || attempts != 1 || !startedAt.Valid ||
+		!heartbeatAt.Valid {
+		t.Fatalf(
+			"failed page manifest = %q attempts=%d started=%v heartbeat=%v",
+			status, attempts, startedAt.Valid, heartbeatAt.Valid,
+		)
+	}
+	if err := harness.handler.ReconcileBranchPage(t.Context(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT status, attempt_count, heartbeat_at
+		FROM branch_reconciliation_pages
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+	`, page.RepoID, page.Branch, page.Generation).Scan(
+		&status, &attempts, &heartbeatAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if status != "completed" || attempts != 2 || !heartbeatAt.Valid {
+		t.Fatalf(
+			"retried page manifest = %q attempts=%d heartbeat=%v",
+			status, attempts, heartbeatAt.Valid,
+		)
+	}
+}
+
+type manualBranchHarness struct {
+	t       *testing.T
+	repo    string
+	pool    *pgxpool.Pool
+	handler *Handler
+	river   *river.Client[pgx.Tx]
+}
+
+func newManualBranchHarness(t *testing.T, repo string) *manualBranchHarness {
+	t.Helper()
+	pool := fetchTestDatabase(t)
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	_, server, handler, riverClient := newDirectHandler(
+		t, pool, fixture, 5*time.Millisecond, 100,
+	)
+	t.Cleanup(server.Close)
+	handler.SetRiverClient(riverClient)
+	return &manualBranchHarness{
+		t: t, repo: repo, pool: pool, handler: handler, river: riverClient,
+	}
+}
+
+func (h *manualBranchHarness) warmBranchDependents() {
+	h.t.Helper()
+	h.refreshStack(142, queue.QueueEvent)
+	h.refreshPR(4812, queue.QueueEvent)
+	h.refreshPR(4815, queue.QueueEvent)
+}
+
+func (h *manualBranchHarness) refreshPR(number int, queueName string) {
+	h.t.Helper()
+	err := h.handler.RefreshPR(h.t.Context(), queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			fmt.Sprintf("pr:%s:%d", h.repo, number),
+		).RefreshArgs,
+		Queue: queueName,
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *manualBranchHarness) refreshRepository(queueName string) {
+	h.t.Helper()
+	err := h.handler.RefreshRepository(h.t.Context(), queue.RefreshRequest{
+		Args: queue.NewRefreshRepositoryHeadArgs(
+			"repo:" + h.repo + ":metadata",
+		).RefreshArgs,
+		Queue: queueName,
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *manualBranchHarness) refreshStack(number int, queueName string) {
+	h.t.Helper()
+	err := h.handler.RefreshStack(h.t.Context(), queue.RefreshRequest{
+		Args: queue.NewRefreshStackArgs(
+			fmt.Sprintf("stack:%s:%d", h.repo, number),
+		).RefreshArgs,
+		Queue: queueName,
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *manualBranchHarness) rewindBranchCache(
+	branch string,
+	currentSHA string,
+	oldSHA string,
+) {
+	h.t.Helper()
+	if _, err := h.pool.Exec(h.t.Context(), `
+		UPDATE pull_requests AS pull
+		SET head_sha = CASE
+		        WHEN pull.head_ref = $2 AND pull.head_sha = $3 THEN $4
+		        ELSE pull.head_sha
+		    END,
+		    base_sha = CASE
+		        WHEN pull.base_ref = $2 AND pull.base_sha = $3 THEN $4
+		        ELSE pull.base_sha
+		    END,
+		    etag = ''
+		FROM repos
+		WHERE repos.id = pull.repo_id
+		  AND repos.full_name = $1
+		  AND pull.state = 'open'
+		  AND (pull.head_ref = $2 OR pull.base_ref = $2)
+	`, h.repo, branch, currentSHA, oldSHA); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(h.t.Context(), `
+		UPDATE stacks AS stack
+		SET entries = (
+		        SELECT jsonb_agg(
+		            CASE
+		              WHEN entry.value->>'head_ref' = $2
+		               AND entry.value->>'head_sha' = $3
+		              THEN jsonb_set(
+		                  entry.value, '{head_sha}', to_jsonb($4::text)
+		              )
+		              ELSE entry.value
+		            END
+		            ORDER BY entry.ordinality
+		        )
+		        FROM jsonb_array_elements(stack.entries)
+		             WITH ORDINALITY AS entry(value, ordinality)
+		    ),
+		    etag = ''
+		FROM repos
+		WHERE repos.id = stack.repo_id
+		  AND repos.full_name = $1
+		  AND stack.open
+	`, h.repo, branch, currentSHA, oldSHA); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(h.t.Context(), `
+		UPDATE pull_request_change_snapshots AS snapshot
+		SET head_sha = CASE
+		        WHEN pull.head_ref = $2 AND snapshot.head_sha = $3
+		        THEN $4 ELSE snapshot.head_sha
+		    END,
+		    base_sha = CASE
+		        WHEN pull.base_ref = $2 AND snapshot.base_sha = $3
+		        THEN $4 ELSE snapshot.base_sha
+		    END,
+		    codeowners_sha = CASE
+		        WHEN pull.base_ref = $2 AND snapshot.codeowners_sha = $3
+		        THEN $4 ELSE snapshot.codeowners_sha
+		    END,
+		    etag = ''
+		FROM pull_requests AS pull, repos
+		WHERE repos.id = snapshot.repo_id
+		  AND pull.repo_id = snapshot.repo_id
+		  AND pull.number = snapshot.pr_number
+		  AND repos.full_name = $1
+		  AND (pull.head_ref = $2 OR pull.base_ref = $2)
+	`, h.repo, branch, currentSHA, oldSHA); err != nil {
+		h.t.Fatal(err)
+	}
+	// Preserve a cache state the old per-entity path could actually have
+	// produced: dependent rows and their parent snapshot share one exact fence.
+	// Rewinding only the snapshot would manufacture a validator association
+	// that never existed and make the reference path reuse it incorrectly.
+	if _, err := h.pool.Exec(h.t.Context(), `
+		UPDATE pull_request_changed_files AS file
+		SET head_sha = CASE
+		        WHEN pull.head_ref = $2 AND file.head_sha = $3
+		        THEN $4 ELSE file.head_sha
+		    END,
+		    base_sha = CASE
+		        WHEN pull.base_ref = $2 AND file.base_sha = $3
+		        THEN $4 ELSE file.base_sha
+		    END
+		FROM pull_requests AS pull, repos
+		WHERE repos.id = file.repo_id
+		  AND pull.repo_id = file.repo_id
+		  AND pull.number = file.pr_number
+		  AND repos.full_name = $1
+		  AND (pull.head_ref = $2 OR pull.base_ref = $2)
+	`, h.repo, branch, currentSHA, oldSHA); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(h.t.Context(), `
+		UPDATE pull_request_file_owners AS owner
+		SET head_sha = CASE
+		        WHEN pull.head_ref = $2 AND owner.head_sha = $3
+		        THEN $4 ELSE owner.head_sha
+		    END,
+		    base_sha = CASE
+		        WHEN pull.base_ref = $2 AND owner.base_sha = $3
+		        THEN $4 ELSE owner.base_sha
+		    END
+		FROM pull_requests AS pull, repos
+		WHERE repos.id = owner.repo_id
+		  AND pull.repo_id = owner.repo_id
+		  AND pull.number = owner.pr_number
+		  AND repos.full_name = $1
+		  AND (pull.head_ref = $2 OR pull.base_ref = $2)
+	`, h.repo, branch, currentSHA, oldSHA); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *manualBranchHarness) applyBranchPage(
+	hint *store.BranchPushHint,
+) queue.BranchReconcilePageArgs {
+	h.t.Helper()
+	tx, err := h.pool.Begin(h.t.Context())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer tx.Rollback(h.t.Context()) //nolint:errcheck // rollback after commit
+	if err := outbox.AcquireWriterFence(h.t.Context(), tx); err != nil {
+		h.t.Fatal(err)
+	}
+	writer := store.NewEntityWriter(h.pool)
+	result, err := writer.ApplyBranchPushTx(h.t.Context(), tx, hint)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	pageCounts := []int(nil)
+	if len(result.Targets) > 0 {
+		pageCounts = []int{len(result.Targets)}
+	}
+	if err := writer.RecordBranchReconciliationPagesTx(
+		h.t.Context(), tx, result.RepoID, hint.Branch, result.Generation,
+		pageCounts,
+	); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := tx.Commit(h.t.Context()); err != nil {
+		h.t.Fatal(err)
+	}
+	targets := make([]queue.BranchReconcileTarget, 0, len(result.Targets))
+	for _, target := range result.Targets {
+		targets = append(targets, queue.BranchReconcileTarget{
+			Kind:       target.RefreshKind,
+			Key:        target.RefreshKey,
+			EntityKey:  target.EntityKey,
+			Generation: target.RefreshGeneration,
+		})
+	}
+	return queue.NewBranchReconcilePageArgs(
+		result.RepoID, hint.RepoFullName, hint.Branch,
+		result.Generation, 1, targets,
+	)
+}
+
+func (h *manualBranchHarness) bumpDirectGeneration(
+	target queue.BranchReconcileTarget,
+) {
+	h.t.Helper()
+	tx, err := h.pool.Begin(h.t.Context())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer tx.Rollback(h.t.Context()) //nolint:errcheck // rollback after commit
+	if err := queue.InsertRefreshesTx(
+		h.t.Context(), tx, h.river,
+		[]queue.RefreshSpec{{Kind: target.Kind, Key: target.Key}},
+		queue.QueueEvent,
+	); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := tx.Commit(h.t.Context()); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
 type pipelineEvent struct {
 	event   string
 	payload map[string]any
@@ -4110,7 +4820,7 @@ func newPipelineHarness(t *testing.T, repo string) *pipelineHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := New(Options{
+	handler, err := New(&Options{
 		Pool:           pool,
 		REST:           rest,
 		GraphQL:        graphQL,
@@ -4449,7 +5159,7 @@ func newDirectHandlerWithMiddleware(
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := New(Options{
+	handler, err := New(&Options{
 		Pool:             pool,
 		REST:             rest,
 		GraphQL:          graphQL,

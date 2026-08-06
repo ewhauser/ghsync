@@ -249,6 +249,11 @@ type payloadEnvelope struct {
 	Action     string `json:"action"`
 	Number     int    `json:"number"`
 	Ref        string `json:"ref"`
+	Before     string `json:"before"`
+	After      string `json:"after"`
+	Created    bool   `json:"created"`
+	Deleted    bool   `json:"deleted"`
+	Forced     bool   `json:"forced"`
 	Repository struct {
 		FullName      string `json:"full_name"`
 		DefaultBranch string `json:"default_branch"`
@@ -310,6 +315,17 @@ type classification struct {
 	intents      []Intent
 	matchedRules int
 	stackHint    *stackSummaryHint
+	branchHint   *branchPushHint
+}
+
+type branchPushHint struct {
+	Repo            string
+	Branch          string
+	BeforeSHA       string
+	AfterSHA        string
+	TransitionKnown bool
+	Deleted         bool
+	Forced          bool
 }
 
 // Classify parses only events that have a configured rule. Unknown events are
@@ -401,7 +417,57 @@ func (c Classifier) classifyContent(
 		matchedRules: matchedRules,
 	}
 	result.stackHint = completeStackSummaryHint(&payload, intents)
+	result.branchHint = completeBranchPushHint(&payload, intents)
 	return result, nil
+}
+
+func completeBranchPushHint(
+	payload *payloadEnvelope,
+	intents []Intent,
+) *branchPushHint {
+	const branchPrefix = "refs/heads/"
+	if payload == nil || payload.Repository.FullName == "" ||
+		!strings.HasPrefix(payload.Ref, branchPrefix) {
+		return nil
+	}
+	branch := strings.TrimPrefix(payload.Ref, branchPrefix)
+	key := "branch:" + payload.Repository.FullName + ":" + branch
+	found := false
+	for _, intent := range intents {
+		if intent.Kind == queue.KindRefreshBranch && intent.Key == key {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	// GitHub push deliveries always carry before/after, including all-zero
+	// creation/deletion sentinels. Older synthetic fixtures and manually
+	// replayed incomplete payloads still use bounded pages, but cannot prove a
+	// local SHA transition.
+	transitionKnown := payload.Before != "" && payload.After != ""
+	return &branchPushHint{
+		Repo:            payload.Repository.FullName,
+		Branch:          branch,
+		BeforeSHA:       normalizePushSHA(payload.Before),
+		AfterSHA:        normalizePushSHA(payload.After),
+		TransitionKnown: transitionKnown,
+		Deleted:         payload.Deleted,
+		Forced:          payload.Forced,
+	}
+}
+
+func normalizePushSHA(sha string) string {
+	if sha == "" {
+		return ""
+	}
+	for _, character := range sha {
+		if character != '0' {
+			return sha
+		}
+	}
+	return ""
 }
 
 func (c Classifier) classifyStored(

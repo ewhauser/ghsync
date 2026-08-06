@@ -14,6 +14,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 	"github.com/ewhauser/ghsync/internal/testdb"
 )
@@ -32,6 +33,94 @@ func (*noopWorker) Work(context.Context, *river.Job[noopArgs]) error {
 
 func registerNoopWorker(workers *river.Workers) {
 	river.AddWorker(workers, &noopWorker{})
+}
+
+type branchIsolationHandler struct {
+	pageStarted chan struct{}
+	releasePage chan struct{}
+	directPR    chan struct{}
+	releasePR   <-chan struct{}
+	directErr   error
+}
+
+func (h *branchIsolationHandler) RefreshPR(
+	context.Context,
+	RefreshRequest,
+) error {
+	h.directPR <- struct{}{}
+	if h.releasePR != nil {
+		<-h.releasePR
+	}
+	return h.directErr
+}
+
+func (*branchIsolationHandler) RefreshRepository(
+	context.Context,
+	RefreshRequest,
+) error {
+	return nil
+}
+
+func (*branchIsolationHandler) RefreshRepoRules(
+	context.Context,
+	RefreshRequest,
+) error {
+	return nil
+}
+
+func (*branchIsolationHandler) RefreshStack(
+	context.Context,
+	RefreshRequest,
+) error {
+	return nil
+}
+
+func (*branchIsolationHandler) RefreshChecks(
+	context.Context,
+	RefreshRequest,
+) error {
+	return nil
+}
+
+func (*branchIsolationHandler) RefreshBranch(
+	context.Context,
+	RefreshRequest,
+) error {
+	return nil
+}
+
+func (h *branchIsolationHandler) ReconcileBranchPage(
+	ctx context.Context,
+	_ *BranchReconcilePageArgs,
+) error {
+	h.pageStarted <- struct{}{}
+	select {
+	case <-h.releasePage:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*branchIsolationHandler) ResolveStackMembership(
+	context.Context,
+	RefreshRequest,
+) error {
+	return nil
+}
+
+func (*branchIsolationHandler) BackfillRepoPage(
+	context.Context,
+	BackfillRepoPageArgs,
+) error {
+	return nil
+}
+
+func (*branchIsolationHandler) BackfillInstallationPage(
+	context.Context,
+	BackfillInstallationPageArgs,
+) error {
+	return nil
 }
 
 func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
@@ -63,8 +152,10 @@ func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 		_ = client.StopAndCancel(stopCtx)
 	}()
 
-	jobIDs := make(map[int64]string, 3)
-	for _, queueName := range []string{QueueInteractive, QueueEvent, QueueSweep} {
+	jobIDs := make(map[int64]string, 4)
+	for _, queueName := range []string{
+		QueueInteractive, QueueEvent, QueueBulk, QueueSweep,
+	} {
 		result, err := client.Insert(ctx, noopArgs{}, &river.InsertOpts{Queue: queueName})
 		if err != nil {
 			t.Fatalf("insert %s job: %v", queueName, err)
@@ -95,6 +186,233 @@ func TestThreeQueuesExecuteNoopJobs(t *testing.T) {
 	defer stopCancel()
 	if err := client.Stop(stopCtx); err != nil {
 		t.Fatalf("stop: %v", err)
+	}
+	stopped = true
+}
+
+func TestLargeBranchReconciliationReservesDirectEntityPickup(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testdb.New(t).Pool
+	handler := &branchIsolationHandler{
+		pageStarted: make(chan struct{}, 4),
+		releasePage: make(chan struct{}),
+		directPR:    make(chan struct{}, 1),
+	}
+	client, err := NewClient(
+		pool,
+		WithRefreshHandler(handler),
+		WithQueues(QueueEvent, QueueBulk),
+		WithQueueMaxWorkers(QueueEvent, 1),
+		WithQueueMaxWorkers(QueueBulk, 4),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for page := 1; page <= 4; page++ {
+		_, err := client.Insert(
+			ctx,
+			NewBranchReconcilePageArgs(
+				4800,
+				"acme/isolation",
+				"main",
+				1,
+				page,
+				[]BranchReconcileTarget{{
+					Kind:       KindRefreshPR,
+					Key:        fmt.Sprintf("pr:acme/isolation:%d", page),
+					EntityKey:  fmt.Sprintf("pr:1:4800:%d", page),
+					Generation: 0,
+				}},
+			),
+			NewBackfillInsertOptsForQueue(QueueBulk),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	defer func() {
+		if stopped {
+			return
+		}
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer stopCancel()
+		_ = client.StopAndCancel(stopCtx)
+	}()
+	released := false
+	defer func() {
+		if !released {
+			close(handler.releasePage)
+		}
+	}()
+
+	// Saturate every bulk worker with branch pages before inserting direct
+	// entity work. The event worker is a reserved lane, so pickup does not
+	// depend on any page finishing.
+	for range 4 {
+		select {
+		case <-handler.pageStarted:
+		case <-ctx.Done():
+			t.Fatalf("waiting for sweep saturation: %v", ctx.Err())
+		}
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit
+	if err := InsertRefreshesTx(
+		ctx,
+		tx,
+		client,
+		[]RefreshSpec{{
+			Kind: KindRefreshPR,
+			Key:  "pr:acme/isolation:999",
+		}},
+		QueueEvent,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handler.directPR:
+	case <-ctx.Done():
+		t.Fatalf(
+			"direct entity pickup waited behind branch pages: %v",
+			ctx.Err(),
+		)
+	}
+
+	close(handler.releasePage)
+	released = true
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := client.Stop(stopCtx); err != nil {
+		t.Fatal(err)
+	}
+	stopped = true
+}
+
+func TestBulkOwnedGenerationCompletesSupersededDirectJobWithoutFollowup(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testdb.New(t).Pool
+	release := make(chan struct{})
+	handler := &branchIsolationHandler{
+		pageStarted: make(chan struct{}, 1),
+		releasePage: make(chan struct{}),
+		directPR:    make(chan struct{}, 1),
+		releasePR:   release,
+		directErr:   store.ErrRefreshGenerationSuperseded,
+	}
+	client, err := NewClient(
+		pool,
+		WithRefreshHandler(handler),
+		WithQueues(QueueEvent),
+		WithQueueMaxWorkers(QueueEvent, 1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "pr:acme/superseded:1"
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRefreshesTx(
+		ctx, tx, client,
+		[]RefreshSpec{{Kind: KindRefreshPR, Key: key}},
+		QueueEvent,
+	); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	events, unsubscribe := client.Subscribe(
+		river.EventKindJobCompleted,
+		river.EventKindJobFailed,
+	)
+	defer unsubscribe()
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	released := false
+	defer func() {
+		if stopped {
+			return
+		}
+		if !released {
+			close(release)
+		}
+		stopCtx, stopCancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer stopCancel()
+		_ = client.StopAndCancel(stopCtx)
+	}()
+
+	select {
+	case <-handler.directPR:
+	case <-ctx.Done():
+		t.Fatalf("direct refresh did not start: %v", ctx.Err())
+	}
+	// This is the state written by the branch bulk transaction: generation 2
+	// is owned by its page, so completed_generation advances with generation.
+	if _, err := pool.Exec(ctx, `
+		UPDATE refresh_intent_generations
+		SET generation = 2, completed_generation = 2
+		WHERE kind = $1 AND refresh_key = $2
+	`, KindRefreshPR, key); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	released = true
+	select {
+	case event := <-events:
+		if event.Kind == river.EventKindJobFailed {
+			t.Fatal("superseded direct job failed instead of completing")
+		}
+	case <-ctx.Done():
+		t.Fatalf("waiting for superseded completion: %v", ctx.Err())
+	}
+
+	var jobs, generation, completed int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), max(intent.generation),
+		       max(intent.completed_generation)
+		FROM river_job AS job
+		JOIN refresh_intent_generations AS intent
+		  ON intent.kind = job.args->>'kind'
+		 AND intent.refresh_key = job.args->>'key'
+		WHERE job.kind = $1 AND job.args->>'key' = $2
+	`, KindRefreshPR, key).Scan(&jobs, &generation, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 || generation != 2 || completed != 2 {
+		t.Fatalf(
+			"superseded state jobs/generation/completed = %d/%d/%d",
+			jobs, generation, completed,
+		)
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := client.Stop(stopCtx); err != nil {
+		t.Fatal(err)
 	}
 	stopped = true
 }

@@ -79,6 +79,38 @@ type BackfillCursor struct {
 	QueueName      string
 }
 
+type BranchReconciliation struct {
+	RepoID          int64
+	Branch          string
+	Generation      int64
+	BeforeSha       string
+	AfterSha        string
+	TransitionKnown bool
+	Deleted         bool
+	Forced          bool
+	DeliveryGuid    string
+	ReceivedAt      pgtype.Timestamptz
+	AppliedAt       pgtype.Timestamptz
+	TargetCount     int32
+	PageCount       int32
+	CompletedAt     pgtype.Timestamptz
+}
+
+type BranchReconciliationPage struct {
+	RepoID            int64
+	Branch            string
+	Generation        int64
+	PageNumber        int32
+	TargetCount       int32
+	Status            string
+	SupersededTargets int32
+	AttemptCount      int64
+	CreatedAt         pgtype.Timestamptz
+	LastStartedAt     pgtype.Timestamptz
+	HeartbeatAt       pgtype.Timestamptz
+	CompletedAt       pgtype.Timestamptz
+}
+
 type ChangeEvent struct {
 	Seq        int64
 	Stream     string
@@ -139,6 +171,16 @@ type ConsumerCursor struct {
 type DerivationDirty struct {
 	ScopeKey string
 	MarkedAt pgtype.Timestamptz
+}
+
+type DriftEntitiesWithoutBranchFence struct {
+	InstallationID int64
+	EntityKind     string
+	SourceID       int64
+	EntityKey      string
+	LockKey        string
+	CacheSnapshot  []byte
+	LastCheckedAt  pgtype.Timestamptz
 }
 
 type DriftEntitiesWithoutChangeInput struct {

@@ -520,6 +520,10 @@ func New(fixture Fixture, webhookSecret string, options ...Option) *Server { //n
 	mux.HandleFunc("GET "+ControlTruthPath, s.controlTruth)
 	mux.HandleFunc("POST "+ControlFaultPath, s.controlFaults)
 	mux.HandleFunc("GET /repos/{owner}/{repo}", s.getRepository)
+	mux.HandleFunc(
+		"GET /repos/{owner}/{repo}/branches/{branch...}",
+		s.getBranch,
+	)
 	mux.HandleFunc("GET /installation/repositories", s.listInstallationRepositories)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets", s.listRepositoryRules)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/stacks", s.listStacks)

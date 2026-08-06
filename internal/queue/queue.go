@@ -1,5 +1,5 @@
-// Package queue wires River with the sync engine's three priority-class
-// queues (SYNC_ENGINE C-B3): interactive > event > sweep.
+// Package queue wires River with isolated interactive, event, bulk, and sweep
+// work lanes (SYNC_ENGINE C-B3).
 package queue
 
 import (
@@ -20,6 +20,9 @@ const (
 	QueueInteractive = "interactive"
 	// QueueEvent serves webhook-originated refreshes.
 	QueueEvent = "event"
+	// QueueBulk serves bounded branch-reconciliation pages without consuming
+	// direct-event or C-R1 sweep workers.
+	QueueBulk = "bulk"
 	// QueueSweep serves bounded-staleness refreshes.
 	QueueSweep = "sweep"
 	// QueueReconcile serves sweep state-machine and gap-healing work.
@@ -151,6 +154,7 @@ type RefreshObservation struct {
 	CacheCommittedAt time.Time
 	StartedAt        time.Time
 	CompletedAt      time.Time
+	Superseded       bool
 	Err              error
 }
 
@@ -200,8 +204,8 @@ func WithPlugins(plugins ...rivertype.Plugin) ClientOption {
 }
 
 // NewClient builds a River client for the selected component queues and
-// worker registrars. Without WithQueues it owns the three priority queues:
-// interactive, event, and sweep.
+// worker registrars. Without WithQueues it owns the four fetch queues:
+// interactive, event, bulk, and sweep.
 func NewClient(
 	pool *pgxpool.Pool,
 	options ...ClientOption,
@@ -226,12 +230,15 @@ func NewClient(
 	}
 	queueNames := configured.queueNames
 	if !configured.queuesExplicit {
-		queueNames = []string{QueueInteractive, QueueEvent, QueueSweep}
+		queueNames = []string{
+			QueueInteractive, QueueEvent, QueueBulk, QueueSweep,
+		}
 	}
 	queues := make(map[string]river.QueueConfig, len(queueNames))
 	defaults := map[string]int{
 		QueueInteractive: 4,
 		QueueEvent:       8,
+		QueueBulk:        4,
 		QueueSweep:       4,
 		QueueReconcile:   2,
 		QueueDrift:       1,

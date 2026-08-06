@@ -48,56 +48,63 @@ type Runtime struct {
 	mu  sync.Mutex
 	cas map[string]ratioCounts
 
-	githubRequests         metric.Int64Counter
-	requestAttribution     metric.Int64Counter
-	conditionalRequests    metric.Int64Counter
-	conditional304s        metric.Int64Counter
-	starvations            metric.Int64Counter
-	dispatchBatches        metric.Int64Histogram
-	fetches                metric.Int64Counter
-	eventToCache           metric.Float64Histogram
-	invalidEventLatency    metric.Int64Counter
-	cacheWrites            metric.Int64Counter
-	sweepOverruns          metric.Int64Counter
-	gapHealRequests        metric.Int64Counter
-	gapWindowIncomplete    metric.Int64Counter
-	driftTransitions       metric.Int64Counter
-	prunerDeletes          metric.Int64Counter
-	watermarkAdvances      metric.Int64Counter
-	outboxFenceWait        metric.Float64Histogram
-	outboxFenceHold        metric.Float64Histogram
-	deriverPassDuration    metric.Float64Histogram
-	deriverPasses          metric.Int64Counter
-	stalenessMisses        metric.Int64Counter
-	budgetRemaining        metric.Int64ObservableGauge
-	budgetLimit            metric.Int64ObservableGauge
-	gateClosed             metric.Int64ObservableGauge
-	queueDepth             metric.Int64ObservableGauge
-	oldestDeliveryAge      metric.Float64ObservableGauge
-	outstandingGenCount    metric.Int64ObservableGauge
-	outstandingGenAge      metric.Float64ObservableGauge
-	parkedCount            metric.Int64ObservableGauge
-	parkedAge              metric.Float64ObservableGauge
-	cacheStaleness         metric.Float64ObservableGauge
-	stalenessBound         metric.Float64ObservableGauge
-	casRejectRatio         metric.Float64ObservableGauge
-	tombstoneCount         metric.Int64ObservableGauge
-	sweepDuration          metric.Float64ObservableGauge
-	sweepPeriod            metric.Float64ObservableGauge
-	driftFindings          metric.Int64ObservableGauge
-	watermarkLag           metric.Int64ObservableGauge
-	watermarkAge           metric.Float64ObservableGauge
-	prunableOutboxDepth    metric.Int64ObservableGauge
-	consumerOutstanding    metric.Int64ObservableGauge
-	consumerOutstandingAge metric.Float64ObservableGauge
-	resyncCount            metric.Int64ObservableCounter
-	deriverDirtyBacklog    metric.Int64ObservableGauge
-	operationSuccesses     metric.Int64ObservableGauge
-	operationSamples       metric.Int64ObservableGauge
-	operationSuccessAge    metric.Float64ObservableGauge
-	operationSampleAge     metric.Float64ObservableGauge
-	roleEnabled            metric.Int64ObservableGauge
-	callbackRegistration   metric.Registration
+	githubRequests           metric.Int64Counter
+	requestAttribution       metric.Int64Counter
+	conditionalRequests      metric.Int64Counter
+	conditional304s          metric.Int64Counter
+	starvations              metric.Int64Counter
+	dispatchBatches          metric.Int64Histogram
+	fetches                  metric.Int64Counter
+	eventToCache             metric.Float64Histogram
+	invalidEventLatency      metric.Int64Counter
+	cacheWrites              metric.Int64Counter
+	sweepOverruns            metric.Int64Counter
+	gapHealRequests          metric.Int64Counter
+	gapWindowIncomplete      metric.Int64Counter
+	driftTransitions         metric.Int64Counter
+	prunerDeletes            metric.Int64Counter
+	watermarkAdvances        metric.Int64Counter
+	outboxFenceWait          metric.Float64Histogram
+	outboxFenceHold          metric.Float64Histogram
+	deriverPassDuration      metric.Float64Histogram
+	deriverPasses            metric.Int64Counter
+	stalenessMisses          metric.Int64Counter
+	branchBulkApplications   metric.Int64Counter
+	branchBulkEntities       metric.Int64Counter
+	branchPages              metric.Int64Counter
+	branchSuperseded         metric.Int64Counter
+	directEntityRefreshes    metric.Int64Counter
+	budgetRemaining          metric.Int64ObservableGauge
+	budgetLimit              metric.Int64ObservableGauge
+	gateClosed               metric.Int64ObservableGauge
+	queueDepth               metric.Int64ObservableGauge
+	oldestDeliveryAge        metric.Float64ObservableGauge
+	outstandingGenCount      metric.Int64ObservableGauge
+	outstandingEventGenCount metric.Int64ObservableGauge
+	outstandingGenAge        metric.Float64ObservableGauge
+	parkedCount              metric.Int64ObservableGauge
+	parkedAge                metric.Float64ObservableGauge
+	cacheStaleness           metric.Float64ObservableGauge
+	stalenessBound           metric.Float64ObservableGauge
+	casRejectRatio           metric.Float64ObservableGauge
+	tombstoneCount           metric.Int64ObservableGauge
+	sweepDuration            metric.Float64ObservableGauge
+	sweepPeriod              metric.Float64ObservableGauge
+	driftFindings            metric.Int64ObservableGauge
+	watermarkLag             metric.Int64ObservableGauge
+	watermarkAge             metric.Float64ObservableGauge
+	prunableOutboxDepth      metric.Int64ObservableGauge
+	consumerOutstanding      metric.Int64ObservableGauge
+	consumerOutstandingAge   metric.Float64ObservableGauge
+	resyncCount              metric.Int64ObservableCounter
+	deriverDirtyBacklog      metric.Int64ObservableGauge
+	operationSuccesses       metric.Int64ObservableGauge
+	operationSamples         metric.Int64ObservableGauge
+	operationSuccessAge      metric.Float64ObservableGauge
+	operationSampleAge       metric.Float64ObservableGauge
+	roleEnabled              metric.Int64ObservableGauge
+	branchBacklog            metric.Int64ObservableGauge
+	callbackRegistration     metric.Registration
 }
 
 func NewRuntime(options RuntimeOptions) (*Runtime, error) { //nolint:gocritic // constructor copies validated options into owned metric state
@@ -272,6 +279,36 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	); err != nil {
 		return err
 	}
+	if r.branchBulkApplications, err = meter.Int64Counter(
+		"ghsync_c_c3_branch_bulk_applications",
+		metric.WithDescription("Atomic local branch-hint applications by outcome."),
+	); err != nil {
+		return err
+	}
+	if r.branchBulkEntities, err = meter.Int64Counter(
+		"ghsync_c_c3_branch_bulk_entities",
+		metric.WithDescription("Cache entities transitioned by branch hints, by class."),
+	); err != nil {
+		return err
+	}
+	if r.branchPages, err = meter.Int64Counter(
+		"ghsync_c_o4_branch_reconciliation_pages",
+		metric.WithDescription("Bounded branch reconciliation pages by outcome."),
+	); err != nil {
+		return err
+	}
+	if r.branchSuperseded, err = meter.Int64Counter(
+		"ghsync_c_c2_branch_reconciliation_superseded",
+		metric.WithDescription("Branch reconciliation pages or targets superseded by newer work."),
+	); err != nil {
+		return err
+	}
+	if r.directEntityRefreshes, err = meter.Int64Counter(
+		"ghsync_c_q2_direct_entity_refreshes",
+		metric.WithDescription("Direct River entity refreshes, distinct from branch pages."),
+	); err != nil {
+		return err
+	}
 	if err := r.registerObservables(meter); err != nil {
 		return err
 	}
@@ -372,6 +409,70 @@ func (r *Runtime) DispatchBatch(
 	r.dispatchBatches.Record(ctx, int64(count))
 }
 
+func (r *Runtime) BranchBulkApplied(
+	ctx context.Context,
+	repositories int,
+	pullRequests int,
+	stacks int,
+	pages int,
+	supersededPages int64,
+) {
+	outcome := "applied"
+	if repositories+pullRequests+stacks == 0 {
+		outcome = "no_transition"
+	}
+	r.branchBulkApplications.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", outcome),
+		attribute.String("page_count", boundedCountLabel(pages)),
+	))
+	for kind, count := range map[string]int{
+		"repository":   repositories,
+		"pull_request": pullRequests,
+		"stack":        stacks,
+	} {
+		if count > 0 {
+			r.branchBulkEntities.Add(ctx, int64(count), metric.WithAttributes(
+				attribute.String("entity_kind", kind),
+			))
+		}
+	}
+	if supersededPages > 0 {
+		r.branchSuperseded.Add(ctx, supersededPages, metric.WithAttributes(
+			attribute.String("unit", "page"),
+		))
+	}
+}
+
+func (r *Runtime) BranchReconciliationPage(
+	ctx context.Context,
+	outcome string,
+	targets int,
+	superseded int,
+) {
+	r.branchPages.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", outcome),
+		attribute.String("target_count", boundedCountLabel(targets)),
+	))
+	if superseded > 0 {
+		r.branchSuperseded.Add(ctx, int64(superseded), metric.WithAttributes(
+			attribute.String("unit", "target"),
+		))
+	}
+}
+
+func boundedCountLabel(count int) string {
+	switch {
+	case count == 0:
+		return "0"
+	case count <= 5:
+		return "1_5"
+	case count <= 25:
+		return "6_25"
+	default:
+		return "26_plus"
+	}
+}
+
 func (r *Runtime) RefreshFinished(
 	ctx context.Context,
 	observation *queue.RefreshObservation,
@@ -379,13 +480,22 @@ func (r *Runtime) RefreshFinished(
 	outcome := "success"
 	if observation.Err != nil {
 		outcome = "error"
+	} else if observation.Superseded {
+		outcome = "superseded"
 	}
 	r.fetches.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("kind", observation.Kind),
 		attribute.String("queue", observation.Queue),
 		attribute.String("outcome", outcome),
 	))
-	if observation.Err == nil &&
+	if observation.Kind == queue.KindRefreshPR ||
+		observation.Kind == queue.KindRefreshStack {
+		r.directEntityRefreshes.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("entity_kind", observation.Kind),
+			attribute.String("outcome", outcome),
+		))
+	}
+	if observation.Err == nil && !observation.Superseded &&
 		!observation.EventReceivedAt.IsZero() &&
 		!observation.CacheCommittedAt.IsZero() {
 		latency := observation.CacheCommittedAt.Sub(

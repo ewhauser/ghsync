@@ -196,6 +196,19 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := database.Pool.Exec(ctx, `
+		INSERT INTO refresh_intent_generations (
+		    kind, refresh_key, generation, completed_generation,
+		    event_received_at, updated_at
+		)
+		VALUES
+		    ('refresh_pr', 'pr:metrics:event', 2, 1,
+		     clock_timestamp() - interval '2 seconds', clock_timestamp()),
+		    ('refresh_repository', 'repo:metrics:sweep', 1, 0,
+		     NULL, clock_timestamp())
+	`); err != nil {
+		t.Fatal(err)
+	}
 
 	runtimeMetrics, err := NewRuntime(RuntimeOptions{
 		Pool:               database.Pool,
@@ -268,6 +281,15 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		EventReceivedAt:  receivedAt,
 		CacheCommittedAt: receivedAt.Add(time.Second),
 	})
+	runtimeMetrics.RefreshFinished(ctx, &queue.RefreshObservation{
+		Kind:       queue.KindRefreshStack,
+		Queue:      queue.QueueEvent,
+		Superseded: true,
+	})
+	runtimeMetrics.BranchBulkApplied(ctx, 1, 250, 10, 11, 2)
+	runtimeMetrics.BranchReconciliationPage(
+		ctx, "partial_superseded", 25, 3,
+	)
 
 	response := httptest.NewRecorder()
 	registry.Handler().ServeHTTP(
@@ -288,7 +310,8 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		"ghsync_c_s2_watermark_lag_sequences",
 		`ghsync_c_s2_outbox_fence_wait_seconds_count{outcome="acquired",role="shared_writer"} 1`,
 		`ghsync_c_s2_outbox_fence_hold_seconds_count{outcome="acquired",role="shared_writer"} 1`,
-		"ghsync_c_q2_outstanding_generations",
+		"ghsync_c_q2_outstanding_generations 2",
+		"ghsync_c_q2_outstanding_event_generations 1",
 		"ghsync_c_o4_operation_samples",
 		"ghsync_c_o4_last_operation_sample_age_seconds",
 		// Issue #22: the expected-operation roster must include the deriver
@@ -297,11 +320,21 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		`ghsync_c_o4_last_operation_sample_age_seconds{component="deriver",operation="dirty_sets"}`,
 		`ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="repo_rules"}`,
 		`ghsync_c_o4_last_operation_success_age_seconds{component="sweep",operation="closed_tracked"}`,
+		`ghsync_c_o4_last_operation_success_age_seconds{component="fetch",operation="branch_reconciliation"}`,
 		"ghsync_c_p5_deriver_dirty_backlog",
 		`ghsync_c_r2_sweep_period_seconds{sweep_kind="stacks"} 225`,
 		`ghsync_c_o4_role_enabled{role="fetch"} 1`,
 		`ghsync_c_q2_event_to_cache_latency_seconds_count{kind="refresh_pr"} 1`,
 		`ghsync_c_q2_invalid_event_cache_latency_total{kind="refresh_pr"} 1`,
+		`ghsync_c_c3_branch_bulk_applications_total{outcome="applied",page_count="6_25"} 1`,
+		`ghsync_c_c3_branch_bulk_entities_total{entity_kind="pull_request"} 250`,
+		`ghsync_c_o4_branch_reconciliation_pages_total{outcome="partial_superseded",target_count="6_25"} 1`,
+		`ghsync_c_c2_branch_reconciliation_superseded_total{unit="page"} 2`,
+		`ghsync_c_c2_branch_reconciliation_superseded_total{unit="target"} 3`,
+		`ghsync_c_q2_direct_entity_refreshes_total{entity_kind="refresh_pr",outcome="success"} 2`,
+		`ghsync_c_q2_direct_entity_refreshes_total{entity_kind="refresh_stack",outcome="superseded"} 1`,
+		`ghsync_c_o4_branch_reconciliation_backlog{unit="pages"} 0`,
+		`ghsync_c_o4_branch_reconciliation_backlog{unit="targets"} 0`,
 	} {
 		if !strings.Contains(string(body), name) {
 			t.Errorf("metrics exposition omitted %q", name)

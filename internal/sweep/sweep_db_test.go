@@ -237,7 +237,7 @@ func newSweepHarness(
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := fetch.New(fetch.Options{
+	handler, err := fetch.New(&fetch.Options{
 		Pool:           pool,
 		REST:           rest,
 		GraphQL:        graphQL,

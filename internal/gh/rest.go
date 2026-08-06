@@ -352,6 +352,41 @@ func (c *RESTClient) GetRepository(
 	return &repository, response, nil
 }
 
+// GetBranchHead fetches the authoritative commit at one branch ref. The
+// repository REST representation does not include default_branch_ref.target,
+// so repository reconciliation must observe this resource separately before
+// it can close an out-of-order default-branch push gap.
+func (c *RESTClient) GetBranchHead(
+	ctx context.Context,
+	class budget.Class,
+	owner string,
+	repo string,
+	branch string,
+) (string, error) {
+	if branch == "" {
+		return "", fmt.Errorf("branch name is required")
+	}
+	path := fmt.Sprintf(
+		"repos/%s/%s/branches/%s",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		url.PathEscape(branch),
+	)
+	var payload struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+	}
+	_, err := c.client.getJSON(ctx, class, path, nil, "", &payload)
+	if err != nil {
+		return "", err
+	}
+	if payload.Commit.SHA == "" {
+		return "", fmt.Errorf("branch response has no commit SHA")
+	}
+	return payload.Commit.SHA, nil
+}
+
 // ListInstallationRepositories fetches one installation repository page.
 func (c *RESTClient) ListInstallationRepositories(
 	ctx context.Context,

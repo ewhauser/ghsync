@@ -51,6 +51,21 @@ func TestRefreshJobArgsArePointersOnly(t *testing.T) {
 			}
 		})
 	}
+	headArgs := NewRefreshRepositoryHeadArgs("repo:acme/monolith:metadata")
+	encoded, err := json.Marshal(headArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 3 ||
+		fields["kind"] != KindRefreshRepository ||
+		fields["key"] == "" ||
+		fields["observe_default_branch_head"] != true {
+		t.Fatalf("branch-head args = %s, want pointer plus observation mode", encoded)
+	}
 }
 
 func TestInstallationBackfillArgsCarryExpectedCursorOnly(t *testing.T) {

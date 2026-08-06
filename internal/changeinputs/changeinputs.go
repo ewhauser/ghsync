@@ -119,6 +119,8 @@ func hydrateFromMirror(
 		ctx,
 		repositoryOwner+"/"+repositoryName,
 		number,
+		node.BaseRefOID,
+		node.HeadRefOID,
 	)
 	if err != nil {
 		return nil, PullRequestFence{}, fmt.Errorf(

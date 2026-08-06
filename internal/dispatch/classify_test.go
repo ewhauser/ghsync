@@ -259,6 +259,81 @@ func TestDefaultClassifierHintCoverage(t *testing.T) {
 	}
 }
 
+func TestCompleteBranchPushHintNormalizesDeliveryShapes(t *testing.T) {
+	t.Parallel()
+	const zeros = "0000000000000000000000000000000000000000"
+	tests := []struct {
+		name       string
+		payload    payloadEnvelope
+		want       bool
+		wantKnown  bool
+		wantBefore string
+		wantAfter  string
+	}{
+		{
+			name: "force push",
+			payload: payloadEnvelope{
+				Ref: "refs/heads/main", Before: "old", After: "new", Forced: true,
+			},
+			want: true, wantKnown: true, wantBefore: "old", wantAfter: "new",
+		},
+		{
+			name: "deletion sentinel",
+			payload: payloadEnvelope{
+				Ref: "refs/heads/main", Before: "old", After: zeros, Deleted: true,
+			},
+			want: true, wantKnown: true, wantBefore: "old", wantAfter: "",
+		},
+		{
+			name: "creation sentinel",
+			payload: payloadEnvelope{
+				Ref: "refs/heads/main", Before: zeros, After: "new", Created: true,
+			},
+			want: true, wantKnown: true, wantBefore: "", wantAfter: "new",
+		},
+		{
+			name: "incomplete legacy fixture",
+			payload: payloadEnvelope{
+				Ref: "refs/heads/main", Before: "", After: "new",
+			},
+			want: true, wantAfter: "new",
+		},
+		{
+			name: "tag",
+			payload: payloadEnvelope{
+				Ref: "refs/tags/v1", Before: "old", After: "new",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			test.payload.Repository.FullName = "acme/monolith"
+			key := "branch:acme/monolith:main"
+			hint := completeBranchPushHint(
+				&test.payload,
+				[]Intent{{Kind: queue.KindRefreshBranch, Key: key}},
+			)
+			if (hint != nil) != test.want {
+				t.Fatalf("hint = %+v, want present %t", hint, test.want)
+			}
+			if hint != nil &&
+				(hint.BeforeSHA != test.wantBefore || hint.AfterSHA != test.wantAfter) {
+				t.Fatalf(
+					"normalized transition = %q -> %q, want %q -> %q",
+					hint.BeforeSHA, hint.AfterSHA, test.wantBefore, test.wantAfter,
+				)
+			}
+			if hint != nil && hint.TransitionKnown != test.wantKnown {
+				t.Fatalf(
+					"transition known = %t, want %t",
+					hint.TransitionKnown, test.wantKnown,
+				)
+			}
+		})
+	}
+}
+
 func TestCodeownersPushRuleTargetsOnlyEffectiveDefaultBranchPaths(
 	t *testing.T,
 ) {

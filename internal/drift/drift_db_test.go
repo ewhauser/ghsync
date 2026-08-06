@@ -117,7 +117,7 @@ func newReadyDriftHarnessWithProjections(
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := fetch.New(fetch.Options{
+	handler, err := fetch.New(&fetch.Options{
 		Pool:           pool,
 		REST:           rest,
 		GraphQL:        graphQL,
@@ -1309,7 +1309,7 @@ func TestStackDriftIgnoresMemberUpdatedAtChurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := fetch.New(fetch.Options{
+	handler, err := fetch.New(&fetch.Options{
 		Pool:           pool,
 		REST:           rest,
 		GraphQL:        graphQL,
@@ -1481,7 +1481,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := fetch.New(fetch.Options{
+	handler, err := fetch.New(&fetch.Options{
 		Pool:           pool,
 		REST:           rest,
 		GraphQL:        graphQL,

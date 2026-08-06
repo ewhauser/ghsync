@@ -112,6 +112,7 @@ func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
 		"fetch,sweep,drift": {
 			queue.QueueInteractive,
 			queue.QueueEvent,
+			queue.QueueBulk,
 			queue.QueueSweep,
 			queue.QueueReconcile,
 			queue.QueueDrift,
@@ -123,6 +124,7 @@ func TestRolePlansPollOnlyOwnedQueueFamilies(t *testing.T) {
 		"fetch,sweep,drift,pruner": {
 			queue.QueueInteractive,
 			queue.QueueEvent,
+			queue.QueueBulk,
 			queue.QueueSweep,
 			queue.QueueReconcile,
 			queue.QueueDrift,
@@ -272,27 +274,31 @@ func TestParseRequeueOptions(t *testing.T) {
 	}
 }
 
-// seedPushDelivery stores one webhook delivery that DefaultClassifier maps
-// to a refresh_branch intent.
-func seedPushDelivery(
+// seedRefreshDelivery stores one webhook delivery that DefaultClassifier maps
+// to a refresh_pr intent. Branch pushes now use the bulk path and may produce
+// no River job for a cold repository, so they are not a valid worker-
+// registration probe.
+func seedRefreshDelivery(
 	t *testing.T,
 	pool *pgxpool.Pool,
 	guid string,
 ) {
 	t.Helper()
 	payload := []byte(`{
-		"ref": "refs/heads/main",
+		"action": "synchronize",
+		"number": 4812,
+		"pull_request": {"number": 4812},
 		"repository": {"full_name": "acme/monolith"}
 	}`)
 	headers := []byte(`{
 		"x-github-delivery": "` + guid + `",
-		"x-github-event": "push"
+		"x-github-event": "pull_request"
 	}`)
 	if _, err := dbgen.New(pool).InsertWebhookDelivery(
 		context.Background(),
 		dbgen.InsertWebhookDeliveryParams{
 			DeliveryGuid: guid,
-			Event:        "push",
+			Event:        "pull_request",
 			RawBody:      payload,
 			Headers:      headers,
 		},
@@ -342,7 +348,7 @@ func TestDispatchOnlyClientInsertsClassifiedRefreshJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	seedPushDelivery(t, database.Pool, "issue-7-dispatch-only")
+	seedRefreshDelivery(t, database.Pool, "issue-7-dispatch-only")
 	count, err := issue7Dispatcher(t, database.Pool, riverClient).
 		DispatchBatch(context.Background())
 	if err != nil {
@@ -359,13 +365,13 @@ func TestDispatchOnlyClientInsertsClassifiedRefreshJobs(t *testing.T) {
 	if err := database.Pool.QueryRow(
 		context.Background(),
 		`SELECT count(*) FROM river_job
-		 WHERE kind = 'refresh_branch'
+		 WHERE kind = 'refresh_pr'
 		   AND state IN ('available', 'scheduled')`,
 	).Scan(&pending); err != nil {
 		t.Fatal(err)
 	}
 	if pending != 1 {
-		t.Fatalf("unworked refresh_branch jobs = %d, want 1", pending)
+		t.Fatalf("unworked refresh_pr jobs = %d, want 1", pending)
 	}
 }
 
@@ -394,7 +400,7 @@ func TestWithoutRefreshWorkersRejectsRefreshInserts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	seedPushDelivery(t, database.Pool, "issue-7-worker-only")
+	seedRefreshDelivery(t, database.Pool, "issue-7-worker-only")
 	_, err = issue7Dispatcher(t, database.Pool, riverClient).
 		DispatchBatch(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "not registered") {
