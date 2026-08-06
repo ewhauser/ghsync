@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,21 @@ type Event struct {
 // network I/O in Handler: external effects cannot share this exactly-once
 // transaction and must run after commit with their own idempotency.
 type Handler func(context.Context, pgx.Tx, Event) error
+
+// tailHandlerError marks application failures so Tail's transport-error
+// normalization never replaces a handler's error identity.
+type tailHandlerError struct {
+	seq   int64
+	cause error
+}
+
+func (e *tailHandlerError) Error() string {
+	return fmt.Sprintf("handle stream event %d: %v", e.seq, e.cause)
+}
+
+func (e *tailHandlerError) Unwrap() error {
+	return e.cause
+}
 
 // ErrResyncRequired is returned when a cursor is behind its stream's pruned
 // horizon. Call Bootstrap and replace the local snapshot before tailing again.
@@ -422,7 +438,7 @@ func (c *Client) Tail(
 			continue
 		}
 		if err != nil {
-			return err
+			return normalizeTailContextError(ctx, err)
 		}
 		if delivered == c.batchSize {
 			continue
@@ -524,10 +540,23 @@ func (c *Client) acquireListener(ctx context.Context) (*pgxpool.Conn, error) {
 		acquireCtx,
 		"LISTEN "+notificationChannel,
 	); err != nil {
-		listener.Release()
+		destroyListener(ctx, listener)
 		return nil, err
 	}
 	return listener, nil
+}
+
+// destroyListener closes the underlying connection before releasing it so the
+// pool cannot reuse a conn whose protocol state is unknown after a failed or
+// deadline-interrupted LISTEN/UNLISTEN exchange.
+func destroyListener(ctx context.Context, listener *pgxpool.Conn) {
+	closeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		time.Second,
+	)
+	defer cancel()
+	_ = listener.Conn().Close(closeCtx)
+	listener.Release()
 }
 
 func releaseListener(ctx context.Context, listener *pgxpool.Conn) {
@@ -538,7 +567,10 @@ func releaseListener(ctx context.Context, listener *pgxpool.Conn) {
 	defer cancel()
 	// Raw SQL exception: PostgreSQL does not parameterize UNLISTEN channel
 	// identifiers, so this fixed protocol channel cannot be expressed in sqlc.
-	_, _ = listener.Exec(ctx, "UNLISTEN "+notificationChannel)
+	if _, err := listener.Exec(ctx, "UNLISTEN "+notificationChannel); err != nil {
+		destroyListener(ctx, listener)
+		return
+	}
 	listener.Release()
 }
 
@@ -663,9 +695,7 @@ func (c *Client) deliverPage(
 	}
 	for _, event := range events {
 		if err := handler(ctx, tx, event); err != nil {
-			return 0, fmt.Errorf(
-				"handle stream event %d: %w", event.Seq, err,
-			)
+			return 0, &tailHandlerError{seq: event.Seq, cause: err}
 		}
 		cursor = event.Seq
 	}
@@ -685,6 +715,27 @@ func (c *Client) deliverPage(
 		return 0, fmt.Errorf("commit stream page: %w", err)
 	}
 	return len(events), nil
+}
+
+// normalizeTailContextError closes pgx's write-side cancellation gap. pgx
+// normally translates deadline-interrupted reads into the context error, but
+// an extended-protocol flush can surface the underlying socket timeout
+// directly. When Tail's context is already done, report that terminal cause
+// instead of misclassifying its transport symptom as an independent failure.
+func normalizeTailContextError(ctx context.Context, err error) error {
+	var handlerErr *tailHandlerError
+	if errors.As(err, &handlerErr) {
+		return err
+	}
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return err
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return ctxErr
+	}
+	return err
 }
 
 func isSerializationFailure(err error) bool {
