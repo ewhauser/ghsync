@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	randv2 "math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ const (
 	defaultRenewInterval    = 10 * time.Second
 	defaultSnapshotInterval = 30 * time.Second
 	defaultStoreTimeout     = 5 * time.Second
+	maxStandbyRetryInterval = 3 * time.Second
 	appRESTBudgetClass      = "app_jwt_rest"
 	persistedBudgetRowCount = 3
 )
@@ -71,6 +73,11 @@ type LeaseOptions struct {
 	StoreTimeout     time.Duration
 	Clock            Clock
 }
+
+// LeaseStandbyHook reports one failed acquisition before NewLeasedStandby
+// waits to retry. Owner is the caller-supplied diagnostic process name; the
+// opaque lease token is never exposed.
+type LeaseStandbyHook func(owner string, retryIn time.Duration)
 
 type leaseRuntime struct {
 	store          LeaseStore
@@ -163,6 +170,91 @@ func NewLeased(
 	gate.setLeaseUntil(leaseUntil)
 	go gate.runLease(leaseCtx, runtime)
 	return gate, nil
+}
+
+// NewLeasedStandby acquires the Postgres-coordinated C-B1/C-O2 singleton,
+// waiting on a capped, jittered timer while another live runtime holds it.
+// The first attempt is immediate. Only ErrLeaseHeld is retryable; store,
+// configuration, token-generation, and invalid acquired-expiry errors remain
+// fatal. No gate is returned, and therefore no GitHub call can be admitted,
+// until an acquisition succeeds. If cancellation races with a successful
+// acquisition, the acquired gate is closed and its token-checked lease is
+// released before cancellation is returned.
+func NewLeasedStandby(
+	ctx context.Context,
+	client *http.Client,
+	gateOptions Options, //nolint:gocritic // value options are normalized before the gate owns them
+	store LeaseStore,
+	leaseOptions LeaseOptions,
+	onStandby LeaseStandbyHook,
+) (*Gate, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("budget lease standby: nil context")
+	}
+	if err := normalizeLeaseOptions(&leaseOptions, gateOptions.Clock); err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		gate, err := NewLeased(
+			ctx,
+			client,
+			gateOptions,
+			store,
+			leaseOptions,
+		)
+		if err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				closeCtx, cancelClose := context.WithTimeout(
+					context.WithoutCancel(ctx),
+					leaseOptions.StoreTimeout,
+				)
+				closeErr := gate.Close(closeCtx)
+				cancelClose()
+				if closeErr != nil {
+					return nil, errors.Join(
+						ctxErr,
+						fmt.Errorf(
+							"release budget lease after standby cancellation: %w",
+							closeErr,
+						),
+					)
+				}
+				return nil, ctxErr
+			}
+			return gate, nil
+		}
+		if !errors.Is(err, ErrLeaseHeld) {
+			return nil, err
+		}
+
+		retryIn := standbyRetryDelay(leaseOptions.TTL)
+		timer := newClockTimer(
+			leaseOptions.Clock,
+			leaseOptions.Clock.Now().Add(retryIn),
+		)
+		if onStandby != nil {
+			onStandby(leaseOptions.Owner, retryIn)
+		}
+		select {
+		case <-ctx.Done():
+			timer.stop()
+			return nil, ctx.Err()
+		case <-timer.channel:
+		}
+	}
+}
+
+func standbyRetryDelay(ttl time.Duration) time.Duration {
+	maximum := min(ttl/3, maxStandbyRetryInterval)
+	if maximum <= time.Nanosecond {
+		return time.Nanosecond
+	}
+	minimum := maximum / 2
+	return minimum + time.Duration(randv2.Int64N(int64(maximum-minimum)))
 }
 
 // ErrLeaseHeld reports that another process owns the unexpired installation
