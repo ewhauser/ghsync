@@ -318,6 +318,7 @@ func (h *Handler) BackfillRepoPage(
 			class,
 			source,
 			args.RepoFullName,
+			false,
 		)
 		if err != nil {
 			return err

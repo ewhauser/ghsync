@@ -549,7 +549,7 @@ webhook_deliveries(delivery_guid PRIMARY KEY, event, raw_body, headers,
 
 -- Job queue: River-owned tables (river_job, river_leader, ...) via River's
 -- migrations. Our conventions on top:
---   priority queues: interactive | event | sweep    (C-B3 fetch classes)
+--   fetch queues: interactive | event | bulk | sweep (C-B3 isolation/classes)
 --   component queues: reconcile | drift | pruner
 --   job args:    {kind, key} where key = 'pr:acme/monolith:4812' | 'stack:...:142'
 --   coalescing:  River UniqueOpts + durable refresh generations per C-Q1

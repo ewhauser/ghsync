@@ -33,6 +33,24 @@ func (s *Server) getRepository(w http.ResponseWriter, r *http.Request) {
 	s.writeConditionalJSON(w, r, fx.Repository)
 }
 
+func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) {
+	fx, ok := s.checkRepo(w, r)
+	if !ok {
+		return
+	}
+	if r.PathValue("branch") != fx.Repository.DefaultBranch ||
+		fx.Repository.DefaultBranchSHA == "" {
+		http.NotFound(w, r)
+		return
+	}
+	s.writeConditionalJSON(w, r, map[string]any{
+		"name": fx.Repository.DefaultBranch,
+		"commit": map[string]string{
+			"sha": fx.Repository.DefaultBranchSHA,
+		},
+	})
+}
+
 func (s *Server) listInstallationRepositories(
 	w http.ResponseWriter,
 	r *http.Request,

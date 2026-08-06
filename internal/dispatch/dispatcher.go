@@ -23,7 +23,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
@@ -32,18 +34,21 @@ const (
 	MaxDebounce                    = 15 * time.Second
 	classificationRetryBaseBackoff = time.Second
 	classificationRetryMaxBackoff  = time.Minute
+	// DefaultBranchReconcilePageSize matches the GraphQL nodes batch ceiling.
+	DefaultBranchReconcilePageSize = 25
 )
 
 // Config controls dispatcher batching, poison tolerance, and bounded debounce.
 type Config struct {
-	BatchSize    int
-	MaxAttempts  int
-	Debounce     time.Duration
-	PollInterval time.Duration
-	Now          func() time.Time
-	Classifier   Classifier
-	Observer     Observer
-	Tracer       trace.Tracer
+	BatchSize      int
+	MaxAttempts    int
+	Debounce       time.Duration
+	PollInterval   time.Duration
+	Now            func() time.Time
+	Classifier     Classifier
+	Observer       Observer
+	Tracer         trace.Tracer
+	BranchPageSize int
 }
 
 // Observer is M6's C-P2/C-I5 observability seam. Implementations run only
@@ -60,6 +65,19 @@ type UnmatchedEventObserver interface {
 	DispatchUnmatchedEvent(context.Context, string)
 }
 
+// BranchBulkObserver distinguishes local branch hint application from remote
+// entity refresh work without attaching repository or entity keys as tags.
+type BranchBulkObserver interface {
+	BranchBulkApplied(
+		context.Context,
+		int,
+		int,
+		int,
+		int,
+		int64,
+	)
+}
+
 type noopObserver struct{}
 
 func (noopObserver) DispatchBatch(context.Context, int) {}
@@ -69,6 +87,7 @@ type Dispatcher struct {
 	pool   *pgxpool.Pool
 	river  *river.Client[pgx.Tx]
 	config Config
+	writer *store.EntityWriter
 
 	dispatchBatch func(context.Context) (int, error)
 	retryDelay    func(time.Duration) time.Duration
@@ -94,6 +113,16 @@ func New(
 			MaxDebounce,
 		)
 	}
+	if config.BranchPageSize == 0 {
+		config.BranchPageSize = DefaultBranchReconcilePageSize
+	}
+	if config.BranchPageSize < 0 ||
+		config.BranchPageSize > DefaultBranchReconcilePageSize {
+		return nil, fmt.Errorf(
+			"branch reconciliation page size must be in [1,%d]",
+			DefaultBranchReconcilePageSize,
+		)
+	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
@@ -112,6 +141,7 @@ func New(
 		pool:   pool,
 		river:  riverClient,
 		config: config,
+		writer: store.NewEntityWriter(pool),
 	}
 	dispatcher.dispatchBatch = dispatcher.DispatchBatch
 	dispatcher.retryDelay = jitteredRetryDelay
@@ -275,6 +305,12 @@ func (d *Dispatcher) dispatchBatchAttempt(
 	results := make([]deliveryResult, 0, len(deliveries))
 	intents := make([]Intent, 0, len(deliveries))
 	intentReceivedAt := make(map[Intent]time.Time, len(deliveries))
+	type pendingBranchPush struct {
+		hint         branchPushHint
+		deliveryGUID string
+		receivedAt   time.Time
+	}
+	branchPushes := make([]pendingBranchPush, 0)
 	unmatchedEvents := make([]string, 0)
 	for index := range deliveries {
 		delivery := &deliveries[index]
@@ -307,6 +343,14 @@ func (d *Dispatcher) dispatchBatchAttempt(
 			unmatchedEvents = append(unmatchedEvents, delivery.Event)
 		}
 		classified := result.intents
+		if result.branchHint != nil {
+			branchPushes = append(branchPushes, pendingBranchPush{
+				hint:         *result.branchHint,
+				deliveryGUID: delivery.DeliveryGuid,
+				receivedAt:   delivery.ReceivedAt.Time,
+			})
+			classified = withoutBranchRefresh(classified)
+		}
 		if result.stackHint != nil {
 			matches, matchErr := stackSummaryMatchesCache(
 				ctx,
@@ -338,6 +382,108 @@ func (d *Dispatcher) dispatchBatchAttempt(
 			DeliveryGUID: delivery.DeliveryGuid,
 			Status:       "processed",
 		})
+	}
+
+	type branchBulkObservation struct {
+		result store.BranchBulkResult
+		pages  int
+	}
+	branchObservations := make([]branchBulkObservation, 0, len(branchPushes))
+	if len(branchPushes) > 0 {
+		fenceObserver, _ := d.config.Observer.(outbox.FenceObserver)
+		fencedTx, fenceErr := outbox.AcquireObservedWriterFence(
+			ctx, tx, fenceObserver,
+		)
+		if fenceErr != nil {
+			return 0, fenceErr
+		}
+		tx = fencedTx
+		queries = dbgen.New(tx)
+		for _, pending := range branchPushes {
+			bulk, err := d.writer.ApplyBranchPushTx(
+				ctx,
+				tx,
+				&store.BranchPushHint{
+					RepoFullName:    pending.hint.Repo,
+					Branch:          pending.hint.Branch,
+					BeforeSHA:       pending.hint.BeforeSHA,
+					AfterSHA:        pending.hint.AfterSHA,
+					TransitionKnown: pending.hint.TransitionKnown,
+					Deleted:         pending.hint.Deleted,
+					Forced:          pending.hint.Forced,
+					DeliveryGUID:    pending.deliveryGUID,
+					ReceivedAt:      pending.receivedAt,
+				},
+			)
+			if err != nil {
+				if errors.Is(
+					err, store.ErrBranchRefreshGenerationContention,
+				) {
+					return 0, fmt.Errorf(
+						"bulk apply branch push: %s: %w",
+						err.Error(),
+						queue.ErrRefreshGenerationContention,
+					)
+				}
+				return 0, fmt.Errorf("bulk apply branch push: %w", err)
+			}
+			if bulk.RepoID == 0 {
+				continue
+			}
+			pageParams, pageCounts, err := branchReconciliationPages(
+				pending.hint,
+				&bulk,
+				d.config.BranchPageSize,
+			)
+			if err != nil {
+				return 0, err
+			}
+			if err := d.writer.RecordBranchReconciliationPagesTx(
+				ctx,
+				tx,
+				bulk.RepoID,
+				pending.hint.Branch,
+				bulk.Generation,
+				pageCounts,
+			); err != nil {
+				return 0, err
+			}
+			if len(pageParams) > 0 {
+				inserted, err := d.river.InsertManyTx(ctx, tx, pageParams)
+				if err != nil {
+					return 0, fmt.Errorf(
+						"insert branch reconciliation pages: %w", err,
+					)
+				}
+				if len(inserted) != len(pageParams) {
+					return 0, fmt.Errorf(
+						"inserted %d branch pages for %d specs",
+						len(inserted), len(pageParams),
+					)
+				}
+			}
+			// A default-branch hint also changes the repository head. Exact
+			// before-SHA CAS prevents most stale writes, but two causally linked
+			// pushes can arrive in reverse order (new1->new2, then old->new1).
+			// One constant-size bulk-lane repository observation closes that gap;
+			// it is not dependent fanout and its generation was claimed above.
+			if bulk.RepositoryRefreshKey != "" {
+				if _, err := d.river.InsertTx(
+					ctx,
+					tx,
+					queue.NewRefreshRepositoryHeadArgs(bulk.RepositoryRefreshKey),
+					queue.NewRefreshInsertOptsForQueue(queue.QueueBulk, time.Time{}),
+				); err != nil {
+					return 0, fmt.Errorf(
+						"insert default-branch repository reconciliation: %w", err,
+					)
+				}
+			}
+			branchObservations = append(
+				branchObservations,
+				branchBulkObservation{result: bulk, pages: len(pageParams)},
+			)
+		}
 	}
 
 	if len(intents) > 0 {
@@ -402,6 +548,18 @@ func (d *Dispatcher) dispatchBatchAttempt(
 		return 0, fmt.Errorf("commit dispatch batch: %w", err)
 	}
 	d.config.Observer.DispatchBatch(ctx, len(deliveries))
+	if observer, ok := d.config.Observer.(BranchBulkObserver); ok {
+		for _, observation := range branchObservations {
+			observer.BranchBulkApplied(
+				ctx,
+				observation.result.Repositories,
+				observation.result.PullRequests,
+				observation.result.Stacks,
+				observation.pages,
+				observation.result.SupersededPages,
+			)
+		}
+	}
 	for _, event := range unmatchedEvents {
 		slog.WarnContext(
 			ctx,
@@ -521,6 +679,68 @@ func withoutMatchingStackRefresh(
 		filtered = append(filtered, intent)
 	}
 	return filtered
+}
+
+func withoutBranchRefresh(intents []Intent) []Intent {
+	filtered := make([]Intent, 0, len(intents))
+	for _, intent := range intents {
+		if intent.Kind == queue.KindRefreshBranch {
+			continue
+		}
+		filtered = append(filtered, intent)
+	}
+	return filtered
+}
+
+func branchReconciliationPages(
+	hint branchPushHint,
+	bulk *store.BranchBulkResult,
+	pageSize int,
+) ([]river.InsertManyParams, []int, error) {
+	if pageSize <= 0 {
+		return nil, nil, fmt.Errorf(
+			"branch reconciliation page size must be positive",
+		)
+	}
+	params := make(
+		[]river.InsertManyParams,
+		0,
+		(len(bulk.Targets)+pageSize-1)/pageSize,
+	)
+	counts := make([]int, 0, cap(params))
+	for start := 0; start < len(bulk.Targets); start += pageSize {
+		end := min(start+pageSize, len(bulk.Targets))
+		targets := make([]queue.BranchReconcileTarget, 0, end-start)
+		for _, target := range bulk.Targets[start:end] {
+			if target.RefreshKind != queue.KindRefreshPR &&
+				target.RefreshKind != queue.KindRefreshStack {
+				return nil, nil, fmt.Errorf(
+					"unsupported branch reconciliation target kind %q",
+					target.RefreshKind,
+				)
+			}
+			targets = append(targets, queue.BranchReconcileTarget{
+				Kind:       target.RefreshKind,
+				Key:        target.RefreshKey,
+				EntityKey:  target.EntityKey,
+				Generation: target.RefreshGeneration,
+			})
+		}
+		page := len(params) + 1
+		params = append(params, river.InsertManyParams{
+			Args: queue.NewBranchReconcilePageArgs(
+				bulk.RepoID,
+				hint.Repo,
+				hint.Branch,
+				bulk.Generation,
+				page,
+				targets,
+			),
+			InsertOpts: queue.NewBackfillInsertOptsForQueue(queue.QueueBulk),
+		})
+		counts = append(counts, len(targets))
+	}
+	return params, counts, nil
 }
 
 func (d *Dispatcher) insertParams(

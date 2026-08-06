@@ -19,9 +19,11 @@ import (
 	"github.com/ewhauser/ghsync/internal/budget"
 	"github.com/ewhauser/ghsync/internal/changeinputs"
 	"github.com/ewhauser/ghsync/internal/gh"
+	"github.com/ewhauser/ghsync/internal/opsstate"
 	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/repoutil"
 	"github.com/ewhauser/ghsync/internal/store"
+	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
 type Options struct {
@@ -33,6 +35,30 @@ type Options struct {
 	BatchWindow      time.Duration
 	BackfillPageSize int
 	CacheObserver    store.CacheObserver
+	BranchObserver   BranchObserver
+}
+
+// BranchObserver reports bounded page outcomes without exposing raw entity
+// keys as metric attributes.
+type BranchObserver interface {
+	BranchReconciliationPage(
+		context.Context,
+		string,
+		int,
+		int,
+	)
+}
+
+type noopBranchObserver struct{}
+
+const branchPageHeartbeatInterval = 15 * time.Second
+
+func (noopBranchObserver) BranchReconciliationPage(
+	context.Context,
+	string,
+	int,
+	int,
+) {
 }
 
 type Handler struct {
@@ -45,12 +71,13 @@ type Handler struct {
 	orgID            int64
 	backfillPageSize int
 	coordinator      *prCoordinator
+	branchObserver   BranchObserver
 
 	riverMu sync.RWMutex
 	river   *river.Client[pgx.Tx]
 }
 
-func New(options Options) (*Handler, error) {
+func New(options *Options) (*Handler, error) {
 	if options.Pool == nil || options.REST == nil || options.GraphQL == nil {
 		return nil, fmt.Errorf(
 			"fetch handler requires Postgres, REST, and GraphQL",
@@ -63,6 +90,10 @@ func New(options Options) (*Handler, error) {
 		options.BackfillPageSize = 100
 	}
 	writer := store.NewEntityWriter(options.Pool, options.CacheObserver)
+	branchObserver := options.BranchObserver
+	if branchObserver == nil {
+		branchObserver = noopBranchObserver{}
+	}
 	codeowners := changeinputs.NewSourceResolver(options.REST)
 	handler := &Handler{
 		pool:             options.Pool,
@@ -73,6 +104,7 @@ func New(options Options) (*Handler, error) {
 		installationID:   options.InstallationID,
 		orgID:            options.OrgID,
 		backfillPageSize: options.BackfillPageSize,
+		branchObserver:   branchObserver,
 	}
 	handler.coordinator = newPRCoordinator(
 		options.GraphQL,
@@ -106,7 +138,13 @@ func (h *Handler) RefreshRepository(
 	}
 	repository, err := h.writer.Repository(ctx, key.Repo)
 	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = h.ensureRepository(ctx, class, source, key.Repo)
+		_, err = h.ensureRepository(
+			ctx,
+			class,
+			source,
+			key.Repo,
+			request.Args.ObserveDefaultBranchHead,
+		)
 		return err
 	}
 	if err != nil {
@@ -151,6 +189,19 @@ func (h *Handler) RefreshRepository(
 		return fmt.Errorf("fetch repository %s: %w", key.Repo, err)
 	}
 	if response.NotModified {
+		if request.Args.ObserveDefaultBranchHead {
+			headSHA, headErr := h.rest.GetBranchHead(
+				ctx, class, owner, name, repository.DefaultBranch,
+			)
+			if headErr != nil {
+				return fmt.Errorf(
+					"fetch repository default branch %s: %w",
+					repository.DefaultBranch,
+					headErr,
+				)
+			}
+			repository.DefaultHeadSHA = headSHA
+		}
 		_, err = h.writer.ApplyRepositoryObserved(
 			ctx,
 			observation,
@@ -166,6 +217,19 @@ func (h *Handler) RefreshRepository(
 		h.installationID,
 		h.orgID,
 	)
+	if request.Args.ObserveDefaultBranchHead {
+		headSHA, err := h.rest.GetBranchHead(
+			ctx, class, owner, name, record.DefaultBranch,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"fetch repository default branch %s: %w",
+				record.DefaultBranch,
+				err,
+			)
+		}
+		record.DefaultHeadSHA = headSHA
+	}
 	_, err = h.writer.ApplyRepositoryObserved(
 		ctx,
 		observation,
@@ -189,7 +253,7 @@ func (h *Handler) RefreshRepoRules(
 	if err != nil {
 		return err
 	}
-	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo, false)
 	if err != nil {
 		return err
 	}
@@ -331,7 +395,7 @@ func (h *Handler) refreshPRREST(
 	queueName string,
 	hydrateGraphQL bool,
 ) error {
-	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo, false)
 	if err != nil {
 		return err
 	}
@@ -548,7 +612,7 @@ func (h *Handler) RefreshStack(
 	if err != nil {
 		return err
 	}
-	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo, false)
 	if err != nil {
 		return err
 	}
@@ -642,7 +706,7 @@ func (h *Handler) RefreshChecks(
 	if err != nil {
 		return err
 	}
-	repository, err := h.ensureRepository(ctx, class, source, key.Repo)
+	repository, err := h.ensureRepository(ctx, class, source, key.Repo, false)
 	if err != nil {
 		return err
 	}
@@ -775,6 +839,239 @@ func (h *Handler) RefreshBranch(
 		specs = append(specs, queue.RefreshSpec{Kind: kind, Key: target})
 	}
 	return h.enqueue(ctx, specs, request.Queue)
+}
+
+// ReconcileBranchPage performs remote-only reconciliation for one bounded
+// subset. All GitHub calls finish before each independently fenced entity
+// transaction, and page bookkeeping starts only after every target finishes
+// (C-C6).
+func (h *Handler) ReconcileBranchPage(
+	ctx context.Context,
+	args *queue.BranchReconcilePageArgs,
+) error {
+	if args.RepoID <= 0 || args.RepoFullName == "" || args.Branch == "" ||
+		args.Generation <= 0 || args.Page <= 0 || len(args.Targets) == 0 ||
+		len(args.Targets) > defaultBatchSize {
+		return fmt.Errorf("invalid branch reconciliation page")
+	}
+	queries := dbgen.New(h.pool)
+	status, err := queries.GetBranchReconciliationPage(
+		ctx,
+		dbgen.GetBranchReconciliationPageParams{
+			RepoID:     args.RepoID,
+			Branch:     args.Branch,
+			Generation: args.Generation,
+			PageNumber: int32(args.Page),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("read branch reconciliation page: %w", err)
+	}
+	if status != "pending" {
+		if status == "superseded" {
+			h.branchObserver.BranchReconciliationPage(
+				ctx, "superseded", len(args.Targets), len(args.Targets),
+			)
+		}
+		return nil
+	}
+	pageIdentity := dbgen.StartBranchReconciliationPageParams{
+		RepoID:     args.RepoID,
+		Branch:     args.Branch,
+		Generation: args.Generation,
+		PageNumber: int32(args.Page),
+	}
+	started, err := queries.StartBranchReconciliationPage(ctx, pageIdentity)
+	if err != nil {
+		return fmt.Errorf("start branch reconciliation page: %w", err)
+	}
+	if started == 0 {
+		// A newer push may supersede the page between the read and this
+		// atomic start marker. In that case there is deliberately no remote
+		// work to perform.
+		return nil
+	}
+
+	type targetResult struct {
+		superseded bool
+		err        error
+	}
+	results := make(chan targetResult, len(args.Targets))
+	pageCtx, cancelPage := context.WithCancel(ctx)
+	defer cancelPage()
+	var targets sync.WaitGroup
+	for _, target := range args.Targets {
+		targets.Go(func() {
+			targetCtx := store.WithBranchReconciliationFence(
+				withoutRepositoryObservation(pageCtx),
+				&store.BranchReconciliationFence{
+					RepoID:            args.RepoID,
+					Branch:            args.Branch,
+					BranchGeneration:  args.Generation,
+					RefreshKind:       target.Kind,
+					RefreshKey:        target.Key,
+					RefreshGeneration: target.Generation,
+					EntityKey:         target.EntityKey,
+				},
+			)
+			request := queue.RefreshRequest{
+				Args: queue.RefreshArgs{
+					PointerKind: target.Kind,
+					Key:         target.Key,
+				},
+				Queue: queue.QueueBulk,
+			}
+			var targetErr error
+			switch target.Kind {
+			case queue.KindRefreshPR:
+				targetErr = h.RefreshPR(targetCtx, request)
+			case queue.KindRefreshStack:
+				targetErr = h.RefreshStack(targetCtx, request)
+			default:
+				targetErr = fmt.Errorf(
+					"unsupported branch page target kind %q", target.Kind,
+				)
+			}
+			results <- targetResult{
+				superseded: errors.Is(
+					targetErr,
+					store.ErrBranchReconciliationSuperseded,
+				),
+				err: targetErr,
+			}
+		})
+	}
+	workersDone := make(chan struct{})
+	go func() {
+		targets.Wait()
+		close(results)
+		close(workersDone)
+	}()
+
+	superseded := 0
+	errs := make([]error, 0)
+	manifestChanged := false
+	heartbeat := time.NewTicker(branchPageHeartbeatInterval)
+	defer heartbeat.Stop()
+	for results != nil {
+		select {
+		case result, ok := <-results:
+			if !ok {
+				results = nil
+				continue
+			}
+			if result.superseded {
+				superseded++
+				continue
+			}
+			if result.err != nil {
+				errs = append(errs, result.err)
+			}
+		case <-heartbeat.C:
+			updated, heartbeatErr := queries.HeartbeatBranchReconciliationPage(
+				ctx,
+				dbgen.HeartbeatBranchReconciliationPageParams(pageIdentity),
+			)
+			if heartbeatErr != nil {
+				errs = append(errs, fmt.Errorf(
+					"heartbeat branch reconciliation page: %w", heartbeatErr,
+				))
+				cancelPage()
+				// Disable further ticks while the target goroutines observe the
+				// cancellation and drain their buffered results.
+				heartbeat.Stop()
+				continue
+			}
+			if updated == 0 {
+				// The page was completed by a duplicate worker or superseded by a
+				// newer branch generation. Either way, stop unnecessary remote work;
+				// the final completion CAS below determines the durable outcome.
+				cancelPage()
+				heartbeat.Stop()
+				manifestChanged = true
+			}
+		}
+	}
+	<-workersDone
+	if manifestChanged {
+		latestStatus, statusErr := queries.GetBranchReconciliationPage(
+			ctx,
+			dbgen.GetBranchReconciliationPageParams{
+				RepoID:     args.RepoID,
+				Branch:     args.Branch,
+				Generation: args.Generation,
+				PageNumber: int32(args.Page),
+			},
+		)
+		if statusErr != nil {
+			return fmt.Errorf("re-read branch reconciliation page: %w", statusErr)
+		}
+		if latestStatus != "pending" {
+			return nil
+		}
+	}
+	if len(errs) > 0 {
+		h.branchObserver.BranchReconciliationPage(
+			ctx, "error", len(args.Targets), superseded,
+		)
+		return errors.Join(errs...)
+	}
+
+	// Every network response has been fully materialized and its entity
+	// transaction committed before this bookkeeping transaction begins.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin branch page completion: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	now, err := dbgen.New(tx).GetDatabaseClock(ctx)
+	if err != nil {
+		return fmt.Errorf("read branch page completion clock: %w", err)
+	}
+	completedPages, err := dbgen.New(tx).CompleteBranchReconciliationPage(
+		ctx,
+		dbgen.CompleteBranchReconciliationPageParams{
+			SupersededTargets: int32(superseded),
+			CompletedAt:       now,
+			RepoID:            args.RepoID,
+			Branch:            args.Branch,
+			Generation:        args.Generation,
+			PageNumber:        int32(args.Page),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("complete branch reconciliation page: %w", err)
+	}
+	if completedPages == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit superseded branch page: %w", err)
+		}
+		h.branchObserver.BranchReconciliationPage(
+			ctx, "superseded", len(args.Targets), len(args.Targets),
+		)
+		return nil
+	}
+	if err := opsstate.RecordSuccessN(
+		ctx,
+		tx,
+		h.installationID,
+		"fetch",
+		"branch_reconciliation",
+		int64(len(args.Targets)),
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit branch page completion: %w", err)
+	}
+	outcome := "success"
+	if superseded > 0 {
+		outcome = "partial_superseded"
+	}
+	h.branchObserver.BranchReconciliationPage(
+		ctx, outcome, len(args.Targets), superseded,
+	)
+	return nil
 }
 
 func (h *Handler) pullRequestHook(
@@ -926,6 +1223,7 @@ func (h *Handler) ensureRepository(
 	class budget.Class,
 	source store.SyncSource,
 	fullName string,
+	includeDefaultHead bool,
 ) (store.RepositoryRecord, error) {
 	repository, err := h.writer.Repository(ctx, fullName)
 	if err == nil {
@@ -972,6 +1270,19 @@ func (h *Handler) ensureRepository(
 		h.installationID,
 		h.orgID,
 	)
+	if includeDefaultHead {
+		headSHA, err := h.rest.GetBranchHead(
+			ctx, class, owner, repoName, record.DefaultBranch,
+		)
+		if err != nil {
+			return store.RepositoryRecord{}, fmt.Errorf(
+				"fetch repository default branch %s: %w",
+				record.DefaultBranch,
+				err,
+			)
+		}
+		record.DefaultHeadSHA = headSHA
+	}
 	record.ETag = response.ETag
 	record.LastCheckedAt = time.Now()
 	if _, err := h.writer.ApplyRepository(
@@ -994,7 +1305,7 @@ func classAndSource(
 		return budget.Interactive, store.SyncSourceInteractive, nil
 	case queue.QueueEvent:
 		return budget.Event, store.SyncSourceWebhook, nil
-	case queue.QueueSweep:
+	case queue.QueueBulk, queue.QueueSweep:
 		return budget.Sweep, store.SyncSourceReconcile, nil
 	default:
 		return "", "", fmt.Errorf("unknown refresh queue %q", queueName)

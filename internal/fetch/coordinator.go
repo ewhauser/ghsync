@@ -13,6 +13,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/budget"
 	"github.com/ewhauser/ghsync/internal/changeinputs"
 	"github.com/ewhauser/ghsync/internal/gh"
+	"github.com/ewhauser/ghsync/internal/queue"
 	"github.com/ewhauser/ghsync/internal/store"
 )
 
@@ -24,15 +25,16 @@ const (
 )
 
 type pullBatchItem struct {
-	ctx       context.Context //nolint:containedctx // queued work must retain each caller's values until the batch flushes
-	key       entityKey
-	nodeID    string
-	metadata  store.FetchMetadata
-	source    store.SyncSource
-	class     budget.Class
-	startedAt time.Time
-	hook      func(string) store.PullRequestHook
-	result    chan pullBatchResult
+	ctx                  context.Context //nolint:containedctx // queued work must retain each caller's values until the batch flushes
+	key                  entityKey
+	nodeID               string
+	metadata             store.FetchMetadata
+	source               store.SyncSource
+	class                budget.Class
+	startedAt            time.Time
+	hook                 func(string) store.PullRequestHook
+	result               chan pullBatchResult
+	repositoryGeneration int64
 }
 
 type pullBatchResult struct {
@@ -45,11 +47,31 @@ type pullApplyContext struct {
 	values          context.Context //nolint:containedctx // per-item values must survive shared batch transport
 }
 
+type skipRepositoryObservationContextKey struct{}
+
+// withoutRepositoryObservation keeps branch-page PR reconciliation scoped to
+// its PR target. The push transaction already established the repository's
+// branch SHA; replaying the GraphQL node's incidental parent representation
+// could otherwise overwrite a newer local branch generation.
+func withoutRepositoryObservation(ctx context.Context) context.Context {
+	return context.WithValue(
+		ctx,
+		skipRepositoryObservationContextKey{},
+		true,
+	)
+}
+
+func skipsRepositoryObservation(ctx context.Context) bool {
+	skips, _ := ctx.Value(skipRepositoryObservationContextKey{}).(bool)
+	return skips
+}
+
 func (c pullApplyContext) Value(key any) any {
-	if value := c.values.Value(key); value != nil {
-		return value
-	}
-	return c.Context.Value(key)
+	// Cancellation and the transport deadline come from the shared batch
+	// context, but values are entity-local. Falling back to the first item's
+	// context when this item had no value leaked branch/generation fences into
+	// unrelated direct refreshes in the same GraphQL batch.
+	return c.values.Value(key)
 }
 
 type pullBatchKey struct {
@@ -209,6 +231,17 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		}
 		item.metadata = metadata
 		item.nodeID = metadata.NodeID
+		repositoryKey := "repo:" + metadata.RepoFullName + ":metadata"
+		repositoryGeneration, err := c.writer.RefreshGeneration(
+			callCtx,
+			queue.KindRefreshRepository,
+			repositoryKey,
+		)
+		if err != nil {
+			results[item] = pullBatchResult{err: err}
+			continue
+		}
+		item.repositoryGeneration = repositoryGeneration
 		active = append(active, item)
 	}
 	if len(active) == 0 {
@@ -279,7 +312,7 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		repoID := record.Repository.GitHubID
 		candidate := preparedPull{item: item, record: record}
 		prepared = append(prepared, candidate)
-		if _, exists := repositoryCandidates[repoID]; !exists {
+		if _, exists := repositoryCandidates[repoID]; !exists && !skipsRepositoryObservation(item.ctx) {
 			repositoryCandidates[repoID] = candidate
 		}
 	}
@@ -300,16 +333,32 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	for _, repoID := range repoIDs {
 		candidate := repositoryCandidates[repoID]
 		err := func() error {
-			repositoryObservation, err := c.writer.BeginObservation(
-				callCtx,
+			repositoryCtx := context.Context(pullApplyContext{
+				Context: callCtx,
+				values:  candidate.item.ctx,
+			})
+			repositoryCtx = store.WithRefreshGenerationFence(
+				repositoryCtx,
+				store.RefreshGenerationFence{
+					Kind: queue.KindRefreshRepository,
+					RefreshKey: "repo:" +
+						candidate.item.metadata.RepoFullName + ":metadata",
+					Generation: candidate.item.repositoryGeneration,
+				},
+			)
+			// pullApplyContext embeds callCtx, so cancellation and deadlines
+			// are inherited; only Values are item-local. contextcheck cannot
+			// see through the custom wrapper type.
+			repositoryObservation, err := c.writer.BeginObservation( //nolint:contextcheck // pullApplyContext embeds callCtx
+				repositoryCtx,
 				store.RepositoryEntityKey(c.installationID, repoID),
 			)
 			if err != nil {
 				return err
 			}
-			defer closeObservation(callCtx, repositoryObservation)
-			_, err = c.writer.ApplyRepositoryObserved(
-				callCtx,
+			defer closeObservation(repositoryCtx, repositoryObservation) //nolint:contextcheck // pullApplyContext embeds callCtx
+			_, err = c.writer.ApplyRepositoryObserved(                   //nolint:contextcheck // pullApplyContext embeds callCtx
+				repositoryCtx,
 				repositoryObservation,
 				candidate.record.Repository,
 				candidate.item.source,
@@ -318,6 +367,12 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			)
 			return err
 		}()
+		if errors.Is(err, store.ErrRefreshGenerationSuperseded) {
+			// A newer repository/default-branch generation supersedes only the
+			// incidental parent representation. The independently fenced PR
+			// response remains authoritative and must still be applied.
+			continue
+		}
 		if err != nil {
 			repositoryFailures[repoID] = err
 		}

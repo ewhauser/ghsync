@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -33,6 +34,16 @@ func TestSortedPullRequestKeysUseImmutableRepositoryIdentity(t *testing.T) {
 	want := []string{"pr:1:1001:4812", "pr:1:1001:4820"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("sorted immutable keys = %v, want %v", got, want)
+	}
+}
+
+func TestPullApplyContextDoesNotInheritFirstBatchItemValues(t *testing.T) {
+	t.Parallel()
+	firstItem := withoutRepositoryObservation(context.Background())
+	directItem := context.Background()
+	merged := pullApplyContext{Context: firstItem, values: directItem}
+	if skipsRepositoryObservation(merged) {
+		t.Fatal("direct batch item inherited the first item's branch-page value")
 	}
 }
 

@@ -93,9 +93,14 @@ SELECT
     request.head_sha
 FROM pull_request_review_requests AS request
 JOIN repos AS repo ON repo.id = request.repo_id
+JOIN pull_requests AS pull
+  ON pull.repo_id = request.repo_id
+ AND pull.number = request.pr_number
 WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND repo.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
   AND request.tombstoned_at IS NULL
+  AND request.head_sha = pull.head_sha
 ORDER BY request.pr_number, request.reviewer_kind, request.reviewer_gh_id;
 
 -- name: ListLoadgenCachedStacks :many
@@ -123,9 +128,14 @@ SELECT review.pr_number, review.gh_id, review.node_id,
        review.gh_updated_at, review.head_sha
 FROM pull_request_reviews AS review
 JOIN repos AS repo ON repo.id = review.repo_id
+JOIN pull_requests AS pull
+  ON pull.repo_id = review.repo_id
+ AND pull.number = review.pr_number
 WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND repo.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
   AND review.tombstoned_at IS NULL
+  AND review.head_sha = pull.head_sha
 ORDER BY review.pr_number, review.node_id;
 
 -- name: ListLoadgenCachedPullRequestComments :many
@@ -134,9 +144,14 @@ SELECT comment.pr_number, comment.gh_id, comment.node_id,
        comment.created_at, comment.gh_updated_at, comment.head_sha
 FROM pull_request_comments AS comment
 JOIN repos AS repo ON repo.id = comment.repo_id
+JOIN pull_requests AS pull
+  ON pull.repo_id = comment.repo_id
+ AND pull.number = comment.pr_number
 WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND repo.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
   AND comment.tombstoned_at IS NULL
+  AND comment.head_sha = pull.head_sha
 ORDER BY comment.pr_number, comment.node_id;
 
 -- name: ListLoadgenCachedPullRequestChangeSnapshots :many
@@ -147,9 +162,15 @@ SELECT snapshot.pr_number, snapshot.base_sha, snapshot.head_sha,
        snapshot.codeowners_source, snapshot.codeowners_hash
 FROM pull_request_change_snapshots AS snapshot
 JOIN repos AS repo ON repo.id = snapshot.repo_id
+JOIN pull_requests AS pull
+  ON pull.repo_id = snapshot.repo_id
+ AND pull.number = snapshot.pr_number
 WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND repo.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
   AND snapshot.tombstoned_at IS NULL
+  AND snapshot.base_sha = pull.base_sha
+  AND snapshot.head_sha = pull.head_sha
 ORDER BY snapshot.pr_number;
 
 -- name: ListLoadgenCachedPullRequestChangedFiles :many
@@ -157,9 +178,21 @@ SELECT file.pr_number, file.path, file.previous_path, file.change_type,
        file.base_sha, file.head_sha
 FROM pull_request_changed_files AS file
 JOIN repos AS repo ON repo.id = file.repo_id
+JOIN pull_requests AS pull
+  ON pull.repo_id = file.repo_id
+ AND pull.number = file.pr_number
+JOIN pull_request_change_snapshots AS snapshot
+  ON snapshot.repo_id = file.repo_id
+ AND snapshot.pr_number = file.pr_number
 WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND repo.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
+  AND snapshot.tombstoned_at IS NULL
   AND file.tombstoned_at IS NULL
+  AND snapshot.base_sha = pull.base_sha
+  AND snapshot.head_sha = pull.head_sha
+  AND file.base_sha = snapshot.base_sha
+  AND file.head_sha = snapshot.head_sha
 ORDER BY file.pr_number, file.path;
 
 -- name: ListLoadgenCachedPullRequestFileOwners :many
@@ -169,9 +202,21 @@ SELECT owner.pr_number, owner.path, owner.owner_token, owner.owner_type,
        owner.source_line, owner.base_sha, owner.head_sha
 FROM pull_request_file_owners AS owner
 JOIN repos AS repo ON repo.id = owner.repo_id
+JOIN pull_requests AS pull
+  ON pull.repo_id = owner.repo_id
+ AND pull.number = owner.pr_number
+JOIN pull_request_change_snapshots AS snapshot
+  ON snapshot.repo_id = owner.repo_id
+ AND snapshot.pr_number = owner.pr_number
 WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND repo.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
+  AND snapshot.tombstoned_at IS NULL
   AND owner.tombstoned_at IS NULL
+  AND snapshot.base_sha = pull.base_sha
+  AND snapshot.head_sha = pull.head_sha
+  AND owner.base_sha = snapshot.base_sha
+  AND owner.head_sha = snapshot.head_sha
 ORDER BY owner.pr_number, owner.path, owner.owner_token;
 
 -- name: ListLoadgenCachedCheckRuns :many
@@ -208,7 +253,12 @@ SELECT
     thread.head_sha
 FROM review_threads AS thread
 JOIN repos AS repo ON repo.id = thread.repo_id
+JOIN pull_requests AS pull
+  ON pull.repo_id = thread.repo_id
+ AND pull.number = thread.pr_number
 WHERE repo.full_name = sqlc.arg(repo_full_name)
   AND repo.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
   AND thread.tombstoned_at IS NULL
+  AND thread.head_sha = pull.head_sha
 ORDER BY thread.id;

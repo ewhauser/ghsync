@@ -77,12 +77,16 @@ func (w *EntityWriter) PullRequestChangeMetadata(
 	ctx context.Context,
 	repo string,
 	number int,
+	baseSHA string,
+	headSHA string,
 ) (PullRequestChangeFetchMetadata, error) {
 	rows, err := dbgen.New(w.pool).ListPullRequestChangeFetchMetadata(
 		ctx,
 		dbgen.ListPullRequestChangeFetchMetadataParams{
 			RepoFullName: repo,
 			PrNumber:     int32(number),
+			BaseSha:      baseSHA,
+			HeadSha:      headSHA,
 		},
 	)
 	if err != nil {

@@ -657,7 +657,7 @@ func serve(args []string) error {
 	if needsRiver {
 		var fetchHandler *fetch.Handler
 		if roles[roleFetch] {
-			fetchHandler, err = fetch.New(fetch.Options{
+			fetchHandler, err = fetch.New(&fetch.Options{
 				Pool:             pool,
 				REST:             rest,
 				GraphQL:          graphQL,
@@ -666,6 +666,7 @@ func serve(args []string) error {
 				BatchWindow:      cfg.FetchBatchWindow,
 				BackfillPageSize: cfg.BackfillPageSize,
 				CacheObserver:    runtimeMetrics,
+				BranchObserver:   runtimeMetrics,
 			})
 			if err != nil {
 				return err
@@ -973,6 +974,7 @@ func riverPlanForRoles(roles map[string]bool) riverRolePlan {
 			queues,
 			queue.QueueInteractive,
 			queue.QueueEvent,
+			queue.QueueBulk,
 			queue.QueueSweep,
 		)
 	}

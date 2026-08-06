@@ -834,7 +834,7 @@ func drainAndAssert(
 			}
 			return nil, fmt.Errorf(
 				"pipeline did not drain and converge within %s "+
-					"(deliveries=%d/%d event_queue=%.0f generations=%.0f "+
+					"(deliveries=%d/%d event_queue=%.0f event_generations=%.0f "+
 					"watermark_lag=%.0f open_drift=%.0f "+
 					"convergence=%v trust_passes=%t "+
 					"delivery_error=%v)",
@@ -848,7 +848,7 @@ func drainAndAssert(
 				),
 				metricValue(
 					final,
-					"ghsync_c_q2_outstanding_generations",
+					"ghsync_c_q2_outstanding_event_generations",
 					nil,
 				),
 				metricValue(

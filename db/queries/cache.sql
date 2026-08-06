@@ -153,25 +153,42 @@ LEFT JOIN pull_request_change_snapshots AS snapshot
   ON snapshot.repo_id = pull_requests.repo_id
  AND snapshot.pr_number = pull_requests.number
  AND snapshot.tombstoned_at IS NULL
+ -- These columns describe the base-branch CODEOWNERS source. They remain
+ -- reusable across a head-only transition, but never across a base fence.
+ AND snapshot.base_sha = pull_requests.base_sha
+ AND snapshot.codeowners_ref = pull_requests.base_ref
+ AND snapshot.codeowners_sha = pull_requests.base_sha
 WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
   AND pull_requests.number = sqlc.arg(pr_number);
 
 -- name: ListPullRequestChangeFetchMetadata :many
 -- The snapshot and changed-file rows carry the first-page validator for the
 -- REST files collection. Previous paths are retained so a 304 can reuse the
--- last authoritative rename supplement without another response body.
+-- last authoritative rename supplement without another response body. The
+-- caller supplies the just-fetched GraphQL base/head fence: matching only the
+-- pre-fetch database row is insufficient when GitHub advanced during the
+-- observation.
 SELECT snapshot.files_etag AS etag, COALESCE(file.path, '')::text AS path,
        COALESCE(file.previous_path, '')::text AS previous_path
 FROM pull_request_change_snapshots AS snapshot
+JOIN pull_requests AS pull
+  ON pull.repo_id = snapshot.repo_id
+ AND pull.number = snapshot.pr_number
 JOIN repos ON repos.id = snapshot.repo_id
 JOIN repo_aliases ON repo_aliases.repo_id = repos.id
 LEFT JOIN pull_request_changed_files AS file
   ON file.repo_id = snapshot.repo_id
  AND file.pr_number = snapshot.pr_number
  AND file.tombstoned_at IS NULL
+ AND file.base_sha = snapshot.base_sha
+ AND file.head_sha = snapshot.head_sha
 WHERE repo_aliases.full_name = sqlc.arg(repo_full_name)
   AND snapshot.pr_number = sqlc.arg(pr_number)
   AND snapshot.tombstoned_at IS NULL
+  AND snapshot.base_sha = pull.base_sha
+  AND snapshot.head_sha = pull.head_sha
+  AND snapshot.base_sha = sqlc.arg(base_sha)
+  AND snapshot.head_sha = sqlc.arg(head_sha)
 ORDER BY file.path;
 
 -- name: GetCheckRunsFetchMetadata :one
@@ -395,6 +412,14 @@ WHERE stacks.gh_updated_at IS NULL
            stacks.gh_id, stacks.node_id, stacks.base_ref,
            stacks.base_sha, stacks.open, stacks.entries, stacks.head_sha
        )
+   )
+   -- A branch hint clears the validator without claiming an authoritative
+   -- observation. An equal-version 200 response may therefore confirm the
+   -- locally transitioned domain and restore observation provenance.
+   OR (
+       EXCLUDED.gh_updated_at IS NOT DISTINCT FROM stacks.gh_updated_at
+       AND stacks.etag = ''
+       AND EXCLUDED.etag <> ''
    )
    OR (
        stacks.tombstoned_at IS NOT NULL
@@ -1415,16 +1440,26 @@ WITH candidates AS (
            request.reviewer_login AS owner_login,
            request.last_checked_at
     FROM pull_request_review_requests AS request
+    JOIN pull_requests AS pull
+      ON pull.repo_id = request.repo_id
+     AND pull.number = request.pr_number
     WHERE request.repo_id = sqlc.arg(repo_id)
       AND request.tombstoned_at IS NULL
+      AND pull.tombstoned_at IS NULL
+      AND request.head_sha = pull.head_sha
 
     UNION ALL
 
     SELECT 'user'::text, NULL::bigint, review.author_node_id,
            review.author_login, review.last_checked_at
     FROM pull_request_reviews AS review
+    JOIN pull_requests AS pull
+      ON pull.repo_id = review.repo_id
+     AND pull.number = review.pr_number
     WHERE review.repo_id = sqlc.arg(repo_id)
       AND review.tombstoned_at IS NULL
+      AND pull.tombstoned_at IS NULL
+      AND review.head_sha = pull.head_sha
       AND review.author_kind = 'user'
       AND review.author_node_id IS NOT NULL
       AND review.author_login IS NOT NULL
@@ -1434,8 +1469,13 @@ WITH candidates AS (
     SELECT 'user'::text, NULL::bigint, comment.author_node_id,
            comment.author_login, comment.last_checked_at
     FROM pull_request_comments AS comment
+    JOIN pull_requests AS pull
+      ON pull.repo_id = comment.repo_id
+     AND pull.number = comment.pr_number
     WHERE comment.repo_id = sqlc.arg(repo_id)
       AND comment.tombstoned_at IS NULL
+      AND pull.tombstoned_at IS NULL
+      AND comment.head_sha = pull.head_sha
       AND comment.author_kind = 'user'
       AND comment.author_node_id IS NOT NULL
       AND comment.author_login IS NOT NULL

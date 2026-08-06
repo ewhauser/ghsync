@@ -333,6 +333,7 @@ func assertLive(
 		"ghsync_c_p2_queue_depth",
 		"ghsync_c_q2_oldest_unprocessed_delivery_age_seconds",
 		"ghsync_c_q2_outstanding_generations",
+		"ghsync_c_q2_outstanding_event_generations",
 		"ghsync_c_r1_cache_staleness_seconds",
 		"ghsync_c_r1_staleness_bound_seconds",
 		"ghsync_c_s2_watermark_lag_sequences",
@@ -440,7 +441,7 @@ func pipelineDrained(families map[string]*dto.MetricFamily) bool {
 		) == 0 &&
 		metricValue(
 			families,
-			"ghsync_c_q2_outstanding_generations",
+			"ghsync_c_q2_outstanding_event_generations",
 			nil,
 		) == 0 &&
 		metricValue(

@@ -54,6 +54,12 @@ SELECT
         WHERE completed_generation < generation
     ) AS outstanding_generations,
     (
+        SELECT count(*)
+        FROM refresh_intent_generations
+        WHERE completed_generation < generation
+          AND event_received_at IS NOT NULL
+    ) AS outstanding_event_generations,
+    (
         SELECT COALESCE(EXTRACT(EPOCH FROM (
             clock_timestamp() - min(event_received_at)
         )), 0)::double precision
@@ -226,6 +232,7 @@ WITH expected AS (
     UNION ALL SELECT 'sweep', 'closed_tracked'
     UNION ALL SELECT 'watermarker', 'entities'
     UNION ALL SELECT 'deriver', 'dirty_sets'
+    UNION ALL SELECT 'fetch', 'branch_reconciliation'
 )
 SELECT expected.component,
        expected.operation,

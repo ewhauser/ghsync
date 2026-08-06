@@ -52,6 +52,12 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	); err != nil {
 		return err
 	}
+	if r.outstandingEventGenCount, err = meter.Int64ObservableGauge(
+		"ghsync_c_q2_outstanding_event_generations",
+		metric.WithDescription("Event-backed refresh generations not yet completed (C-Q2)."),
+	); err != nil {
+		return err
+	}
 	if r.outstandingGenAge, err = meter.Float64ObservableGauge(
 		"ghsync_c_q2_oldest_outstanding_generation_age_seconds",
 		metric.WithDescription("Age of the oldest event-backed incomplete generation (C-Q2)."),
@@ -184,6 +190,12 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	); err != nil {
 		return err
 	}
+	if r.branchBacklog, err = meter.Int64ObservableGauge(
+		"ghsync_c_o4_branch_reconciliation_backlog",
+		metric.WithDescription("Current branch reconciliation backlog by pages and targets."),
+	); err != nil {
+		return err
+	}
 
 	r.callbackRegistration, err = meter.RegisterCallback(
 		r.observe,
@@ -193,6 +205,7 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 		r.queueDepth,
 		r.oldestDeliveryAge,
 		r.outstandingGenCount,
+		r.outstandingEventGenCount,
 		r.outstandingGenAge,
 		r.parkedCount,
 		r.parkedAge,
@@ -215,6 +228,7 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 		r.operationSuccessAge,
 		r.operationSampleAge,
 		r.roleEnabled,
+		r.branchBacklog,
 	)
 	return err
 }
@@ -243,11 +257,34 @@ func (r *Runtime) observe(ctx context.Context, observer metric.Observer) error {
 		r.observeStream,
 		r.observeDeriver,
 		r.observeOperationHeartbeats,
+		r.observeBranchReconciliation,
 	} {
 		if err := observe(ctx, observer); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+func (r *Runtime) observeBranchReconciliation(
+	ctx context.Context,
+	observer metric.Observer,
+) error {
+	backlog, err := dbgen.New(r.options.Pool).
+		CollectBranchReconciliationBacklog(ctx)
+	if err != nil {
+		return fmt.Errorf("collect branch reconciliation backlog: %w", err)
+	}
+	observer.ObserveInt64(
+		r.branchBacklog,
+		backlog.PendingPages,
+		metric.WithAttributes(attribute.String("unit", "pages")),
+	)
+	observer.ObserveInt64(
+		r.branchBacklog,
+		backlog.PendingTargets,
+		metric.WithAttributes(attribute.String("unit", "targets")),
+	)
 	return nil
 }
 
@@ -443,6 +480,10 @@ func (r *Runtime) observeDeliveries(
 	observer.ObserveInt64(
 		r.outstandingGenCount,
 		row.OutstandingGenerations,
+	)
+	observer.ObserveInt64(
+		r.outstandingEventGenCount,
+		row.OutstandingEventGenerations,
 	)
 	observer.ObserveFloat64(r.outstandingGenAge, row.OldestGeneration)
 	observer.ObserveInt64(r.parkedCount, row.Parked)

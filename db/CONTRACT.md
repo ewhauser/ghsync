@@ -418,6 +418,9 @@ SELECT snapshot.base_sha, snapshot.head_sha,
        owner.owner_gh_id, owner.owner_node_id, owner.owner_login,
        owner.source_pattern, owner.source_line
 FROM pull_request_change_snapshots AS snapshot
+JOIN pull_requests AS pull
+  ON pull.repo_id = snapshot.repo_id
+ AND pull.number = snapshot.pr_number
 JOIN pull_request_changed_files AS file
  ON file.repo_id = snapshot.repo_id
  AND file.pr_number = snapshot.pr_number
@@ -434,6 +437,9 @@ LEFT JOIN pull_request_file_owners AS owner
 WHERE snapshot.repo_id = $1
   AND snapshot.pr_number = $2
   AND snapshot.tombstoned_at IS NULL
+  AND pull.tombstoned_at IS NULL
+  AND snapshot.base_sha = pull.base_sha
+  AND snapshot.head_sha = pull.head_sha
 ORDER BY file.path, owner.owner_token;
 ```
 <!-- diff-to-owner-sql:end -->

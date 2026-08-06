@@ -155,6 +155,23 @@ SELECT generation, completed_generation, deadline_at, event_received_at
 FROM refresh_intent_generations
 WHERE kind = $1 AND refresh_key = $2;
 
+-- name: GetRefreshIntentGenerationForShare :one
+-- Post-fetch writers hold a shared row lock through their short entity
+-- transaction. Producers either finish their generation bump first or wait
+-- until this write commits; no advisory lock is retained across hooks.
+SELECT generation
+FROM refresh_intent_generations
+WHERE kind = sqlc.arg(kind)
+  AND refresh_key = sqlc.arg(refresh_key)
+FOR SHARE;
+
+-- name: GetRefreshIntentStateForShare :one
+SELECT generation, completed_generation
+FROM refresh_intent_generations
+WHERE kind = sqlc.arg(kind)
+  AND refresh_key = sqlc.arg(refresh_key)
+FOR SHARE;
+
 -- name: GetRefreshIntentGenerationForUpdate :one
 -- Workers lock the generation before transactionally completing their River
 -- job. A concurrent dispatcher therefore bumps either before the recheck or

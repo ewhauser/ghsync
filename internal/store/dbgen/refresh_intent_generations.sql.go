@@ -145,6 +145,29 @@ func (q *Queries) CompleteRefreshIntentGeneration(ctx context.Context, arg Compl
 	return err
 }
 
+const getRefreshIntentGenerationForShare = `-- name: GetRefreshIntentGenerationForShare :one
+SELECT generation
+FROM refresh_intent_generations
+WHERE kind = $1
+  AND refresh_key = $2
+FOR SHARE
+`
+
+type GetRefreshIntentGenerationForShareParams struct {
+	Kind       string
+	RefreshKey string
+}
+
+// Post-fetch writers hold a shared row lock through their short entity
+// transaction. Producers either finish their generation bump first or wait
+// until this write commits; no advisory lock is retained across hooks.
+func (q *Queries) GetRefreshIntentGenerationForShare(ctx context.Context, arg GetRefreshIntentGenerationForShareParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getRefreshIntentGenerationForShare, arg.Kind, arg.RefreshKey)
+	var generation int64
+	err := row.Scan(&generation)
+	return generation, err
+}
+
 const getRefreshIntentGenerationForUpdate = `-- name: GetRefreshIntentGenerationForUpdate :one
 SELECT generation
 FROM refresh_intent_generations
@@ -194,6 +217,31 @@ func (q *Queries) GetRefreshIntentState(ctx context.Context, arg GetRefreshInten
 		&i.DeadlineAt,
 		&i.EventReceivedAt,
 	)
+	return i, err
+}
+
+const getRefreshIntentStateForShare = `-- name: GetRefreshIntentStateForShare :one
+SELECT generation, completed_generation
+FROM refresh_intent_generations
+WHERE kind = $1
+  AND refresh_key = $2
+FOR SHARE
+`
+
+type GetRefreshIntentStateForShareParams struct {
+	Kind       string
+	RefreshKey string
+}
+
+type GetRefreshIntentStateForShareRow struct {
+	Generation          int64
+	CompletedGeneration int64
+}
+
+func (q *Queries) GetRefreshIntentStateForShare(ctx context.Context, arg GetRefreshIntentStateForShareParams) (GetRefreshIntentStateForShareRow, error) {
+	row := q.db.QueryRow(ctx, getRefreshIntentStateForShare, arg.Kind, arg.RefreshKey)
+	var i GetRefreshIntentStateForShareRow
+	err := row.Scan(&i.Generation, &i.CompletedGeneration)
 	return i, err
 }
 
