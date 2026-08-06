@@ -568,8 +568,11 @@ func serve(args []string) error {
 				otelhttp.WithPropagators(tracing.Propagator()),
 			),
 		}
-		githubGate, err = budget.NewLeased(
-			budgetCtx,
+		standbyCtx, cancelStandby := context.WithCancel(budgetCtx)
+		defer cancelStandby()
+		stopStandbyOnSignal := context.AfterFunc(signalCtx, cancelStandby)
+		githubGate, err = budget.NewLeasedStandby(
+			standbyCtx,
 			githubHTTPClient,
 			budget.Options{
 				MaxConcurrent:          cfg.BudgetMaxConcurrent,
@@ -591,9 +594,35 @@ func serve(args []string) error {
 				TTL:            cfg.BudgetLeaseTTL,
 				RenewInterval:  cfg.BudgetLeaseRenewInterval,
 			},
+			func(owner string, retryIn time.Duration) {
+				slog.Info(
+					"GitHub budget gate standing by",
+					"owner", owner,
+					"retry_in", retryIn,
+				)
+			},
 		)
+		standbySignalStopped := stopStandbyOnSignal()
 		if err != nil {
+			if !standbySignalStopped && signalCtx.Err() != nil {
+				return nil
+			}
 			return fmt.Errorf("GitHub budget gate: %w", err)
+		}
+		if !standbySignalStopped {
+			closeCtx, cancelGate := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			closeErr := githubGate.Close(closeCtx)
+			cancelGate()
+			if closeErr != nil {
+				return fmt.Errorf(
+					"GitHub budget gate signal handoff: %w",
+					closeErr,
+				)
+			}
+			return nil
 		}
 		var appTokens gh.TokenProvider
 		if cfg.GitHubToken != "" {
