@@ -1433,7 +1433,7 @@ func TestCompleteGapHealCursorAcceptsBoundaryAboveMaxInt32(t *testing.T) {
 		completedAt.Add(-2*time.Minute),
 		completedAt.Add(-90*time.Minute),
 		completedAt.Add(-2*time.Minute),
-		int64((30 * time.Hour).Nanoseconds()),
+		(30 * time.Hour).Nanoseconds(),
 		completedAt.Add(time.Minute),
 	); err != nil {
 		t.Fatal(err)
