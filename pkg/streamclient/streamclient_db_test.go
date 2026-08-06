@@ -21,6 +21,104 @@ import (
 
 var streamTestID atomic.Int64
 
+type testTimeoutError struct{}
+
+func (testTimeoutError) Error() string   { return "i/o timeout" }
+func (testTimeoutError) Timeout() bool   { return true }
+func (testTimeoutError) Temporary() bool { return true }
+
+func TestNormalizeTailContextError(t *testing.T) {
+	t.Parallel()
+	transportErr := fmt.Errorf(
+		"advance consumer cursor: %w",
+		fmt.Errorf("write failed: %w", testTimeoutError{}),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := normalizeTailContextError(ctx, transportErr); !errors.Is(
+		got,
+		context.Canceled,
+	) {
+		t.Fatalf("normalized timeout = %v, want context canceled", got)
+	}
+
+	terminalErr := errors.New("terminal database error")
+	if got := normalizeTailContextError(ctx, terminalErr); !errors.Is(
+		got,
+		terminalErr,
+	) {
+		t.Fatalf("normalized terminal error = %v, want %v", got, terminalErr)
+	}
+	if got := normalizeTailContextError(
+		context.Background(),
+		transportErr,
+	); !errors.Is(got, transportErr) {
+		t.Fatalf("normalized live timeout = %v, want %v", got, transportErr)
+	}
+
+	deadlineCtx, stopDeadline := context.WithTimeout(
+		context.Background(),
+		0,
+	)
+	defer stopDeadline()
+	if got := normalizeTailContextError(
+		deadlineCtx,
+		transportErr,
+	); !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("normalized deadline timeout = %v, want deadline exceeded", got)
+	}
+
+	handlerCause := fmt.Errorf("handler dependency: %w", testTimeoutError{})
+	handlerErr := &tailHandlerError{seq: 42, cause: handlerCause}
+	if got := normalizeTailContextError(ctx, handlerErr); !errors.Is(
+		got,
+		handlerCause,
+	) || errors.Is(got, context.Canceled) {
+		t.Fatalf("normalized handler timeout = %v, want %v", got, handlerErr)
+	}
+}
+
+func TestTailPreservesHandlerTimeoutAfterCancellation(t *testing.T) {
+	t.Parallel()
+	pool := streamTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	streamName := uniqueStreamName("handler-timeout")
+	consumer := uniqueStreamName("consumer")
+	client := newTestClient(t, pool, 10)
+	snapshot, err := client.Bootstrap(ctx, consumer, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	seq := insertCommittedEvent(
+		t, ctx, pool, streamName, "handler-timeout", time.Now(),
+	)
+	watermarker := newTestWatermarker(t, pool)
+	defer watermarker.Close(context.Background()) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	advanceThrough(t, ctx, watermarker, seq)
+
+	handlerCause := fmt.Errorf("handler dependency: %w", testTimeoutError{})
+	tailCtx, stopTail := context.WithCancel(ctx)
+	err = client.Tail(
+		tailCtx,
+		consumer,
+		streamName,
+		func(context.Context, pgx.Tx, Event) error {
+			stopTail()
+			return handlerCause
+		},
+	)
+	if !errors.Is(err, handlerCause) {
+		t.Fatalf("Tail error = %v, want handler error %v", err, handlerCause)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("Tail error = %v, unexpectedly replaced by context cancellation", err)
+	}
+}
+
 func TestIsRetryableTaxonomy(t *testing.T) {
 	t.Parallel()
 	contention := newCursorContention(
