@@ -166,7 +166,7 @@ SET cursor = '',
     pass_high_watermark_at = NULL,
     boundary_delivery_id = COALESCE(
         NULLIF(pass_boundary_delivery_id, 0),
-        NULLIF($2, 0),
+        NULLIF($2::bigint, 0::bigint),
         boundary_delivery_id
     ),
     pass_boundary_delivery_id = 0,
@@ -187,7 +187,7 @@ RETURNING installation_id, cursor, cutoff, started_at, updated_at, completed_at,
 
 type CompleteGapHealCursorParams struct {
 	ObservedHighWatermarkAt    pgtype.Timestamptz
-	ObservedBoundaryDeliveryID interface{}
+	ObservedBoundaryDeliveryID int64
 	CompletedAt                pgtype.Timestamptz
 	InstallationID             int64
 	ExpectedCursor             string

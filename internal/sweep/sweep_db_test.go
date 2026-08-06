@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -32,6 +33,7 @@ import (
 	"github.com/ewhauser/ghsync/internal/ingress"
 	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/queue"
+	"github.com/ewhauser/ghsync/internal/repoutil"
 	"github.com/ewhauser/ghsync/internal/store"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 	"github.com/ewhauser/ghsync/internal/testdb"
@@ -1396,6 +1398,126 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 		)
 		return err == nil && row.Title == "truth changed during outage"
 	})
+}
+
+func TestCompleteGapHealCursorAcceptsBoundaryAboveMaxInt32(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	ctx := t.Context()
+	completedAt := time.Now().UTC().Truncate(time.Microsecond)
+	observedHighWatermark := completedAt.Add(-time.Minute)
+	const observedBoundaryDeliveryID int64 = 3835152601846906886
+	if observedBoundaryDeliveryID <= int64(math.MaxInt32) {
+		t.Fatalf(
+			"test delivery ID = %d, want greater than MaxInt32",
+			observedBoundaryDeliveryID,
+		)
+	}
+
+	if _, err := database.Pool.Exec(ctx, `
+		INSERT INTO gap_heal_cursors (
+		    installation_id, cursor, cutoff, started_at, updated_at,
+		    high_watermark_at, pass_high_watermark_at,
+		    boundary_delivery_id, pass_boundary_delivery_id,
+		    scan_mode, cursor_version, lookback_duration_ns, page_size,
+		    lease_token, lease_until
+		) VALUES (
+		    46, 'next-page', $1, $2, $2,
+		    $3, $4,
+		    101, 0,
+		    'deep', 1, $5, 100,
+		    'issue-46', $6
+		)
+	`,
+		completedAt.Add(-6*time.Hour),
+		completedAt.Add(-2*time.Minute),
+		completedAt.Add(-90*time.Minute),
+		completedAt.Add(-2*time.Minute),
+		int64((30 * time.Hour).Nanoseconds()),
+		completedAt.Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	service := &Service{
+		pool: database.Pool,
+		config: Config{
+			InstallationID: 46,
+			Now:            func() time.Time { return completedAt },
+		},
+	}
+	if err := service.completeGapWindow(
+		ctx,
+		"next-page",
+		repoutil.Timestamptz(observedHighWatermark),
+		observedBoundaryDeliveryID,
+		"issue-46",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		cursor                 string
+		highWatermark          time.Time
+		passHighWatermark      *time.Time
+		boundaryDeliveryID     int64
+		passBoundaryDeliveryID int64
+		storedCompletedAt      time.Time
+		leaseToken             *string
+	)
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT cursor, high_watermark_at, pass_high_watermark_at,
+		       boundary_delivery_id, pass_boundary_delivery_id,
+		       completed_at, lease_token
+		FROM gap_heal_cursors
+		WHERE installation_id = 46
+	`).Scan(
+		&cursor,
+		&highWatermark,
+		&passHighWatermark,
+		&boundaryDeliveryID,
+		&passBoundaryDeliveryID,
+		&storedCompletedAt,
+		&leaseToken,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != "" {
+		t.Fatalf("cursor = %q, want completed empty cursor", cursor)
+	}
+	if !highWatermark.Equal(observedHighWatermark) {
+		t.Fatalf(
+			"high watermark = %s, want %s",
+			highWatermark,
+			observedHighWatermark,
+		)
+	}
+	if passHighWatermark != nil {
+		t.Fatalf("pass high watermark = %s, want NULL", *passHighWatermark)
+	}
+	if boundaryDeliveryID != observedBoundaryDeliveryID {
+		t.Fatalf(
+			"boundary delivery ID = %d, want %d",
+			boundaryDeliveryID,
+			observedBoundaryDeliveryID,
+		)
+	}
+	if passBoundaryDeliveryID != 0 {
+		t.Fatalf(
+			"pass boundary delivery ID = %d, want 0",
+			passBoundaryDeliveryID,
+		)
+	}
+	if !storedCompletedAt.Equal(completedAt) {
+		t.Fatalf(
+			"completed at = %s, want %s",
+			storedCompletedAt,
+			completedAt,
+		)
+	}
+	if leaseToken != nil {
+		t.Fatalf("lease token = %q, want NULL", *leaseToken)
+	}
 }
 
 func TestGapHealingSteadyStateRequestsScaleWithNewDeliveriesAndRestart(

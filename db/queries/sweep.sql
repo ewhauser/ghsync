@@ -391,7 +391,7 @@ SET cursor = '',
     pass_high_watermark_at = NULL,
     boundary_delivery_id = COALESCE(
         NULLIF(pass_boundary_delivery_id, 0),
-        NULLIF(sqlc.arg(observed_boundary_delivery_id), 0),
+        NULLIF(sqlc.arg(observed_boundary_delivery_id)::bigint, 0::bigint),
         boundary_delivery_id
     ),
     pass_boundary_delivery_id = 0,
