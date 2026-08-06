@@ -134,7 +134,10 @@ func runContext(ctx context.Context, cfg *apiConfig) error {
 		shutdownTimeout,
 	)
 	defer cancel()
-	if err := httpServer.Shutdown(shutdownCtx); err != nil && result == nil {
+	// Shutdown re-closes any listener Serve has not yet untracked; that
+	// second close is not a shutdown failure.
+	if err := httpServer.Shutdown(shutdownCtx); err != nil &&
+		!errors.Is(err, net.ErrClosed) && result == nil {
 		result = fmt.Errorf("shut down HTTP server: %w", err)
 	}
 	if !tailerStopped {
