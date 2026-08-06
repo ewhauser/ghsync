@@ -506,6 +506,7 @@ func (s *Service) inspectSample(
 		return dbgen.DriftFinding{}, false, true, nil
 	}
 	equal, diff, err := semanticDiff(
+		current.EntityKind,
 		current.CacheSnapshot,
 		upstream,
 	)
@@ -906,27 +907,49 @@ func (s *Service) fullFetch(
 				"drift fetch PR change inputs %s: %w", key, err,
 			)
 		}
-		return encodeSnapshot(map[string]any{
+		// GraphQL is the cache's authoritative review-decision source. Its
+		// nullable field cannot distinguish an absent value after decoding,
+		// though, so retain a present REST extension as evidence instead of
+		// masking a genuine cross-source decision mismatch. If neither source
+		// observes the dimension, omit it so comparison fails open.
+		reviewDecision := nodes[0].ReviewDecision
+		if reviewDecision == "" {
+			reviewDecision = pull.ReviewDecision
+		}
+		// Prefer the raw REST mergeability value so the comparison-local mapping
+		// preserves its policy/check-state semantics for every other consumer.
+		// GraphQL is a lossless fallback when REST did not observe the field.
+		mergeability := pull.GetMergeableState()
+		if mergeability == "" {
+			mergeability = nodes[0].Mergeable
+		}
+		snapshot := map[string]any{
 			"id":              pull.GetID(),
 			"node_id":         pull.GetNodeID(),
 			"number":          pull.GetNumber(),
 			"title":           pull.GetTitle(),
 			"state":           pull.GetState(),
+			"merged":          pull.GetMerged(),
 			"draft":           pull.GetDraft(),
 			"author_login":    pull.GetUser().GetLogin(),
 			"head_ref":        pull.GetHead().GetRef(),
 			"head_sha":        pull.GetHead().GetSHA(),
 			"base_ref":        pull.GetBase().GetRef(),
 			"base_sha":        baseSHA,
-			"review_decision": pull.ReviewDecision,
-			"mergeable_state": pull.GetMergeableState(),
 			"stack_number":    stackNumber,
 			"stack_position":  stackPosition,
 			"review_requests": semanticReviewRequests(pull),
 			"reviews":         semanticPullRequestReviews(nodes[0]),
 			"comments":        semanticPullRequestComments(nodes[0]),
 			"change_inputs":   changeinputs.Semantic(changeSnapshot),
-		}), spec, nil
+		}
+		if reviewDecision != "" {
+			snapshot["review_decision"] = reviewDecision
+		}
+		if mergeability != "" {
+			snapshot["mergeable_state"] = mergeability
+		}
+		return encodeSnapshot(snapshot), spec, nil
 	case "stack":
 		repo, number, err := numberedKey(key, "stack:")
 		if err != nil {
@@ -1324,7 +1347,11 @@ func semanticOptionalTime(value *time.Time) any {
 	return semanticTime(*value)
 }
 
-func semanticDiff(cache, upstream []byte) (bool, []byte, error) {
+func semanticDiff(
+	entityKind string,
+	cache []byte,
+	upstream []byte,
+) (bool, []byte, error) {
 	var cachedValue, upstreamValue any
 	if err := json.Unmarshal(cache, &cachedValue); err != nil {
 		return false, nil, fmt.Errorf("decode cache snapshot: %w", err)
@@ -1334,6 +1361,19 @@ func semanticDiff(cache, upstream []byte) (bool, []byte, error) {
 	}
 	cachedValue = normalizeSemantic(cachedValue)
 	upstreamValue = normalizeSemantic(upstreamValue)
+	if entityKind == "pull_request" {
+		// Pull-request source representations differ only for the explicitly
+		// enumerated fields in canonicalizePullRequestComparison. Every other
+		// field retains normalizeSemantic's exact, case-sensitive comparison.
+		cachedPull, cachedOK := cachedValue.(map[string]any)
+		upstreamPull, upstreamOK := upstreamValue.(map[string]any)
+		if cachedOK && upstreamOK {
+			cachedValue, upstreamValue = canonicalizePullRequestComparison(
+				cachedPull,
+				upstreamPull,
+			)
+		}
+	}
 	if reflect.DeepEqual(cachedValue, upstreamValue) {
 		return true, []byte(`{}`), nil
 	}

@@ -3,11 +3,14 @@ package drift
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,11 +61,44 @@ type driftHarness struct {
 }
 
 func newReadyDriftHarness(t *testing.T) *driftHarness {
+	return newReadyDriftHarnessWithProjections(
+		t,
+		pullRequestResponseProjections{},
+	)
+}
+
+func newReadyDriftHarnessWithRESTProjection(
+	t *testing.T,
+	projection func(map[string]any),
+) *driftHarness {
+	return newReadyDriftHarnessWithProjections(
+		t,
+		pullRequestResponseProjections{rest: projection},
+	)
+}
+
+type pullRequestResponseProjections struct {
+	rest    func(map[string]any)
+	graphQL func(map[string]any) bool
+}
+
+func newReadyDriftHarnessWithProjections(
+	t *testing.T,
+	projections pullRequestResponseProjections,
+) *driftHarness {
 	t.Helper()
 	pool := driftTestDatabase(t)
 	fixture := fakegithub.DefaultFixture()
 	fake := fakegithub.New(fixture, "drift-secret")
-	server := httptest.NewServer(fake)
+	var githubHandler http.Handler = fake
+	if projections.rest != nil || projections.graphQL != nil {
+		githubHandler = &projectedPullRequestHandler{
+			next:        fake,
+			restPath:    "/repos/acme/monolith/pulls/4810",
+			projections: projections,
+		}
+	}
+	server := httptest.NewServer(githubHandler)
 	t.Cleanup(server.Close)
 	gate := budget.New(server.Client(), budget.Options{})
 	rest, err := gh.NewRESTClient(
@@ -225,6 +261,66 @@ func newReadyDriftHarness(t *testing.T) *driftHarness {
 	}
 }
 
+type projectedPullRequestHandler struct {
+	next        http.Handler
+	restPath    string
+	projections pullRequestResponseProjections
+}
+
+func (h *projectedPullRequestHandler) ServeHTTP(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	isREST := h.projections.rest != nil &&
+		r.Method == http.MethodGet && r.URL.Path == h.restPath
+	isGraphQL := h.projections.graphQL != nil &&
+		r.Method == http.MethodPost && r.URL.Path == "/graphql"
+	if !isREST && !isGraphQL {
+		h.next.ServeHTTP(w, r)
+		return
+	}
+	recorder := httptest.NewRecorder()
+	h.next.ServeHTTP(recorder, r)
+	for name, values := range recorder.Header() {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	if recorder.Code != http.StatusOK {
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	mutated := false
+	if isREST {
+		h.projections.rest(payload)
+		mutated = true
+	} else {
+		mutated = h.projections.graphQL(payload)
+	}
+	if !mutated {
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+		return
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The projected representation no longer has the fake's entity tag. Do
+	// not let a conditional response hide the exact source shape under test.
+	w.Header().Del("Content-Length")
+	w.Header().Del("Etag")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(encoded)
+}
+
 func (h *driftHarness) divergePullRequest() {
 	h.fixture.PullRequests[1].Title = "mutated behind cache"
 	h.fixture.PullRequests[1].UpdatedAt = h.fixture.PullRequests[1].
@@ -310,6 +406,290 @@ func TestDriftTreatsHistoricalStackPositionAsConvergedTruth(t *testing.T) {
 	}
 	if len(findings) != 0 {
 		t.Fatalf("historical stack position produced drift: %+v", findings)
+	}
+}
+
+func TestDriftTreatsRESTAndGraphQLPullRequestValuesAsConverged(t *testing.T) {
+	t.Parallel()
+	harness := newReadyDriftHarnessWithRESTProjection(
+		t,
+		func(payload map[string]any) {
+			payload["state"] = "closed"
+			payload["merged"] = true
+			payload["mergeable_state"] = "clean"
+			delete(payload, "review_decision")
+		},
+	)
+	ctx := t.Context()
+	pull := &harness.fixture.PullRequests[0]
+	pull.State = "merged"
+	pull.ReviewDecision = "APPROVED"
+	pull.MergeableState = "MERGEABLE"
+	pull.UpdatedAt = pull.UpdatedAt.Add(time.Minute)
+	harness.fake.SetFixture(harness.fixture)
+	if err := harness.handler.RefreshPR(ctx, queue.RefreshRequest{
+		Args: queue.NewRefreshPRArgs(
+			"pr:acme/monolith:4810",
+		).RefreshArgs,
+		Queue: queue.QueueSweep,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForCacheProducers(t, harness.pool)
+
+	var state, reviewDecision, mergeability string
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT pull.state, pull.review_decision, pull.mergeable_state
+		FROM pull_requests AS pull
+		JOIN repos ON repos.id = pull.repo_id
+		WHERE repos.full_name = 'acme/monolith'
+		  AND pull.number = 4810
+	`).Scan(&state, &reviewDecision, &mergeability); err != nil {
+		t.Fatal(err)
+	}
+	if state != "merged" || reviewDecision != "APPROVED" ||
+		mergeability != "MERGEABLE" {
+		t.Fatalf(
+			"GraphQL cache state/review/mergeability = %q/%q/%q",
+			state,
+			reviewDecision,
+			mergeability,
+		)
+	}
+	var generationBefore int64
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT COALESCE((
+			SELECT generation
+			FROM refresh_intent_generations
+			WHERE kind = 'refresh_pr'
+			  AND refresh_key = 'pr:acme/monolith:4810'
+		), 0)
+	`).Scan(&generationBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("semantically equivalent PR produced drift: %+v", findings)
+	}
+	var findingCount int
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM drift_findings
+		WHERE entity_kind = 'pull_request'
+		  AND entity_key = 'pr:acme/monolith:4810'
+	`).Scan(&findingCount); err != nil {
+		t.Fatal(err)
+	}
+	if findingCount != 0 {
+		t.Fatalf("semantically equivalent PR findings = %d, want 0", findingCount)
+	}
+	var generationAfter int64
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT COALESCE((
+			SELECT generation
+			FROM refresh_intent_generations
+			WHERE kind = 'refresh_pr'
+			  AND refresh_key = 'pr:acme/monolith:4810'
+		), 0)
+	`).Scan(&generationAfter); err != nil {
+		t.Fatal(err)
+	}
+	if generationAfter != generationBefore {
+		t.Fatalf(
+			"semantically equivalent PR heal generation = %d -> %d",
+			generationBefore,
+			generationAfter,
+		)
+	}
+}
+
+func TestDriftUsesPresentRESTDecisionWhenGraphQLDecisionIsAbsent(
+	t *testing.T,
+) {
+	t.Parallel()
+	var omitNextTargetDecision atomic.Bool
+	harness := newReadyDriftHarnessWithProjections(
+		t,
+		pullRequestResponseProjections{
+			graphQL: func(payload map[string]any) bool {
+				if !omitNextTargetDecision.Load() {
+					return false
+				}
+				data, ok := payload["data"].(map[string]any)
+				if !ok {
+					return false
+				}
+				nodes, ok := data["nodes"].([]any)
+				if !ok {
+					return false
+				}
+				for _, value := range nodes {
+					node, ok := value.(map[string]any)
+					if !ok {
+						continue
+					}
+					number, ok := node["number"].(float64)
+					if !ok || int(number) != 4812 {
+						continue
+					}
+					if !omitNextTargetDecision.CompareAndSwap(true, false) {
+						return false
+					}
+					delete(node, "reviewDecision")
+					return true
+				}
+				return false
+			},
+		},
+	)
+	ctx := t.Context()
+	if _, err := harness.pool.Exec(ctx, `
+		UPDATE pull_requests AS pull
+		SET review_decision = 'APPROVED'
+		FROM repos
+		WHERE repos.id = pull.repo_id
+		  AND repos.full_name = 'acme/monolith'
+		  AND pull.number = 4812
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first target GraphQL response belongs to drift fullFetch. The real
+	// refresh_pr heal sees the fixture's subsequent CHANGES_REQUESTED value.
+	omitNextTargetDecision.Store(true)
+	findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if omitNextTargetDecision.Load() {
+		t.Fatal("target GraphQL review-decision projection was not exercised")
+	}
+	if len(findings) != 1 ||
+		findings[0].EntityKey != "pr:acme/monolith:4812" ||
+		!strings.Contains(string(findings[0].Diff), "review_decision") {
+		t.Fatalf("REST review-decision drift findings = %+v", findings)
+	}
+	var upstream map[string]any
+	if err := json.Unmarshal(findings[0].UpstreamSnapshot, &upstream); err != nil {
+		t.Fatal(err)
+	}
+	if upstream["review_decision"] != "CHANGES_REQUESTED" {
+		t.Fatalf(
+			"fullFetch review_decision = %v, want REST CHANGES_REQUESTED",
+			upstream["review_decision"],
+		)
+	}
+
+	waitForCacheProducers(t, harness.pool)
+	var healed string
+	if err := harness.pool.QueryRow(ctx, `
+		SELECT pull.review_decision
+		FROM pull_requests AS pull
+		JOIN repos ON repos.id = pull.repo_id
+		WHERE repos.full_name = 'acme/monolith'
+		  AND pull.number = 4812
+	`).Scan(&healed); err != nil {
+		t.Fatal(err)
+	}
+	if healed != "CHANGES_REQUESTED" {
+		t.Fatalf("healed review_decision = %q", healed)
+	}
+	if findings, err := harness.service.Detect(ctx, DetectArgs{
+		InstallationID: 1,
+		SampleSize:     100,
+	}); err != nil {
+		t.Fatal(err)
+	} else if len(findings) != 0 {
+		t.Fatalf("post-heal REST review-decision findings = %+v", findings)
+	}
+}
+
+func TestDriftDetectsAndHealsCanonicalPullRequestFieldDivergence(
+	t *testing.T,
+) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		field      string
+		corrupt    string
+		wantHealed string
+	}{
+		{name: "state", field: "state", corrupt: "closed", wantHealed: "open"},
+		{
+			name:       "review_decision",
+			field:      "review_decision",
+			corrupt:    "APPROVED",
+			wantHealed: "CHANGES_REQUESTED",
+		},
+		{
+			name:       "mergeable_state",
+			field:      "mergeable_state",
+			corrupt:    "MERGEABLE",
+			wantHealed: "CONFLICTING",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			harness := newReadyDriftHarness(t)
+			ctx := t.Context()
+			if _, err := harness.pool.Exec(ctx, `
+				UPDATE pull_requests AS pull
+				SET `+test.field+` = $1
+				FROM repos
+				WHERE repos.id = pull.repo_id
+				  AND repos.full_name = 'acme/monolith'
+				  AND pull.number = 4812
+			`, test.corrupt); err != nil {
+				t.Fatal(err)
+			}
+
+			findings, err := harness.service.Detect(ctx, DetectArgs{
+				InstallationID: 1,
+				SampleSize:     100,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(findings) != 1 ||
+				findings[0].EntityKey != "pr:acme/monolith:4812" ||
+				!strings.Contains(string(findings[0].Diff), test.field) {
+				t.Fatalf("%s drift findings = %+v", test.field, findings)
+			}
+			waitForCacheProducers(t, harness.pool)
+
+			var healed string
+			if err := harness.pool.QueryRow(ctx, `
+				SELECT `+test.field+`
+				FROM pull_requests AS pull
+				JOIN repos ON repos.id = pull.repo_id
+				WHERE repos.full_name = 'acme/monolith'
+				  AND pull.number = 4812
+			`).Scan(&healed); err != nil {
+				t.Fatal(err)
+			}
+			if healed != test.wantHealed {
+				t.Fatalf("healed %s = %q, want %q", test.field, healed, test.wantHealed)
+			}
+			if findings, err := harness.service.Detect(ctx, DetectArgs{
+				InstallationID: 1,
+				SampleSize:     100,
+			}); err != nil {
+				t.Fatal(err)
+			} else if len(findings) != 0 {
+				t.Fatalf("post-heal %s findings = %+v", test.field, findings)
+			}
+		})
 	}
 }
 
@@ -1541,7 +1921,7 @@ func TestSemanticDiffNormalizesIDOrderedCollections(t *testing.T) {
 	t.Parallel()
 	cache := []byte(`{"runs":[{"id":10,"name":"ten"},{"id":2,"name":"two"}]}`)
 	upstream := []byte(`{"runs":[{"name":"two","id":2},{"name":"ten","id":10}]}`)
-	equal, diff, err := semanticDiff(cache, upstream)
+	equal, diff, err := semanticDiff("checks", cache, upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1554,7 +1934,7 @@ func TestSemanticDiffNormalizesReviewRequestsInGo(t *testing.T) {
 	t.Parallel()
 	cache := []byte(`{"review_requests":[{"kind":"user","id":7},{"kind":"team","id":7}]}`)
 	upstream := []byte(`{"review_requests":[{"id":7,"kind":"team"},{"id":7,"kind":"user"}]}`)
-	equal, diff, err := semanticDiff(cache, upstream)
+	equal, diff, err := semanticDiff("pull_request", cache, upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1579,7 +1959,7 @@ func TestSemanticDiffNormalizesNullableDatabaseIDsByNodeIDInGo(
 			{"author_node_id":null,"node_id":"review-Z","id":null}
 		]
 	}`)
-	equal, diff, err := semanticDiff(cache, upstream)
+	equal, diff, err := semanticDiff("pull_request", cache, upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1614,7 +1994,7 @@ func TestSemanticDiffNormalizesChangedFilesAndOwnersInGo(t *testing.T) {
 			]
 		}
 	}`)
-	equal, diff, err := semanticDiff(cache, upstream)
+	equal, diff, err := semanticDiff("pull_request", cache, upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
