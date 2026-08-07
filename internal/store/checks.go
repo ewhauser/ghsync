@@ -36,8 +36,8 @@ func (w *EntityWriter) ChecksMetadata(
 	}, nil
 }
 
-// ApplyChecksObserved conditionally replaces a head SHA's check runs while
-// holding its observation lock.
+// ApplyChecksObserved conditionally replaces a head SHA's check runs against
+// its optimistic observation version.
 func (w *EntityWriter) ApplyChecksObserved(
 	ctx context.Context,
 	observation *Observation,

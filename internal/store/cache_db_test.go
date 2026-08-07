@@ -1498,22 +1498,6 @@ func TestEntityKeyConstructorsMatchSQLGrammar(t *testing.T) {
 			wantLockKeys,
 		)
 	}
-
-	var discoveryKey string
-	if err := pool.QueryRow(
-		ctx,
-		`SELECT ('repo-discovery:' || $1::bigint || ':' || $2::text)::text`,
-		repository.InstallationID,
-		repository.FullName,
-	).Scan(&discoveryKey); err != nil {
-		t.Fatal(err)
-	}
-	if want := RepositoryDiscoveryKey(
-		repository.InstallationID,
-		repository.FullName,
-	); discoveryKey != want {
-		t.Fatalf("SQL discovery key = %q, Go constructor = %q", discoveryKey, want)
-	}
 }
 
 func waitForAdvisoryWaiters(

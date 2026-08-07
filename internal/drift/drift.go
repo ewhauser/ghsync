@@ -464,7 +464,7 @@ func (s *Service) inspectSample(
 		if closeErr := observation.CloseContext(ctx); closeErr != nil {
 			slog.WarnContext(
 				context.WithoutCancel(ctx),
-				"drift observation cleanup failed; connection destroyed",
+				"drift observation cleanup failed",
 				"entity_key", observation.Key(),
 				"error", closeErr,
 			)
@@ -517,38 +517,53 @@ func (s *Service) inspectSample(
 			err,
 		)
 	}
-	if equal {
-		if _, err := dbgen.New(s.pool).ResolveOpenDriftFindings(
-			ctx,
-			dbgen.ResolveOpenDriftFindingsParams{
-				ResolvedAt:     repoutil.Timestamptz(s.config.Now()),
-				InstallationID: s.config.InstallationID,
-				EntityKind:     current.EntityKind,
-				EntityKey:      current.EntityKey,
-			},
-		); err != nil {
-			return dbgen.DriftFinding{}, false, false, fmt.Errorf(
-				"resolve drift findings: %w",
-				err,
-			)
-		}
-		return dbgen.DriftFinding{}, false, false, nil
-	}
-	finding, first, escalated, err := s.recordAndHeal(
+	var finding dbgen.DriftFinding
+	var first, escalated bool
+	err = s.writer.WithObservationTransaction(
 		ctx,
-		&driftSample{
-			EntityKind:    current.EntityKind,
-			SourceID:      current.SourceID,
-			EntityKey:     current.EntityKey,
-			LockKey:       current.LockKey,
-			CacheSnapshot: current.CacheSnapshot,
+		observation,
+		func(tx pgx.Tx) error {
+			if equal {
+				_, resolveErr := dbgen.New(tx).ResolveOpenDriftFindings(
+					ctx,
+					dbgen.ResolveOpenDriftFindingsParams{
+						ResolvedAt:     repoutil.Timestamptz(s.config.Now()),
+						InstallationID: s.config.InstallationID,
+						EntityKind:     current.EntityKind,
+						EntityKey:      current.EntityKey,
+					},
+				)
+				if resolveErr != nil {
+					return fmt.Errorf("resolve drift findings: %w", resolveErr)
+				}
+				return nil
+			}
+			var recordErr error
+			finding, first, escalated, recordErr = s.recordAndHealTx(
+				ctx,
+				tx,
+				&driftSample{
+					EntityKind:    current.EntityKind,
+					SourceID:      current.SourceID,
+					EntityKey:     current.EntityKey,
+					LockKey:       current.LockKey,
+					CacheSnapshot: current.CacheSnapshot,
+				},
+				upstream,
+				diff,
+				&spec,
+			)
+			return recordErr
 		},
-		upstream,
-		diff,
-		&spec,
 	)
+	if errors.Is(err, store.ErrObservationSuperseded) {
+		return dbgen.DriftFinding{}, false, true, nil
+	}
 	if err != nil {
 		return dbgen.DriftFinding{}, false, false, err
+	}
+	if equal {
+		return dbgen.DriftFinding{}, false, false, nil
 	}
 	if first {
 		s.config.Observer.Divergence(ctx, &finding)
@@ -623,8 +638,9 @@ func (s *Service) logSkippedSample(
 	)
 }
 
-func (s *Service) recordAndHeal(
+func (s *Service) recordAndHealTx(
 	ctx context.Context,
+	tx pgx.Tx,
 	sample *driftSample,
 	upstream []byte,
 	diff []byte,
@@ -636,14 +652,6 @@ func (s *Service) recordAndHeal(
 			"drift River client is not configured",
 		)
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
-			"begin drift finding: %w",
-			err,
-		)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	now := s.config.Now().UTC()
 	// Must match diff_hash values already stored in drift_findings (md5 of
 	// the canonical diff). This is a content
@@ -719,12 +727,6 @@ func (s *Service) recordAndHeal(
 				)
 			}
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return dbgen.DriftFinding{}, false, false, fmt.Errorf(
-				"commit persistent drift finding: %w",
-				err,
-			)
-		}
 		return finding, false, escalated, nil
 	}
 	finding, err = queries.InsertDriftFinding(
@@ -773,12 +775,6 @@ func (s *Service) recordAndHeal(
 	if err != nil {
 		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
 			"record drift heal generation: %w",
-			err,
-		)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return dbgen.DriftFinding{}, false, false, fmt.Errorf(
-			"commit drift finding: %w",
 			err,
 		)
 	}

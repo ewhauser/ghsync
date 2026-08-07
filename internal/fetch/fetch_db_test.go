@@ -788,7 +788,7 @@ func TestCoordinatorStampsEveryGangedItemEventContext(t *testing.T) {
 	}
 }
 
-func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
+func TestCoordinatorObservationsDoNotReservePoolDuringGitHubBatch(t *testing.T) {
 	t.Parallel()
 	database := testdb.New(t)
 	waiterPool := fetchPoolWithStatementTimeout(
@@ -822,9 +822,10 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 	var releaseSlow sync.Once
 	releaseSlowResponse := func() { releaseSlow.Do(func() { close(slowGate) }) }
 	defer releaseSlowResponse()
+	slowPool := fetchPoolWithMaxConns(t, database.URL, 2)
 	slowFake, slowServer, slowHandler, slowRiver := newDirectHandler(
 		t,
-		database.Pool,
+		slowPool,
 		fixture,
 		5*time.Millisecond,
 		100,
@@ -837,7 +838,7 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 		slowDone <- slowHandler.RefreshPR(t.Context(), refreshPRRequest(4812))
 	}()
 	waitForFakeRequest(t, slowFake, http.MethodPost, "/graphql")
-	probe, err := database.Pool.Acquire(t.Context())
+	probe, err := slowPool.Acquire(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -846,7 +847,7 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 		t,
 		probe,
 		store.PullRequestEntityKey(1, fixture.Repository.ID, 4812),
-		false,
+		true,
 	)
 	assertObservationLockAvailability(
 		t,
@@ -854,6 +855,19 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 		store.RepositoryEntityKey(1, fixture.Repository.ID),
 		true,
 	)
+	controlCtx, cancelControl := context.WithTimeout(
+		t.Context(), 250*time.Millisecond,
+	)
+	defer cancelControl()
+	var controlPlaneHealthy bool
+	if err := slowPool.QueryRow(controlCtx, `SELECT true`).Scan(
+		&controlPlaneHealthy,
+	); err != nil {
+		t.Fatalf("control-plane query during slow GitHub batch: %v", err)
+	}
+	if !controlPlaneHealthy {
+		t.Fatal("control-plane query did not complete")
+	}
 
 	fixture.PullRequests[2].Title = "fast sibling escaped repository lock"
 	fastFake.SetFixture(fixture)
@@ -877,6 +891,67 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 	releaseSlowResponse()
 	if err := <-slowDone; err != nil {
 		t.Fatalf("slow batch: %v", err)
+	}
+}
+
+func TestEnsureRepositorySerializesColdDiscoveryWithoutPoolReservation(
+	t *testing.T,
+) {
+	t.Parallel()
+	repo := "acme/discovery-singleflight"
+	database := testdb.New(t)
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	responseGate := make(chan struct{})
+	var releaseResponse sync.Once
+	release := func() { releaseResponse.Do(func() { close(responseGate) }) }
+	defer release()
+	path := "/repos/" + repo
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		database.Pool,
+		fixture,
+		5*time.Millisecond,
+		100,
+		fakegithub.WithResponseGate(http.MethodGet, path, responseGate),
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+
+	type result struct {
+		repository store.RepositoryRecord
+		err        error
+	}
+	done := make(chan result, 2)
+	discover := func() {
+		repository, err := handler.ensureRepository(
+			t.Context(),
+			budget.Event,
+			store.SyncSourceWebhook,
+			repo,
+			false,
+		)
+		done <- result{repository: repository, err: err}
+	}
+	go discover()
+	waitForFakeRequest(t, fake, http.MethodGet, path)
+	go discover()
+	time.Sleep(100 * time.Millisecond)
+	if got := fake.RequestCount(http.MethodGet, path); got != 1 {
+		t.Fatalf("concurrent cold repository requests = %d, want 1", got)
+	}
+
+	release()
+	for range 2 {
+		result := <-done
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.repository.FullName != repo {
+			t.Fatalf("discovered repository = %q, want %q", result.repository.FullName, repo)
+		}
+	}
+	if got := fake.RequestCount(http.MethodGet, path); got != 1 {
+		t.Fatalf("completed cold repository requests = %d, want 1", got)
 	}
 }
 
@@ -1299,7 +1374,7 @@ func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
 	}
 }
 
-func TestBatchObservationLockBlocksConcurrentWorkerAndCommitsFollowupGeneration(
+func TestBatchObservationRetriesConcurrentWorkerAndCommitsFollowupGeneration(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -1378,16 +1453,17 @@ func TestBatchObservationLockBlocksConcurrentWorkerAndCommitsFollowupGeneration(
 	go func() {
 		resolveDone <- handler.ResolveStackMembership(ctx, resolveRequest)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	for fake.RequestCount(
+		http.MethodGet,
+		"/repos/acme/monolith/pulls/4812",
+	) == baselineREST && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if got := fake.RequestCount(
 		http.MethodGet,
 		"/repos/acme/monolith/pulls/4812",
-	); got != baselineREST {
-		t.Fatalf(
-			"concurrent REST worker fetched while batch held lock: %d -> %d",
-			baselineREST,
-			got,
-		)
+	); got == baselineREST {
+		t.Fatal("concurrent REST worker did not fetch during GraphQL observation")
 	}
 	if err := <-refreshDone; err != nil {
 		t.Fatal(err)
@@ -4085,8 +4161,10 @@ func TestOrderIndependenceFinalCacheState(t *testing.T) {
 		}
 		harness.dispatchAll()
 		harness.waitIdle()
-		// Reconciliation must converge the source-rich PR observation after any
+		// Reconciliation must converge the semantic PR observation after any
 		// event-order race with parent-only repository or stack observations.
+		// A domain-equal sweep does not replace the provenance of the webhook
+		// observation that already committed the same repository state.
 		if _, err := harness.river.Insert(
 			t.Context(),
 			queue.NewRefreshPRArgs(fmt.Sprintf("pr:%s:4812", repo)),
@@ -4113,7 +4191,7 @@ func expectedOrderCacheSnapshot() cacheSnapshot {
 	// and snapshotCache. It prevents an identically empty or consistently
 	// malformed implementation from satisfying C-I4 by self-comparison.
 	return cacheSnapshot{
-		Repos:        `[{"gh_id": 2001, "node_id": "R_acme_order", "archived": false, "head_sha": "aaaa000", "full_name": "acme/order", "tombstoned": false, "sync_source": "reconcile", "gh_updated_at": "2026-07-28T12:00:00Z", "default_branch": "main"}]`,
+		Repos:        `[{"gh_id": 2001, "node_id": "R_acme_order", "archived": false, "head_sha": "aaaa000", "full_name": "acme/order", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T12:00:00Z", "default_branch": "main"}]`,
 		RepoRules:    `[]`,
 		Stacks:       `[{"open": true, "gh_id": 9876543, "number": 142, "entries": [{"draft": false, "state": "closed", "number": 4810, "head_ref": "refactor/tokenizer", "head_sha": "bbbb001", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4812, "head_ref": "refactor/bm25f-ranker", "head_sha": "8f31c2d", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4815, "head_ref": "feat/relevance-debug", "head_sha": "bbbb003", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4816, "head_ref": "feat/results-rewire", "head_sha": "bbbb004", "updated_at": "2026-07-28T12:00:00Z"}, {"draft": false, "state": "open", "number": 4820, "head_ref": "feat/relevance-telemetry", "head_sha": "bbbb005", "updated_at": "2026-07-28T12:00:00Z"}], "node_id": "S_kwDOABCDEF4AAAAA", "base_ref": "main", "base_sha": "aaaa000", "head_sha": "bbbb005", "tombstoned": false, "sync_source": "webhook", "gh_updated_at": "2026-07-28T12:00:00Z"}]`,
 		Pulls:        `[{"gh_id": 804810, "state": "closed", "title": "Tokenizer rewrite for query parser", "number": 4810, "node_id": "PR_kwDOABCDEF4810", "base_ref": "main", "base_sha": "aaaa000", "head_ref": "refactor/tokenizer", "head_sha": "bbbb001", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 1, "review_decision": "APPROVED"}, {"gh_id": 804812, "state": "open", "title": "BM25F ranker integration", "number": 4812, "node_id": "PR_kwDOABCDEF4812", "base_ref": "refactor/tokenizer", "base_sha": "bbbb001", "head_ref": "refactor/bm25f-ranker", "head_sha": "8f31c2d", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 2, "review_decision": "CHANGES_REQUESTED"}, {"gh_id": 804815, "state": "open", "title": "Relevance debug API endpoint", "number": 4815, "node_id": "PR_kwDOABCDEF4815", "base_ref": "refactor/bm25f-ranker", "base_sha": "8f31c2d", "head_ref": "feat/relevance-debug", "head_sha": "bbbb003", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 3, "review_decision": "REVIEW_REQUIRED"}, {"gh_id": 804816, "state": "open", "title": "Results page rewiring", "number": 4816, "node_id": "PR_kwDOABCDEF4816", "base_ref": "feat/relevance-debug", "base_sha": "bbbb003", "head_ref": "feat/results-rewire", "head_sha": "bbbb004", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 4, "review_decision": "REVIEW_REQUIRED"}, {"gh_id": 804820, "state": "open", "title": "Relevance telemetry dashboards", "number": 4820, "node_id": "PR_kwDOABCDEF4820", "base_ref": "feat/results-rewire", "base_sha": "bbbb004", "head_ref": "feat/relevance-telemetry", "head_sha": "bbbb005", "tombstoned": false, "sync_source": "webhook", "stack_number": 142, "gh_updated_at": "2026-07-28T12:00:00Z", "stack_position": 5, "review_decision": "REVIEW_REQUIRED"}]`,
@@ -4260,6 +4338,113 @@ func TestBranchBulkPagesConvergeWithIndividualRefreshes(t *testing.T) {
 			"page status/superseded = %q/%d, want completed/1",
 			status, superseded,
 		)
+	}
+}
+
+func TestSlowBranchPagesDoNotStarveSmallDatabasePool(t *testing.T) {
+	t.Parallel()
+	const branch = "refactor/bm25f-ranker"
+	repo := "acme/branch-small-pool"
+	database := testdb.New(t)
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	_, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t, database.Pool, fixture, 5*time.Millisecond, 100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	seed := &manualBranchHarness{
+		t: t, repo: repo, pool: database.Pool, handler: seedHandler,
+		river: seedRiver,
+	}
+	seed.warmBranchDependents()
+	seed.rewindBranchCache(branch, "8f31c2d", "slow-page-old-head")
+	page := seed.applyBranchPage(&store.BranchPushHint{
+		RepoFullName:    repo,
+		Branch:          branch,
+		BeforeSHA:       "slow-page-old-head",
+		AfterSHA:        "8f31c2d",
+		TransitionKnown: true,
+		DeliveryGUID:    "slow-pages-small-pool",
+		ReceivedAt:      time.Date(2026, 8, 6, 20, 0, 0, 0, time.UTC),
+	})
+	if len(page.Targets) < 2 {
+		t.Fatalf("branch fixture produced %d targets, want at least 2", len(page.Targets))
+	}
+
+	// Split the bounded target set into two durable pages so both page workers
+	// can have slow GitHub calls in flight against the same two-connection pool.
+	split := (len(page.Targets) + 1) / 2
+	if _, err := database.Pool.Exec(t.Context(), `
+		UPDATE branch_reconciliation_pages
+		SET target_count = $5
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+		  AND page_number = $4
+	`, page.RepoID, page.Branch, page.Generation, page.Page, split); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(t.Context(), `
+		INSERT INTO branch_reconciliation_pages (
+		    repo_id, branch, generation, page_number, target_count,
+		    status, created_at
+		) VALUES ($1, $2, $3, 2, $4, 'pending', clock_timestamp())
+	`, page.RepoID, page.Branch, page.Generation,
+		len(page.Targets)-split); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(t.Context(), `
+		UPDATE branch_reconciliations
+		SET page_count = 2
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+	`, page.RepoID, page.Branch, page.Generation); err != nil {
+		t.Fatal(err)
+	}
+	pages := []queue.BranchReconcilePageArgs{
+		queue.NewBranchReconcilePageArgs(
+			page.RepoID, page.RepoFullName, page.Branch, page.Generation, 1,
+			page.Targets[:split],
+		),
+		queue.NewBranchReconcilePageArgs(
+			page.RepoID, page.RepoFullName, page.Branch, page.Generation, 2,
+			page.Targets[split:],
+		),
+	}
+
+	smallPool := fetchPoolWithMaxConns(t, database.URL, 2)
+	slowFake, slowServer, slowHandler, slowRiver := newDirectHandler(
+		t, smallPool, fixture, 5*time.Millisecond, 100,
+		fakegithub.WithResponseDelay(750*time.Millisecond),
+	)
+	defer slowServer.Close()
+	slowHandler.SetRiverClient(slowRiver)
+	done := make(chan error, len(pages))
+	for index := range pages {
+		go func(page *queue.BranchReconcilePageArgs) {
+			done <- slowHandler.ReconcileBranchPage(t.Context(), page)
+		}(&pages[index])
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for slowFake.Concurrent() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("two slow branch-page requests were not concurrently in flight")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	controlCtx, cancelControl := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancelControl()
+	var controlPlaneHealthy bool
+	if err := smallPool.QueryRow(controlCtx, `SELECT true`).Scan(
+		&controlPlaneHealthy,
+	); err != nil {
+		t.Fatalf("control-plane query starved by slow branch pages: %v", err)
+	}
+	if !controlPlaneHealthy {
+		t.Fatal("control-plane query did not complete")
+	}
+	for range pages {
+		if err := <-done; err != nil {
+			t.Fatalf("slow branch page: %v", err)
+		}
 	}
 }
 
@@ -5288,6 +5473,25 @@ func fetchPoolWithStatementTimeout(
 	))
 	parsed.RawQuery = query.Encode()
 	pool, err := store.Connect(t.Context(), parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+func fetchPoolWithMaxConns(
+	t *testing.T,
+	databaseURL string,
+	maxConns int32,
+) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.MaxConns = maxConns
+	pool, err := pgxpool.NewWithConfig(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}

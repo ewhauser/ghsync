@@ -30,8 +30,8 @@ func (w *EntityWriter) RepoRulesMetadata(
 	}, row.RepoID, nil
 }
 
-// ApplyRepoRulesObserved conditionally replaces repository rules while holding
-// the repository-rules observation lock.
+// ApplyRepoRulesObserved conditionally replaces repository rules against the
+// optimistic repository-rules observation version.
 func (w *EntityWriter) ApplyRepoRulesObserved(
 	ctx context.Context,
 	observation *Observation,

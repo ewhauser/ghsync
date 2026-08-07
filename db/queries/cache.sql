@@ -1,14 +1,6 @@
 -- name: AcquireEntityAdvisoryLock :exec
--- C-C1 transaction-scoped serialization for direct writer calls.
+-- C-C1 transaction-scoped serialization for every entity writer.
 SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg(entity_key)::text, 0));
-
--- name: AcquireEntitySessionLock :exec
--- Fetch workers use a dedicated connection and hold this lock from before
--- observation until after the state transaction commits.
-SELECT pg_advisory_lock(hashtextextended(sqlc.arg(entity_key)::text, 0));
-
--- name: ReleaseEntitySessionLock :one
-SELECT pg_advisory_unlock(hashtextextended(sqlc.arg(entity_key)::text, 0));
 
 -- name: GetRepoByFullName :one
 SELECT repos.*

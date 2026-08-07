@@ -410,9 +410,9 @@ func pullRecordsFromList(
 		)
 		// The list endpoint is discovery input, not an authoritative
 		// replace-set observation. Its response is fetched before the PR
-		// entity observation lock and may omit or lag review requests. The
+		// entity observation version and may omit or lag review requests. The
 		// backfill child refresh writes the complete detail/GraphQL set while
-		// holding that lock.
+		// holding its short compare-and-write transaction.
 		record.ReviewRequests = nil
 		record.ReviewRequestsKnown = false
 		records = append(records, record)

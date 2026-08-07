@@ -7,9 +7,8 @@ import (
 	"github.com/ewhauser/ghsync/internal/store"
 )
 
-// closeObservation makes C-C6 cleanup failures operationally visible. The
-// store owns the bounded unlock and destroys an ambiguous physical session;
-// fetch callers cannot change an already-completed primary operation here.
+// closeObservation retains the fetch API's symmetric observation lifetime.
+// Optimistic observations own no resources, so close is currently a no-op.
 func closeObservation(ctx context.Context, observation *store.Observation) {
 	if observation == nil {
 		return
@@ -17,7 +16,7 @@ func closeObservation(ctx context.Context, observation *store.Observation) {
 	if err := observation.CloseContext(ctx); err != nil {
 		slog.WarnContext(
 			context.WithoutCancel(ctx),
-			"observation cleanup failed; connection destroyed",
+			"observation cleanup failed",
 			"entity_key", observation.Key(),
 			"error", err,
 		)
