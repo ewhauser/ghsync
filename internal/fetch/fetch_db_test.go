@@ -1135,6 +1135,172 @@ func TestCoordinatorDropsSupersededParentButCommitsUnrelatedDirectPR(
 	}
 }
 
+func TestCoordinatorRepositoryConflictDoesNotFailBatchPRs(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	baseFixture := fakegithub.DefaultFixture()
+	_, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t, database.Pool, baseFixture, 5*time.Millisecond, 100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	seedCoordinatorPulls(t, seedHandler, 4812, 4815)
+
+	gatedFixture := baseFixture
+	gatedFixture.PullRequests[1].Title = "losing batch PR one still applies"
+	gatedFixture.PullRequests[2].Title = "losing batch PR two still applies"
+	gate := make(chan struct{})
+	var release sync.Once
+	releaseResponse := func() { release.Do(func() { close(gate) }) }
+	defer releaseResponse()
+	gatedFake, gatedServer, gatedHandler, gatedRiver := newDirectHandler(
+		t,
+		database.Pool,
+		gatedFixture,
+		500*time.Millisecond,
+		100,
+		fakegithub.WithResponseGate(http.MethodPost, "/graphql", gate),
+	)
+	defer gatedServer.Close()
+	gatedHandler.SetRiverClient(gatedRiver)
+
+	done := make(chan error, 2)
+	go func() {
+		done <- gatedHandler.RefreshPR(t.Context(), refreshPRRequest(4812))
+	}()
+	go func() {
+		done <- gatedHandler.RefreshPR(t.Context(), refreshPRRequest(4815))
+	}()
+	waitForFakeRequest(t, gatedFake, http.MethodPost, "/graphql")
+
+	// A competing writer commits a newer repository representation while the
+	// gated batch's GraphQL response is held, superseding the batch's
+	// pre-fetch repository observation snapshot.
+	writer := store.NewEntityWriter(database.Pool)
+	repository, err := writer.Repository(t.Context(), "acme/monolith")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := writer.BeginObservation(
+		t.Context(),
+		store.RepositoryEntityKey(
+			repository.InstallationID,
+			repository.GitHubID,
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository.GitHubUpdatedAt = repository.GitHubUpdatedAt.Add(time.Hour)
+	if _, err := writer.ApplyRepositoryObserved(
+		t.Context(),
+		observation,
+		repository,
+		store.SyncSourceWebhook,
+		"",
+		time.Now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	fetchesBeforeRelease := gatedFake.RequestCount(http.MethodPost, "/graphql")
+	releaseResponse()
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("losing batch: %v", err)
+		}
+	}
+	if got := gatedFake.RequestCount(http.MethodPost, "/graphql"); got != fetchesBeforeRelease {
+		t.Fatalf(
+			"GraphQL fetches after repository conflict = %d, want %d (batch must not refetch)",
+			got,
+			fetchesBeforeRelease,
+		)
+	}
+
+	var titleOne, titleTwo string
+	if err := database.Pool.QueryRow(t.Context(), `
+		SELECT pull.title
+		FROM pull_requests AS pull
+		JOIN repos ON repos.id = pull.repo_id
+		WHERE repos.full_name = 'acme/monolith' AND pull.number = 4812
+	`).Scan(&titleOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Pool.QueryRow(t.Context(), `
+		SELECT pull.title
+		FROM pull_requests AS pull
+		JOIN repos ON repos.id = pull.repo_id
+		WHERE repos.full_name = 'acme/monolith' AND pull.number = 4815
+	`).Scan(&titleTwo); err != nil {
+		t.Fatal(err)
+	}
+	if titleOne != gatedFixture.PullRequests[1].Title ||
+		titleTwo != gatedFixture.PullRequests[2].Title {
+		t.Fatalf(
+			"losing batch PR titles = %q/%q, want both applied",
+			titleOne,
+			titleTwo,
+		)
+	}
+	converged, err := writer.Repository(t.Context(), "acme/monolith")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !converged.GitHubUpdatedAt.Equal(repository.GitHubUpdatedAt) {
+		t.Fatalf(
+			"repository regressed past the competing writer: %v, want %v",
+			converged.GitHubUpdatedAt,
+			repository.GitHubUpdatedAt,
+		)
+	}
+}
+
+func TestCoordinatorSameRepositoryFanoutConvergesWithoutRefetch(t *testing.T) {
+	t.Parallel()
+	database := testdb.New(t)
+	baseFixture := fakegithub.DefaultFixture()
+	_, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t, database.Pool, baseFixture, 5*time.Millisecond, 100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	numbers := []int{4812, 4815, 4816, 4820}
+	seedCoordinatorPulls(t, seedHandler, numbers...)
+
+	// Independent runtimes refreshing distinct PRs of one repository race
+	// their incidental parent applies. Every worker must converge on its
+	// single authoritative fetch; a repository snapshot race must not force
+	// any of them back to GitHub (issue #60).
+	fakes := make([]*fakegithub.Server, len(numbers))
+	done := make(chan error, len(numbers))
+	for index, number := range numbers {
+		fake, server, handler, riverClient := newDirectHandler(
+			t, database.Pool, baseFixture, 5*time.Millisecond, 100,
+		)
+		t.Cleanup(server.Close)
+		handler.SetRiverClient(riverClient)
+		fakes[index] = fake
+		go func(handler *Handler, number int) {
+			done <- handler.RefreshPR(t.Context(), refreshPRRequest(number))
+		}(handler, number)
+	}
+	for range numbers {
+		if err := <-done; err != nil {
+			t.Fatalf("same-repository fanout: %v", err)
+		}
+	}
+	for index, fake := range fakes {
+		if got := fake.RequestCount(http.MethodPost, "/graphql"); got != 1 {
+			t.Fatalf(
+				"worker %d GraphQL fetches = %d, want exactly 1",
+				index,
+				got,
+			)
+		}
+	}
+}
+
 func TestCoordinatorIsolatesReviewThreadTransportFailure(t *testing.T) {
 	t.Parallel()
 	pool := fetchTestDatabase(t)
