@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,7 +54,12 @@ type noopBranchObserver struct{}
 
 const branchPageHeartbeatInterval = 15 * time.Second
 
-const observationRetryLimit = 3
+const (
+	observationRetryLimit = 3
+	// observationRetryBackoffCeiling bounds the first retry's jitter window;
+	// later attempts double it.
+	observationRetryBackoffCeiling = 50 * time.Millisecond
+)
 
 func (noopBranchObserver) BranchReconciliationPage(
 	context.Context,
@@ -1374,12 +1380,24 @@ func retrySupersededObservation(
 	fn func() error,
 ) error {
 	var err error
-	for range observationRetryLimit {
+	for attempt := range observationRetryLimit {
 		if err = fn(); !errors.Is(err, store.ErrObservationSuperseded) {
 			return err
 		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+		if attempt == observationRetryLimit-1 {
+			break
+		}
+		// A superseded observation means a competing writer committed during
+		// this handler's remote fetch. Retrying immediately keeps concurrent
+		// same-repository workers phase-locked on the next conflict (issue
+		// #60); full jitter desynchronizes their refetches instead.
+		ceiling := observationRetryBackoffCeiling << attempt
+		timer := time.NewTimer(rand.N(ceiling))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
 	return err
