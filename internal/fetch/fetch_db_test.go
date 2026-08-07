@@ -1374,7 +1374,7 @@ func TestPullRequestStateAndFollowupGenerationsCommitAtomically(t *testing.T) {
 	}
 }
 
-func TestBatchObservationLockBlocksConcurrentWorkerAndCommitsFollowupGeneration(
+func TestBatchObservationRetriesConcurrentWorkerAndCommitsFollowupGeneration(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -1453,16 +1453,17 @@ func TestBatchObservationLockBlocksConcurrentWorkerAndCommitsFollowupGeneration(
 	go func() {
 		resolveDone <- handler.ResolveStackMembership(ctx, resolveRequest)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	for fake.RequestCount(
+		http.MethodGet,
+		"/repos/acme/monolith/pulls/4812",
+	) == baselineREST && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if got := fake.RequestCount(
 		http.MethodGet,
 		"/repos/acme/monolith/pulls/4812",
-	); got != baselineREST {
-		t.Fatalf(
-			"concurrent REST worker fetched while batch held lock: %d -> %d",
-			baselineREST,
-			got,
-		)
+	); got == baselineREST {
+		t.Fatal("concurrent REST worker did not fetch during GraphQL observation")
 	}
 	if err := <-refreshDone; err != nil {
 		t.Fatal(err)

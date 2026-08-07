@@ -53,6 +53,8 @@ type noopBranchObserver struct{}
 
 const branchPageHeartbeatInterval = 15 * time.Second
 
+const observationRetryLimit = 3
+
 func (noopBranchObserver) BranchReconciliationPage(
 	context.Context,
 	string,
@@ -126,6 +128,15 @@ func (h *Handler) SetRiverClient(client *river.Client[pgx.Tx]) {
 }
 
 func (h *Handler) RefreshRepository(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
+	return retrySupersededObservation(ctx, func() error {
+		return h.refreshRepositoryOnce(ctx, request)
+	})
+}
+
+func (h *Handler) refreshRepositoryOnce(
 	ctx context.Context,
 	request queue.RefreshRequest,
 ) error {
@@ -246,6 +257,15 @@ func (h *Handler) RefreshRepoRules(
 	ctx context.Context,
 	request queue.RefreshRequest,
 ) error {
+	return retrySupersededObservation(ctx, func() error {
+		return h.refreshRepoRulesOnce(ctx, request)
+	})
+}
+
+func (h *Handler) refreshRepoRulesOnce(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
 	key, err := parseEntityKey(request.Args.Key, "repo_rules")
 	if err != nil {
 		return err
@@ -327,6 +347,15 @@ func (h *Handler) RefreshPR(
 	ctx context.Context,
 	request queue.RefreshRequest,
 ) error {
+	return retrySupersededObservation(ctx, func() error {
+		return h.refreshPROnce(ctx, request)
+	})
+}
+
+func (h *Handler) refreshPROnce(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
 	key, err := parseEntityKey(request.Args.Key, "pr")
 	if err != nil {
 		return err
@@ -374,6 +403,15 @@ func (h *Handler) RefreshPR(
 }
 
 func (h *Handler) ResolveStackMembership(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
+	return retrySupersededObservation(ctx, func() error {
+		return h.resolveStackMembershipOnce(ctx, request)
+	})
+}
+
+func (h *Handler) resolveStackMembershipOnce(
 	ctx context.Context,
 	request queue.RefreshRequest,
 ) error {
@@ -605,6 +643,15 @@ func (h *Handler) RefreshStack(
 	ctx context.Context,
 	request queue.RefreshRequest,
 ) error {
+	return retrySupersededObservation(ctx, func() error {
+		return h.refreshStackOnce(ctx, request)
+	})
+}
+
+func (h *Handler) refreshStackOnce(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
 	key, err := parseEntityKey(request.Args.Key, "stack")
 	if err != nil {
 		return err
@@ -696,6 +743,15 @@ func (h *Handler) RefreshStack(
 }
 
 func (h *Handler) RefreshChecks(
+	ctx context.Context,
+	request queue.RefreshRequest,
+) error {
+	return retrySupersededObservation(ctx, func() error {
+		return h.refreshChecksOnce(ctx, request)
+	})
+}
+
+func (h *Handler) refreshChecksOnce(
 	ctx context.Context,
 	request queue.RefreshRequest,
 ) error {
@@ -1311,6 +1367,22 @@ func classAndSource(
 	default:
 		return "", "", fmt.Errorf("unknown refresh queue %q", queueName)
 	}
+}
+
+func retrySupersededObservation(
+	ctx context.Context,
+	fn func() error,
+) error {
+	var err error
+	for range observationRetryLimit {
+		if err = fn(); !errors.Is(err, store.ErrObservationSuperseded) {
+			return err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	return err
 }
 
 func requestKey(key entityKey) string {

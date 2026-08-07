@@ -373,13 +373,15 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			)
 			return err
 		}()
-		if errors.Is(err, store.ErrRefreshGenerationSuperseded) ||
-			errors.Is(err, store.ErrObservationSuperseded) {
+		if errors.Is(err, store.ErrRefreshGenerationSuperseded) {
 			// A newer repository/default-branch generation supersedes only the
 			// incidental parent representation. The independently fenced PR
 			// response remains authoritative and must still be applied.
 			continue
 		}
+		// An observation conflict does not prove that the competing repository
+		// write observed a newer GitHub representation. Fail the affected items
+		// so their bounded handler retry refetches both parent and PR together.
 		if err != nil {
 			repositoryFailures[repoID] = err
 		}

@@ -208,7 +208,8 @@ var ErrRefreshGenerationSuperseded = errors.New(
 
 // ErrObservationSuperseded means another write committed after the remote
 // observation began. The stale response is discarded before any cache row or
-// outbox event can commit; ordinary direct refreshes may safely retry it.
+// outbox event can commit; direct refresh handlers retry it with a new remote
+// observation before returning control to River.
 var ErrObservationSuperseded = errors.New("observation superseded")
 
 // RefreshGenerationFence is the generation a direct River worker observed
