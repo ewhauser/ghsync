@@ -894,6 +894,67 @@ func TestCoordinatorObservationsDoNotReservePoolDuringGitHubBatch(t *testing.T) 
 	}
 }
 
+func TestEnsureRepositorySerializesColdDiscoveryWithoutPoolReservation(
+	t *testing.T,
+) {
+	t.Parallel()
+	repo := "acme/discovery-singleflight"
+	database := testdb.New(t)
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	responseGate := make(chan struct{})
+	var releaseResponse sync.Once
+	release := func() { releaseResponse.Do(func() { close(responseGate) }) }
+	defer release()
+	path := "/repos/" + repo
+	fake, server, handler, riverClient := newDirectHandler(
+		t,
+		database.Pool,
+		fixture,
+		5*time.Millisecond,
+		100,
+		fakegithub.WithResponseGate(http.MethodGet, path, responseGate),
+	)
+	defer server.Close()
+	handler.SetRiverClient(riverClient)
+
+	type result struct {
+		repository store.RepositoryRecord
+		err        error
+	}
+	done := make(chan result, 2)
+	discover := func() {
+		repository, err := handler.ensureRepository(
+			t.Context(),
+			budget.Event,
+			store.SyncSourceWebhook,
+			repo,
+			false,
+		)
+		done <- result{repository: repository, err: err}
+	}
+	go discover()
+	waitForFakeRequest(t, fake, http.MethodGet, path)
+	go discover()
+	time.Sleep(100 * time.Millisecond)
+	if got := fake.RequestCount(http.MethodGet, path); got != 1 {
+		t.Fatalf("concurrent cold repository requests = %d, want 1", got)
+	}
+
+	release()
+	for range 2 {
+		result := <-done
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.repository.FullName != repo {
+			t.Fatalf("discovered repository = %q, want %q", result.repository.FullName, repo)
+		}
+	}
+	if got := fake.RequestCount(http.MethodGet, path); got != 1 {
+		t.Fatalf("completed cold repository requests = %d, want 1", got)
+	}
+}
+
 func TestCoordinatorRepositoryMetadataConvergesWhenOlderBatchLandsLast(
 	t *testing.T,
 ) {

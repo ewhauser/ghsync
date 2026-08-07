@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
@@ -128,6 +129,57 @@ func TestObservationVersionAdvancesOnlyOnCommit(t *testing.T) {
 		func(entityTx) error { return nil },
 	); err != nil {
 		t.Fatalf("reuse observation after rollback: %v", err)
+	}
+}
+
+func TestObservationTransactionFencesWithoutAdvancingVersion(t *testing.T) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	baseTime := time.Date(2026, 8, 6, 13, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/observed-side-state", 4201, baseTime)
+	pull := storeTestPull(&repository, baseTime, "initial-head")
+	if _, err := writer.ApplyPullRequest(t.Context(), pull); err != nil {
+		t.Fatal(err)
+	}
+	key := PullRequestEntityKey(
+		repository.InstallationID,
+		repository.GitHubID,
+		pull.Number,
+	)
+	observation, err := writer.BeginObservation(t.Context(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := writer.WithObservationTransaction(
+			t.Context(),
+			observation,
+			func(pgx.Tx) error { return nil },
+		); err != nil {
+			t.Fatalf("reuse read-only observation transaction: %v", err)
+		}
+	}
+
+	newer := pull
+	newer.HeadSHA = "newer-head"
+	if _, err := writer.ApplyPullRequest(t.Context(), newer); err != nil {
+		t.Fatal(err)
+	}
+	callbackRan := false
+	err = writer.WithObservationTransaction(
+		t.Context(),
+		observation,
+		func(pgx.Tx) error {
+			callbackRan = true
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrObservationSuperseded) {
+		t.Fatalf("stale observation transaction error = %v, want %v", err, ErrObservationSuperseded)
+	}
+	if callbackRan {
+		t.Fatal("stale observation transaction ran its callback")
 	}
 }
 

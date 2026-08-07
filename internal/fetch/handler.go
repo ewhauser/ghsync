@@ -72,6 +72,7 @@ type Handler struct {
 	backfillPageSize int
 	coordinator      *prCoordinator
 	branchObserver   BranchObserver
+	discoveries      discoveryGate
 
 	riverMu sync.RWMutex
 	river   *river.Client[pgx.Tx]
@@ -1235,14 +1236,14 @@ func (h *Handler) ensureRepository(
 			err,
 		)
 	}
-	discovery, err := h.writer.BeginObservation(
-		ctx,
-		store.RepositoryDiscoveryKey(h.installationID, fullName),
-	)
+	releaseDiscovery, err := h.discoveries.acquire(ctx, fullName)
 	if err != nil {
-		return store.RepositoryRecord{}, err
+		return store.RepositoryRecord{}, fmt.Errorf(
+			"wait for repository discovery: %w",
+			err,
+		)
 	}
-	defer closeObservation(ctx, discovery)
+	defer releaseDiscovery()
 	if repository, err = h.writer.Repository(ctx, fullName); err == nil {
 		return repository, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {

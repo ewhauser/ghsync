@@ -134,6 +134,62 @@ func (w *EntityWriter) beginEntityTx(
 	return tx, nil
 }
 
+func verifyObservationVersion(
+	ctx context.Context,
+	tx pgx.Tx,
+	observation *Observation,
+) error {
+	currentVersion, err := dbgen.New(tx).
+		GetEntityObservationVersionForUpdate(ctx, observation.key)
+	if errors.Is(err, pgx.ErrNoRows) {
+		currentVersion = 0
+	} else if err != nil {
+		return fmt.Errorf("read locked observation version: %w", err)
+	}
+	if currentVersion != observation.version {
+		return ErrObservationSuperseded
+	}
+	return nil
+}
+
+// WithObservationTransaction runs fn while holding the observation's short
+// transaction-scoped entity lock and committed-version fence. It is intended
+// for non-cache state that must remain consistent with an observed cache
+// snapshot. It does not advance the cache write version.
+func (w *EntityWriter) WithObservationTransaction(
+	ctx context.Context,
+	observation *Observation,
+	fn func(pgx.Tx) error,
+) error {
+	if observation == nil {
+		return fmt.Errorf("observation is required")
+	}
+	if fn == nil {
+		return fmt.Errorf("observation transaction callback is required")
+	}
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin observation transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	if err := dbgen.New(tx).AcquireEntityAdvisoryLock(
+		ctx,
+		observation.key,
+	); err != nil {
+		return fmt.Errorf("lock %s: %w", observation.key, err)
+	}
+	if err := verifyObservationVersion(ctx, tx, observation); err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit observation transaction: %w", err)
+	}
+	return nil
+}
+
 type entityTx struct {
 	ctx          context.Context //nolint:containedctx // transaction callbacks share this exact transaction-scoped context
 	tx           pgx.Tx
@@ -235,18 +291,14 @@ func (w *EntityWriter) withEntityTx(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
 	if observation != nil {
-		currentVersion, versionErr := dbgen.New(tx).
-			GetEntityObservationVersionForUpdate(ctx, key)
-		if errors.Is(versionErr, pgx.ErrNoRows) {
-			currentVersion = 0
-		} else if versionErr != nil {
-			return fmt.Errorf("read locked observation version: %w", versionErr)
-		}
-		if currentVersion != observation.version {
-			if _, ok := branchReconciliationFenceFromContext(ctx); ok {
-				return ErrBranchReconciliationSuperseded
+		if err := verifyObservationVersion(ctx, tx, observation); err != nil {
+			if errors.Is(err, ErrObservationSuperseded) {
+				if _, ok := branchReconciliationFenceFromContext(ctx); ok {
+					return ErrBranchReconciliationSuperseded
+				}
+				return ErrObservationSuperseded
 			}
-			return ErrObservationSuperseded
+			return err
 		}
 	}
 

@@ -2,7 +2,6 @@ package store
 
 import (
 	"errors"
-	"fmt"
 	"sort"
 	"time"
 
@@ -15,21 +14,11 @@ import (
 // Lock ordering: all keys returned by this file share one advisory-lock
 // keyspace. A path that must hold multiple distinct entity locks acquires their
 // complete key strings in ascending lexical order and releases in reverse.
-// In particular, repository discovery precedes its repository write
-// (repo-discovery:... -> repo:...), and the GraphQL coordinator acquires its
-// sorted PR observations before a short repository apply (pr:... -> repo:...).
-// No path may acquire a PR observation while holding a repository observation.
 
 // RepositoryEntityKey returns the normative lock and change-stream key for a
 // repository.
 func RepositoryEntityKey(installationID, repositoryGitHubID int64) string {
 	return outbox.RepositoryKey(installationID, repositoryGitHubID)
-}
-
-// RepositoryDiscoveryKey returns the normative lock key for repository
-// discovery by full name.
-func RepositoryDiscoveryKey(installationID int64, fullName string) string {
-	return fmt.Sprintf("repo-discovery:%d:%s", installationID, fullName)
 }
 
 // PullRequestEntityKey returns the normative lock, scope, and change-stream key

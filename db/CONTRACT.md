@@ -665,25 +665,20 @@ forms happen to contain the same text:
    threads), `stack:{installation_id}:{repo_gh_id}:{number}`, and
    `checks:{installation_id}:{repo_gh_id}:{head_sha}`.
 
-All entity observation and transaction locks share one PostgreSQL advisory-lock
-keyspace, derived with `hashtextextended(key, 0)`. Drift `lock_key` values and
-the entity-writer keys therefore coordinate with each other.
-`store.RepositoryDiscoveryKey` also mints
-`repo-discovery:{installation_id}:{owner}/{name}` into this same keyspace while
-an as-yet-unknown repository is fetched. Do not introduce a new producer or
-change a grammar without checking every producer that participates in this
-shared lock space.
+All entity write transactions and observation-version checks share one
+PostgreSQL advisory-lock keyspace, derived with `hashtextextended(key, 0)`.
+Drift `lock_key` values and entity-writer keys therefore coordinate with each
+other during their short post-fetch transactions. Optimistic observations own
+no advisory lock or pool connection while GitHub RPCs are in flight.
 
-When one operation must hold multiple distinct entity locks, it acquires their
-complete key strings in ascending lexical order and releases them in reverse.
-The two intentional nested paths are repository discovery followed by the
-repository writer's transaction lock (`repo-discovery:...` then `repo:...`),
-and the GraphQL PR coordinator's sorted PR observations followed by its short,
-post-hydration repository apply (`pr:...` then `repo:...`). The coordinator
-releases the repository observation before opening any PR writer transaction;
-no production path acquires a PR observation while holding a repository
-observation. Sweeps and backfills only enqueue those refreshes after their
-network reads and never hold entity locks themselves.
+Cold repository discovery happens before a GitHub ID is known, so the singleton
+fetch role serializes it by full name with a context-cancellable in-process
+gate. The elected caller performs the GitHub RPC without a database resource;
+waiters reread the cache after entering the gate. Repository and PR writes then
+take their own transaction-scoped entity locks separately. Sweeps and backfills
+only enqueue those refreshes after their network reads and never hold entity
+locks themselves. Do not introduce a new producer or change a key grammar
+without checking every producer that participates in the shared lock space.
 
 ## Writer fence and visibility watermark
 
