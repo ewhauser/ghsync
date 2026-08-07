@@ -22,6 +22,12 @@ var errGraphQLNodeNotFound = errors.New("GraphQL PR node was not found")
 const (
 	defaultBatchWindow = 5 * time.Millisecond
 	defaultBatchSize   = gh.MaxPullRequestBatch
+
+	// incidentalRepositoryApplyAttempts bounds in-place retries of the parent
+	// repository apply. Each retry re-snapshots the observation, so each
+	// absorbs one competing repository commit; a batch racing N-1 concurrent
+	// same-repository batches converges without ever escalating to a refetch.
+	incidentalRepositoryApplyAttempts = 5
 )
 
 type pullBatchItem struct {
@@ -347,19 +353,19 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			candidate.item,
 			&candidate.record.Repository,
 		)
-		switch {
-		case errors.Is(err, store.ErrRefreshGenerationSuperseded):
+		if errors.Is(err, store.ErrRefreshGenerationSuperseded) {
 			// A newer repository/default-branch generation supersedes only the
 			// incidental parent representation. The independently fenced PR
 			// response remains authoritative and must still be applied.
-		case errors.Is(err, store.ErrObservationSuperseded):
-			// Competing same-repository batches only prove interleaving, never
-			// staleness: the repository upsert is monotonic by GitHub's own
-			// update clock, so losing every snapshot race costs at most this
-			// incidental parent write's freshness. Failing the batch here
-			// turned one repository conflict into a synchronized refetch of
-			// every prepared PR (issue #60).
-		case err != nil:
+			continue
+		}
+		// A snapshot race that survives every in-place retry means sustained
+		// competing writes; only then do the depending items fail so the
+		// handler's jittered retry refetches parent and PR together. The
+		// incidental apply must eventually land or refetch — silently skipping
+		// it lets a later reconcile-source refresh claim domain changes (and
+		// provenance) the webhook observation already carried.
+		if err != nil {
 			repositoryFailures[repoID] = err
 		}
 	}
@@ -410,8 +416,9 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 // snapshot and this apply supersedes only the snapshot, not the fetched data:
 // UpsertRepositoryWriteIfNewer keeps the row monotonic by GitHub's update
 // clock regardless of local commit order. Conflicts therefore retry against a
-// fresh observation without another remote fetch, and ErrObservationSuperseded
-// escapes only after the retry budget is exhausted.
+// fresh observation without another remote fetch (issue #60); each retry
+// absorbs one competing commit, so ErrObservationSuperseded escapes only
+// under sustained same-repository churn.
 // pullApplyContext embeds callCtx, so cancellation and deadlines are
 // inherited; only Values are item-local. contextcheck cannot see through the
 // custom wrapper type.
@@ -437,7 +444,7 @@ func (c *prCoordinator) applyIncidentalRepository(
 	)
 	observation := item.repositoryObservation
 	var err error
-	for attempt := range observationRetryLimit {
+	for attempt := range incidentalRepositoryApplyAttempts {
 		if attempt > 0 {
 			observation, err = c.writer.BeginObservation(
 				repositoryCtx,
