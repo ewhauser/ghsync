@@ -145,6 +145,31 @@ func (q *Queries) CompleteRefreshIntentGeneration(ctx context.Context, arg Compl
 	return err
 }
 
+const getLatestTerminalRefreshJobState = `-- name: GetLatestTerminalRefreshJobState :one
+SELECT state::text AS state
+FROM river_job
+WHERE kind = $1::text
+  AND args->>'key' = $2::text
+  AND state IN ('cancelled', 'completed', 'discarded')
+ORDER BY id DESC
+LIMIT 1
+`
+
+type GetLatestTerminalRefreshJobStateParams struct {
+	Kind       string
+	RefreshKey string
+}
+
+// Observability for a replaced orphan pointer: the most recent terminal job
+// for the refresh identity explains how the previous pointer died. River may
+// have pruned it already, so callers treat no-rows as unknown.
+func (q *Queries) GetLatestTerminalRefreshJobState(ctx context.Context, arg GetLatestTerminalRefreshJobStateParams) (string, error) {
+	row := q.db.QueryRow(ctx, getLatestTerminalRefreshJobState, arg.Kind, arg.RefreshKey)
+	var state string
+	err := row.Scan(&state)
+	return state, err
+}
+
 const getRefreshIntentGenerationForShare = `-- name: GetRefreshIntentGenerationForShare :one
 SELECT generation
 FROM refresh_intent_generations
@@ -243,6 +268,61 @@ func (q *Queries) GetRefreshIntentStateForShare(ctx context.Context, arg GetRefr
 	var i GetRefreshIntentStateForShareRow
 	err := row.Scan(&i.Generation, &i.CompletedGeneration)
 	return i, err
+}
+
+const listOutstandingRefreshIntentGenerations = `-- name: ListOutstandingRefreshIntentGenerations :many
+SELECT kind, refresh_key, generation, completed_generation, updated_at
+FROM refresh_intent_generations
+WHERE generation > completed_generation
+  AND updated_at <= $1
+ORDER BY updated_at, kind, refresh_key
+LIMIT $2
+`
+
+type ListOutstandingRefreshIntentGenerationsParams struct {
+	StaleBefore pgtype.Timestamptz
+	BatchLimit  int32
+}
+
+type ListOutstandingRefreshIntentGenerationsRow struct {
+	Kind                string
+	RefreshKey          string
+	Generation          int64
+	CompletedGeneration int64
+	UpdatedAt           pgtype.Timestamptz
+}
+
+// Reconciliation input for orphaned pointer jobs (issue #61). An outstanding
+// generation whose unique River pointer reached a terminal state has no live
+// work left to complete it. Producers and completion both bump updated_at, so
+// a freshly signalled row is never scanned; a merely delayed row is harmless
+// because the reconciler's unique re-insert deduplicates against its live
+// pointer. Branch bulk targets self-claim their generations
+// (completed_generation = generation) and therefore never appear here.
+func (q *Queries) ListOutstandingRefreshIntentGenerations(ctx context.Context, arg ListOutstandingRefreshIntentGenerationsParams) ([]ListOutstandingRefreshIntentGenerationsRow, error) {
+	rows, err := q.db.Query(ctx, listOutstandingRefreshIntentGenerations, arg.StaleBefore, arg.BatchLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOutstandingRefreshIntentGenerationsRow
+	for rows.Next() {
+		var i ListOutstandingRefreshIntentGenerationsRow
+		if err := rows.Scan(
+			&i.Kind,
+			&i.RefreshKey,
+			&i.Generation,
+			&i.CompletedGeneration,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const tryAcquireRefreshIntentGenerationLocks = `-- name: TryAcquireRefreshIntentGenerationLocks :one

@@ -63,6 +63,7 @@ type Runtime struct {
 	gapWindowIncomplete      metric.Int64Counter
 	driftTransitions         metric.Int64Counter
 	prunerDeletes            metric.Int64Counter
+	orphanedRefreshPointers  metric.Int64Counter
 	watermarkAdvances        metric.Int64Counter
 	outboxFenceWait          metric.Float64Histogram
 	outboxFenceHold          metric.Float64Histogram
@@ -240,6 +241,12 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	if r.prunerDeletes, err = meter.Int64Counter(
 		"ghsync_c_r2_pruner_deletes",
 		metric.WithDescription("Rows or payloads removed by bounded retention passes (C-R2/C-S7)."),
+	); err != nil {
+		return err
+	}
+	if r.orphanedRefreshPointers, err = meter.Int64Counter(
+		"ghsync_c_r5_orphaned_refresh_pointers",
+		metric.WithDescription("Outstanding refresh generations whose terminal pointer job was replaced by reconciliation (issue #61)."),
 	); err != nil {
 		return err
 	}
@@ -607,6 +614,20 @@ func (r *Runtime) PrunerDelete(
 	}
 	r.prunerDeletes.Add(ctx, count, metric.WithAttributes(
 		attribute.String("kind", kind),
+	))
+}
+
+// OrphanedRefreshReplaced counts one outstanding refresh generation whose
+// terminal pointer job reconciliation replaced, distinguishing orphaned
+// generations from merely delayed ones (issue #61).
+func (r *Runtime) OrphanedRefreshReplaced(
+	ctx context.Context,
+	kind string,
+	terminalState string,
+) {
+	r.orphanedRefreshPointers.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("kind", kind),
+		attribute.String("terminal_state", terminalState),
 	))
 }
 

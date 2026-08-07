@@ -709,6 +709,7 @@ func serve(args []string) error {
 				runtimeMetrics,
 			}
 			sweepCfg.OnPrune = runtimeMetrics.PrunerDelete
+			sweepCfg.OnOrphanedRefresh = runtimeMetrics.OrphanedRefreshReplaced
 			sweepService, err = sweep.New(sweep.Options{
 				Pool:       pool,
 				REST:       rest,

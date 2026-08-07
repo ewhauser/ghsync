@@ -181,6 +181,33 @@ FROM refresh_intent_generations
 WHERE kind = $1 AND refresh_key = $2
 FOR UPDATE;
 
+-- name: ListOutstandingRefreshIntentGenerations :many
+-- Reconciliation input for orphaned pointer jobs (issue #61). An outstanding
+-- generation whose unique River pointer reached a terminal state has no live
+-- work left to complete it. Producers and completion both bump updated_at, so
+-- a freshly signalled row is never scanned; a merely delayed row is harmless
+-- because the reconciler's unique re-insert deduplicates against its live
+-- pointer. Branch bulk targets self-claim their generations
+-- (completed_generation = generation) and therefore never appear here.
+SELECT kind, refresh_key, generation, completed_generation, updated_at
+FROM refresh_intent_generations
+WHERE generation > completed_generation
+  AND updated_at <= sqlc.arg(stale_before)
+ORDER BY updated_at, kind, refresh_key
+LIMIT sqlc.arg(batch_limit);
+
+-- name: GetLatestTerminalRefreshJobState :one
+-- Observability for a replaced orphan pointer: the most recent terminal job
+-- for the refresh identity explains how the previous pointer died. River may
+-- have pruned it already, so callers treat no-rows as unknown.
+SELECT state::text AS state
+FROM river_job
+WHERE kind = sqlc.arg(kind)::text
+  AND args->>'key' = sqlc.arg(refresh_key)::text
+  AND state IN ('cancelled', 'completed', 'discarded')
+ORDER BY id DESC
+LIMIT 1;
+
 -- name: CompleteRefreshIntentGeneration :exec
 UPDATE refresh_intent_generations
 SET completed_generation = GREATEST(
