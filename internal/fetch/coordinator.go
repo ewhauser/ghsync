@@ -22,6 +22,12 @@ var errGraphQLNodeNotFound = errors.New("GraphQL PR node was not found")
 const (
 	defaultBatchWindow = 5 * time.Millisecond
 	defaultBatchSize   = gh.MaxPullRequestBatch
+
+	// incidentalRepositoryApplyAttempts bounds in-place retries of the parent
+	// repository apply. Each retry re-snapshots the observation, so each
+	// absorbs one competing repository commit; a batch racing N-1 concurrent
+	// same-repository batches converges without ever escalating to a refetch.
+	incidentalRepositoryApplyAttempts = 5
 )
 
 type pullBatchItem struct {
@@ -342,46 +348,23 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 	slices.Sort(repoIDs)
 	for _, repoID := range repoIDs {
 		candidate := repositoryCandidates[repoID]
-		err := func() error {
-			repositoryCtx := context.Context(pullApplyContext{
-				Context: callCtx,
-				values:  candidate.item.ctx,
-			})
-			repositoryCtx = store.WithRefreshGenerationFence(
-				repositoryCtx,
-				store.RefreshGenerationFence{
-					Kind: queue.KindRefreshRepository,
-					RefreshKey: "repo:" +
-						candidate.item.metadata.RepoFullName + ":metadata",
-					Generation: candidate.item.repositoryGeneration,
-				},
-			)
-			// pullApplyContext embeds callCtx, so cancellation and deadlines
-			// are inherited; only Values are item-local. contextcheck cannot
-			// see through the custom wrapper type.
-			defer closeObservation( //nolint:contextcheck // pullApplyContext embeds callCtx
-				repositoryCtx,
-				candidate.item.repositoryObservation,
-			)
-			_, err := c.writer.ApplyRepositoryObserved( //nolint:contextcheck // pullApplyContext embeds callCtx
-				repositoryCtx,
-				candidate.item.repositoryObservation,
-				candidate.record.Repository,
-				candidate.item.source,
-				"",
-				candidate.item.startedAt,
-			)
-			return err
-		}()
+		err := c.applyIncidentalRepository(
+			callCtx,
+			candidate.item,
+			&candidate.record.Repository,
+		)
 		if errors.Is(err, store.ErrRefreshGenerationSuperseded) {
 			// A newer repository/default-branch generation supersedes only the
 			// incidental parent representation. The independently fenced PR
 			// response remains authoritative and must still be applied.
 			continue
 		}
-		// An observation conflict does not prove that the competing repository
-		// write observed a newer GitHub representation. Fail the affected items
-		// so their bounded handler retry refetches both parent and PR together.
+		// A snapshot race that survives every in-place retry means sustained
+		// competing writes; only then do the depending items fail so the
+		// handler's jittered retry refetches parent and PR together. The
+		// incidental apply must eventually land or refetch — silently skipping
+		// it lets a later reconcile-source refresh claim domain changes (and
+		// provenance) the webhook observation already carried.
 		if err != nil {
 			repositoryFailures[repoID] = err
 		}
@@ -393,7 +376,11 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		candidate := &prepared[index]
 		item := candidate.item
 		record := &candidate.record
-		if repoErr := repositoryFailures[record.Repository.GitHubID]; repoErr != nil {
+		// Items that skipped the incidental parent observation never depend on
+		// the repository apply, so a repository-level failure cannot invalidate
+		// their independently fenced PR result.
+		if repoErr := repositoryFailures[record.Repository.GitHubID]; repoErr != nil &&
+			!skipsRepositoryObservation(item.ctx) {
 			results[item] = pullBatchResult{err: repoErr}
 			continue
 		}
@@ -422,6 +409,70 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		}
 	}
 	c.finishAll(batch, results, nil)
+}
+
+// applyIncidentalRepository applies one batch's parent-repository
+// representation. A repository write that commits between the pre-fetch
+// snapshot and this apply supersedes only the snapshot, not the fetched data:
+// UpsertRepositoryWriteIfNewer keeps the row monotonic by GitHub's update
+// clock regardless of local commit order. Conflicts therefore retry against a
+// fresh observation without another remote fetch (issue #60); each retry
+// absorbs one competing commit, so ErrObservationSuperseded escapes only
+// under sustained same-repository churn.
+// pullApplyContext embeds callCtx, so cancellation and deadlines are
+// inherited; only Values are item-local. contextcheck cannot see through the
+// custom wrapper type.
+//
+//nolint:contextcheck // pullApplyContext embeds callCtx
+func (c *prCoordinator) applyIncidentalRepository(
+	callCtx context.Context,
+	item *pullBatchItem,
+	repository *store.RepositoryRecord,
+) error {
+	repositoryCtx := context.Context(pullApplyContext{
+		Context: callCtx,
+		values:  item.ctx,
+	})
+	repositoryCtx = store.WithRefreshGenerationFence(
+		repositoryCtx,
+		store.RefreshGenerationFence{
+			Kind: queue.KindRefreshRepository,
+			RefreshKey: "repo:" +
+				item.metadata.RepoFullName + ":metadata",
+			Generation: item.repositoryGeneration,
+		},
+	)
+	observation := item.repositoryObservation
+	var err error
+	for attempt := range incidentalRepositoryApplyAttempts {
+		if attempt > 0 {
+			observation, err = c.writer.BeginObservation(
+				repositoryCtx,
+				store.RepositoryEntityKey(
+					item.metadata.InstallationID,
+					item.metadata.RepoGitHubID,
+				),
+			)
+			if err != nil {
+				return err
+			}
+		}
+		func() {
+			defer closeObservation(repositoryCtx, observation)
+			_, err = c.writer.ApplyRepositoryObserved(
+				repositoryCtx,
+				observation,
+				*repository,
+				item.source,
+				"",
+				item.startedAt,
+			)
+		}()
+		if !errors.Is(err, store.ErrObservationSuperseded) {
+			return err
+		}
+	}
+	return err
 }
 
 // matchingPullETag returns a validator only while it is still paired with the
