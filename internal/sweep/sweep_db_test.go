@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/rivertype"
 
 	"github.com/ewhauser/ghsync/internal/budget"
 	"github.com/ewhauser/ghsync/internal/dispatch"
@@ -3148,5 +3149,129 @@ func TestRepoRulesAndClosedKickoffsRecordHeartbeats(t *testing.T) {
 				t.Fatalf("%s sample count = %d", kind, samples)
 			}
 		}
+	}
+}
+
+func TestReconcileRefreshOrphansReplacesPointerAndRecordsHeartbeat(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testdb.New(t).Pool
+	type replaced struct {
+		kind          string
+		terminalState string
+	}
+	var replacements []replaced
+	service, err := New(Options{
+		Pool: pool,
+		Config: Config{
+			InstallationID:        1,
+			OpenStackMaxStaleness: 5 * time.Minute,
+			OpenPRMaxStaleness:    10 * time.Minute,
+			RepoRulesMaxStaleness: time.Hour,
+			ClosedMaxStaleness:    24 * time.Hour,
+			RepositoryListPeriod:  time.Hour,
+			PageSize:              50,
+			GapHealPeriod:         5 * time.Minute,
+			GapWindow:             6 * time.Hour,
+			GapPageSize:           50,
+			GapMaxPages:           10,
+			GapDeepScanPeriod:     24 * time.Hour,
+			RetentionPeriod:       24 * time.Hour,
+			RetentionAge:          90 * 24 * time.Hour,
+			RetentionBatchSize:    100,
+			OnOrphanedRefresh: func(_ context.Context, kind, state string) {
+				replacements = append(replacements, replaced{
+					kind:          kind,
+					terminalState: state,
+				})
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	riverClient, err := queue.NewClient(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetRiverClient(riverClient)
+
+	key := fmt.Sprintf("checks:acme/orphaned:%d", time.Now().UnixNano())
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := queue.InsertRefreshesTx(
+		ctx,
+		tx,
+		riverClient,
+		[]queue.RefreshSpec{{Kind: queue.KindRefreshChecks, Key: key}},
+		queue.QueueEvent,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE river_job
+		SET state = 'cancelled', finalized_at = now()
+		WHERE kind = 'refresh_checks' AND args->>'key' = $1
+	`, key); err != nil {
+		t.Fatal(err)
+	}
+	// The default staleness horizon would skip this freshly bumped row; age
+	// it past the horizon the way a long-orphaned generation would present.
+	if _, err := pool.Exec(ctx, `
+		UPDATE refresh_intent_generations
+		SET updated_at = now() - interval '1 hour'
+		WHERE kind = 'refresh_checks' AND refresh_key = $1
+	`, key); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.ReconcileRefreshOrphans(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(replacements) != 1 ||
+		replacements[0].kind != queue.KindRefreshChecks ||
+		replacements[0].terminalState != string(rivertype.JobStateCancelled) {
+		t.Fatalf("orphan hook calls = %+v", replacements)
+	}
+	var livePointers int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM river_job
+		WHERE kind = 'refresh_checks'
+		  AND args->>'key' = $1
+		  AND state IN (
+		      'available', 'pending', 'retryable', 'running', 'scheduled'
+		  )
+	`, key).Scan(&livePointers); err != nil {
+		t.Fatal(err)
+	}
+	if livePointers != 1 {
+		t.Fatalf("replacement pointers = %d, want 1", livePointers)
+	}
+	var successes, samples int64
+	if err := pool.QueryRow(ctx, `
+		SELECT success_count, sample_count
+		FROM operation_heartbeats
+		WHERE installation_id = 1
+		  AND component = 'sweep'
+		  AND operation = 'refresh_orphan_scan'
+	`).Scan(&successes, &samples); err != nil {
+		t.Fatal(err)
+	}
+	if successes != 1 || samples != 1 {
+		t.Fatalf(
+			"orphan scan heartbeat successes/samples = %d/%d, want 1/1",
+			successes,
+			samples,
+		)
 	}
 }

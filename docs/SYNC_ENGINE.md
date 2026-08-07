@@ -311,6 +311,20 @@ explicit review checklist rather than relying on call-site folklore:
   cursor, pass watermark, scan mode, shape version, and deep completion are
   durable; the per-installation lease still fences advance and completion
   without holding a database lock across delivery-list or redelivery calls.
+- **C-R5 — Outstanding generations always have live work.** Generation bumps
+  insert their unique River pointer transactionally, but River may still move
+  a pointer to a terminal state (discarded after exhausted retries,
+  cancelled) with the generation outstanding — and nothing else would ever
+  recreate it (issue #61). A periodic reconciliation pass lists stale rows
+  with `generation > completed_generation` and re-executes the producer's
+  idempotent unique insert for the current generation under the completion
+  path's one-key advisory lock. A live pointer in any queue deduplicates the
+  insert, so a merely delayed generation is untouched, concurrent reconcilers
+  cannot double-enqueue, and later signals coalesce onto the replacement
+  exactly as onto an original pointer. The pass never advances
+  `completed_generation` — only a successful refresh completes a generation —
+  and each replacement is surfaced with the prior pointer's terminal job
+  state (branch bulk targets self-claim their generations and never appear).
 
 ### Derivation & change feed (C-D)
 
@@ -622,7 +636,7 @@ maps to River's discarded state plus our error surfacing.
 | `dispatcher` | Batch-claims deliveries → refresh intents; payload-as-hint classification | C-I4, C-I5, C-Q1, C-Q3, C-P2 |
 | `fetcher` | River workers on the three fetch-priority queues; gangs due jobs into GraphQL batches; transactional set-writes | C-C1..C-C3, C-O1, C-P3, C-P4 |
 | `budgeter` | Per-installation gate (leased singleton); classes, headers, concurrency | C-B1..C-B6 |
-| `sweeper` | River **periodic jobs** (leader-elected by River) enqueue sweep work; cursors + disappearance checks + gap healing in ordinary workers | C-R1..C-R4 |
+| `sweeper` | River **periodic jobs** (leader-elected by River) enqueue sweep work; cursors + disappearance checks + gap healing + orphaned-pointer reconciliation in ordinary workers | C-R1..C-R5 |
 | `deriver` | Drain dirty scopes as a set → run pure engine → write derived + outbox per batch | C-D1..C-D4, C-P5 |
 | Postgres consumer (external) | Snapshot-consistent reads and exactly one `streamclient` tailer per `(consumer, stream)` | C-D5, C-S3..C-S5 |
 | `watermarker` | Leased singleton loop; advances the visibility watermark through the bounded writer fence | C-S2 |

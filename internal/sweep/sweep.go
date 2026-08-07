@@ -35,15 +35,20 @@ const (
 	KindRepoRules    = "repo_rules"
 	KindClosed       = "closed_tracked"
 
-	jobKindKickoff = "sweep_kickoff"
-	jobKindPage    = "sweep_list_page"
-	jobKindGapHeal = "sweep_gap_heal"
-	jobKindPrune   = "retention_prune"
+	jobKindKickoff    = "sweep_kickoff"
+	jobKindPage       = "sweep_list_page"
+	jobKindGapHeal    = "sweep_gap_heal"
+	jobKindPrune      = "retention_prune"
+	jobKindOrphanScan = "refresh_orphan_scan"
 
 	defaultGapLeaseTTL          = 5 * time.Minute
 	defaultGapContinuationDelay = 30 * time.Second
 	defaultGapDeepScanPeriod    = 24 * time.Hour
 	githubDeliveryRetention     = 72 * time.Hour
+
+	defaultOrphanScanPeriod = 5 * time.Minute
+	defaultOrphanStaleAfter = 15 * time.Minute
+	defaultOrphanBatchLimit = 200
 )
 
 var gapLeaseFallbackCounter atomic.Uint64
@@ -88,12 +93,48 @@ type Config struct {
 	// RetentionBatchSize bounds deletes per transaction.
 	RetentionBatchSize int
 
+	// OrphanScanPeriod controls refresh-pointer orphan reconciliation
+	// scheduling (issue #61).
+	OrphanScanPeriod time.Duration
+	// OrphanStaleAfter is how long an outstanding refresh generation may go
+	// untouched before the scan considers it a replacement candidate.
+	OrphanStaleAfter time.Duration
+	// OrphanBatchLimit bounds outstanding generations inspected per pass.
+	OrphanBatchLimit int
+
 	// Now supplies service time; it defaults to time.Now.
 	Now func() time.Time
 	// Observer receives sweep-overrun and gap-healing signals.
 	Observer Observer
 	// OnPrune receives per-kind deletion totals after a prune pass.
 	OnPrune PruneHook
+	// OnOrphanedRefresh receives one call per replaced orphan pointer with
+	// the refresh kind and the prior pointer's terminal River job state.
+	OnOrphanedRefresh OrphanHook
+}
+
+// OrphanHook is issue #61's orphaned-pointer accounting seam.
+type OrphanHook func(context.Context, string, string)
+
+func (c *Config) orphanScanPeriod() time.Duration {
+	if c.OrphanScanPeriod > 0 {
+		return c.OrphanScanPeriod
+	}
+	return defaultOrphanScanPeriod
+}
+
+func (c *Config) orphanStaleAfter() time.Duration {
+	if c.OrphanStaleAfter > 0 {
+		return c.OrphanStaleAfter
+	}
+	return defaultOrphanStaleAfter
+}
+
+func (c *Config) orphanBatchLimit() int32 {
+	if c.OrphanBatchLimit > 0 {
+		return int32(c.OrphanBatchLimit) //nolint:gosec // validated positive configuration bound
+	}
+	return defaultOrphanBatchLimit
 }
 
 // PruneHook is M6's C-R retention-deletion accounting seam.
@@ -388,6 +429,12 @@ type PruneArgs struct{}
 
 func (PruneArgs) Kind() string { return jobKindPrune }
 
+// OrphanScanArgs triggers one refresh-pointer orphan reconciliation pass.
+// Refresh generations are deployment-global, so the args carry no scope.
+type OrphanScanArgs struct{}
+
+func (OrphanScanArgs) Kind() string { return jobKindOrphanScan }
+
 type kickoffWorker struct {
 	river.WorkerDefaults[KickoffArgs]
 	service *Service
@@ -447,12 +494,25 @@ func (w *pruneWorker) Work(
 	return err
 }
 
+type orphanScanWorker struct {
+	river.WorkerDefaults[OrphanScanArgs]
+	service *Service
+}
+
+func (w *orphanScanWorker) Work(
+	ctx context.Context,
+	_ *river.Job[OrphanScanArgs],
+) error {
+	return w.service.ReconcileRefreshOrphans(ctx)
+}
+
 func (s *Service) RegisterReconciliationWorkers(
 	workers *river.Workers,
 ) {
 	river.AddWorker(workers, &kickoffWorker{service: s})
 	river.AddWorker(workers, &listPageWorker{service: s})
 	river.AddWorker(workers, &gapHealWorker{service: s})
+	river.AddWorker(workers, &orphanScanWorker{service: s})
 }
 
 func (s *Service) RegisterPrunerWorker(workers *river.Workers) {
@@ -480,7 +540,70 @@ func (s *Service) ReconciliationPeriodicJobs() []*river.PeriodicJob {
 				RunOnStart: true,
 			},
 		),
+		river.NewPeriodicJob(
+			river.PeriodicInterval(s.config.orphanScanPeriod()),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return OrphanScanArgs{},
+					periodicInsertOpts(queue.QueueReconcile)
+			},
+			&river.PeriodicJobOpts{
+				ID:         "ghsync_refresh_orphan_scan",
+				RunOnStart: true,
+			},
+		),
 	}
+}
+
+// ReconcileRefreshOrphans restores live pointer work for outstanding refresh
+// generations whose unique River job reached a terminal state (issue #61). A
+// replacement is enqueued on the sweep queue for the current generation;
+// merely delayed generations deduplicate against their live pointer and are
+// reported only through the pass heartbeat.
+func (s *Service) ReconcileRefreshOrphans(ctx context.Context) error {
+	client := s.riverClient()
+	if client == nil {
+		return fmt.Errorf("sweep River client is not configured")
+	}
+	staleBefore := s.config.Now().Add(-s.config.orphanStaleAfter())
+	result, err := queue.ReconcileOrphanedRefreshPointers(
+		ctx,
+		s.pool,
+		client,
+		staleBefore,
+		s.config.orphanBatchLimit(),
+		queue.QueueSweep,
+	)
+	if err != nil {
+		return err
+	}
+	for _, orphan := range result.Orphans {
+		slog.WarnContext(
+			ctx,
+			"C-R5 orphaned refresh generation re-enqueued",
+			"refresh_kind", orphan.Kind,
+			"refresh_key", orphan.Key,
+			"generation", orphan.Generation,
+			"terminal_job_state", orphan.TerminalState,
+		)
+		if s.config.OnOrphanedRefresh != nil {
+			s.config.OnOrphanedRefresh(
+				ctx,
+				orphan.Kind,
+				orphan.TerminalState,
+			)
+		}
+	}
+	if err := opsstate.RecordSuccessN(
+		ctx,
+		s.pool,
+		s.config.InstallationID,
+		"sweep",
+		jobKindOrphanScan,
+		int64(len(result.Orphans)),
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 func newGapLeaseToken() string {
