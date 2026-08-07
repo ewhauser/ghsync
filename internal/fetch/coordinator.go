@@ -25,16 +25,17 @@ const (
 )
 
 type pullBatchItem struct {
-	ctx                  context.Context //nolint:containedctx // queued work must retain each caller's values until the batch flushes
-	key                  entityKey
-	nodeID               string
-	metadata             store.FetchMetadata
-	source               store.SyncSource
-	class                budget.Class
-	startedAt            time.Time
-	hook                 func(string) store.PullRequestHook
-	result               chan pullBatchResult
-	repositoryGeneration int64
+	ctx                   context.Context //nolint:containedctx // queued work must retain each caller's values until the batch flushes
+	key                   entityKey
+	nodeID                string
+	metadata              store.FetchMetadata
+	source                store.SyncSource
+	class                 budget.Class
+	startedAt             time.Time
+	hook                  func(string) store.PullRequestHook
+	result                chan pullBatchResult
+	repositoryGeneration  int64
+	repositoryObservation *store.Observation
 }
 
 type pullBatchResult struct {
@@ -242,6 +243,18 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			continue
 		}
 		item.repositoryGeneration = repositoryGeneration
+		repositoryObservation, err := c.writer.BeginObservation(
+			callCtx,
+			store.RepositoryEntityKey(
+				item.metadata.InstallationID,
+				item.metadata.RepoGitHubID,
+			),
+		)
+		if err != nil {
+			results[item] = pullBatchResult{err: err}
+			continue
+		}
+		item.repositoryObservation = repositoryObservation
 		active = append(active, item)
 	}
 	if len(active) == 0 {
@@ -317,13 +330,10 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 		}
 	}
 
-	// C-C6 lock ordering: every remote fetch and hydration request is complete
-	// before taking a repository observation. PR observations may already be
-	// held, so repository observations are always acquired PR -> repository,
-	// released immediately after ApplyRepositoryObserved, and never retained
-	// into a PR writer transaction. No path may acquire a PR observation while
-	// holding a repository observation. Repository C-C1 serialization remains
-	// intact; C-C2 rejects an older batch that reaches this window last.
+	// Every remote fetch and hydration request is complete before repository
+	// apply. PR observations above are resource-free version tokens; repository
+	// and PR compare-and-write transactions each take only their own entity's
+	// transaction-scoped lock (C-C6).
 	repositoryFailures := make(map[int64]error)
 	repoIDs := make([]int64, 0, len(repositoryCandidates))
 	for repoID := range repositoryCandidates {
@@ -349,17 +359,13 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			// pullApplyContext embeds callCtx, so cancellation and deadlines
 			// are inherited; only Values are item-local. contextcheck cannot
 			// see through the custom wrapper type.
-			repositoryObservation, err := c.writer.BeginObservation( //nolint:contextcheck // pullApplyContext embeds callCtx
+			defer closeObservation( //nolint:contextcheck // pullApplyContext embeds callCtx
 				repositoryCtx,
-				store.RepositoryEntityKey(c.installationID, repoID),
+				candidate.item.repositoryObservation,
 			)
-			if err != nil {
-				return err
-			}
-			defer closeObservation(repositoryCtx, repositoryObservation) //nolint:contextcheck // pullApplyContext embeds callCtx
-			_, err = c.writer.ApplyRepositoryObserved(                   //nolint:contextcheck // pullApplyContext embeds callCtx
+			_, err := c.writer.ApplyRepositoryObserved( //nolint:contextcheck // pullApplyContext embeds callCtx
 				repositoryCtx,
-				repositoryObservation,
+				candidate.item.repositoryObservation,
 				candidate.record.Repository,
 				candidate.item.source,
 				"",
@@ -367,7 +373,8 @@ func (c *prCoordinator) execute(batch *pendingPullBatch) {
 			)
 			return err
 		}()
-		if errors.Is(err, store.ErrRefreshGenerationSuperseded) {
+		if errors.Is(err, store.ErrRefreshGenerationSuperseded) ||
+			errors.Is(err, store.ErrObservationSuperseded) {
 			// A newer repository/default-branch generation supersedes only the
 			// incidental parent representation. The independently fenced PR
 			// response remains authoritative and must still be applied.

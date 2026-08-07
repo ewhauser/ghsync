@@ -164,8 +164,8 @@ func (w *EntityWriter) ApplyPullRequest(
 	return w.applyPullRequest(ctx, nil, &pull, nil)
 }
 
-// ApplyPullRequestObserved conditionally applies a pull request while holding
-// its observation lock.
+// ApplyPullRequestObserved conditionally applies a pull request against its
+// optimistic observation version.
 func (w *EntityWriter) ApplyPullRequestObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -739,8 +739,8 @@ func (w *EntityWriter) ApplyPullRequestBatch(
 	return outcomes
 }
 
-// TombstonePullRequestObserved conditionally tombstones a pull request while
-// holding its observation lock.
+// TombstonePullRequestObserved conditionally tombstones a pull request against
+// its optimistic observation version.
 func (w *EntityWriter) TombstonePullRequestObserved(
 	ctx context.Context,
 	observation *Observation,

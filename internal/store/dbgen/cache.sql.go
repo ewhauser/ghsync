@@ -15,20 +15,9 @@ const acquireEntityAdvisoryLock = `-- name: AcquireEntityAdvisoryLock :exec
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
 `
 
-// C-C1 transaction-scoped serialization for direct writer calls.
+// C-C1 transaction-scoped serialization for every entity writer.
 func (q *Queries) AcquireEntityAdvisoryLock(ctx context.Context, entityKey string) error {
 	_, err := q.db.Exec(ctx, acquireEntityAdvisoryLock, entityKey)
-	return err
-}
-
-const acquireEntitySessionLock = `-- name: AcquireEntitySessionLock :exec
-SELECT pg_advisory_lock(hashtextextended($1::text, 0))
-`
-
-// Fetch workers use a dedicated connection and hold this lock from before
-// observation until after the state transaction commits.
-func (q *Queries) AcquireEntitySessionLock(ctx context.Context, entityKey string) error {
-	_, err := q.db.Exec(ctx, acquireEntitySessionLock, entityKey)
 	return err
 }
 
@@ -1093,17 +1082,6 @@ type MarkDerivationDirtyParams struct {
 func (q *Queries) MarkDerivationDirty(ctx context.Context, arg MarkDerivationDirtyParams) error {
 	_, err := q.db.Exec(ctx, markDerivationDirty, arg.MarkedAt, arg.ScopeKeys)
 	return err
-}
-
-const releaseEntitySessionLock = `-- name: ReleaseEntitySessionLock :one
-SELECT pg_advisory_unlock(hashtextextended($1::text, 0))
-`
-
-func (q *Queries) ReleaseEntitySessionLock(ctx context.Context, entityKey string) (bool, error) {
-	row := q.db.QueryRow(ctx, releaseEntitySessionLock, entityKey)
-	var pg_advisory_unlock bool
-	err := row.Scan(&pg_advisory_unlock)
-	return pg_advisory_unlock, err
 }
 
 const replaceCheckRuns = `-- name: ReplaceCheckRuns :many

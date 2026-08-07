@@ -35,8 +35,8 @@ func (w *EntityWriter) ApplyRepository(
 	return w.applyRepository(ctx, nil, &repository, source, etag, observedAt)
 }
 
-// ApplyRepositoryObserved conditionally applies a repository while holding its
-// observation lock.
+// ApplyRepositoryObserved conditionally applies a repository against its
+// optimistic observation version.
 func (w *EntityWriter) ApplyRepositoryObserved(
 	ctx context.Context,
 	observation *Observation,

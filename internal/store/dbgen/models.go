@@ -245,6 +245,11 @@ type DriftSampleCursor struct {
 	UpdatedAt      pgtype.Timestamptz
 }
 
+type EntityObservationVersion struct {
+	EntityKey string
+	Version   int64
+}
+
 type GapHealCursor struct {
 	InstallationID         int64
 	Cursor                 string

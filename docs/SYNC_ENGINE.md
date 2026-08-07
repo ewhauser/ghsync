@@ -125,15 +125,16 @@ Consequences baked into the design:
 
 ### Cache integrity (C-C)
 
-- **C-C1 — Serialized per entity.** At most one in-flight fetch+write per
-  entity key (`repo`, `pr_number` / `stack_number`). Enforced by job-queue
-  keying (§6), not by hope. Two workers may never interleave writes for the
-  same PR.
+- **C-C1 — Serialized per-entity commits.** Remote fetches may overlap, but
+  at most one compare-and-write transaction runs per entity key (`repo`,
+  `pr_number` / `stack_number`). The transaction-scoped advisory lock prevents
+  interleaved cache/outbox writes without reserving a connection during I/O.
 - **C-C2 — Monotonic writes.** Every cache write carries the fetch's
   observed version (`updated_at`, `head_sha`, ETag). A write is applied only
   if it is not older than the stored version (compare-and-set in SQL). A slow
-  response that lands after a newer one is discarded. This makes C-C1's
-  guarantee robust even across worker crashes and retries.
+  response that lands after a newer commit is discarded. The committed entity
+  observation version covers equal-upstream-version responses and makes C-C1
+  robust across overlapping fetches, worker crashes, and retries.
 - **C-C3 — Atomic write + invalidate + emit.** Entity upsert, dirty-marking
   of affected derivation scopes, and the outbox event insert happen in one
   Postgres transaction. There is no state where the cache changed but nothing
@@ -154,19 +155,16 @@ Consequences baked into the design:
   callbacks are database/CPU-only. Otherwise a slow or cyclic network
   dependency can retain row/advisory locks, make peers hit `statement_timeout`,
   and exhaust the connection pool through retries.
-  The one narrow exception is C-C1's per-entity observation: one dedicated
-  pgx session (never an open transaction) holds that entity's session advisory
-  lock across its authoritative GitHub fetch and write because serializing the
-  complete fetch+write observation is the correctness boundary. It is keyed
-  to one entity rather than shared across a repository batch. The session is
-  returned to pgxpool only after a confirmed unlock; an unlock failure or
-  cleanup timeout hijacks and closes the physical connection so PostgreSQL
-  releases the session lock on backend teardown. Repository metadata found by
-  a PR batch is different: its repository lock is acquired only after all
-  fetch and hydration calls, held solely around `ApplyRepositoryObserved`, and
-  released before any PR writer transaction. C-C2 makes two such narrowed
-  windows converge when the older response arrives last. This separation and
-  fail-closed cleanup are the durable lessons from
+  C-C1's per-entity observation is an optimistic committed-version token. The
+  pre-fetch version read releases its connection immediately. After remote I/O
+  completes, the writer takes the entity's transaction-scoped advisory lock,
+  compares the token with `entity_observation_versions`, applies the cache and
+  outbox mutation, and advances the version in the same commit. A response is
+  discarded when another entity write committed while it was in flight.
+  Direct refreshes retry that optimistic conflict; branch-page targets count
+  it as superseded because the winning observation already supplied newer
+  truth. Repository metadata found by a PR batch uses the same short
+  compare-and-write window. This separation is the durable lesson from
   [#18](https://github.com/ewhauser/ghsync/issues/18) and
   [#19](https://github.com/ewhauser/ghsync/issues/19).
 
@@ -175,8 +173,8 @@ explicit review checklist rather than relying on call-site folklore:
 
 | Sites | Transaction / contended-lock window | External-I/O verdict |
 |---|---|---|
-| `fetch.Handler` entity refreshes and `ensureRepository` | A per-entity session observation spans that entity's fetch and write; no transaction is open during the fetch. Discovery's nested direct repository write is ordered `repo-discovery:...` then `repo:...`. | The documented C-C1 exception. Each lock protects one authoritative observation, never a repository batch. |
-| `fetch.prCoordinator.execute` | Sorted `pr:...` observations span GraphQL and hydration. After every remote call, it briefly acquires `repo:...`, applies repository metadata, and releases it before PR writer transactions. | The only PR+repository site; ordering is `pr:...` then `repo:...`. There is no `repo:...` then `pr:...` site. |
+| `fetch.Handler` entity refreshes and `ensureRepository` | A per-entity version token spans the fetch; it owns no database resource. Each apply uses one short transaction-scoped entity lock. | No connection, transaction, or contended lock overlaps GitHub I/O. |
+| `fetch.prCoordinator.execute` | Sorted `pr:...` version tokens span GraphQL and hydration. Repository and PR applies then run as independent short compare-and-write transactions. | No cross-entity lock ordering: each transaction owns exactly one entity lock. |
 | `drift.inspectSample` / `recordAndHeal` | The upstream read completes before the drift observation. The later finding transaction performs SQL and River `InsertTx` only. | No external call under the observation or transaction. |
 | Entity-writer transactions and `TransactionHook` implementations | `withEntityTx` holds the entity/write fences around cache, dirty, outbox, and hook DB work. Fetch hooks close only over refresh specs and a River client, then call `queue.InsertRefreshesTx`. | River inserts are PostgreSQL work through the supplied transaction; no hook reaches the GitHub budget gate or another network client. |
 | Dispatcher and deriver (`DispatchBatch`, `derive.runOnce`) | Claim/classify/insert and snapshot/derive/write respectively remain inside their transactions. Classification and derivation are CPU-only. | No network client is reachable from either transactional callback path. |
@@ -460,8 +458,9 @@ else, so no pipeline stage does per-event work that could be per-batch work.
 - **C-P4 — Due fetches gang into GraphQL batches.** The fetcher may claim up
   to K (default 25) due entity-refresh jobs at once and satisfy them with one
   `nodes(ids:)` GraphQL call, then apply results per entity (each under its
-  C-C1 advisory lock; locks taken in sorted key order to make multi-entity
-  batches deadlock-free). This is what makes reconnect-after-outage storms
+  own short C-C1 advisory-lock transaction; entities are applied in sorted
+  order, but no transaction retains more than one entity lock). This is what
+  makes reconnect-after-outage storms
   cheap: 500 stale PRs ≈ 20 GraphQL calls, not 500.
 - **C-P5 — Derivation drains dirty sets, not dirty rows.** The deriver wakes
   (NOTIFY or interval), claims the *entire* current dirty set up to a cap,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,16 +14,13 @@ import (
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
-// Observation owns C-C1's narrowly allowed C-C6 exception: a session-level
-// advisory lock on one dedicated connection, held across one entity's GitHub
-// fetch and write. No transaction is open during the network call, and shared
-// repository metadata locks must use a shorter post-fetch scope.
+// Observation is an optimistic snapshot of one entity's committed write
+// version. It never owns a transaction, connection, or advisory lock, so it is
+// safe to retain across remote I/O. The writer verifies the version under the
+// short transaction-scoped entity lock and advances it only on commit.
 type Observation struct {
-	conn *pgxpool.Conn
-	key  string
-
-	mu     sync.Mutex
-	closed bool
+	key     string
+	version int64
 }
 
 // Key returns the entity key protected by the observation.
@@ -35,85 +31,15 @@ func (o *Observation) Key() string {
 	return o.key
 }
 
-// Close releases the observation's advisory lock and dedicated connection.
+// Close is retained for API compatibility. Observations own no resources.
 func (o *Observation) Close() error {
-	return o.CloseContext(context.Background())
+	return nil
 }
 
-// CloseContext releases the observation using a bounded cleanup context
-// derived from ctx while remaining usable after caller cancellation.
+// CloseContext is retained for API compatibility. Observations own no
+// resources, including after cancellation.
 func (o *Observation) CloseContext(ctx context.Context) error {
-	if o == nil {
-		return nil
-	}
-	o.mu.Lock()
-	if o.closed {
-		o.mu.Unlock()
-		return nil
-	}
-	o.closed = true
-	conn := o.conn
-	o.conn = nil
-	o.mu.Unlock()
-
-	cleanupCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		5*time.Second,
-	)
-	defer cancel()
-	unlocked, err := dbgen.New(conn).ReleaseEntitySessionLock(cleanupCtx, o.key)
-	if err == nil && unlocked {
-		conn.Release()
-		return nil
-	}
-	if err == nil {
-		err = errors.New("pg_advisory_unlock reported lock not held")
-	}
-
-	// C-C6: an unlock error leaves the session-lock state unknown. Hijack the
-	// physical connection so pgxpool can never lend that session to another
-	// borrower, then close its socket; PostgreSQL releases session locks when
-	// it observes backend teardown. Close always closes the underlying socket,
-	// even if the graceful Terminate exchange itself reports an error.
-	destroyErr := destroyObservationConnection(cleanupCtx, conn)
-	releaseErr := fmt.Errorf("release observation lock %s: %w", o.key, err)
-	if destroyErr != nil {
-		return errors.Join(
-			releaseErr,
-			fmt.Errorf("destroy observation connection %s: %w", o.key, destroyErr),
-		)
-	}
-	return releaseErr
-}
-
-func destroyObservationConnection(
-	ctx context.Context,
-	conn *pgxpool.Conn,
-) error {
-	physical := conn.Hijack()
-	destroyCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		time.Second,
-	)
-	defer cancel()
-	// pgconn.Close defers the underlying net.Conn.Close, so the physical socket
-	// is closed even if its bounded graceful Terminate exchange reports an
-	// error. PostgreSQL then tears down the backend and its session locks.
-	return physical.Close(destroyCtx)
-}
-
-func (o *Observation) begin(ctx context.Context) (pgx.Tx, error) {
-	if o == nil {
-		return nil, fmt.Errorf("observation is required")
-	}
-	o.mu.Lock()
-	closed := o.closed
-	conn := o.conn
-	o.mu.Unlock()
-	if closed || conn == nil {
-		return nil, fmt.Errorf("observation %s is closed", o.key)
-	}
-	return conn.Begin(ctx)
+	return nil
 }
 
 // EntityWriter owns C-C1..C-C6. Network fetches never enter this package.
@@ -149,8 +75,9 @@ func NewEntityWriter(
 	}
 }
 
-// BeginObservation acquires C-C1's dedicated session-level advisory lock for
-// entityKey. See C-C6 before extending its lifetime or nesting observations.
+// BeginObservation snapshots the entity's last committed write version. The
+// query checks out a connection only for its own duration; the returned token
+// owns no database resource while callers perform remote I/O.
 func (w *EntityWriter) BeginObservation(
 	ctx context.Context,
 	entityKey string,
@@ -158,27 +85,13 @@ func (w *EntityWriter) BeginObservation(
 	if entityKey == "" {
 		return nil, fmt.Errorf("observation entity key is required")
 	}
-	conn, err := w.pool.Acquire(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("acquire observation connection: %w", err)
+	version, err := dbgen.New(w.pool).GetEntityObservationVersion(ctx, entityKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		version = 0
+	} else if err != nil {
+		return nil, fmt.Errorf("read observation version %s: %w", entityKey, err)
 	}
-	if err := dbgen.New(conn).AcquireEntitySessionLock(ctx, entityKey); err != nil {
-		lockErr := fmt.Errorf("lock observation %s: %w", entityKey, err)
-		// A failed or canceled lock statement has ambiguous server-side state.
-		// Never return that physical session to pgxpool.
-		if destroyErr := destroyObservationConnection(ctx, conn); destroyErr != nil {
-			return nil, errors.Join(
-				lockErr,
-				fmt.Errorf(
-					"destroy failed observation connection %s: %w",
-					entityKey,
-					destroyErr,
-				),
-			)
-		}
-		return nil, lockErr
-	}
-	return &Observation{conn: conn, key: entityKey}, nil
+	return &Observation{key: entityKey, version: version}, nil
 }
 
 func (w *EntityWriter) beginEntityTx(
@@ -186,20 +99,16 @@ func (w *EntityWriter) beginEntityTx(
 	observation *Observation,
 	key string,
 ) (pgx.Tx, error) {
-	var tx pgx.Tx
-	var err error
 	if observation != nil {
 		if err := requireObservation(observation, key); err != nil {
 			return nil, err
 		}
-		tx, err = observation.begin(ctx)
-	} else {
-		tx, err = w.pool.Begin(ctx)
-		if err == nil {
-			err = dbgen.New(tx).AcquireEntityAdvisoryLock(ctx, key)
-			if err != nil {
-				err = fmt.Errorf("lock %s: %w", key, err)
-			}
+	}
+	tx, err := w.pool.Begin(ctx)
+	if err == nil {
+		err = dbgen.New(tx).AcquireEntityAdvisoryLock(ctx, key)
+		if err != nil {
+			err = fmt.Errorf("lock %s: %w", key, err)
 		}
 	}
 	if err != nil {
@@ -240,6 +149,11 @@ type entityTxFunc func(entityTx) error
 var ErrRefreshGenerationSuperseded = errors.New(
 	"refresh generation superseded",
 )
+
+// ErrObservationSuperseded means another write committed after the remote
+// observation began. The stale response is discarded before any cache row or
+// outbox event can commit; ordinary direct refreshes may safely retry it.
+var ErrObservationSuperseded = errors.New("observation superseded")
 
 // RefreshGenerationFence is the generation a direct River worker observed
 // immediately before it began remote I/O.
@@ -320,6 +234,21 @@ func (w *EntityWriter) withEntityTx(
 		return fmt.Errorf("begin entity transaction: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // deferred cleanup cannot change the primary operation result
+	if observation != nil {
+		currentVersion, versionErr := dbgen.New(tx).
+			GetEntityObservationVersionForUpdate(ctx, key)
+		if errors.Is(versionErr, pgx.ErrNoRows) {
+			currentVersion = 0
+		} else if versionErr != nil {
+			return fmt.Errorf("read locked observation version: %w", versionErr)
+		}
+		if currentVersion != observation.version {
+			if _, ok := branchReconciliationFenceFromContext(ctx); ok {
+				return ErrBranchReconciliationSuperseded
+			}
+			return ErrObservationSuperseded
+		}
+	}
 
 	databaseTime, err := databaseClock(ctx, tx)
 	if err != nil {
@@ -345,6 +274,9 @@ func (w *EntityWriter) withEntityTx(
 		if err := checkBranchReconciliationFence(ctx, tx, key, fence); err != nil {
 			return err
 		}
+	}
+	if _, err := dbgen.New(tx).AdvanceEntityObservationVersion(ctx, key); err != nil {
+		return fmt.Errorf("advance observation version: %w", err)
 	}
 	if err := w.commitEntityTx(ctx, tx); err != nil {
 		return fmt.Errorf("commit entity transaction: %w", err)

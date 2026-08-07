@@ -464,7 +464,7 @@ func (s *Service) inspectSample(
 		if closeErr := observation.CloseContext(ctx); closeErr != nil {
 			slog.WarnContext(
 				context.WithoutCancel(ctx),
-				"drift observation cleanup failed; connection destroyed",
+				"drift observation cleanup failed",
 				"entity_key", observation.Key(),
 				"error", closeErr,
 			)

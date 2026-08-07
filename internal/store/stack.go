@@ -47,8 +47,8 @@ func (w *EntityWriter) ApplyStack(
 	return w.applyStack(ctx, nil, &stack, nil)
 }
 
-// ApplyStackObserved conditionally applies a stack while holding its
-// observation lock.
+// ApplyStackObserved conditionally applies a stack against its optimistic
+// observation version.
 func (w *EntityWriter) ApplyStackObserved(
 	ctx context.Context,
 	observation *Observation,
@@ -259,8 +259,8 @@ func (w *EntityWriter) TouchStack(
 	return nil
 }
 
-// TombstoneStackObserved conditionally tombstones a stack while holding its
-// observation lock.
+// TombstoneStackObserved conditionally tombstones a stack against its
+// optimistic observation version.
 func (w *EntityWriter) TombstoneStackObserved(
 	ctx context.Context,
 	observation *Observation,

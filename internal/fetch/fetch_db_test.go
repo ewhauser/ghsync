@@ -788,7 +788,7 @@ func TestCoordinatorStampsEveryGangedItemEventContext(t *testing.T) {
 	}
 }
 
-func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
+func TestCoordinatorObservationsDoNotReservePoolDuringGitHubBatch(t *testing.T) {
 	t.Parallel()
 	database := testdb.New(t)
 	waiterPool := fetchPoolWithStatementTimeout(
@@ -822,9 +822,10 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 	var releaseSlow sync.Once
 	releaseSlowResponse := func() { releaseSlow.Do(func() { close(slowGate) }) }
 	defer releaseSlowResponse()
+	slowPool := fetchPoolWithMaxConns(t, database.URL, 2)
 	slowFake, slowServer, slowHandler, slowRiver := newDirectHandler(
 		t,
-		database.Pool,
+		slowPool,
 		fixture,
 		5*time.Millisecond,
 		100,
@@ -837,7 +838,7 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 		slowDone <- slowHandler.RefreshPR(t.Context(), refreshPRRequest(4812))
 	}()
 	waitForFakeRequest(t, slowFake, http.MethodPost, "/graphql")
-	probe, err := database.Pool.Acquire(t.Context())
+	probe, err := slowPool.Acquire(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -846,7 +847,7 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 		t,
 		probe,
 		store.PullRequestEntityKey(1, fixture.Repository.ID, 4812),
-		false,
+		true,
 	)
 	assertObservationLockAvailability(
 		t,
@@ -854,6 +855,19 @@ func TestCoordinatorRepositoryLockDoesNotSpanGitHubBatch(t *testing.T) {
 		store.RepositoryEntityKey(1, fixture.Repository.ID),
 		true,
 	)
+	controlCtx, cancelControl := context.WithTimeout(
+		t.Context(), 250*time.Millisecond,
+	)
+	defer cancelControl()
+	var controlPlaneHealthy bool
+	if err := slowPool.QueryRow(controlCtx, `SELECT true`).Scan(
+		&controlPlaneHealthy,
+	); err != nil {
+		t.Fatalf("control-plane query during slow GitHub batch: %v", err)
+	}
+	if !controlPlaneHealthy {
+		t.Fatal("control-plane query did not complete")
+	}
 
 	fixture.PullRequests[2].Title = "fast sibling escaped repository lock"
 	fastFake.SetFixture(fixture)
@@ -4263,6 +4277,113 @@ func TestBranchBulkPagesConvergeWithIndividualRefreshes(t *testing.T) {
 	}
 }
 
+func TestSlowBranchPagesDoNotStarveSmallDatabasePool(t *testing.T) {
+	t.Parallel()
+	const branch = "refactor/bm25f-ranker"
+	repo := "acme/branch-small-pool"
+	database := testdb.New(t)
+	fixture := fixtureForRepo(fakegithub.DefaultFixture(), repo)
+	_, seedServer, seedHandler, seedRiver := newDirectHandler(
+		t, database.Pool, fixture, 5*time.Millisecond, 100,
+	)
+	defer seedServer.Close()
+	seedHandler.SetRiverClient(seedRiver)
+	seed := &manualBranchHarness{
+		t: t, repo: repo, pool: database.Pool, handler: seedHandler,
+		river: seedRiver,
+	}
+	seed.warmBranchDependents()
+	seed.rewindBranchCache(branch, "8f31c2d", "slow-page-old-head")
+	page := seed.applyBranchPage(&store.BranchPushHint{
+		RepoFullName:    repo,
+		Branch:          branch,
+		BeforeSHA:       "slow-page-old-head",
+		AfterSHA:        "8f31c2d",
+		TransitionKnown: true,
+		DeliveryGUID:    "slow-pages-small-pool",
+		ReceivedAt:      time.Date(2026, 8, 6, 20, 0, 0, 0, time.UTC),
+	})
+	if len(page.Targets) < 2 {
+		t.Fatalf("branch fixture produced %d targets, want at least 2", len(page.Targets))
+	}
+
+	// Split the bounded target set into two durable pages so both page workers
+	// can have slow GitHub calls in flight against the same two-connection pool.
+	split := (len(page.Targets) + 1) / 2
+	if _, err := database.Pool.Exec(t.Context(), `
+		UPDATE branch_reconciliation_pages
+		SET target_count = $5
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+		  AND page_number = $4
+	`, page.RepoID, page.Branch, page.Generation, page.Page, split); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(t.Context(), `
+		INSERT INTO branch_reconciliation_pages (
+		    repo_id, branch, generation, page_number, target_count,
+		    status, created_at
+		) VALUES ($1, $2, $3, 2, $4, 'pending', clock_timestamp())
+	`, page.RepoID, page.Branch, page.Generation,
+		len(page.Targets)-split); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(t.Context(), `
+		UPDATE branch_reconciliations
+		SET page_count = 2
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+	`, page.RepoID, page.Branch, page.Generation); err != nil {
+		t.Fatal(err)
+	}
+	pages := []queue.BranchReconcilePageArgs{
+		queue.NewBranchReconcilePageArgs(
+			page.RepoID, page.RepoFullName, page.Branch, page.Generation, 1,
+			page.Targets[:split],
+		),
+		queue.NewBranchReconcilePageArgs(
+			page.RepoID, page.RepoFullName, page.Branch, page.Generation, 2,
+			page.Targets[split:],
+		),
+	}
+
+	smallPool := fetchPoolWithMaxConns(t, database.URL, 2)
+	slowFake, slowServer, slowHandler, slowRiver := newDirectHandler(
+		t, smallPool, fixture, 5*time.Millisecond, 100,
+		fakegithub.WithResponseDelay(750*time.Millisecond),
+	)
+	defer slowServer.Close()
+	slowHandler.SetRiverClient(slowRiver)
+	done := make(chan error, len(pages))
+	for index := range pages {
+		go func(page *queue.BranchReconcilePageArgs) {
+			done <- slowHandler.ReconcileBranchPage(t.Context(), page)
+		}(&pages[index])
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for slowFake.Concurrent() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("two slow branch-page requests were not concurrently in flight")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	controlCtx, cancelControl := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancelControl()
+	var controlPlaneHealthy bool
+	if err := smallPool.QueryRow(controlCtx, `SELECT true`).Scan(
+		&controlPlaneHealthy,
+	); err != nil {
+		t.Fatalf("control-plane query starved by slow branch pages: %v", err)
+	}
+	if !controlPlaneHealthy {
+		t.Fatal("control-plane query did not complete")
+	}
+	for range pages {
+		if err := <-done; err != nil {
+			t.Fatalf("slow branch page: %v", err)
+		}
+	}
+}
+
 // snapshotBranchConvergenceCache compares every persisted semantic,
 // authoritative-version, validator, and provenance field in both PR and stack
 // cache scopes. It strips only database-local identities and wall-clock
@@ -5288,6 +5409,25 @@ func fetchPoolWithStatementTimeout(
 	))
 	parsed.RawQuery = query.Encode()
 	pool, err := store.Connect(t.Context(), parsed.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+func fetchPoolWithMaxConns(
+	t *testing.T,
+	databaseURL string,
+	maxConns int32,
+) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.MaxConns = maxConns
+	pool, err := pgxpool.NewWithConfig(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}

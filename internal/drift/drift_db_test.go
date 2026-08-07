@@ -1638,7 +1638,7 @@ func TestDriftDetectorRecordsDiffAndSelfHealsWithoutWebhook(
 
 	// Model a sample selected before a concurrent legitimate cache refresh.
 	// inspectSample must discard this stale snapshot and reread while holding
-	// the same entity observation lock used by refresh writers.
+	// the same optimistic entity observation used by refresh writers.
 	current, err := dbgen.New(pool).GetCachedEntitySnapshot(
 		ctx,
 		dbgen.GetCachedEntitySnapshotParams{
