@@ -4490,19 +4490,28 @@ func TestBranchBulkPagesConvergeWithIndividualRefreshes(t *testing.T) {
 
 	var status string
 	var superseded int
+	var parentCompleted bool
 	if err := bulk.pool.QueryRow(t.Context(), `
-		SELECT status, superseded_targets
-		FROM branch_reconciliation_pages
-		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+		SELECT page.status,
+		       page.superseded_targets,
+		       reconciliation.completed_at IS NOT NULL
+		FROM branch_reconciliation_pages AS page
+		JOIN branch_reconciliations AS reconciliation
+		  ON reconciliation.repo_id = page.repo_id
+		 AND reconciliation.branch = page.branch
+		 AND reconciliation.generation = page.generation
+		WHERE page.repo_id = $1
+		  AND page.branch = $2
+		  AND page.generation = $3
 	`, page.RepoID, page.Branch, page.Generation).Scan(
-		&status, &superseded,
+		&status, &superseded, &parentCompleted,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if status != "completed" || superseded != 1 {
+	if status != "completed" || superseded != 1 || !parentCompleted {
 		t.Fatalf(
-			"page status/superseded = %q/%d, want completed/1",
-			status, superseded,
+			"page status/superseded/parent complete = %q/%d/%t, want completed/1/true",
+			status, superseded, parentCompleted,
 		)
 	}
 }
@@ -4611,6 +4620,31 @@ func TestSlowBranchPagesDoNotStarveSmallDatabasePool(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatalf("slow branch page: %v", err)
 		}
+	}
+	var pendingPages int
+	var parentCompleted bool
+	if err := smallPool.QueryRow(t.Context(), `
+		SELECT (
+		           SELECT count(*)
+		           FROM branch_reconciliation_pages
+		           WHERE repo_id = $1 AND branch = $2 AND generation = $3
+		             AND status = 'pending'
+		       ),
+		       reconciliation.completed_at IS NOT NULL
+		FROM branch_reconciliations AS reconciliation
+		WHERE reconciliation.repo_id = $1
+		  AND reconciliation.branch = $2
+		  AND reconciliation.generation = $3
+	`, page.RepoID, page.Branch, page.Generation).Scan(
+		&pendingPages, &parentCompleted,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if pendingPages != 0 || !parentCompleted {
+		t.Fatalf(
+			"concurrent page completion left pending=%d parent_complete=%t",
+			pendingPages, parentCompleted,
+		)
 	}
 }
 
@@ -4876,6 +4910,80 @@ func TestBranchPageFailureLeavesOnlyBoundedPagePendingForRetry(t *testing.T) {
 			"retried page manifest = %q attempts=%d heartbeat=%v",
 			status, attempts, heartbeatAt.Valid,
 		)
+	}
+	var pageCompletedAt, parentCompletedAt pgtype.Timestamptz
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT page.completed_at, reconciliation.completed_at
+		FROM branch_reconciliation_pages AS page
+		JOIN branch_reconciliations AS reconciliation
+		  ON reconciliation.repo_id = page.repo_id
+		 AND reconciliation.branch = page.branch
+		 AND reconciliation.generation = page.generation
+		WHERE page.repo_id = $1 AND page.branch = $2 AND page.generation = $3
+	`, page.RepoID, page.Branch, page.Generation).Scan(
+		&pageCompletedAt, &parentCompletedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !parentCompletedAt.Valid ||
+		!parentCompletedAt.Time.Equal(pageCompletedAt.Time) {
+		t.Fatalf(
+			"page/parent completion = %v/%v, want equal durable timestamps",
+			pageCompletedAt, parentCompletedAt,
+		)
+	}
+
+	// Recreate the v0.5.2 leak: every page is completed but the parent is not.
+	// An idempotent retry must skip remote work and repair that parent using the
+	// original last-page completion timestamp.
+	if _, err := harness.pool.Exec(t.Context(), `
+		UPDATE branch_reconciliations
+		SET completed_at = NULL
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+	`, page.RepoID, page.Branch, page.Generation); err != nil {
+		t.Fatal(err)
+	}
+	backlog, err := dbgen.New(harness.pool).
+		CollectBranchReconciliationBacklog(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog.PendingPages != 0 || backlog.PendingTargets != 0 ||
+		backlog.IncompleteReconciliations != 1 {
+		t.Fatalf("leaked parent backlog = %+v, want 0/0/1", backlog)
+	}
+	if err := harness.handler.ReconcileBranchPage(t.Context(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.pool.QueryRow(t.Context(), `
+		SELECT reconciliation.completed_at, page.attempt_count
+		FROM branch_reconciliations AS reconciliation
+		JOIN branch_reconciliation_pages AS page
+		  ON page.repo_id = reconciliation.repo_id
+		 AND page.branch = reconciliation.branch
+		 AND page.generation = reconciliation.generation
+		WHERE reconciliation.repo_id = $1
+		  AND reconciliation.branch = $2
+		  AND reconciliation.generation = $3
+	`, page.RepoID, page.Branch, page.Generation).Scan(
+		&parentCompletedAt, &attempts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !parentCompletedAt.Valid ||
+		!parentCompletedAt.Time.Equal(pageCompletedAt.Time) || attempts != 2 {
+		t.Fatalf(
+			"completion repair timestamp/attempts = %v/%d, want %v/2",
+			parentCompletedAt, attempts, pageCompletedAt,
+		)
+	}
+	backlog, err = dbgen.New(harness.pool).
+		CollectBranchReconciliationBacklog(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog.IncompleteReconciliations != 0 {
+		t.Fatalf("repaired parent backlog = %+v, want no incomplete parents", backlog)
 	}
 }
 

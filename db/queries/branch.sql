@@ -444,41 +444,64 @@ WHERE repo_id = sqlc.arg(repo_id)
   AND branch = sqlc.arg(branch)
 FOR SHARE;
 
--- name: CompleteBranchReconciliationPage :one
-WITH completed AS (
-    UPDATE branch_reconciliation_pages AS page
+-- name: LockBranchReconciliationForCompletion :one
+SELECT generation
+FROM branch_reconciliations
+WHERE repo_id = sqlc.arg(repo_id)
+  AND branch = sqlc.arg(branch)
+  AND generation = sqlc.arg(generation)
+FOR UPDATE;
+
+-- name: CompleteBranchReconciliationPage :execrows
+UPDATE branch_reconciliation_pages AS page
 SET status = 'completed',
     superseded_targets = sqlc.arg(superseded_targets),
     heartbeat_at = sqlc.arg(completed_at),
     completed_at = sqlc.arg(completed_at)
-    WHERE page.repo_id = sqlc.arg(repo_id)
-      AND page.branch = sqlc.arg(branch)
-      AND page.generation = sqlc.arg(generation)
-      AND page.page_number = sqlc.arg(page_number)
-      AND page.status = 'pending'
-    RETURNING page.repo_id
-), finished AS (
-    UPDATE branch_reconciliations AS reconciliation
-    SET completed_at = sqlc.arg(completed_at)
-    WHERE reconciliation.repo_id = sqlc.arg(repo_id)
-      AND reconciliation.branch = sqlc.arg(branch)
-      AND reconciliation.generation = sqlc.arg(generation)
-      AND NOT EXISTS (
-          SELECT 1
-          FROM branch_reconciliation_pages AS page
-          WHERE page.repo_id = reconciliation.repo_id
-            AND page.branch = reconciliation.branch
-            AND page.generation = reconciliation.generation
-            AND page.status = 'pending'
-      )
-    RETURNING reconciliation.repo_id
+WHERE page.repo_id = sqlc.arg(repo_id)
+  AND page.branch = sqlc.arg(branch)
+  AND page.generation = sqlc.arg(generation)
+  AND page.page_number = sqlc.arg(page_number)
+  AND page.status = 'pending';
+
+-- name: FinalizeBranchReconciliation :execrows
+UPDATE branch_reconciliations AS reconciliation
+SET completed_at = (
+    SELECT max(page.completed_at)
+    FROM branch_reconciliation_pages AS page
+    WHERE page.repo_id = reconciliation.repo_id
+      AND page.branch = reconciliation.branch
+      AND page.generation = reconciliation.generation
 )
-SELECT count(*)::bigint AS completed_count FROM completed
-WHERE (SELECT count(*) FROM finished) >= 0;
+WHERE reconciliation.repo_id = sqlc.arg(repo_id)
+  AND reconciliation.branch = sqlc.arg(branch)
+  AND reconciliation.generation = sqlc.arg(generation)
+  AND reconciliation.completed_at IS NULL
+  AND reconciliation.page_count > 0
+  AND reconciliation.page_count = (
+      SELECT count(*)
+      FROM branch_reconciliation_pages AS page
+      WHERE page.repo_id = reconciliation.repo_id
+        AND page.branch = reconciliation.branch
+        AND page.generation = reconciliation.generation
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM branch_reconciliation_pages AS page
+      WHERE page.repo_id = reconciliation.repo_id
+        AND page.branch = reconciliation.branch
+        AND page.generation = reconciliation.generation
+        AND page.status = 'pending'
+  );
 
 -- name: CollectBranchReconciliationBacklog :one
 SELECT count(*)::bigint AS pending_pages,
-       COALESCE(sum(page.target_count), 0)::bigint AS pending_targets
+       COALESCE(sum(page.target_count), 0)::bigint AS pending_targets,
+       (
+           SELECT count(*)::bigint
+           FROM branch_reconciliations AS incomplete
+           WHERE incomplete.completed_at IS NULL
+       ) AS incomplete_reconciliations
 FROM branch_reconciliation_pages AS page
 JOIN branch_reconciliations AS reconciliation
   ON reconciliation.repo_id = page.repo_id

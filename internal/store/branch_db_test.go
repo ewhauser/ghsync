@@ -539,7 +539,204 @@ func TestBranchPageStateUsesDurablePostgresClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if backlog.PendingPages != 0 || backlog.PendingTargets != 0 {
+	if backlog.PendingPages != 0 || backlog.PendingTargets != 0 ||
+		backlog.IncompleteReconciliations != 0 {
 		t.Fatalf("zero-page backlog = %+v", backlog)
+	}
+}
+
+func TestConcurrentBranchPageCompletionSerializesOnParent(t *testing.T) {
+	t.Parallel()
+	pool, _ := storeTestDatabase(t)
+	writer := NewEntityWriter(pool)
+	now := time.Date(2026, 8, 9, 19, 0, 0, 0, time.UTC)
+	repository := storeTestRepository("acme/concurrent-branch-pages", 64903, now)
+	if _, err := writer.ApplyRepository(
+		t.Context(), repository, SyncSourceReconcile, "", now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	bulk := applyBranchPushTestTx(t, pool, writer, &BranchPushHint{
+		RepoFullName:    repository.FullName,
+		Branch:          "main",
+		BeforeSHA:       "before",
+		AfterSHA:        "after",
+		TransitionKnown: true,
+		DeliveryGUID:    "concurrent-page-completion",
+		ReceivedAt:      now,
+	})
+	manifestTx, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manifestTx.Rollback(t.Context()) //nolint:errcheck // rollback after commit is a no-op
+	if err := writer.RecordBranchReconciliationPagesTx(
+		t.Context(), manifestTx, bulk.RepoID, "main", bulk.Generation,
+		[]int{1, 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := manifestTx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	firstTx, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstTx.Rollback(t.Context()) //nolint:errcheck // rollback after commit is a no-op
+	firstQueries := dbgen.New(firstTx)
+	identity := dbgen.LockBranchReconciliationForCompletionParams{
+		RepoID: bulk.RepoID, Branch: "main", Generation: bulk.Generation,
+	}
+	if _, err := firstQueries.LockBranchReconciliationForCompletion(
+		t.Context(), identity,
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstCompletedAt := now.Add(time.Minute)
+	if completed, err := firstQueries.CompleteBranchReconciliationPage(
+		t.Context(),
+		dbgen.CompleteBranchReconciliationPageParams{
+			SupersededTargets: 0,
+			CompletedAt:       timestamp(firstCompletedAt),
+			RepoID:            bulk.RepoID,
+			Branch:            "main",
+			Generation:        bulk.Generation,
+			PageNumber:        1,
+		},
+	); err != nil || completed != 1 {
+		t.Fatalf("complete first branch page = %d, %v", completed, err)
+	}
+
+	secondPID := make(chan int32, 1)
+	secondDone := make(chan error, 1)
+	lastCompletedAt := now.Add(2 * time.Minute)
+	go func() {
+		secondTx, secondErr := pool.Begin(t.Context())
+		if secondErr != nil {
+			secondDone <- secondErr
+			return
+		}
+		defer secondTx.Rollback(t.Context()) //nolint:errcheck // test error cleanup
+		var backendPID int32
+		if secondErr := secondTx.QueryRow(
+			t.Context(), `SELECT pg_backend_pid()`,
+		).Scan(&backendPID); secondErr != nil {
+			secondDone <- secondErr
+			return
+		}
+		secondPID <- backendPID
+		secondQueries := dbgen.New(secondTx)
+		if _, secondErr := secondQueries.LockBranchReconciliationForCompletion(
+			t.Context(), identity,
+		); secondErr != nil {
+			secondDone <- secondErr
+			return
+		}
+		completed, secondErr := secondQueries.CompleteBranchReconciliationPage(
+			t.Context(),
+			dbgen.CompleteBranchReconciliationPageParams{
+				SupersededTargets: 0,
+				CompletedAt:       timestamp(lastCompletedAt),
+				RepoID:            bulk.RepoID,
+				Branch:            "main",
+				Generation:        bulk.Generation,
+				PageNumber:        2,
+			},
+		)
+		if secondErr != nil {
+			secondDone <- fmt.Errorf(
+				"complete second branch page: %w", secondErr,
+			)
+			return
+		}
+		if completed != 1 {
+			secondDone <- fmt.Errorf(
+				"complete second branch page = %d, want 1", completed,
+			)
+			return
+		}
+		finalized, secondErr := secondQueries.FinalizeBranchReconciliation(
+			t.Context(),
+			dbgen.FinalizeBranchReconciliationParams(identity),
+		)
+		if secondErr != nil {
+			secondDone <- fmt.Errorf(
+				"finalize concurrent branch pages: %w", secondErr,
+			)
+			return
+		}
+		if finalized != 1 {
+			secondDone <- fmt.Errorf(
+				"finalize concurrent branch pages = %d, want 1", finalized,
+			)
+			return
+		}
+		secondDone <- secondTx.Commit(t.Context())
+	}()
+
+	var backendPID int32
+	select {
+	case backendPID = <-secondPID:
+	case err := <-secondDone:
+		t.Fatalf("start concurrent page completion: %v", err)
+	}
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		var waiting bool
+		if err := pool.QueryRow(t.Context(), `
+			SELECT wait_event_type = 'Lock'
+			FROM pg_stat_activity
+			WHERE pid = $1
+		`, backendPID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case <-poll.C:
+		case <-deadline.C:
+			t.Fatal("second page completion did not wait on the parent lock")
+		}
+	}
+	if finalized, err := firstQueries.FinalizeBranchReconciliation(
+		t.Context(),
+		dbgen.FinalizeBranchReconciliationParams(identity),
+	); err != nil || finalized != 0 {
+		t.Fatalf(
+			"first page prematurely finalized reconciliation = %d, %v",
+			finalized, err,
+		)
+	}
+	if err := firstTx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("second page completion remained blocked after parent commit")
+	}
+
+	var completedAt time.Time
+	if err := pool.QueryRow(t.Context(), `
+		SELECT completed_at
+		FROM branch_reconciliations
+		WHERE repo_id = $1 AND branch = 'main' AND generation = $2
+	`, bulk.RepoID, bulk.Generation).Scan(&completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !completedAt.Equal(lastCompletedAt) {
+		t.Fatalf(
+			"concurrent parent completion = %s, want %s",
+			completedAt, lastCompletedAt,
+		)
 	}
 }

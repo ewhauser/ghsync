@@ -335,6 +335,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		`ghsync_c_q2_direct_entity_refreshes_total{entity_kind="refresh_stack",outcome="superseded"} 1`,
 		`ghsync_c_o4_branch_reconciliation_backlog{unit="pages"} 0`,
 		`ghsync_c_o4_branch_reconciliation_backlog{unit="targets"} 0`,
+		`ghsync_c_o4_branch_reconciliation_backlog{unit="reconciliations"} 0`,
 	} {
 		if !strings.Contains(string(body), name) {
 			t.Errorf("metrics exposition omitted %q", name)
