@@ -192,7 +192,7 @@ func (r *Runtime) registerObservables(meter metric.Meter) error {
 	}
 	if r.branchBacklog, err = meter.Int64ObservableGauge(
 		"ghsync_c_o4_branch_reconciliation_backlog",
-		metric.WithDescription("Current branch reconciliation backlog by pages and targets."),
+		metric.WithDescription("Current branch reconciliation backlog by reconciliations, pages, and targets."),
 	); err != nil {
 		return err
 	}
@@ -284,6 +284,11 @@ func (r *Runtime) observeBranchReconciliation(
 		r.branchBacklog,
 		backlog.PendingTargets,
 		metric.WithAttributes(attribute.String("unit", "targets")),
+	)
+	observer.ObserveInt64(
+		r.branchBacklog,
+		backlog.IncompleteReconciliations,
+		metric.WithAttributes(attribute.String("unit", "reconciliations")),
 	)
 	return nil
 }

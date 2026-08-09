@@ -931,6 +931,11 @@ func (h *Handler) ReconcileBranchPage(
 		return fmt.Errorf("read branch reconciliation page: %w", err)
 	}
 	if status != "pending" {
+		if status == "completed" {
+			if err := h.healBranchReconciliationCompletion(ctx, args); err != nil {
+				return err
+			}
+		}
 		if status == "superseded" {
 			h.branchObserver.BranchReconciliationPage(
 				ctx, "superseded", len(args.Targets), len(args.Targets),
@@ -1070,6 +1075,11 @@ func (h *Handler) ReconcileBranchPage(
 			return fmt.Errorf("re-read branch reconciliation page: %w", statusErr)
 		}
 		if latestStatus != "pending" {
+			if latestStatus == "completed" {
+				if err := h.healBranchReconciliationCompletion(ctx, args); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 	}
@@ -1087,11 +1097,32 @@ func (h *Handler) ReconcileBranchPage(
 		return fmt.Errorf("begin branch page completion: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
-	now, err := dbgen.New(tx).GetDatabaseClock(ctx)
+	completionQueries := dbgen.New(tx)
+	_, err = completionQueries.LockBranchReconciliationForCompletion(
+		ctx,
+		dbgen.LockBranchReconciliationForCompletionParams{
+			RepoID:     args.RepoID,
+			Branch:     args.Branch,
+			Generation: args.Generation,
+		},
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit superseded branch page: %w", err)
+		}
+		h.branchObserver.BranchReconciliationPage(
+			ctx, "superseded", len(args.Targets), len(args.Targets),
+		)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock branch reconciliation completion: %w", err)
+	}
+	now, err := completionQueries.GetDatabaseClock(ctx)
 	if err != nil {
 		return fmt.Errorf("read branch page completion clock: %w", err)
 	}
-	completedPages, err := dbgen.New(tx).CompleteBranchReconciliationPage(
+	completedPages, err := completionQueries.CompleteBranchReconciliationPage(
 		ctx,
 		dbgen.CompleteBranchReconciliationPageParams{
 			SupersededTargets: int32(superseded),
@@ -1104,6 +1135,16 @@ func (h *Handler) ReconcileBranchPage(
 	)
 	if err != nil {
 		return fmt.Errorf("complete branch reconciliation page: %w", err)
+	}
+	if _, err := completionQueries.FinalizeBranchReconciliation(
+		ctx,
+		dbgen.FinalizeBranchReconciliationParams{
+			RepoID:     args.RepoID,
+			Branch:     args.Branch,
+			Generation: args.Generation,
+		},
+	); err != nil {
+		return fmt.Errorf("finalize branch reconciliation: %w", err)
 	}
 	if completedPages == 0 {
 		if err := tx.Commit(ctx); err != nil {
@@ -1134,6 +1175,50 @@ func (h *Handler) ReconcileBranchPage(
 	h.branchObserver.BranchReconciliationPage(
 		ctx, outcome, len(args.Targets), superseded,
 	)
+	return nil
+}
+
+// healBranchReconciliationCompletion lets an idempotent retry repair a parent
+// left incomplete after its page was already committed. The parent row lock is
+// the serialization point shared with normal page completion, so concurrent
+// final pages cannot each observe the other as pending.
+func (h *Handler) healBranchReconciliationCompletion(
+	ctx context.Context,
+	args *queue.BranchReconcilePageArgs,
+) error {
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin branch reconciliation completion repair: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	queries := dbgen.New(tx)
+	_, err = queries.LockBranchReconciliationForCompletion(
+		ctx,
+		dbgen.LockBranchReconciliationForCompletionParams{
+			RepoID:     args.RepoID,
+			Branch:     args.Branch,
+			Generation: args.Generation,
+		},
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock branch reconciliation completion repair: %w", err)
+	}
+	if _, err := queries.FinalizeBranchReconciliation(
+		ctx,
+		dbgen.FinalizeBranchReconciliationParams{
+			RepoID:     args.RepoID,
+			Branch:     args.Branch,
+			Generation: args.Generation,
+		},
+	); err != nil {
+		return fmt.Errorf("repair branch reconciliation completion: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit branch reconciliation completion repair: %w", err)
+	}
 	return nil
 }
 

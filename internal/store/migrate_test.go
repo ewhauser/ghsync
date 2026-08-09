@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ewhauser/ghsync/internal/outbox"
 	"github.com/ewhauser/ghsync/internal/store/dbgen"
 )
 
@@ -341,6 +342,136 @@ func TestVerifyChecksum(t *testing.T) {
 	}
 	if err := verifyChecksum("0001.sql", nil, checksum); err == nil {
 		t.Fatal("missing checksum accepted")
+	}
+}
+
+func TestBranchReconciliationCompletionMigrationRepairsTerminalParents(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := testDatabasePool(t)
+	writer := NewEntityWriter(pool)
+	now := time.Date(2026, 8, 9, 18, 0, 0, 0, time.UTC)
+
+	seed := func(
+		repoName string,
+		githubID int64,
+		branch string,
+	) BranchBulkResult {
+		t.Helper()
+		repository := storeTestRepository(repoName, githubID, now)
+		if _, err := writer.ApplyRepository(
+			ctx, repository, SyncSourceReconcile, "", now,
+		); err != nil {
+			t.Fatal(err)
+		}
+		branchTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer branchTx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+		if err := outbox.AcquireWriterFence(ctx, branchTx); err != nil {
+			t.Fatal(err)
+		}
+		bulk, err := writer.ApplyBranchPushTx(ctx, branchTx, &BranchPushHint{
+			RepoFullName:    repository.FullName,
+			Branch:          branch,
+			BeforeSHA:       "before",
+			AfterSHA:        "after",
+			TransitionKnown: true,
+			DeliveryGUID:    "migration-" + branch,
+			ReceivedAt:      now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := branchTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+		if err := writer.RecordBranchReconciliationPagesTx(
+			ctx, tx, bulk.RepoID, branch, bulk.Generation, []int{1, 1},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return bulk
+	}
+
+	terminal := seed("acme/migration-terminal-branch", 64901, "main")
+	pending := seed("acme/migration-pending-branch", 64902, "release")
+	firstCompletedAt := now.Add(time.Minute)
+	lastCompletedAt := now.Add(2 * time.Minute)
+	if _, err := pool.Exec(ctx, `
+		UPDATE branch_reconciliation_pages
+		SET status = CASE page_number
+		                 WHEN 1 THEN 'completed'
+		                 ELSE 'superseded'
+		             END,
+		    superseded_targets = CASE page_number WHEN 1 THEN 0 ELSE 1 END,
+		    completed_at = CASE page_number
+		                       WHEN 1 THEN $4::timestamptz
+		                       ELSE $5::timestamptz
+		                   END
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+	`, terminal.RepoID, "main", terminal.Generation,
+		firstCompletedAt, lastCompletedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE branch_reconciliation_pages
+		SET status = 'completed', completed_at = $4
+		WHERE repo_id = $1 AND branch = $2 AND generation = $3
+		  AND page_number = 1
+	`, pending.RepoID, "release", pending.Generation,
+		firstCompletedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		DELETE FROM schema_migrations
+		WHERE name = '0015_branch_reconciliation_completion.sql'
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("apply branch reconciliation completion migration: %v", err)
+	}
+	var terminalCompletedAt, pendingCompletedAt pgtype.Timestamptz
+	if err := pool.QueryRow(ctx, `
+		SELECT completed_at
+		FROM branch_reconciliations
+		WHERE repo_id = $1 AND branch = 'main'
+	`, terminal.RepoID).Scan(&terminalCompletedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT completed_at
+		FROM branch_reconciliations
+		WHERE repo_id = $1 AND branch = 'release'
+	`, pending.RepoID).Scan(&pendingCompletedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !terminalCompletedAt.Valid ||
+		!terminalCompletedAt.Time.Equal(lastCompletedAt) {
+		t.Fatalf(
+			"repaired terminal completion = %v, want %s",
+			terminalCompletedAt, lastCompletedAt,
+		)
+	}
+	if pendingCompletedAt.Valid {
+		t.Fatalf(
+			"migration completed a parent with a pending page: %v",
+			pendingCompletedAt,
+		)
 	}
 }
 

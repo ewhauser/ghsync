@@ -444,7 +444,12 @@ func (q *Queries) BeginBranchReconciliation(ctx context.Context, arg BeginBranch
 
 const collectBranchReconciliationBacklog = `-- name: CollectBranchReconciliationBacklog :one
 SELECT count(*)::bigint AS pending_pages,
-       COALESCE(sum(page.target_count), 0)::bigint AS pending_targets
+       COALESCE(sum(page.target_count), 0)::bigint AS pending_targets,
+       (
+           SELECT count(*)::bigint
+           FROM branch_reconciliations AS incomplete
+           WHERE incomplete.completed_at IS NULL
+       ) AS incomplete_reconciliations
 FROM branch_reconciliation_pages AS page
 JOIN branch_reconciliations AS reconciliation
   ON reconciliation.repo_id = page.repo_id
@@ -454,48 +459,29 @@ WHERE page.status = 'pending'
 `
 
 type CollectBranchReconciliationBacklogRow struct {
-	PendingPages   int64
-	PendingTargets int64
+	PendingPages              int64
+	PendingTargets            int64
+	IncompleteReconciliations int64
 }
 
 func (q *Queries) CollectBranchReconciliationBacklog(ctx context.Context) (CollectBranchReconciliationBacklogRow, error) {
 	row := q.db.QueryRow(ctx, collectBranchReconciliationBacklog)
 	var i CollectBranchReconciliationBacklogRow
-	err := row.Scan(&i.PendingPages, &i.PendingTargets)
+	err := row.Scan(&i.PendingPages, &i.PendingTargets, &i.IncompleteReconciliations)
 	return i, err
 }
 
-const completeBranchReconciliationPage = `-- name: CompleteBranchReconciliationPage :one
-WITH completed AS (
-    UPDATE branch_reconciliation_pages AS page
+const completeBranchReconciliationPage = `-- name: CompleteBranchReconciliationPage :execrows
+UPDATE branch_reconciliation_pages AS page
 SET status = 'completed',
     superseded_targets = $1,
     heartbeat_at = $2,
     completed_at = $2
-    WHERE page.repo_id = $3
-      AND page.branch = $4
-      AND page.generation = $5
-      AND page.page_number = $6
-      AND page.status = 'pending'
-    RETURNING page.repo_id
-), finished AS (
-    UPDATE branch_reconciliations AS reconciliation
-    SET completed_at = $2
-    WHERE reconciliation.repo_id = $3
-      AND reconciliation.branch = $4
-      AND reconciliation.generation = $5
-      AND NOT EXISTS (
-          SELECT 1
-          FROM branch_reconciliation_pages AS page
-          WHERE page.repo_id = reconciliation.repo_id
-            AND page.branch = reconciliation.branch
-            AND page.generation = reconciliation.generation
-            AND page.status = 'pending'
-      )
-    RETURNING reconciliation.repo_id
-)
-SELECT count(*)::bigint AS completed_count FROM completed
-WHERE (SELECT count(*) FROM finished) >= 0
+WHERE page.repo_id = $3
+  AND page.branch = $4
+  AND page.generation = $5
+  AND page.page_number = $6
+  AND page.status = 'pending'
 `
 
 type CompleteBranchReconciliationPageParams struct {
@@ -508,7 +494,7 @@ type CompleteBranchReconciliationPageParams struct {
 }
 
 func (q *Queries) CompleteBranchReconciliationPage(ctx context.Context, arg CompleteBranchReconciliationPageParams) (int64, error) {
-	row := q.db.QueryRow(ctx, completeBranchReconciliationPage,
+	result, err := q.db.Exec(ctx, completeBranchReconciliationPage,
 		arg.SupersededTargets,
 		arg.CompletedAt,
 		arg.RepoID,
@@ -516,9 +502,55 @@ func (q *Queries) CompleteBranchReconciliationPage(ctx context.Context, arg Comp
 		arg.Generation,
 		arg.PageNumber,
 	)
-	var completed_count int64
-	err := row.Scan(&completed_count)
-	return completed_count, err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const finalizeBranchReconciliation = `-- name: FinalizeBranchReconciliation :execrows
+UPDATE branch_reconciliations AS reconciliation
+SET completed_at = (
+    SELECT max(page.completed_at)
+    FROM branch_reconciliation_pages AS page
+    WHERE page.repo_id = reconciliation.repo_id
+      AND page.branch = reconciliation.branch
+      AND page.generation = reconciliation.generation
+)
+WHERE reconciliation.repo_id = $1
+  AND reconciliation.branch = $2
+  AND reconciliation.generation = $3
+  AND reconciliation.completed_at IS NULL
+  AND reconciliation.page_count > 0
+  AND reconciliation.page_count = (
+      SELECT count(*)
+      FROM branch_reconciliation_pages AS page
+      WHERE page.repo_id = reconciliation.repo_id
+        AND page.branch = reconciliation.branch
+        AND page.generation = reconciliation.generation
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM branch_reconciliation_pages AS page
+      WHERE page.repo_id = reconciliation.repo_id
+        AND page.branch = reconciliation.branch
+        AND page.generation = reconciliation.generation
+        AND page.status = 'pending'
+  )
+`
+
+type FinalizeBranchReconciliationParams struct {
+	RepoID     int64
+	Branch     string
+	Generation int64
+}
+
+func (q *Queries) FinalizeBranchReconciliation(ctx context.Context, arg FinalizeBranchReconciliationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finalizeBranchReconciliation, arg.RepoID, arg.Branch, arg.Generation)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getBranchReconciliationGenerationForShare = `-- name: GetBranchReconciliationGenerationForShare :one
@@ -693,6 +725,28 @@ func (q *Queries) ListBranchReconciliationGenerationKeys(ctx context.Context, ar
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockBranchReconciliationForCompletion = `-- name: LockBranchReconciliationForCompletion :one
+SELECT generation
+FROM branch_reconciliations
+WHERE repo_id = $1
+  AND branch = $2
+  AND generation = $3
+FOR UPDATE
+`
+
+type LockBranchReconciliationForCompletionParams struct {
+	RepoID     int64
+	Branch     string
+	Generation int64
+}
+
+func (q *Queries) LockBranchReconciliationForCompletion(ctx context.Context, arg LockBranchReconciliationForCompletionParams) (int64, error) {
+	row := q.db.QueryRow(ctx, lockBranchReconciliationForCompletion, arg.RepoID, arg.Branch, arg.Generation)
+	var generation int64
+	err := row.Scan(&generation)
+	return generation, err
 }
 
 const recordBranchReconciliationPages = `-- name: RecordBranchReconciliationPages :exec
