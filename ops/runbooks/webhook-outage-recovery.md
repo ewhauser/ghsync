@@ -4,6 +4,8 @@
 
 - `GhsyncOldestDeliveryTooOld` after ingress recovers.
 - Missing GUIDs followed by `ghsync_c_r4_gap_heal_requests_total`.
+- `ghsync_c_r4_gap_unresolved_total` rises with bounded `outcome` and
+  `status_class` labels.
 - C-R1 staleness grows while webhook volume is absent.
 
 ## Diagnosis
@@ -63,8 +65,26 @@ ghsyncd serve --roles=metrics
 The sweep role resumes `gap_heal_cursors` and requests missing GUID
 redelivery. Missing, stale, or incompatible cursor state deliberately starts a
 deep pass over the fixed comparison-plus-deep-period lookback; capped passes
-resume after `GAP_CONTINUATION_DELAY`. Do not delete cursor/delivery rows. If
-initial enrollment was never completed:
+resume after `GAP_CONTINUATION_DELAY`. Do not delete cursor/delivery rows.
+
+Failed redeliveries are tracked in `webhook_delivery_retries`. Transient
+outcomes retry exponentially between `GAP_REDELIVERY_BACKOFF` and
+`GAP_REDELIVERY_BACKOFF_MAX`; 4xx outcomes wait for the maximum interval so a
+fixed endpoint can recover without creating a five-minute hot loop. Inspect
+current state with:
+
+```sql
+SELECT delivery_guid, latest_delivery_id, attempt_count, outcome,
+       status_code, next_attempt_at, last_attempted_at
+FROM webhook_delivery_retries
+ORDER BY next_attempt_at, delivery_guid;
+```
+
+Do not delete retry rows to force an attempt. Fix the endpoint and either wait
+until `next_attempt_at` or use GitHub's delivery UI for an explicit operator
+redelivery.
+
+If initial enrollment was never completed:
 
 ```sh
 ghsyncd backfill

@@ -110,6 +110,8 @@ Durations use Go syntax (`250ms`, `5m`, `24h`).
 | `GAP_HEAL_LEASE_TTL` | `5m` | Stale-owner failover bound for gap healing. |
 | `GAP_CONTINUATION_DELAY` | `30s` | Minimum delay before a page-cap continuation becomes runnable. |
 | `GAP_DEEP_SCAN_PERIOD` | `24h` | Target cadence between boundary-independent C-R4 pass starts. |
+| `GAP_REDELIVERY_BACKOFF` | `5m` | Initial durable retry delay for unresolved webhook redeliveries. |
+| `GAP_REDELIVERY_BACKOFF_MAX` | `6h` | Exponential retry ceiling and interval for terminal 4xx outcomes. |
 | `GAP_PAGE_SIZE` | `100` | Delivery page size and incremental overlap bound; max `100`. |
 | `GAP_MAX_PAGES` | `10` | Pages per resumable job before a paced continuation. |
 | `DRIFT_PERIOD` | `1h` | C-O3 cadence. |
@@ -158,6 +160,8 @@ incompatible, or invalid cursor state restarts at the fixed deep root, never an
 unbounded history root.
 The existing `ghsync_c_r4_gap_windows_incomplete` counter and DEBUG cap log
 make paced continuations observable without producing error-level noise.
+`ghsync_c_r4_gap_unresolved_total` records each newly observed failed
+redelivery once, using only bounded `outcome` and `status_class` labels.
 
 Pull-request GraphQL gangs collect for `FETCH_BATCH_WINDOW` and use a fixed
 maximum batch size **K = 25**. K is constrained by the shipped GraphQL query and

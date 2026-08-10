@@ -785,5 +785,7 @@ greatest delivery time observed by a completed C-R4 pass;
 watermark. The separate pass fields preserve both values across capped jobs
 and restarts. `scan_mode`, `last_deep_started_at`, `last_deep_completed_at`,
 and the versioned window shape make the periodic deep-scan guarantee durable.
-These cursor rows are backup state even though they have no consumer
+`webhook_delivery_retries` durably fences redelivery attempts across process
+restarts and records bounded transient or terminal retry state per GUID. These
+cursor and retry rows are backup state even though they have no consumer
 compatibility guarantee.

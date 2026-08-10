@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,10 +44,13 @@ import (
 const sweepTestSecret = "sweep-test-secret"
 
 type observerRecorder struct {
-	mu         sync.Mutex
-	overruns   int
-	redelivery int
-	incomplete int
+	mu              sync.Mutex
+	overruns        int
+	redelivery      int
+	unresolved      int
+	lastOutcome     string
+	lastStatusClass string
+	incomplete      int
 }
 
 type simulatedClock struct {
@@ -154,6 +158,20 @@ func (o *observerRecorder) GapRedelivery(
 ) {
 	o.mu.Lock()
 	o.redelivery++
+	o.mu.Unlock()
+}
+
+func (o *observerRecorder) GapUnresolved(
+	_ context.Context,
+	_ int64,
+	_ string,
+	outcome string,
+	statusClass string,
+) {
+	o.mu.Lock()
+	o.unresolved++
+	o.lastOutcome = outcome
+	o.lastStatusClass = statusClass
 	o.mu.Unlock()
 }
 
@@ -1399,6 +1417,240 @@ func TestGapHealingRequestsRedeliveryAndCacheConverges(t *testing.T) {
 		)
 		return err == nil && row.Title == "truth changed during outage"
 	})
+}
+
+func TestGapHealingPersistsTerminalRedeliveryBackoff(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 100)
+	now := h.now
+	h.service.config.Now = func() time.Time { return now }
+	var targetRequests atomic.Int64
+	target := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		targetRequests.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer target.Close()
+
+	guid, err := h.fake.DropWebhook(
+		target.URL,
+		"push",
+		map[string]any{"ref": "refs/heads/terminal-gap"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		deliveries := h.fake.Deliveries()
+		return len(deliveries) >= 2 && deliveries[0].GUID == guid &&
+			deliveries[0].Redelivery &&
+			deliveries[0].StatusCode == http.StatusForbidden
+	})
+
+	for range 4 {
+		now = now.Add(h.service.config.GapHealPeriod)
+		if err := h.service.HealDeliveryGaps(
+			t.Context(),
+			GapHealArgs{Installation: 1},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests := h.fake.RedeliveryRequests(); len(requests) != 1 {
+		t.Fatalf(
+			"terminal redelivery requests = %v, want one before max backoff",
+			requests,
+		)
+	}
+	if targetRequests.Load() != 1 {
+		t.Fatalf("terminal target requests = %d, want one", targetRequests.Load())
+	}
+
+	restarted, err := New(Options{
+		Pool:       h.pool,
+		REST:       h.rest,
+		Deliveries: h.service.deliveries,
+		Config:     h.service.config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(h.service.config.GapHealPeriod)
+	if err := restarted.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if requests := h.fake.RedeliveryRequests(); len(requests) != 1 {
+		t.Fatalf("post-restart terminal redeliveries = %v, want one", requests)
+	}
+	retry, err := dbgen.New(h.pool).GetWebhookDeliveryRetry(
+		t.Context(),
+		dbgen.GetWebhookDeliveryRetryParams{
+			InstallationID: 1,
+			DeliveryGuid:   guid,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Outcome != "terminal" || retry.AttemptCount != 1 {
+		t.Fatalf("terminal retry state = %+v", retry)
+	}
+	h.observer.mu.Lock()
+	unresolved := h.observer.unresolved
+	lastOutcome := h.observer.lastOutcome
+	lastStatusClass := h.observer.lastStatusClass
+	h.observer.mu.Unlock()
+	if unresolved != 1 || lastOutcome != "terminal" ||
+		lastStatusClass != "4xx" {
+		t.Fatalf(
+			"terminal observations = %d/%q/%q, want 1/terminal/4xx",
+			unresolved,
+			lastOutcome,
+			lastStatusClass,
+		)
+	}
+
+	now = now.Add(h.service.config.GapRedeliveryBackoffMax)
+	if err := restarted.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return len(h.fake.RedeliveryRequests()) == 2
+	})
+}
+
+func TestGapHealingTransientBackoffSurvivesRestartAndClears(t *testing.T) {
+	t.Parallel()
+	h := newSweepHarness(t, 100)
+	now := h.now
+	h.service.config.Now = func() time.Time { return now }
+	ingressMux := ingress.NewMux(ingress.NewHandler(
+		dbgen.New(h.pool),
+		sweepTestSecret,
+		1<<20,
+		time.Second,
+	))
+	var targetStatus atomic.Int64
+	targetStatus.Store(http.StatusServiceUnavailable)
+	target := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if status := int(targetStatus.Load()); status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		ingressMux.ServeHTTP(w, r)
+	}))
+	defer target.Close()
+
+	guid, err := h.fake.DropWebhook(
+		target.URL+ingress.WebhookPath,
+		"push",
+		map[string]any{
+			"ref": "refs/heads/transient-gap",
+			"repository": map[string]any{
+				"full_name": "acme/monolith",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		deliveries := h.fake.Deliveries()
+		return len(deliveries) >= 2 && deliveries[0].GUID == guid &&
+			deliveries[0].StatusCode == http.StatusServiceUnavailable
+	})
+
+	restarted, err := New(Options{
+		Pool:       h.pool,
+		REST:       h.rest,
+		Deliveries: h.service.deliveries,
+		Config:     h.service.config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(h.service.config.GapRedeliveryBackoff)
+	if err := restarted.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		deliveries := h.fake.Deliveries()
+		return len(deliveries) >= 3 && deliveries[0].GUID == guid &&
+			deliveries[0].StatusCode == http.StatusServiceUnavailable
+	})
+
+	now = now.Add(h.service.config.GapRedeliveryBackoff - time.Second)
+	if err := restarted.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if requests := h.fake.RedeliveryRequests(); len(requests) != 2 {
+		t.Fatalf(
+			"redeliveries before doubled backoff = %v, want two",
+			requests,
+		)
+	}
+
+	now = now.Add(time.Second)
+	targetStatus.Store(0)
+	if err := restarted.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		_, err := dbgen.New(h.pool).GetWebhookDelivery(t.Context(), guid)
+		return err == nil
+	})
+	if requests := h.fake.RedeliveryRequests(); len(requests) != 3 {
+		t.Fatalf("eventual redeliveries = %v, want three", requests)
+	}
+	now = now.Add(time.Second)
+	if err := restarted.HealDeliveryGaps(
+		t.Context(),
+		GapHealArgs{Installation: 1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, err = dbgen.New(h.pool).GetWebhookDeliveryRetry(
+		t.Context(),
+		dbgen.GetWebhookDeliveryRetryParams{
+			InstallationID: 1,
+			DeliveryGuid:   guid,
+		},
+	)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("healed retry state error = %v, want no row", err)
+	}
 }
 
 func TestCompleteGapHealCursorAcceptsBoundaryAboveMaxInt32(t *testing.T) {

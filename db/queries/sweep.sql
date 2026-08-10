@@ -294,6 +294,98 @@ SELECT delivery_guid
 FROM webhook_deliveries
 WHERE delivery_guid = ANY(sqlc.arg(delivery_guids)::text[]);
 
+-- name: GetWebhookDeliveryRetry :one
+SELECT *
+FROM webhook_delivery_retries
+WHERE installation_id = sqlc.arg(installation_id)
+  AND delivery_guid = sqlc.arg(delivery_guid);
+
+-- name: UpsertWebhookDeliveryRetryObservation :one
+INSERT INTO webhook_delivery_retries (
+    installation_id,
+    delivery_guid,
+    latest_delivery_id,
+    attempt_count,
+    outcome,
+    status_code,
+    next_attempt_at,
+    last_attempted_at,
+    updated_at
+) VALUES (
+    sqlc.arg(installation_id),
+    sqlc.arg(delivery_guid),
+    sqlc.arg(latest_delivery_id),
+    sqlc.arg(attempt_count),
+    sqlc.arg(outcome),
+    sqlc.arg(status_code),
+    sqlc.arg(next_attempt_at),
+    sqlc.narg(last_attempted_at),
+    sqlc.arg(updated_at)
+)
+ON CONFLICT (installation_id, delivery_guid) DO UPDATE
+SET latest_delivery_id = EXCLUDED.latest_delivery_id,
+    outcome = EXCLUDED.outcome,
+    status_code = EXCLUDED.status_code,
+    next_attempt_at = EXCLUDED.next_attempt_at,
+    claim_token = NULL,
+    updated_at = EXCLUDED.updated_at
+WHERE webhook_delivery_retries.latest_delivery_id =
+      sqlc.arg(previous_delivery_id)
+RETURNING *;
+
+-- name: ClaimWebhookDeliveryRetry :one
+UPDATE webhook_delivery_retries AS retry
+SET attempt_count = retry.attempt_count + CASE
+        WHEN retry.outcome = 'claiming' THEN 0
+        ELSE 1
+    END,
+    outcome = 'claiming',
+    next_attempt_at = sqlc.arg(next_attempt_at),
+    claim_token = sqlc.arg(claim_token),
+    last_attempted_at = sqlc.arg(attempted_at),
+    updated_at = sqlc.arg(attempted_at)
+WHERE retry.installation_id = sqlc.arg(installation_id)
+  AND retry.delivery_guid = sqlc.arg(delivery_guid)
+  AND retry.latest_delivery_id = sqlc.arg(expected_delivery_id)
+  AND (
+      retry.next_attempt_at <= sqlc.arg(attempted_at)
+      OR retry.outcome = 'claiming'
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM webhook_deliveries AS existing
+      WHERE existing.delivery_guid = retry.delivery_guid
+  )
+RETURNING retry.*;
+
+-- name: AcceptWebhookDeliveryRetry :execrows
+UPDATE webhook_delivery_retries
+SET outcome = 'pending',
+    claim_token = NULL,
+    updated_at = sqlc.arg(accepted_at)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND delivery_guid = sqlc.arg(delivery_guid)
+  AND latest_delivery_id = sqlc.arg(expected_delivery_id)
+  AND outcome = 'claiming'
+  AND claim_token = sqlc.arg(claim_token);
+
+-- name: ReleaseWebhookDeliveryRetryClaim :execrows
+UPDATE webhook_delivery_retries
+SET outcome = 'ready',
+    next_attempt_at = sqlc.arg(failed_at),
+    claim_token = NULL,
+    updated_at = sqlc.arg(failed_at)
+WHERE installation_id = sqlc.arg(installation_id)
+  AND delivery_guid = sqlc.arg(delivery_guid)
+  AND latest_delivery_id = sqlc.arg(expected_delivery_id)
+  AND outcome = 'claiming'
+  AND claim_token = sqlc.arg(claim_token);
+
+-- name: DeleteWebhookDeliveryRetries :exec
+DELETE FROM webhook_delivery_retries
+WHERE installation_id = sqlc.arg(installation_id)
+  AND delivery_guid = ANY(sqlc.arg(delivery_guids)::text[]);
+
 -- name: EnsureGapHealCursor :one
 INSERT INTO gap_heal_cursors (installation_id)
 VALUES (sqlc.arg(installation_id))

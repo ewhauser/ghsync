@@ -44,6 +44,8 @@ const (
 	defaultGapLeaseTTL          = 5 * time.Minute
 	defaultGapContinuationDelay = 30 * time.Second
 	defaultGapDeepScanPeriod    = 24 * time.Hour
+	defaultGapRedeliveryBackoff = 5 * time.Minute
+	defaultGapRedeliveryMax     = 6 * time.Hour
 	githubDeliveryRetention     = 72 * time.Hour
 
 	defaultOrphanScanPeriod = 5 * time.Minute
@@ -85,6 +87,10 @@ type Config struct {
 	GapContinuationDelay time.Duration
 	// GapDeepScanPeriod bounds detection of deliveries behind the cheap cursor.
 	GapDeepScanPeriod time.Duration
+	// GapRedeliveryBackoff is the initial durable delay after a redelivery.
+	GapRedeliveryBackoff time.Duration
+	// GapRedeliveryBackoffMax caps retry delay and paces terminal 4xx retries.
+	GapRedeliveryBackoffMax time.Duration
 
 	// RetentionPeriod controls payload-pruner scheduling.
 	RetentionPeriod time.Duration
@@ -151,6 +157,8 @@ func (c *Config) validate() error {
 		"gap-heal lease TTL":     c.GapLeaseTTL,
 		"gap continuation delay": c.GapContinuationDelay,
 		"gap deep-scan period":   c.GapDeepScanPeriod,
+		"gap redelivery backoff": c.GapRedeliveryBackoff,
+		"gap redelivery max":     c.GapRedeliveryBackoffMax,
 		"gap window":             c.GapWindow,
 		"retention period":       c.RetentionPeriod,
 		"retention age":          c.RetentionAge,
@@ -169,6 +177,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf(
 			"gap window plus deep-scan period must not exceed %s",
 			githubDeliveryRetention,
+		)
+	}
+	if c.GapRedeliveryBackoff > c.GapRedeliveryBackoffMax {
+		return fmt.Errorf(
+			"gap redelivery backoff must not exceed its maximum",
 		)
 	}
 	for _, bound := range []time.Duration{
@@ -266,6 +279,7 @@ type Observer interface {
 		time.Duration,
 	)
 	GapRedelivery(context.Context, int64, string)
+	GapUnresolved(context.Context, int64, string, string, string)
 	GapWindowIncomplete(context.Context, string, int)
 }
 
@@ -294,6 +308,22 @@ func (LogObserver) GapRedelivery(
 		"C-R4 webhook delivery gap requested for redelivery",
 		"delivery_id", deliveryID,
 		"delivery_guid", guid,
+	)
+}
+
+func (LogObserver) GapUnresolved(
+	_ context.Context,
+	deliveryID int64,
+	guid string,
+	outcome string,
+	statusClass string,
+) {
+	slog.Warn(
+		"C-R4 webhook delivery gap remains unresolved after redelivery",
+		"delivery_id", deliveryID,
+		"delivery_guid", guid,
+		"outcome", outcome,
+		"status_class", statusClass,
 	)
 }
 
@@ -329,6 +359,24 @@ func (observers Observers) GapRedelivery(
 ) {
 	observer.FanOut(observers, func(item Observer) {
 		item.GapRedelivery(ctx, deliveryID, guid)
+	})
+}
+
+func (observers Observers) GapUnresolved(
+	ctx context.Context,
+	deliveryID int64,
+	guid string,
+	outcome string,
+	statusClass string,
+) {
+	observer.FanOut(observers, func(item Observer) {
+		item.GapUnresolved(
+			ctx,
+			deliveryID,
+			guid,
+			outcome,
+			statusClass,
+		)
 	})
 }
 
@@ -377,6 +425,12 @@ func New(options Options) (*Service, error) { //nolint:gocritic // constructor n
 	}
 	if options.Config.GapDeepScanPeriod <= 0 {
 		options.Config.GapDeepScanPeriod = defaultGapDeepScanPeriod
+	}
+	if options.Config.GapRedeliveryBackoff <= 0 {
+		options.Config.GapRedeliveryBackoff = defaultGapRedeliveryBackoff
+	}
+	if options.Config.GapRedeliveryBackoffMax <= 0 {
+		options.Config.GapRedeliveryBackoffMax = defaultGapRedeliveryMax
 	}
 	if err := options.Config.validate(); err != nil {
 		return nil, err

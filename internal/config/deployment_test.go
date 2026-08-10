@@ -250,6 +250,8 @@ func environmentDefaults() map[string]any {
 		"GAP_HEAL_LEASE_TTL":                  defaultGapLeaseTTL,
 		"GAP_CONTINUATION_DELAY":              defaultGapContinuationDelay,
 		"GAP_DEEP_SCAN_PERIOD":                defaultGapDeepScanPeriod,
+		"GAP_REDELIVERY_BACKOFF":              defaultGapRedeliveryBackoff,
+		"GAP_REDELIVERY_BACKOFF_MAX":          defaultGapRedeliveryBackoffMax,
 		"GAP_PAGE_SIZE":                       defaultGapPageSize,
 		"GAP_MAX_PAGES":                       defaultGapMaxPages,
 		"DRIFT_PERIOD":                        defaultDriftPeriod,
