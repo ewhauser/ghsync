@@ -332,6 +332,8 @@ func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("GAP_COMPARISON_WINDOW", "2h")
 	t.Setenv("GAP_CONTINUATION_DELAY", "45s")
 	t.Setenv("GAP_DEEP_SCAN_PERIOD", "12h")
+	t.Setenv("GAP_REDELIVERY_BACKOFF", "10m")
+	t.Setenv("GAP_REDELIVERY_BACKOFF_MAX", "3h")
 	t.Setenv("DRIFT_SAMPLE_SIZE", "7")
 	t.Setenv("DRIFT_PAGE_SIZE", "50")
 	t.Setenv("RETENTION_AGE", "2160h")
@@ -345,6 +347,8 @@ func TestFromEnvM4ScheduleDefaultsAndOverrides(t *testing.T) {
 		cfg.GapWindow != 2*time.Hour ||
 		cfg.GapContinuationDelay != 45*time.Second ||
 		cfg.GapDeepScanPeriod != 12*time.Hour ||
+		cfg.GapRedeliveryBackoff != 10*time.Minute ||
+		cfg.GapRedeliveryBackoffMax != 3*time.Hour ||
 		cfg.DriftSampleSize != 7 ||
 		cfg.DriftPageSize != 50 ||
 		cfg.RetentionAge != 90*24*time.Hour ||
@@ -361,6 +365,8 @@ func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
 		"GAP_MAX_PAGES":               "0",
 		"GAP_CONTINUATION_DELAY":      "0s",
 		"GAP_DEEP_SCAN_PERIOD":        "0s",
+		"GAP_REDELIVERY_BACKOFF":      "0s",
+		"GAP_REDELIVERY_BACKOFF_MAX":  "0s",
 		"DRIFT_SAMPLE_SIZE":           "none",
 		"DRIFT_PAGE_SIZE":             "101",
 		"RETENTION_AGE":               "-1h",
@@ -373,6 +379,15 @@ func TestFromEnvRejectsInvalidM4Values(t *testing.T) {
 				t.Fatalf("%s=%q accepted", key, value)
 			}
 		})
+	}
+}
+
+func TestFromEnvRejectsGapRedeliveryBackoffBeyondMaximum(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("GAP_REDELIVERY_BACKOFF", "2h")
+	t.Setenv("GAP_REDELIVERY_BACKOFF_MAX", "1h")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("redelivery base backoff beyond maximum accepted")
 	}
 }
 
@@ -548,6 +563,8 @@ func clearConfigEnv(t *testing.T) {
 		"GAP_HEAL_LEASE_TTL",
 		"GAP_CONTINUATION_DELAY",
 		"GAP_DEEP_SCAN_PERIOD",
+		"GAP_REDELIVERY_BACKOFF",
+		"GAP_REDELIVERY_BACKOFF_MAX",
 		"GAP_PAGE_SIZE",
 		"GAP_MAX_PAGES",
 		"DRIFT_PERIOD",

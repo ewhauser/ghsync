@@ -134,7 +134,11 @@ func (s *Service) HealDeliveryGaps(
 			seen[delivery.GUID] = struct{}{}
 			candidates = append(candidates, *delivery)
 		}
-		if err := s.redeliverMissing(workCtx, candidates); err != nil {
+		if err := s.redeliverMissing(
+			workCtx,
+			candidates,
+			args.LeaseToken,
+		); err != nil {
 			if cause := context.Cause(workCtx); cause != nil &&
 				!errors.Is(cause, context.Canceled) {
 				return cause
@@ -572,6 +576,7 @@ func gapContinuationInsertOpts(scheduledAt time.Time) *river.InsertOpts {
 func (s *Service) redeliverMissing(
 	ctx context.Context,
 	deliveries []gh.AppHookDelivery,
+	claimToken string,
 ) error {
 	if len(deliveries) == 0 {
 		return nil
@@ -581,7 +586,8 @@ func (s *Service) redeliverMissing(
 		delivery := &deliveries[index]
 		guids = append(guids, delivery.GUID)
 	}
-	existing, err := dbgen.New(s.pool).ListExistingWebhookDeliveryGUIDs(
+	queries := dbgen.New(s.pool)
+	existing, err := queries.ListExistingWebhookDeliveryGUIDs(
 		ctx,
 		guids,
 	)
@@ -592,20 +598,111 @@ func (s *Service) redeliverMissing(
 	for _, guid := range existing {
 		present[guid] = struct{}{}
 	}
+	if len(existing) > 0 {
+		if err := queries.DeleteWebhookDeliveryRetries(
+			ctx,
+			dbgen.DeleteWebhookDeliveryRetriesParams{
+				InstallationID: s.config.InstallationID,
+				DeliveryGuids:  existing,
+			},
+		); err != nil {
+			return fmt.Errorf("clear healed webhook delivery retries: %w", err)
+		}
+	}
+	now := s.config.Now().UTC()
 	for index := range deliveries {
 		delivery := &deliveries[index]
 		if _, ok := present[delivery.GUID]; ok {
 			continue
 		}
+		retry, newlyObserved, err := s.observeWebhookDeliveryRetry(
+			ctx,
+			queries,
+			delivery,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		if newlyObserved && delivery.Redelivery {
+			s.config.Observer.GapUnresolved(
+				ctx,
+				delivery.ID,
+				delivery.GUID,
+				retry.Outcome,
+				deliveryStatusClass(delivery.StatusCode),
+			)
+		}
+		nextAttempt := now.Add(
+			s.gapRedeliveryBackoff(retry.AttemptCount + 1),
+		)
+		if _, err := queries.ClaimWebhookDeliveryRetry(
+			ctx,
+			dbgen.ClaimWebhookDeliveryRetryParams{
+				NextAttemptAt: repoutil.Timestamptz(nextAttempt),
+				ClaimToken: pgtype.Text{
+					String: claimToken,
+					Valid:  true,
+				},
+				AttemptedAt:        repoutil.Timestamptz(now),
+				InstallationID:     s.config.InstallationID,
+				DeliveryGuid:       delivery.GUID,
+				ExpectedDeliveryID: retry.LatestDeliveryID,
+			},
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			return fmt.Errorf("claim webhook delivery retry: %w", err)
+		}
 		if err := s.deliveries.RedeliverAppHookDelivery(
 			ctx,
 			delivery.ID,
 		); err != nil {
+			releaseErr := s.releaseWebhookDeliveryRetryClaim(
+				ctx,
+				queries,
+				delivery,
+				claimToken,
+				now,
+			)
+			if releaseErr != nil {
+				return fmt.Errorf(
+					"redeliver webhook delivery %d: %w",
+					delivery.ID,
+					errors.Join(
+						err,
+						fmt.Errorf(
+							"release retry claim: %w",
+							releaseErr,
+						),
+					),
+				)
+			}
 			return fmt.Errorf(
 				"redeliver webhook delivery %d: %w",
 				delivery.ID,
 				err,
 			)
+		}
+		accepted, err := queries.AcceptWebhookDeliveryRetry(
+			ctx,
+			dbgen.AcceptWebhookDeliveryRetryParams{
+				AcceptedAt:         repoutil.Timestamptz(now),
+				InstallationID:     s.config.InstallationID,
+				DeliveryGuid:       delivery.GUID,
+				ExpectedDeliveryID: delivery.ID,
+				ClaimToken: pgtype.Text{
+					String: claimToken,
+					Valid:  true,
+				},
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("accept webhook delivery retry: %w", err)
+		}
+		if accepted == 0 {
+			continue
 		}
 		s.config.Observer.GapRedelivery(
 			ctx,
@@ -614,4 +711,155 @@ func (s *Service) redeliverMissing(
 		)
 	}
 	return nil
+}
+
+func (s *Service) releaseWebhookDeliveryRetryClaim(
+	ctx context.Context,
+	queries *dbgen.Queries,
+	delivery *gh.AppHookDelivery,
+	claimToken string,
+	failedAt time.Time,
+) error {
+	_, err := queries.ReleaseWebhookDeliveryRetryClaim(
+		ctx,
+		dbgen.ReleaseWebhookDeliveryRetryClaimParams{
+			FailedAt:           repoutil.Timestamptz(failedAt),
+			InstallationID:     s.config.InstallationID,
+			DeliveryGuid:       delivery.GUID,
+			ExpectedDeliveryID: delivery.ID,
+			ClaimToken: pgtype.Text{
+				String: claimToken,
+				Valid:  true,
+			},
+		},
+	)
+	return err
+}
+
+func (s *Service) observeWebhookDeliveryRetry(
+	ctx context.Context,
+	queries *dbgen.Queries,
+	delivery *gh.AppHookDelivery,
+	now time.Time,
+) (dbgen.WebhookDeliveryRetry, bool, error) {
+	lookup := dbgen.GetWebhookDeliveryRetryParams{
+		InstallationID: s.config.InstallationID,
+		DeliveryGuid:   delivery.GUID,
+	}
+	prior, err := queries.GetWebhookDeliveryRetry(ctx, lookup)
+	if err == nil && prior.LatestDeliveryID == delivery.ID {
+		return prior, false, nil
+	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return dbgen.WebhookDeliveryRetry{}, false, fmt.Errorf(
+			"load webhook delivery retry: %w",
+			err,
+		)
+	}
+
+	previousDeliveryID := int64(0)
+	attemptCount := int32(0)
+	lastAttemptedAt := pgtype.Timestamptz{}
+	if err == nil {
+		previousDeliveryID = prior.LatestDeliveryID
+		attemptCount = prior.AttemptCount
+		lastAttemptedAt = prior.LastAttemptedAt
+	} else if delivery.Redelivery {
+		// A retry row may not exist yet during rollout. Seed one prior attempt
+		// from GitHub's durable redelivery outcome so existing failures do not
+		// get one more immediate retry after migration.
+		attemptCount = 1
+		lastAttemptedAt = repoutil.Timestamptz(delivery.DeliveredAt)
+	}
+
+	outcome := "ready"
+	statusCode := boundedDeliveryStatusCode(delivery.StatusCode)
+	nextAttemptAt := now
+	if delivery.Redelivery {
+		outcome = "transient"
+		deliveredAt := delivery.DeliveredAt.UTC()
+		if deliveredAt.IsZero() {
+			deliveredAt = now
+		}
+		if statusCode >= http.StatusBadRequest &&
+			statusCode < http.StatusInternalServerError {
+			outcome = "terminal"
+			nextAttemptAt = deliveredAt.Add(
+				s.config.GapRedeliveryBackoffMax,
+			)
+		} else {
+			nextAttemptAt = deliveredAt.Add(
+				s.gapRedeliveryBackoff(max(attemptCount, 1)),
+			)
+		}
+	}
+
+	retry, err := queries.UpsertWebhookDeliveryRetryObservation(
+		ctx,
+		dbgen.UpsertWebhookDeliveryRetryObservationParams{
+			InstallationID:     s.config.InstallationID,
+			DeliveryGuid:       delivery.GUID,
+			LatestDeliveryID:   delivery.ID,
+			AttemptCount:       attemptCount,
+			Outcome:            outcome,
+			StatusCode:         int32(statusCode), //nolint:gosec // bounded to 0..599
+			NextAttemptAt:      repoutil.Timestamptz(nextAttemptAt),
+			LastAttemptedAt:    lastAttemptedAt,
+			UpdatedAt:          repoutil.Timestamptz(now),
+			PreviousDeliveryID: previousDeliveryID,
+		},
+	)
+	if err == nil {
+		return retry, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return dbgen.WebhookDeliveryRetry{}, false, fmt.Errorf(
+			"record webhook delivery retry observation: %w",
+			err,
+		)
+	}
+	// A successor may have observed a newer attempt after this worker lost its
+	// lease. Do not overwrite that state with this page's older observation.
+	retry, err = queries.GetWebhookDeliveryRetry(ctx, lookup)
+	if err != nil {
+		return dbgen.WebhookDeliveryRetry{}, false, fmt.Errorf(
+			"reload concurrent webhook delivery retry: %w",
+			err,
+		)
+	}
+	return retry, false, nil
+}
+
+func (s *Service) gapRedeliveryBackoff(attempt int32) time.Duration {
+	delay := s.config.GapRedeliveryBackoff
+	for step := int32(1); step < attempt; step++ {
+		if delay >= s.config.GapRedeliveryBackoffMax/2 {
+			return s.config.GapRedeliveryBackoffMax
+		}
+		delay *= 2
+	}
+	return min(delay, s.config.GapRedeliveryBackoffMax)
+}
+
+func boundedDeliveryStatusCode(statusCode int) int {
+	if statusCode < 0 || statusCode > 599 {
+		return 0
+	}
+	return statusCode
+}
+
+func deliveryStatusClass(statusCode int) string {
+	statusCode = boundedDeliveryStatusCode(statusCode)
+	switch {
+	case statusCode >= 200 && statusCode < 300:
+		return "2xx"
+	case statusCode >= 300 && statusCode < 400:
+		return "3xx"
+	case statusCode >= 400 && statusCode < 500:
+		return "4xx"
+	case statusCode >= 500:
+		return "5xx"
+	default:
+		return "other"
+	}
 }

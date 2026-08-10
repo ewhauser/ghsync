@@ -60,6 +60,7 @@ type Runtime struct {
 	cacheWrites              metric.Int64Counter
 	sweepOverruns            metric.Int64Counter
 	gapHealRequests          metric.Int64Counter
+	gapUnresolved            metric.Int64Counter
 	gapWindowIncomplete      metric.Int64Counter
 	driftTransitions         metric.Int64Counter
 	prunerDeletes            metric.Int64Counter
@@ -223,6 +224,12 @@ func (r *Runtime) RegisterMetrics(meter metric.Meter) error {
 	if r.gapHealRequests, err = meter.Int64Counter(
 		"ghsync_c_r4_gap_heal_requests",
 		metric.WithDescription("GitHub delivery redelivery requests (C-R4)."),
+	); err != nil {
+		return err
+	}
+	if r.gapUnresolved, err = meter.Int64Counter(
+		"ghsync_c_r4_gap_unresolved",
+		metric.WithDescription("Unresolved delivery gaps by bounded retry outcome and status class (C-R4)."),
 	); err != nil {
 		return err
 	}
@@ -574,6 +581,19 @@ func (r *Runtime) GapRedelivery(
 	_ string,
 ) {
 	r.gapHealRequests.Add(ctx, 1)
+}
+
+func (r *Runtime) GapUnresolved(
+	ctx context.Context,
+	_ int64,
+	_ string,
+	outcome string,
+	statusClass string,
+) {
+	r.gapUnresolved.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", outcome),
+		attribute.String("status_class", statusClass),
+	))
 }
 
 func (r *Runtime) GapWindowIncomplete(

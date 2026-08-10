@@ -311,6 +311,13 @@ explicit review checklist rather than relying on call-site folklore:
   cursor, pass watermark, scan mode, shape version, and deep completion are
   durable; the per-installation lease still fences advance and completion
   without holding a database lock across delivery-list or redelivery calls.
+  Redelivery requests also have durable per-GUID retry state. Each accepted
+  request starts at `GAP_REDELIVERY_BACKOFF`; transient outcomes back off
+  exponentially to `GAP_REDELIVERY_BACKOFF_MAX`, while terminal 4xx outcomes
+  wait for that maximum interval before an operator-recoverable retry. A
+  later successful ingress row clears the state. Outcome and status-class
+  metrics use only bounded values (`transient`/`terminal` and
+  `2xx`/`3xx`/`4xx`/`5xx`/`other`).
 - **C-R5 — Outstanding generations always have live work.** Generation bumps
   insert their unique River pointer transactionally, but River may still move
   a pointer to a terminal state (discarded after exhausted retries,

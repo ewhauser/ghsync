@@ -290,6 +290,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 	runtimeMetrics.BranchReconciliationPage(
 		ctx, "partial_superseded", 25, 3,
 	)
+	runtimeMetrics.GapUnresolved(ctx, 1, "guid", "terminal", "4xx")
 
 	response := httptest.NewRecorder()
 	registry.Handler().ServeHTTP(
@@ -329,6 +330,7 @@ func TestRuntimeMetricsExposeConstraintState(t *testing.T) {
 		`ghsync_c_c3_branch_bulk_applications_total{outcome="applied",page_count="6_25"} 1`,
 		`ghsync_c_c3_branch_bulk_entities_total{entity_kind="pull_request"} 250`,
 		`ghsync_c_o4_branch_reconciliation_pages_total{outcome="partial_superseded",target_count="6_25"} 1`,
+		`ghsync_c_r4_gap_unresolved_total{outcome="terminal",status_class="4xx"} 1`,
 		`ghsync_c_c2_branch_reconciliation_superseded_total{unit="page"} 2`,
 		`ghsync_c_c2_branch_reconciliation_superseded_total{unit="target"} 3`,
 		`ghsync_c_q2_direct_entity_refreshes_total{entity_kind="refresh_pr",outcome="success"} 2`,

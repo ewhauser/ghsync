@@ -620,6 +620,19 @@ type WebhookDelivery struct {
 	Tracestate      pgtype.Text
 }
 
+type WebhookDeliveryRetry struct {
+	InstallationID   int64
+	DeliveryGuid     string
+	LatestDeliveryID int64
+	AttemptCount     int32
+	Outcome          string
+	StatusCode       int32
+	NextAttemptAt    pgtype.Timestamptz
+	ClaimToken       pgtype.Text
+	LastAttemptedAt  pgtype.Timestamptz
+	UpdatedAt        pgtype.Timestamptz
+}
+
 type WorkItem struct {
 	IdentityKey string
 	OrgID       int64

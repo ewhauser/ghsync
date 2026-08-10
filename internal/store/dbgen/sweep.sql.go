@@ -11,6 +11,40 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acceptWebhookDeliveryRetry = `-- name: AcceptWebhookDeliveryRetry :execrows
+UPDATE webhook_delivery_retries
+SET outcome = 'pending',
+    claim_token = NULL,
+    updated_at = $1
+WHERE installation_id = $2
+  AND delivery_guid = $3
+  AND latest_delivery_id = $4
+  AND outcome = 'claiming'
+  AND claim_token = $5
+`
+
+type AcceptWebhookDeliveryRetryParams struct {
+	AcceptedAt         pgtype.Timestamptz
+	InstallationID     int64
+	DeliveryGuid       string
+	ExpectedDeliveryID int64
+	ClaimToken         pgtype.Text
+}
+
+func (q *Queries) AcceptWebhookDeliveryRetry(ctx context.Context, arg AcceptWebhookDeliveryRetryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, acceptWebhookDeliveryRetry,
+		arg.AcceptedAt,
+		arg.InstallationID,
+		arg.DeliveryGuid,
+		arg.ExpectedDeliveryID,
+		arg.ClaimToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const advanceGapHealCursor = `-- name: AdvanceGapHealCursor :execrows
 UPDATE gap_heal_cursors
 SET cursor = $1,
@@ -155,6 +189,66 @@ func (q *Queries) ClaimGapHealCursor(ctx context.Context, arg ClaimGapHealCursor
 	return i, err
 }
 
+const claimWebhookDeliveryRetry = `-- name: ClaimWebhookDeliveryRetry :one
+UPDATE webhook_delivery_retries AS retry
+SET attempt_count = retry.attempt_count + CASE
+        WHEN retry.outcome = 'claiming' THEN 0
+        ELSE 1
+    END,
+    outcome = 'claiming',
+    next_attempt_at = $1,
+    claim_token = $2,
+    last_attempted_at = $3,
+    updated_at = $3
+WHERE retry.installation_id = $4
+  AND retry.delivery_guid = $5
+  AND retry.latest_delivery_id = $6
+  AND (
+      retry.next_attempt_at <= $3
+      OR retry.outcome = 'claiming'
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM webhook_deliveries AS existing
+      WHERE existing.delivery_guid = retry.delivery_guid
+  )
+RETURNING retry.installation_id, retry.delivery_guid, retry.latest_delivery_id, retry.attempt_count, retry.outcome, retry.status_code, retry.next_attempt_at, retry.claim_token, retry.last_attempted_at, retry.updated_at
+`
+
+type ClaimWebhookDeliveryRetryParams struct {
+	NextAttemptAt      pgtype.Timestamptz
+	ClaimToken         pgtype.Text
+	AttemptedAt        pgtype.Timestamptz
+	InstallationID     int64
+	DeliveryGuid       string
+	ExpectedDeliveryID int64
+}
+
+func (q *Queries) ClaimWebhookDeliveryRetry(ctx context.Context, arg ClaimWebhookDeliveryRetryParams) (WebhookDeliveryRetry, error) {
+	row := q.db.QueryRow(ctx, claimWebhookDeliveryRetry,
+		arg.NextAttemptAt,
+		arg.ClaimToken,
+		arg.AttemptedAt,
+		arg.InstallationID,
+		arg.DeliveryGuid,
+		arg.ExpectedDeliveryID,
+	)
+	var i WebhookDeliveryRetry
+	err := row.Scan(
+		&i.InstallationID,
+		&i.DeliveryGuid,
+		&i.LatestDeliveryID,
+		&i.AttemptCount,
+		&i.Outcome,
+		&i.StatusCode,
+		&i.NextAttemptAt,
+		&i.ClaimToken,
+		&i.LastAttemptedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const completeGapHealCursor = `-- name: CompleteGapHealCursor :execrows
 UPDATE gap_heal_cursors
 SET cursor = '',
@@ -276,6 +370,22 @@ func (q *Queries) DeleteCheckHistoryBatch(ctx context.Context, arg DeleteCheckHi
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const deleteWebhookDeliveryRetries = `-- name: DeleteWebhookDeliveryRetries :exec
+DELETE FROM webhook_delivery_retries
+WHERE installation_id = $1
+  AND delivery_guid = ANY($2::text[])
+`
+
+type DeleteWebhookDeliveryRetriesParams struct {
+	InstallationID int64
+	DeliveryGuids  []string
+}
+
+func (q *Queries) DeleteWebhookDeliveryRetries(ctx context.Context, arg DeleteWebhookDeliveryRetriesParams) error {
+	_, err := q.db.Exec(ctx, deleteWebhookDeliveryRetries, arg.InstallationID, arg.DeliveryGuids)
+	return err
 }
 
 const ensureGapHealCursor = `-- name: EnsureGapHealCursor :one
@@ -472,6 +582,36 @@ func (q *Queries) GetSweepPage(ctx context.Context, arg GetSweepPageParams) (Swe
 		&i.NextCursor,
 		&i.EntityKeys,
 		&i.ListSeenAt,
+	)
+	return i, err
+}
+
+const getWebhookDeliveryRetry = `-- name: GetWebhookDeliveryRetry :one
+SELECT installation_id, delivery_guid, latest_delivery_id, attempt_count, outcome, status_code, next_attempt_at, claim_token, last_attempted_at, updated_at
+FROM webhook_delivery_retries
+WHERE installation_id = $1
+  AND delivery_guid = $2
+`
+
+type GetWebhookDeliveryRetryParams struct {
+	InstallationID int64
+	DeliveryGuid   string
+}
+
+func (q *Queries) GetWebhookDeliveryRetry(ctx context.Context, arg GetWebhookDeliveryRetryParams) (WebhookDeliveryRetry, error) {
+	row := q.db.QueryRow(ctx, getWebhookDeliveryRetry, arg.InstallationID, arg.DeliveryGuid)
+	var i WebhookDeliveryRetry
+	err := row.Scan(
+		&i.InstallationID,
+		&i.DeliveryGuid,
+		&i.LatestDeliveryID,
+		&i.AttemptCount,
+		&i.Outcome,
+		&i.StatusCode,
+		&i.NextAttemptAt,
+		&i.ClaimToken,
+		&i.LastAttemptedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -1040,6 +1180,41 @@ func (q *Queries) ReapOrphanedRepositorySweepCursors(ctx context.Context, instal
 	return result.RowsAffected(), nil
 }
 
+const releaseWebhookDeliveryRetryClaim = `-- name: ReleaseWebhookDeliveryRetryClaim :execrows
+UPDATE webhook_delivery_retries
+SET outcome = 'ready',
+    next_attempt_at = $1,
+    claim_token = NULL,
+    updated_at = $1
+WHERE installation_id = $2
+  AND delivery_guid = $3
+  AND latest_delivery_id = $4
+  AND outcome = 'claiming'
+  AND claim_token = $5
+`
+
+type ReleaseWebhookDeliveryRetryClaimParams struct {
+	FailedAt           pgtype.Timestamptz
+	InstallationID     int64
+	DeliveryGuid       string
+	ExpectedDeliveryID int64
+	ClaimToken         pgtype.Text
+}
+
+func (q *Queries) ReleaseWebhookDeliveryRetryClaim(ctx context.Context, arg ReleaseWebhookDeliveryRetryClaimParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseWebhookDeliveryRetryClaim,
+		arg.FailedAt,
+		arg.InstallationID,
+		arg.DeliveryGuid,
+		arg.ExpectedDeliveryID,
+		arg.ClaimToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const renewGapHealLease = `-- name: RenewGapHealLease :execrows
 UPDATE gap_heal_cursors
 SET lease_until = $1
@@ -1328,4 +1503,80 @@ func (q *Queries) UpsertSweepPage(ctx context.Context, arg UpsertSweepPageParams
 		arg.ListSeenAt,
 	)
 	return err
+}
+
+const upsertWebhookDeliveryRetryObservation = `-- name: UpsertWebhookDeliveryRetryObservation :one
+INSERT INTO webhook_delivery_retries (
+    installation_id,
+    delivery_guid,
+    latest_delivery_id,
+    attempt_count,
+    outcome,
+    status_code,
+    next_attempt_at,
+    last_attempted_at,
+    updated_at
+) VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    $7,
+    $8,
+    $9
+)
+ON CONFLICT (installation_id, delivery_guid) DO UPDATE
+SET latest_delivery_id = EXCLUDED.latest_delivery_id,
+    outcome = EXCLUDED.outcome,
+    status_code = EXCLUDED.status_code,
+    next_attempt_at = EXCLUDED.next_attempt_at,
+    claim_token = NULL,
+    updated_at = EXCLUDED.updated_at
+WHERE webhook_delivery_retries.latest_delivery_id =
+      $10
+RETURNING installation_id, delivery_guid, latest_delivery_id, attempt_count, outcome, status_code, next_attempt_at, claim_token, last_attempted_at, updated_at
+`
+
+type UpsertWebhookDeliveryRetryObservationParams struct {
+	InstallationID     int64
+	DeliveryGuid       string
+	LatestDeliveryID   int64
+	AttemptCount       int32
+	Outcome            string
+	StatusCode         int32
+	NextAttemptAt      pgtype.Timestamptz
+	LastAttemptedAt    pgtype.Timestamptz
+	UpdatedAt          pgtype.Timestamptz
+	PreviousDeliveryID int64
+}
+
+func (q *Queries) UpsertWebhookDeliveryRetryObservation(ctx context.Context, arg UpsertWebhookDeliveryRetryObservationParams) (WebhookDeliveryRetry, error) {
+	row := q.db.QueryRow(ctx, upsertWebhookDeliveryRetryObservation,
+		arg.InstallationID,
+		arg.DeliveryGuid,
+		arg.LatestDeliveryID,
+		arg.AttemptCount,
+		arg.Outcome,
+		arg.StatusCode,
+		arg.NextAttemptAt,
+		arg.LastAttemptedAt,
+		arg.UpdatedAt,
+		arg.PreviousDeliveryID,
+	)
+	var i WebhookDeliveryRetry
+	err := row.Scan(
+		&i.InstallationID,
+		&i.DeliveryGuid,
+		&i.LatestDeliveryID,
+		&i.AttemptCount,
+		&i.Outcome,
+		&i.StatusCode,
+		&i.NextAttemptAt,
+		&i.ClaimToken,
+		&i.LastAttemptedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }

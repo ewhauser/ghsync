@@ -49,6 +49,8 @@ const (
 	defaultGapLeaseTTL             = 5 * time.Minute
 	defaultGapContinuationDelay    = 30 * time.Second
 	defaultGapDeepScanPeriod       = 24 * time.Hour
+	defaultGapRedeliveryBackoff    = 5 * time.Minute
+	defaultGapRedeliveryBackoffMax = 6 * time.Hour
 	defaultDriftPeriod             = time.Hour
 	defaultDriftSampleSize         = 10
 	defaultDriftPageSize           = 100
@@ -172,6 +174,10 @@ type Config struct {
 	GapContinuationDelay time.Duration
 	// GapDeepScanPeriod bounds detection of deliveries behind the cheap cursor.
 	GapDeepScanPeriod time.Duration
+	// GapRedeliveryBackoff is the initial durable delay after a redelivery.
+	GapRedeliveryBackoff time.Duration
+	// GapRedeliveryBackoffMax caps retry delay and paces terminal 4xx retries.
+	GapRedeliveryBackoffMax time.Duration
 
 	// DriftPeriod controls semantic-drift scan scheduling.
 	DriftPeriod time.Duration
@@ -249,6 +255,8 @@ func FromEnv() (Config, error) {
 		GapLeaseTTL:                defaultGapLeaseTTL,
 		GapContinuationDelay:       defaultGapContinuationDelay,
 		GapDeepScanPeriod:          defaultGapDeepScanPeriod,
+		GapRedeliveryBackoff:       defaultGapRedeliveryBackoff,
+		GapRedeliveryBackoffMax:    defaultGapRedeliveryBackoffMax,
 		DriftPeriod:                defaultDriftPeriod,
 		DriftSampleSize:            defaultDriftSampleSize,
 		DriftPageSize:              defaultDriftPageSize,
@@ -341,6 +349,8 @@ func FromEnv() (Config, error) {
 		{"GAP_HEAL_LEASE_TTL", &cfg.GapLeaseTTL},
 		{"GAP_CONTINUATION_DELAY", &cfg.GapContinuationDelay},
 		{"GAP_DEEP_SCAN_PERIOD", &cfg.GapDeepScanPeriod},
+		{"GAP_REDELIVERY_BACKOFF", &cfg.GapRedeliveryBackoff},
+		{"GAP_REDELIVERY_BACKOFF_MAX", &cfg.GapRedeliveryBackoffMax},
 		{"DRIFT_PERIOD", &cfg.DriftPeriod},
 		{"DRIFT_RESOLVED_RETENTION", &cfg.DriftResolvedRetention},
 		{"RETENTION_PERIOD", &cfg.RetentionPeriod},
@@ -474,6 +484,11 @@ func FromEnv() (Config, error) {
 		cfg.GapDeepScanPeriod > githubDeliveryRetention-cfg.GapWindow {
 		return Config{}, fmt.Errorf(
 			"GAP_COMPARISON_WINDOW plus GAP_DEEP_SCAN_PERIOD must not exceed GitHub's 72h delivery retention",
+		)
+	}
+	if cfg.GapRedeliveryBackoff > cfg.GapRedeliveryBackoffMax {
+		return Config{}, fmt.Errorf(
+			"GAP_REDELIVERY_BACKOFF must not exceed GAP_REDELIVERY_BACKOFF_MAX",
 		)
 	}
 	databaseAuth, err := ParseDatabaseAuth(string(cfg.DatabaseAuth))
