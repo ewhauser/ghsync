@@ -1,4 +1,4 @@
-FROM golang:1.26@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647 AS build
+FROM golang:1.27@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -7,6 +7,6 @@ COPY internal ./internal
 COPY db ./db
 RUN CGO_ENABLED=0 go build -o /fake-github ./cmd/fake-github
 
-FROM gcr.io/distroless/static-debian12:latest@sha256:a9fcaedd4c9b59e12dd65d954f0b5044f19b0647a8a3712e77205df9e7b102cd
+FROM gcr.io/distroless/static-debian12:latest@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2
 COPY --from=build /fake-github /fake-github
 ENTRYPOINT ["/fake-github"]
