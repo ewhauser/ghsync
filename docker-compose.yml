@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a
+    image: postgres:18@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
     # Parallel DB tests (pgtestdb clones a database per test) open more
     # simultaneous connections than the default limit of 100 allows.
     command: postgres -c max_connections=300
@@ -36,7 +36,7 @@ services:
       retries: 15
 
   jaeger:
-    image: jaegertracing/jaeger:2.20.0@sha256:46a886260e04002d8f45e213fc39063fa11a50446048fdaa64786fc0840cb9f8
+    image: jaegertracing/jaeger:2.21.0@sha256:3d0ac795ff98aa04d1be04311d2dac6c25b4bfc8322dc02e53bc5b170c5018c3
     profiles: ["tracing"]
     ports:
       - "127.0.0.1:16686:16686"
